@@ -1,0 +1,49 @@
+[project]
+name = "geosunpre"
+version = "0.1.0"
+description = "Image-led asynchronous dual-fisheye SfM preprocessing"
+readme = "README.md"
+authors = [
+    { name = "Niloux3d", email = "15072763003@163.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.2",
+    "opencv-python>=4.12,<5",
+    "pillow>=12",
+    "pycolmap==4.2.0",
+    "pyceres==2.6",
+    "scipy>=1.15",
+]
+
+[project.optional-dependencies]
+segmentation = ["transformers==4.57.6"]
+loma = [
+    "lomatch @ git+https://github.com/davnords/LoMa.git@8fb59c458f2a2ef44314f462467b229c27786bf0",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[project.scripts]
+geosunpre = "geosunpre:main"
+
+[build-system]
+requires = ["uv_build>=0.12.14,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", extra = "loma" }]
+torchvision = [{ index = "pytorch-cu128", extra = "loma" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pypi-mirror"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
