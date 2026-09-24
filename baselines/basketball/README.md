@@ -11,4 +11,6 @@ uv run --no-sync geosunpre export-baseline --work work/basketball
 
 `baseline-check` 默认核对清单、COLMAP 模型、图像成员、掩码和已有 LFS 导出身份；`--full` 额外重新计算全部原图与掩码的内容哈希。`export-baseline` 在校验后将单一等权分支打包到 `work/basketball/baseline_colmap/`，不运行 SfM、A/B 或 LFS 训练，也不覆盖现有实验输出。导出目录包含 `images/` 原图链接、独立拷贝的 `masks/`、`sparse/0/` 和冻结的 `lfs_config.json`。原图仍须保留在 `input/`。
 
+[基线复跑说明](REPRODUCE.md)给出从原图自动构建等权 SfM 与单分支 LFS COLMAP 输入的命令，也区分了历史冻结产物的只读核对和重打包。新构建会生成独立身份，不覆盖这里的历史清单。
+
 模型来源和 A/B 证据见[全场 SfM](../../reports/basketball_global_sfm.md)、[联合 BA](../../reports/basketball_ground_joint_ba.md)、[LFS A/B](../../reports/basketball_lfs_ab.md)。改动模型、掩码、图像或配置时，应创建新的基线版本并明确晋升理由，不能覆盖本清单或原有目录。

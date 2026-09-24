@@ -2,11 +2,13 @@
 
 import argparse
 import json
+from pathlib import Path
 import sys
 
 
 STABLE_COMMANDS = frozenset({
-    'prepare', 'global-data', 'global-sfm', 'baseline-check', 'export-baseline',
+    'prepare', 'global-data', 'global-sfm', 'build-baseline',
+    'check-computed-baseline', 'baseline-check', 'export-baseline',
 })
 
 
@@ -39,6 +41,22 @@ def main(argv=None):
     sfm.add_argument('--stop-after', choices=['fixed_calibration', 'triangle_supported',
                                               'shared_calibration'],
                      default='shared_calibration')
+
+    build = sub.add_parser('build-baseline',
+                           help='Run the unattended basketball SfM and single-branch LFS export')
+    build.add_argument('--input', help='Raw basketball input; required for prepare/all')
+    build.add_argument('--work', required=True, help='Fresh or resumable work directory')
+    build.add_argument('--stage', choices=['prepare', 'local-calibration', 'global-data',
+                                           'global-sfm', 'equal-ba', 'export', 'all'],
+                       default='all')
+    build.add_argument('--output', help='COLMAP output; default is WORK/baseline_colmap')
+    build.add_argument('--lfs-config',
+                       default=str(Path(__file__).resolve().parents[2] /
+                                   'baselines/basketball/lfs_config.json'))
+    computed = sub.add_parser('check-computed-baseline',
+                              help='Read-only content check of a newly built LFS COLMAP dataset')
+    computed.add_argument('--work', required=True)
+    computed.add_argument('--output', help='COLMAP output; default is WORK/baseline_colmap')
 
     check = sub.add_parser('baseline-check', help='Verify the adopted development baseline')
     check.add_argument('--work', help='Override the work directory in the baseline manifest')
@@ -85,6 +103,13 @@ def main(argv=None):
         if args.stage == 'compare':
             compare_global_stages(args.work)
         return
+    elif args.command == 'build-baseline':
+        from .pipeline.baseline_build import run_baseline
+        result = run_baseline(args.work, input_root=args.input, stage=args.stage,
+                              output=args.output, lfs_config=args.lfs_config)
+    elif args.command == 'check-computed-baseline':
+        from .pipeline.baseline_build import verify_computed_baseline
+        result = verify_computed_baseline(args.work, output=args.output)
     elif args.command == 'baseline-check':
         from .pipeline.baseline import check_baseline
         result = check_baseline(manifest_path=args.manifest, work_override=args.work,

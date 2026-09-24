@@ -35,6 +35,8 @@ def prepare_global(work):
     reused = []
     for name in ['local_sfm', 'transfer_sfm']:
         previous = work / name
+        if not (previous / 'manifest.json').is_file():
+            continue
         for record in load_scene(previous)['images']:
             for kind, suffix in [('valid', '.png'), ('labels', '.png'), ('stats', '.json')]:
                 src = previous / 'masks_v2' / kind / (record['name'] + suffix)

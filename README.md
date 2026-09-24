@@ -18,13 +18,13 @@ PYTHONPATH=src .venv/bin/python -m geosunpre export-baseline --work work/basketb
 ## 代码和资料
 
 - `src/geosunpre/`：共享相机、特征、几何、BA 和验证部件。
-- `src/geosunpre/pipeline/`：输入后的全场数据准备、视觉建图和基线校验/导出。
+- `src/geosunpre/pipeline/`：局部视觉标定、全场建图、无人工标注等权 BA、单分支 LFS 导出及基线校验。
 - `src/geosunpre/experiments/`：局部/迁移对照、加权 A/B 与各轮诊断；独立入口为 `geosunpre-exp` 或 `python -m geosunpre.experiments`。旧 `geosunpre <实验命令>` 暂保留兼容。
 - `baselines/basketball/`：纳入 Git 的小型基线身份清单；`work/` 和 `input/` 存放大型产物与原始数据，不纳入 Git。
 - [实验报告索引](reports/README.md)和[历史命令与结果](experiments/basketball/HISTORY.md)保留各轮试验的复算入口与未晋升结论。
 - [工程边界](docs/engineering_structure.md)说明正式流程与实验的依赖方向。
 
-仅在需要重建全场模型时使用 `geosunpre prepare`、`global-data`、`global-sfm`；它们会处理完整图像集，不是基线校验所需命令。依赖由 `pyproject.toml` 和 `uv.lock` 固定；LoMa 权重和 CUDA 依赖首次安装需要额外下载。
+从原始图像完整复算时运行 `geosunpre build-baseline --input input/篮球场 --work work/basketball_rerun_01`，具体环境、分阶段运行、输出和只读核对命令见[基线复跑说明](baselines/basketball/REPRODUCE.md)。新入口独立完成等权 BA 与单分支 COLMAP 导出，不读取人工标注或加权 A/B 产物；现有冻结基线及其身份仍保持不变。依赖由 `pyproject.toml` 和 `uv.lock` 固定；LoMa 权重和 CUDA 依赖首次安装需要额外下载。
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m pytest -q tests
