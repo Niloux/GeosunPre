@@ -275,4 +275,7 @@ def assert_holdout_isolated(rec,split):
     for track in split['tracks']:
         for name,idx in track['observations']:
             if name in names:
-                assert not names[name].points2D[idx].has_point3D(),f'Validation observation leaked: {name}:{idx}'
+                if not 0 <= idx < len(names[name].points2D):
+                    raise ValueError(f'Validation feature index differs from model: {name}:{idx}')
+                if names[name].points2D[idx].has_point3D():
+                    raise AssertionError(f'Validation observation leaked: {name}:{idx}')

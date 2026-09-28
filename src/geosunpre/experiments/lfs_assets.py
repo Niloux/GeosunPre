@@ -1,4 +1,4 @@
-"""Shared, image-only LichtFeld-Studio inputs for baseline and A/B exports."""
+"""Historical LichtFeld-Studio training inputs for downstream A/B experiments."""
 
 import json
 from pathlib import Path

@@ -90,8 +90,10 @@ def _model_change(source, candidate, floor_height):
 
 
 def run_ground_joint_ba(work):
-    cv2.setNumThreads(1)
     root = Path(work).resolve() / 'global_sfm'
+    if (root / 'lfs_ab/protocol.json').exists():
+        raise ValueError('This work directory contains the frozen historical baseline; use a fresh work directory')
+    cv2.setNumThreads(1)
     output = root / OUTPUT
     output.mkdir(exist_ok=True)
     model_path = root / SOURCE

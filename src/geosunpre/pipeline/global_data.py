@@ -16,6 +16,30 @@ from ..scene import digest, file_digest, load_scene, write_json
 OUTPUT = 'global_sfm'
 
 
+def load_global(work):
+    """Read global feature IDs after checking their image, mask and camera inputs."""
+    work = Path(work).resolve()
+    out = work / OUTPUT
+    scene = load_scene(out)
+    data = json.loads((out / 'frontend.json').read_text())
+    if data['scene_fingerprint'] != scene['fingerprint'] or data['config'] != CONFIG.__dict__:
+        raise ValueError('Global frontend does not match current scene/configuration')
+    features = {}
+    for record in scene['images']:
+        name = record['name']
+        row = data['features'][name]
+        with np.load(row['path'], allow_pickle=False) as cached:
+            metadata = json.loads(str(cached['metadata']))
+            expected = digest({'image_sha256': file_digest(record['source']),
+                               'mask_sha256': file_digest(record['semantic_mask']),
+                               'camera': scene['cameras'][record['camera']],
+                               'fov': scene['fov_degrees'], 'config': data['config']})
+            if expected != row['token'] or str(cached['token']) != expected or metadata['name'] != name:
+                raise ValueError(f'Global feature identity changed: {name}')
+            features[name] = {'keypoints': cached['keypoints'], 'scores': cached['scores']}
+    return out, scene, data, features
+
+
 def prepare_global(work):
     from ..static_masks import generate_masks, mask_review, mask_contact_sheet
     work = Path(work).resolve(); out = work / OUTPUT; out.mkdir(exist_ok=True)
@@ -38,6 +62,10 @@ def prepare_global(work):
         if not (previous / 'manifest.json').is_file():
             continue
         for record in load_scene(previous)['images']:
+            if record.get('semantic_mask') and Path(record['semantic_mask']).resolve() == (
+                    out / 'masks_v2/valid' / (record['name'] + '.png')).resolve():
+                # Unified calibration references the global masks directly.
+                continue
             for kind, suffix in [('valid', '.png'), ('labels', '.png'), ('stats', '.json')]:
                 src = previous / 'masks_v2' / kind / (record['name'] + suffix)
                 dest = out / 'masks_v2' / kind / (record['name'] + suffix)

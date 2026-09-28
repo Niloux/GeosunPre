@@ -53,7 +53,19 @@ def tiny_visual_work(tmp_path):
 
 
 def test_equal_baseline_build_and_export_need_no_manual_labels(tmp_path, monkeypatch):
-    work, root, scene, features, records = tiny_visual_work(tmp_path)
+    from geosunpre.pipeline.holdout import freeze_global_holdout
+    from test_unified_holdout import complete_calibration, global_frontend
+    import pycolmap
+
+    work = global_frontend(tmp_path, frames=(70, 72))
+    freeze_global_holdout(work)
+    complete_calibration(work, monkeypatch)
+    global_reconstruction.freeze_global_geometry(work)
+    root, scene, _, _ = global_reconstruction.load_global(work)
+    records = {row['name']: row for row in scene['images']}
+    model = pycolmap.Reconstruction(work / 'local_sfm/normal_070_094/stages/principal/sparse/0')
+    (work / build.SOURCE).mkdir(parents=True)
+    model.write(work / build.SOURCE)
     monkeypatch.setattr(build, 'EXPECTED_IMAGES', 2)
     calls = []
 
@@ -62,10 +74,6 @@ def test_equal_baseline_build_and_export_need_no_manual_labels(tmp_path, monkeyp
         return {'termination_type': 'test-solver'}
 
     monkeypatch.setattr(build, 'bounded_bundle_adjustment', solve)
-    monkeypatch.setattr(global_reconstruction, 'load_global',
-                        lambda work: (root, scene, {}, features))
-    monkeypatch.setattr(build, 'evaluate_reconstruction',
-                        lambda *args: {'all_candidate_queries': {'count': 0}})
     source_hash = file_digest(work / build.SOURCE / 'cameras.bin')
     first = build.build_equal_control(work)
     second = build.build_equal_control(work)
@@ -78,36 +86,29 @@ def test_equal_baseline_build_and_export_need_no_manual_labels(tmp_path, monkeyp
     assert json.loads((work / build.EQUAL / 'protocol.json').read_text())['manual_annotations_used'] is False
     assert not (root / 'static_validation').exists()
 
-    monkeypatch.setattr(build, 'filtered_points',
-                        lambda rec, **options: (b'ply\nend_header\n', {'exported_points': 20}))
-    config = tmp_path / 'lfs_config.json'
-    write_json(config, {'dataset': {'images': 'images', 'use_test_split': False},
-                        'optimization': {'undistort': False}})
-    exported = build.export_computed_baseline(work, lfs_config=config)
-    assert exported['images'] == 2
-    output = work / 'baseline_colmap'
-    assert (output / 'images/L/a.jpg').resolve() == Path(records['L/a.jpg']['source'])
-    assert (output / 'images/R/b.jpg').resolve() == Path(records['R/b.jpg']['source'])
-    assert np.asarray(Image.open(output / 'masks/L/a.jpg.png')).shape == (8, 8)
-    identity = json.loads((output / 'computed_baseline.json').read_text())
-    assert identity['manual_annotations_used'] is False
-    assert identity['test_split'] is False
-    assert build.verify_computed_baseline(work)['full_content_check'] is True
-    assert build.export_computed_baseline(work, lfs_config=config) == exported
+    validation = json.loads((work / build.EQUAL / 'validation_summary.json').read_text())
+    assert validation['raw']['status'] == 'no_queries'
+    assert validation['triangle']['all_candidate_queries']['count'] == 0
+    with np.load(work / build.EQUAL / 'validation/validation_observations.npz') as observations:
+        assert observations['support_ok'].dtype == np.bool_
+        assert observations['predicted'].shape == (0, 2)
 
-    Image.new('L', (8, 8), 0).save(records['L/a.jpg']['semantic_mask'])
-    try:
-        build.verify_computed_baseline(work)
-    except ValueError as error:
-        assert 'image or mask content changed' in str(error)
-    else:
-        raise AssertionError('Changed semantic mask passed content verification')
-    try:
-        build.export_computed_baseline(work, lfs_config=config)
-    except ValueError as error:
-        assert 'Existing combined mask changed' in str(error)
-    else:
-        raise AssertionError('Changed mask was silently accepted')
+    exported = build.run_baseline(work, stage='export')['export']
+    assert exported['images'] == 2
+    assert exported['points'] == 20
+    output = work / 'colmap'
+    for name, record in records.items():
+        assert (output / 'images' / name).resolve() == Path(record['source'])
+    assert not (output / 'lfs_config.json').exists()
+    assert not (output / 'masks').exists()
+    assert not (output / 'sparse/0/points3D.ply').exists()
+    identity = json.loads((output / 'colmap_export.json').read_text())
+    assert identity['provenance']['manual_annotations_used'] is False
+    assert identity['provenance']['holdout_isolation'] == 'before_local_and_global_geometry'
+    assert 'test_split' not in identity
+    assert 'all_selected_images_train' not in identity
+    assert build.verify_computed_baseline(output=output)['full_content_check'] is True
+    assert build.export_computed_baseline(work) == exported
 
 
 def test_global_data_can_start_without_transfer_experiment(tmp_path, monkeypatch):
@@ -127,7 +128,7 @@ def test_global_data_can_start_without_transfer_experiment(tmp_path, monkeypatch
     def generate_masks(base, output, frames, **kwargs):
         assert frames == [70]
         mask = output / 'valid/L/a.jpg.png'
-        mask.parent.mkdir(parents=True)
+        mask.parent.mkdir(parents=True, exist_ok=True)
         Image.new('L', (8, 8), 255).save(mask)
         write_json(output / 'stats/L/a.jpg.json',
                    {'source_sha256': file_digest(source), 'mask_sha256': file_digest(mask)})
@@ -139,3 +140,7 @@ def test_global_data_can_start_without_transfer_experiment(tmp_path, monkeypatch
     output = global_data.prepare_global(work)
     assert json.loads((output / 'reused_masks.json').read_text())['count'] == 0
     assert json.loads((output / 'manifest.json').read_text())['images'][0]['semantic_mask'].endswith('.png')
+    # The new calibration manifest references global masks, with no local mask
+    # directory to copy from when global-data is resumed.
+    write_json(work / 'local_sfm/manifest.json', json.loads((output / 'manifest.json').read_text()))
+    assert global_data.prepare_global(work) == output

@@ -3,9 +3,7 @@
 from collections import Counter
 from hashlib import sha256
 import json
-import os
 from pathlib import Path
-import shutil
 
 
 MODEL_FILES = ('cameras.bin', 'images.bin', 'points3D.bin', 'rigs.bin', 'frames.bin')
@@ -159,70 +157,26 @@ def check_baseline(repo_root='.', manifest_path=DEFAULT_MANIFEST, work_override=
     }
 
 
-def _copy_immutable(source, destination):
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    source_digest = _digest(source)
-    if destination.exists():
-        _verify_file(destination, source_digest)
-        return
-    temporary = destination.with_name(destination.name + '.tmp')
-    if temporary.exists():
-        raise FileExistsError(temporary)
-    shutil.copyfile(source, temporary)
-    if _digest(temporary) != source_digest:
-        raise RuntimeError(f'Copy changed content: {source}')
-    temporary.replace(destination)
-
-
-def _link_immutable(destination, original):
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    original = Path(original).resolve()
-    if destination.is_symlink():
-        if destination.resolve() != original:
-            raise ValueError(f'Image link points elsewhere: {destination}')
-    elif destination.exists():
-        raise ValueError(f'Expected an image link: {destination}')
-    else:
-        destination.symlink_to(os.path.relpath(original, destination.parent))
-
-
 def export_baseline(repo_root='.', manifest_path=DEFAULT_MANIFEST, work_override=None,
-                    output=None, *, full=False):
-    """Package only the verified equal-control branch; never run SfM or LFS."""
-    checked = check_baseline(repo_root, manifest_path, work_override, full=full,
-                             _verify_release=False)
+                    output=None, *, image_mode='link', include_masks=False, include_ply=False):
+    """Export the frozen source geometry without depending on LFS assets/config."""
+    from .colmap_export import export_colmap
+
     manifest, manifest_path, work, paths = _load_paths(repo_root, manifest_path, work_override)
-    output = Path(output).resolve() if output else work / 'baseline_colmap'
-    if (output == work or any(output.is_relative_to(paths[key]) for key in
-                              ('lfs_dataset', 'lfs_shared', 'source_model'))):
-        raise ValueError('Choose a separate baseline export directory')
-    scene = json.loads(paths['scene_manifest'].read_text())
+    _verify_file(paths['scene_manifest'], manifest['scene_manifest_sha256'])
     for name in MODEL_FILES:
-        _copy_immutable(paths['lfs_dataset'] / 'sparse/0' / name, output / 'sparse/0' / name)
-    _copy_immutable(paths['lfs_shared'] / 'points3D.ply', output / 'sparse/0/points3D.ply')
-    _copy_immutable(paths['lfs_config'], output / 'lfs_config.json')
-    for record in scene['images']:
-        name = record['name']
-        _link_immutable(output / 'images' / name, record['source'])
-        _copy_immutable(paths['lfs_dataset'] / 'masks' / (name + '.png'),
-                        output / 'masks' / (name + '.png'))
-    identity = {
-        'schema_version': 1, 'baseline_name': manifest['name'],
-        'baseline_manifest_sha256': _digest(manifest_path),
-        'lfs_protocol_sha256': manifest['lfs_protocol_sha256'],
-        'model_sha256': manifest['model_sha256'],
-        'common_point_cloud_sha256': manifest['common_point_cloud_sha256'],
-        'originals_and_masks_sha256': manifest['originals_and_masks_sha256'],
-        'image_count': manifest['image_count'],
-        'all_selected_images_train': True, 'test_split': False,
-    }
-    content = (json.dumps(identity, ensure_ascii=False, indent=2) + '\n').encode()
-    identity_path = output / 'baseline_export.json'
-    if identity_path.exists():
-        if identity_path.read_bytes() != content:
-            raise ValueError(f'Existing baseline export identity differs: {identity_path}')
-    else:
-        identity_path.write_bytes(content)
-    if output == work / 'baseline_colmap':
-        checked = check_baseline(repo_root, manifest_path, work_override)
-    return {**checked, 'output': str(output), 'export_identity': str(identity_path)}
+        _verify_file(paths['source_model'] / name, manifest['model_sha256'][name])
+    scene = json.loads(paths['scene_manifest'].read_text())
+    if (scene.get('fingerprint') != manifest['scene_fingerprint']
+            or len(scene['images']) != manifest['image_count']
+            or Counter(row['camera'] for row in scene['images']) != manifest['lenses']):
+        raise ValueError('Frozen scene membership changed')
+    output = Path(output).resolve() if output else work / 'colmap'
+    if output == work or output.is_relative_to(work / 'global_sfm'):
+        raise ValueError('Choose a separate COLMAP export directory')
+    return export_colmap(paths['source_model'], scene, output, image_mode=image_mode,
+                         include_masks=include_masks, include_ply=include_ply,
+                         provenance={'kind': 'frozen_visual_baseline',
+                                     'baseline_name': manifest['name'],
+                                     'baseline_manifest_sha256': _digest(manifest_path),
+                                     'source_model_sha256': manifest['model_sha256']})

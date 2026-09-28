@@ -85,6 +85,7 @@ def triangulate_support(cams,poses,pixels):
 
 def evaluate_reconstruction(rec,scene,features,split,directory):
     directory=Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
     cameras={cid:Camera('L' if cid==1 else 'R',c.width,c.height,tuple(c.params),(0,0))
              for cid,c in rec.cameras.items()}
     original={k:Camera.from_dict(v) for k,v in scene['cameras'].items()}
@@ -92,6 +93,8 @@ def evaluate_reconstruction(rec,scene,features,split,directory):
     records={im['name']:im for im in scene['images']}
     rows=[]
     for track in split['tracks']:
+        if not track['queries']:
+            continue
         support=track['support']
         point=None;support_error=np.inf;angle=0.
         if all(name in images for name,idx in support):
@@ -116,8 +119,14 @@ def evaluate_reconstruction(rec,scene,features,split,directory):
                 'zone':zone,'rho':rho,'observed':observed,'predicted':predicted,'error':error,
                 'support_error':support_error,'support_angle':angle,
                 'support_ok':bool(point is not None and support_error<=3 and angle>=1)})
-    arrays={k:np.asarray([r[k] for r in rows]) for k in ['track_id','name','feature_index','camera','zone','rho',
-            'observed','predicted','error','support_error','support_angle','support_ok']}
+    dtypes = {'track_id': str, 'name': str, 'feature_index': np.int64,
+              'camera': str, 'zone': str, 'rho': float, 'observed': float,
+              'predicted': float, 'error': float, 'support_error': float,
+              'support_angle': float, 'support_ok': bool}
+    arrays = {key: np.asarray([row[key] for row in rows], dtype=dtype)
+              for key, dtype in dtypes.items()}
+    for key in ('observed', 'predicted'):
+        arrays[key] = arrays[key].reshape(-1, 2)
     np.savez_compressed(directory/'validation_observations.npz',**arrays)
     errors=arrays['error']
     groups={}
@@ -141,10 +150,12 @@ def evaluate_reconstruction(rec,scene,features,split,directory):
         occupied=len(np.unique(np.floor(xy/[cameras[im.camera_id].width,cameras[im.camera_id].height]*8).astype(int),axis=0))
         coverage[name]={'training_observations':len(obs),'occupied_8x8_cells':occupied,
                         'top_half_fraction':float(np.mean(xy[:,1]<cameras[im.camera_id].height/2))}
-    summary={'all_candidate_queries':error_summary(errors),'by_camera_and_radius':groups,'per_image':per_image,
+    summary={'status': 'evaluated' if rows else 'no_queries',
+        'holdout_isolation': split.get('isolation_scope', 'stage_only'),
+        'all_candidate_queries':error_summary(errors),'by_camera_and_radius':groups,'per_image':per_image,
         'support_qualified_queries':error_summary(errors[arrays['support_ok']]),
         'training_reprojection':error_summary(training),'coverage':coverage,
-        'note':'Queries and support features are entirely withheld from SfM/BA. Only two support observations triangulate each validation point. Images themselves participate through other features. Raw tracks are not ground-truth correspondences. Failed predictions stay in denominators; null quantiles may mean nonfinite failures.'}
+        'note':'The holdout_isolation field records the split protocol; pipeline entrypoints verify its input identities. Legacy splits only certify stage-level exclusion. Only two support observations triangulate each validation point. Images themselves participate through other features. Raw tracks are not ground-truth correspondences. Failed predictions stay in denominators; null quantiles may mean nonfinite failures.'}
     write_json(directory/'validation.json',summary)
     with (directory/'validation.csv').open('w',newline='') as f:
         writer=csv.writer(f);writer.writerow(['track','image','feature','camera','zone','error_px','support_error_px','support_angle_deg','support_ok'])

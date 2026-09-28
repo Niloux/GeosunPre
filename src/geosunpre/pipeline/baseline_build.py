@@ -1,26 +1,24 @@
-"""Unattended visual baseline reconstruction and single-branch LFS export."""
+"""Unattended visual baseline reconstruction and native COLMAP export."""
 
 from collections import Counter
 import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 import pycolmap
 
-from ..camera import Camera
 from ..local_evaluation import evaluate_reconstruction
 from ..local_reconstruction import assert_holdout_isolated, bounded_bundle_adjustment
 from ..scene import digest, file_digest, load_scene, write_json
-from .baseline import MODEL_FILES, _copy_immutable, _link_immutable
-from .lfs_assets import filtered_points
+from .colmap_export import MODEL_FILES, export_colmap, verify_colmap_export
+from .holdout import ISOLATION_SCOPE
 
 
 EXPECTED_IMAGES = 536
 BA_ITERATIONS = 40
 SOURCE = Path('global_sfm/stages/shared_calibration/sparse/0')
 EQUAL = Path('global_sfm/baseline_equal')
-DEFAULT_CONFIG = Path(__file__).resolve().parents[3] / 'baselines/basketball/lfs_config.json'
+DEFAULT_OUTPUT = 'colmap'
 
 
 def _model_hashes(path):
@@ -56,9 +54,10 @@ def _check_model(rec, scene):
 
 def build_equal_control(work):
     """Continue native fisheye BA at weight one, without floor or manual inputs."""
+    from .global_reconstruction import freeze_global_geometry
+
     work = Path(work).resolve()
-    root = work / 'global_sfm'
-    scene = load_scene(root)
+    root, scene, _, features, _, _ = freeze_global_geometry(work, require_existing=True)
     source_path = work / SOURCE
     source = pycolmap.Reconstruction(source_path)
     _check_model(source, scene)
@@ -134,8 +133,6 @@ def build_equal_control(work):
         if validation['model_sha256'] != result['model_sha256']:
             raise ValueError('Equal BA validation belongs to another model')
     else:
-        from .global_reconstruction import load_global
-        _, _, _, features = load_global(work)
         triangle = json.loads((root / 'triangle_validation_split.json').read_text())
         raw = evaluate_reconstruction(candidate, scene, features, split,
                                       output / 'validation')
@@ -151,22 +148,9 @@ def build_equal_control(work):
             'triangle_holdout': validation['triangle']['all_candidate_queries']}
 
 
-def _write_immutable(path, data):
-    path = Path(path)
-    if path.exists():
-        if path.read_bytes() != data:
-            raise ValueError(f'Existing baseline export differs: {path}')
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + '.tmp')
-    if temporary.exists():
-        raise FileExistsError(temporary)
-    temporary.write_bytes(data)
-    temporary.replace(path)
-
-
-def export_computed_baseline(work, *, output=None, lfs_config=DEFAULT_CONFIG):
-    """Package one computed model; never consult the old frozen manifest."""
+def export_computed_baseline(work, *, output=None, image_mode='link',
+                             include_masks=False, include_ply=False):
+    """Validate the computed candidate and export a consumer-independent dataset."""
     work = Path(work).resolve()
     root = work / 'global_sfm'
     scene = load_scene(root)
@@ -187,160 +171,45 @@ def export_computed_baseline(work, *, output=None, lfs_config=DEFAULT_CONFIG):
             or protocol['split_sha256'] != file_digest(root / 'split.json')
             or protocol['manual_annotations_used'] is not False):
         raise ValueError('Computed equal BA identity differs')
-    from .global_reconstruction import load_global
-    load_global(work)  # Check every original/mask against the frozen LoMa cache.
+    from .global_reconstruction import freeze_global_geometry
+    freeze_global_geometry(work, require_existing=True)
     rec = pycolmap.Reconstruction(model_path)
-    records = _check_model(rec, scene)
-    split = json.loads((root / 'split.json').read_text())
-    assert_holdout_isolated(rec, split)
-    output = Path(output).resolve() if output else work / 'baseline_colmap'
+    _check_model(rec, scene)
+    assert_holdout_isolated(rec, json.loads((root / 'split.json').read_text()))
+    output = Path(output).resolve() if output else work / DEFAULT_OUTPUT
     if output == work or output.is_relative_to(root):
-        raise ValueError('Choose a separate baseline export directory')
-    if (output / 'baseline_export.json').exists():
-        raise ValueError('Destination contains the historical frozen baseline export')
-    config_path = Path(lfs_config).resolve()
-    config = json.loads(config_path.read_text())
-    if (config.get('dataset', {}).get('images') != 'images'
-            or config['dataset'].get('use_test_split') is not False
-            or config.get('optimization', {}).get('undistort') is not False
-            or 'init_path' in config):
-        raise ValueError('LFS config must use original fisheye images and all-view training')
-
-    for name in MODEL_FILES:
-        _copy_immutable(model_path / name, output / 'sparse/0' / name)
-    centers = np.asarray([rec.images[i].projection_center()
-                          for i in sorted(rec.reg_image_ids())], dtype=float)
-    trajectory_radius = float(np.quantile(
-        np.linalg.norm(centers - np.median(centers, axis=0), axis=1), .9))
-    if not np.isfinite(trajectory_radius) or trajectory_radius <= 0:
-        raise ValueError('Invalid visual trajectory scale for point filtering')
-    ply, point_info = filtered_points(rec, max_distance=10 * trajectory_radius)
-    _write_immutable(output / 'sparse/0/points3D.ply', ply)
-    _copy_immutable(config_path, output / 'lfs_config.json')
-    fov = {lens: Camera.from_dict(scene['cameras'][lens]).mask(scene['fov_degrees'])
-           for lens in ('L', 'R')}
-    images_and_masks = []
-    for name, record in sorted(records.items()):
-        source = Path(record['source'])
-        semantic = Path(record['semantic_mask'])
-        if not source.is_file() or not semantic.is_file():
-            raise FileNotFoundError(f'Missing source image or semantic mask: {name}')
-        with Image.open(semantic) as image:
-            valid = np.asarray(image.convert('L')) >= 128
-        combined = (valid & (fov[record['camera']] > 0)).astype(np.uint8) * 255
-        mask_path = output / 'masks' / (name + '.png')
-        if mask_path.exists():
-            with Image.open(mask_path) as image:
-                if image.size != (scene['cameras'][record['camera']]['width'],
-                                  scene['cameras'][record['camera']]['height']) or not np.array_equal(
-                                      np.asarray(image), combined):
-                    raise ValueError(f'Existing combined mask changed: {name}')
-        else:
-            mask_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = mask_path.with_suffix('.png.tmp')
-            if temporary.exists():
-                raise FileExistsError(temporary)
-            Image.fromarray(combined).save(temporary, format='PNG', compress_level=1)
-            temporary.replace(mask_path)
-        _link_immutable(output / 'images' / name, source)
-        images_and_masks.append({'name': name, 'image_sha256': file_digest(source),
-                                 'source_semantic_mask_sha256': file_digest(semantic),
-                                 'combined_mask_sha256': file_digest(mask_path)})
-
-    identity = {
-        'schema_version': 1, 'name': 'basketball_equal_control_computed',
-        'status': 'new_run_candidate',
+        raise ValueError('Choose a separate COLMAP export directory')
+    provenance = {
+        'kind': 'computed_visual_baseline', 'status': 'new_run_candidate',
+        'source_model_sha256': result['model_sha256'],
         'scene_manifest_sha256': file_digest(root / 'manifest.json'),
         'equal_ba_protocol_sha256': file_digest(protocol_path),
         'equal_ba_result_sha256': file_digest(result_path),
         'equal_ba_validation_sha256': file_digest(validation_path),
-        'model_sha256': _model_hashes(model_path),
-        'point_cloud_sha256': file_digest(output / 'sparse/0/points3D.ply'),
-        'lfs_config_sha256': file_digest(output / 'lfs_config.json'),
-        'originals_and_masks_sha256': digest(images_and_masks),
-        'point_filter': point_info, 'image_count': len(records),
-        'lenses': dict(Counter(row['camera'] for row in records.values())),
-        'camera_model': 'OPENCV_FISHEYE',
+        'holdout_protocol_sha256': file_digest(root / 'holdout_protocol.json'),
+        'calibration_identity_sha256': file_digest(work / 'local_sfm/calibration_identity.json'),
+        'holdout_isolation': ISOLATION_SCOPE,
         'independent_exposure_poses': True,
-        'all_selected_images_train': True, 'test_split': False,
-        'manual_annotations_used': False,
-        'navigation_pose_values_or_las_used': False,
+        'manual_annotations_used': False, 'navigation_pose_values_or_las_used': False,
     }
-    write_path = output / 'computed_baseline.json'
-    _write_immutable(write_path, (json.dumps(identity, ensure_ascii=False, indent=2) + '\n').encode())
-    verify_computed_baseline(work, output=output)
-    return {'output': str(output), 'identity': str(write_path),
-            'images': len(records), 'points': point_info['exported_points'],
-            'manual_annotations_used': False}
+    return export_colmap(model_path, scene, output, image_mode=image_mode,
+                         include_masks=include_masks, include_ply=include_ply,
+                         provenance=provenance, quality_report=validation_path)
 
 
-def verify_computed_baseline(work, *, output=None):
-    """Read-only content and camera-contract check of an automated export."""
-    work = Path(work).resolve()
-    output = Path(output).resolve() if output else work / 'baseline_colmap'
-    identity_path = output / 'computed_baseline.json'
-    identity = json.loads(identity_path.read_text())
-    if (identity.get('schema_version') != 1
-            or identity.get('status') != 'new_run_candidate'
-            or identity.get('camera_model') != 'OPENCV_FISHEYE'
-            or identity.get('manual_annotations_used') is not False
-            or identity.get('navigation_pose_values_or_las_used') is not False
-            or identity.get('independent_exposure_poses') is not True
-            or identity.get('all_selected_images_train') is not True
-            or identity.get('test_split') is not False):
-        raise ValueError('Computed baseline contract differs')
-    root = work / 'global_sfm'
-    scene = load_scene(root)
-    source_model = work / EQUAL / 'sparse/0'
-    equal_protocol = json.loads((work / EQUAL / 'protocol.json').read_text())
-    equal_result = json.loads((work / EQUAL / 'result.json').read_text())
-    equal_validation = json.loads((work / EQUAL / 'validation_summary.json').read_text())
-    if (equal_protocol.get('manual_annotations_used') is not False
-            or equal_protocol.get('floor_classification_used') is not False
-            or equal_result.get('manual_annotations_used') is not False
-            or equal_validation.get('manual_annotations_used') is not False):
-        raise ValueError('Equal BA provenance requires manual inputs')
-    for name, actual in (
-            ('scene_manifest_sha256', root / 'manifest.json'),
-            ('equal_ba_protocol_sha256', work / EQUAL / 'protocol.json'),
-            ('equal_ba_result_sha256', work / EQUAL / 'result.json'),
-            ('equal_ba_validation_sha256', work / EQUAL / 'validation_summary.json'),
-            ('point_cloud_sha256', output / 'sparse/0/points3D.ply'),
-            ('lfs_config_sha256', output / 'lfs_config.json')):
-        if file_digest(actual) != identity[name]:
-            raise ValueError(f'Computed baseline file changed: {actual}')
-    if _model_hashes(source_model) != identity['model_sha256']:
-        raise ValueError('Computed source model changed')
-    if _model_hashes(output / 'sparse/0') != identity['model_sha256']:
-        raise ValueError('Exported COLMAP model changed')
-    rec = pycolmap.Reconstruction(output / 'sparse/0')
-    records = _check_model(rec, scene)
-    if (len(records) != identity['image_count']
-            or dict(Counter(row['camera'] for row in records.values())) != identity['lenses']):
-        raise ValueError('Exported image membership changed')
-    images_and_masks = []
-    for name, record in sorted(records.items()):
-        original = Path(record['source']).resolve()
-        linked = output / 'images' / name
-        semantic = Path(record['semantic_mask'])
-        mask = output / 'masks' / (name + '.png')
-        if (not linked.is_file() or linked.resolve() != original
-                or not semantic.is_file() or not mask.is_file()):
-            raise FileNotFoundError(f'Computed baseline image or mask missing: {name}')
-        images_and_masks.append({'name': name, 'image_sha256': file_digest(original),
-                                 'source_semantic_mask_sha256': file_digest(semantic),
-                                 'combined_mask_sha256': file_digest(mask)})
-    if digest(images_and_masks) != identity['originals_and_masks_sha256']:
-        raise ValueError('Computed baseline image or mask content changed')
-    return {'output': str(output), 'identity': str(identity_path),
-            'images': len(records), 'model': str(output / 'sparse/0'),
-            'manual_annotations_used': False, 'full_content_check': True}
+def verify_computed_baseline(work=None, *, output=None):
+    """Check the export independently; work is only a default path convenience."""
+    if output is None:
+        if work is None:
+            raise ValueError('Provide --output or --work')
+        output = Path(work).resolve() / DEFAULT_OUTPUT
+    return verify_colmap_export(output)
 
 
 def run_baseline(work, *, input_root=None, stage='all', output=None,
-                 lfs_config=DEFAULT_CONFIG):
+                 image_mode='link', include_masks=False, include_ply=False):
     """Run or resume the basketball baseline stages in dependency order."""
-    stages = ('prepare', 'local-calibration', 'global-data', 'global-sfm',
+    stages = ('prepare', 'global-data', 'holdout', 'local-calibration', 'global-sfm',
               'equal-ba', 'export')
     if stage not in (*stages, 'all'):
         raise ValueError(f'Unknown baseline stage: {stage}')
@@ -351,10 +220,7 @@ def run_baseline(work, *, input_root=None, stage='all', output=None,
     if stage in ('all', 'prepare') and input_root is None:
         raise ValueError('--input is required for prepare/all')
     if stage in ('all', 'export'):
-        config_path = Path(lfs_config).resolve()
-        if not config_path.is_file():
-            raise FileNotFoundError(config_path)
-        destination = Path(output).resolve() if output else work / 'baseline_colmap'
+        destination = Path(output).resolve() if output else work / DEFAULT_OUTPUT
         if (destination / 'baseline_export.json').exists():
             raise ValueError('Destination contains the frozen historical baseline export')
     selected = stages if stage == 'all' else (stage,)
@@ -367,10 +233,7 @@ def run_baseline(work, *, input_root=None, stage='all', output=None,
             if len(scene['images']) != EXPECTED_IMAGES:
                 raise ValueError(f'Expected {EXPECTED_IMAGES} pose-selected L/R images')
         elif current == 'local-calibration':
-            from .local_calibration import (BASELINE_SEGMENTS, build_frontend,
-                                            prepare_masks, solve_baseline_calibration)
-            prepare_masks(work, segments=BASELINE_SEGMENTS)
-            build_frontend(work, segments=BASELINE_SEGMENTS)
+            from .local_calibration import solve_baseline_calibration
             solve_baseline_calibration(work)
         elif current == 'global-data':
             from .global_data import (extract_global_features,
@@ -378,6 +241,10 @@ def run_baseline(work, *, input_root=None, stage='all', output=None,
             prepare_global(work)
             extract_global_features(work)
             match_global_features(work)
+        elif current == 'holdout':
+            from .holdout import freeze_global_holdout
+            protocol = freeze_global_holdout(work)
+            summary['holdout'] = {key: protocol[key] for key in ('fingerprint', 'isolation_scope')}
         elif current == 'global-sfm':
             from .global_reconstruction import (build_global_mapping,
                                                 evaluate_global_mapping, solve_global)
@@ -388,6 +255,7 @@ def run_baseline(work, *, input_root=None, stage='all', output=None,
             summary['equal'] = build_equal_control(work)
         elif current == 'export':
             summary['export'] = export_computed_baseline(
-                work, output=output, lfs_config=lfs_config)
+                work, output=output, image_mode=image_mode,
+                include_masks=include_masks, include_ply=include_ply)
         summary['stages'].append(current)
     return summary

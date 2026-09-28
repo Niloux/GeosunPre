@@ -12,7 +12,7 @@ from PIL import Image
 import pycolmap
 
 from ..camera import Camera
-from ..pipeline.lfs_assets import filtered_points as _filtered_points, training_config as _training_config
+from .lfs_assets import filtered_points as _filtered_points, training_config as _training_config
 from ..scene import digest, file_digest, load_scene, write_json
 
 
