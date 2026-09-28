@@ -7,21 +7,29 @@ import pycolmap
 import pytest
 
 from geosunpre.camera import Camera
-from geosunpre.local_data import CONFIG, train_edge_mask
-from geosunpre.local_evaluation import evaluate_reconstruction
-from geosunpre.local_reconstruction import assert_holdout_isolated, create_seed
-from geosunpre.pipeline import baseline_build, global_reconstruction, local_calibration
-from geosunpre.pipeline.holdout import (
-    freeze_global_holdout, load_frozen_holdout, restrict_split,
-)
-from geosunpre.scene import digest, file_digest, write_json
+from geosunpre.config import PipelineConfig, save_config
+from geosunpre.sfm.tracks import CONFIG
+from geosunpre.sfm.tracks import train_edge_mask
+from geosunpre.sfm.evaluation import evaluate_reconstruction
+from geosunpre.sfm.reconstruction import assert_holdout_isolated
+from geosunpre.sfm.reconstruction import create_seed
+from geosunpre.pipeline import runner as runner
+from geosunpre.pipeline import reconstruction as global_reconstruction
+from geosunpre.pipeline import calibration as local_calibration
+from geosunpre.pipeline.holdout import freeze_holdout
+from geosunpre.pipeline.holdout import load_frozen_holdout
+from geosunpre.pipeline.holdout import restrict_split
+from geosunpre.artifacts import digest
+from geosunpre.artifacts import file_digest
+from geosunpre.artifacts import write_json
 
 
 def global_frontend(tmp_path, *, frames=(70, 72, 110, 112)):
     """Small real image/cache fixture; no LoMa, GPU or reconstruction is run."""
     work = tmp_path / 'run'
-    root = work / 'global_sfm'
+    root = work / 'sfm'
     root.mkdir(parents=True)
+    save_config(work, PipelineConfig(calibration_frames=(70, 94)))
     cameras = {lens: Camera(lens, 8, 8, (4., 4., 4., 4., 0., 0., 0., 0.), (0., 0.))
                for lens in ('L', 'R')}
     xyz = np.random.default_rng(4).uniform([-.8, -.8, 3.], [.8, .8, 5.], (20, 3))
@@ -96,21 +104,21 @@ def complete_calibration(work, monkeypatch):
     monkeypatch.setattr(local_calibration, 'database_and_seed', database)
     monkeypatch.setattr(local_calibration.pycolmap, 'incremental_mapping', mapping)
     monkeypatch.setattr(local_calibration, 'bounded_bundle_adjustment', solve)
-    result = local_calibration.solve_baseline_calibration(work)
+    result = local_calibration.calibrate(work)
     return result, calls
 
 
 def test_global_holdout_precedes_calibration_and_survives_resume(tmp_path, monkeypatch):
     work = global_frontend(tmp_path)
     with pytest.raises(ValueError, match='Missing pre-calibration holdout'):
-        local_calibration.solve_baseline_calibration(work)
-    protocol = freeze_global_holdout(work)
-    assert freeze_global_holdout(work) == protocol
-    root, scene, data, features = global_reconstruction.load_global(work)
+        local_calibration.calibrate(work)
+    protocol = freeze_holdout(work)
+    assert freeze_holdout(work) == protocol
+    root, scene, data, features = global_reconstruction.load_frontend(work)
     _, split, triangle = load_frozen_holdout(work, data)
     assert split['tracks'] and triangle['tracks']
-    out, local_scene, local_data, _ = local_calibration.prepare_baseline_calibration(work)
-    projected = json.loads((out / 'normal_070_094/split.json').read_text())
+    out, local_scene, local_data, _ = local_calibration.prepare_calibration(work)
+    projected = json.loads((out / 'split.json').read_text())
     held = {(n, i) for t in split['tracks'] for n, i in t['observations']}
     local_names = {r['name'] for r in local_scene['images']}
     assert {(n, i) for t in projected['tracks'] for n, i in t['observations']} == {
@@ -119,20 +127,20 @@ def test_global_holdout_precedes_calibration_and_survives_resume(tmp_path, monke
     result, calls = complete_calibration(work, monkeypatch)
     assert calls == list(local_calibration.STAGES)
     assert result['stages']['principal']['validation']['status'] == 'no_queries'
-    model = local_calibration.verify_baseline_calibration(work, split)
+    model = local_calibration.verify_calibration(work, split)
     assert_holdout_isolated(model, split)
     assert model.num_points3D() == 20 - len(split['tracks'])
-    local_calibration.solve_baseline_calibration(work)
+    local_calibration.calibrate(work)
     assert calls == list(local_calibration.STAGES)
-    global_reconstruction.freeze_global_geometry(work)
-    global_reconstruction.freeze_global_geometry(work, require_existing=True)
+    global_reconstruction.freeze_geometry(work)
+    global_reconstruction.freeze_geometry(work, require_existing=True)
 
 
 @pytest.mark.parametrize('change', ['feature', 'match', 'split', 'triangle'])
 def test_changed_observation_identities_are_rejected(tmp_path, change):
     work = global_frontend(tmp_path)
-    freeze_global_holdout(work)
-    root, _, data, _ = global_reconstruction.load_global(work)
+    freeze_holdout(work)
+    root, _, data, _ = global_reconstruction.load_frontend(work)
     if change in ('feature', 'match'):
         entry = next(iter(data['features'].values())) if change == 'feature' else data['pairs'][0]
         path = Path(entry['path'])
@@ -147,42 +155,42 @@ def test_changed_observation_identities_are_rejected(tmp_path, change):
         value['tracks'] = []
         write_json(path, value)
     with pytest.raises(ValueError, match='Frozen holdout'):
-        local_calibration.solve_baseline_calibration(work)
-    assert not (work / 'local_sfm/calibration_identity.json').exists()
+        local_calibration.calibrate(work)
+    assert not (work / 'calibration/calibration_identity.json').exists()
 
 
 def test_old_geometry_cannot_be_relabelled_as_isolated(tmp_path):
     work = global_frontend(tmp_path)
-    path = work / 'local_sfm/normal_070_094/mapping'
+    path = work / 'calibration/mapping'
     path.mkdir(parents=True)
     (path / 'cameras.bin').write_bytes(b'old model')
     with pytest.raises(ValueError, match='predates the unified holdout'):
-        freeze_global_holdout(work)
-    assert not (work / 'global_sfm/holdout_protocol.json').exists()
+        freeze_holdout(work)
+    assert not (work / 'sfm/holdout_protocol.json').exists()
 
 
 def test_changed_calibration_is_rejected_before_global_fitting(tmp_path, monkeypatch):
     work = global_frontend(tmp_path)
-    freeze_global_holdout(work)
+    freeze_holdout(work)
     complete_calibration(work, monkeypatch)
-    path = work / 'local_sfm/normal_070_094/stages/principal/sparse/0'
+    path = work / 'calibration/stages/principal/sparse/0'
     model = pycolmap.Reconstruction(path)
     model.cameras[1].params[0] += .1
     model.write(path)
     with pytest.raises(ValueError, match='Calibration artifact changed'):
-        global_reconstruction.freeze_global_geometry(work)
+        global_reconstruction.freeze_geometry(work)
     with pytest.raises(ValueError, match='Calibration artifact changed'):
-        local_calibration.solve_baseline_calibration(work)
-    assert not (work / 'global_sfm/geometry_protocol.json').exists()
+        local_calibration.calibrate(work)
+    assert not (work / 'sfm/geometry_protocol.json').exists()
 
 
 def test_short_local_tracks_are_excluded_before_pair_geometry(tmp_path, monkeypatch):
-    from geosunpre import local_reconstruction
+    from geosunpre.sfm import reconstruction as local_reconstruction
 
     work = global_frontend(tmp_path)
-    freeze_global_holdout(work)
-    out, scene, data, features = local_calibration.prepare_baseline_calibration(work)
-    split = json.loads((out / 'normal_070_094/split.json').read_text())
+    freeze_holdout(work)
+    out, scene, data, features = local_calibration.prepare_calibration(work)
+    split = json.loads((out / 'split.json').read_text())
     # A one-image projection cannot be scored, but must still be excluded.
     single = restrict_split(split, scene['images'][:1])
     assert single['tracks'] and all(len(t['observations']) == 1 and not t['queries'] for t in single['tracks'])
@@ -201,15 +209,15 @@ def test_short_local_tracks_are_excluded_before_pair_geometry(tmp_path, monkeypa
     monkeypatch.setattr(local_reconstruction, 'fit_pair', pair)
     with pytest.raises(PairReached):
         local_reconstruction.database_and_seed(
-            out / 'probe', scene, scene['images'], data['segments']['normal_070_094']['pairs'],
+            out / 'probe', scene, scene['images'], data['pairs'],
             features, single)
 
 
 def test_local_query_selection_preserves_global_exclusions(tmp_path):
     work = global_frontend(tmp_path, frames=(70, 72, 74, 110))
-    freeze_global_holdout(work)
-    out, scene, data, features = local_calibration.prepare_baseline_calibration(work)
-    split = json.loads((out / 'normal_070_094/split.json').read_text())
+    freeze_holdout(work)
+    out, scene, data, features = local_calibration.prepare_calibration(work)
+    split = json.loads((out / 'split.json').read_text())
     assert split['tracks'] and all(len(t['observations']) == 3 and len(t['queries']) == 1
                                    for t in split['tracks'])
     summary = evaluate_reconstruction(pycolmap.Reconstruction(), scene, features, split, out / 'no_model')
@@ -219,7 +227,8 @@ def test_local_query_selection_preserves_global_exclusions(tmp_path):
 
 def test_build_orders_holdout_before_any_calibration(tmp_path, monkeypatch):
     from geosunpre import scene
-    from geosunpre.pipeline import global_data, holdout
+    from geosunpre.pipeline import data as global_data
+    from geosunpre.pipeline import holdout
 
     events = []
 
@@ -229,19 +238,20 @@ def test_build_orders_holdout_before_any_calibration(tmp_path, monkeypatch):
             return result
         return stage
 
-    monkeypatch.setattr(scene, 'prepare', record('prepare', {'images': [None] * 536}))
-    for name in ('prepare_global', 'extract_global_features', 'match_global_features'):
+    monkeypatch.setattr(scene, 'prepare', record('prepare', {'images': [
+        {'camera': 'L', 'frame_index': 0}, {'camera': 'R', 'frame_index': 1}]} ))
+    for name in ('prepare_masks', 'extract_features', 'match_features'):
         monkeypatch.setattr(global_data, name, record(name))
-    monkeypatch.setattr(holdout, 'freeze_global_holdout', record(
+    monkeypatch.setattr(holdout, 'freeze_holdout', record(
         'holdout', {'fingerprint': 'test', 'isolation_scope': holdout.ISOLATION_SCOPE}))
-    monkeypatch.setattr(local_calibration, 'solve_baseline_calibration', record('calibration'))
-    for name in ('build_global_mapping', 'evaluate_global_mapping', 'solve_global'):
+    monkeypatch.setattr(local_calibration, 'calibrate', record('calibration'))
+    for name in ('build_mapping', 'evaluate_mapping', 'optimize'):
         monkeypatch.setattr(global_reconstruction, name, record(name))
-    monkeypatch.setattr(baseline_build, 'build_equal_control', record('equal'))
-    monkeypatch.setattr(baseline_build, 'export_computed_baseline', record('export'))
-    baseline_build.run_baseline(tmp_path, input_root='unused')
-    assert events.index('match_global_features') < events.index('holdout')
-    assert events.index('holdout') < events.index('calibration') < events.index('build_global_mapping')
+    monkeypatch.setattr(runner, 'finalize', record('equal'))
+    monkeypatch.setattr(runner, 'export_result', record('export'))
+    runner.run_pipeline(tmp_path, input_root='unused')
+    assert events.index('match_features') < events.index('holdout')
+    assert events.index('holdout') < events.index('calibration') < events.index('build_mapping')
 
 
 def test_isolation_guard_runs_with_python_optimization():
@@ -251,7 +261,7 @@ def test_isolation_guard_runs_with_python_optimization():
 
     script = """
 from types import SimpleNamespace as S
-from geosunpre.local_reconstruction import assert_holdout_isolated
+from geosunpre.sfm.reconstruction import assert_holdout_isolated
 model = S(images={1: S(name='image', points2D=[S(has_point3D=lambda: True)])})
 try:
     assert_holdout_isolated(model, {'tracks': [{'observations': [('image', 0)]}]})

@@ -1,53 +1,106 @@
-# 工程主线与实验的代码边界
-
-正式产物为可识别、可验证的 **COLMAP 数据集**。下游使用方决定训练配置和数据划分。当前 `equal_control` 是开发基线，格式交付与几何质量验收分别记录。
+# 工程结构与运行说明
 
 ## 模块职责
 
 ```text
 src/geosunpre/
-  *.py                     # 相机、场景、前端、几何、BA、评估
+  cli.py                  # run / export / check
+  config.py               # 场景选择配置及冻结身份
+  artifacts.py            # 内容哈希、原子 JSON 写入、不可变协议
+  scene.py                # Geosun 输入校验、L/R 图像选择
+  camera.py               # 原生鱼眼相机与像素约定
+  masks.py                # SegFormer、固定设备遮挡、预览
+  features.py             # LoMa 与内容缓存
+  colmap.py               # COLMAP 原子发布和独立校验
   pipeline/
-    local_calibration.py   # 当前篮球场局部标定配方
-    global_data.py         # 掩码、特征和配对
-    holdout.py             # 几何拟合前冻结全局留出与缓存内容身份
-    global_reconstruction.py
-    baseline_build.py     # 当前配方的阶段编排及等权 BA
-    colmap_export.py       # 通用 COLMAP 导出与独立校验
-    baseline.py            # 历史基线审计、冻结源模型导出
-  experiments/
-    lfs_assets.py          # 历史 LFS 初始化筛选及训练配置
-    ...                    # 局部/迁移、加权 A/B 与诊断
+    runner.py             # 阶段顺序、最终 BA、正式导出
+    runtime.py            # 工作目录锁、阶段状态与耗时
+    data.py               # 全场掩码、特征、候选配对和匹配
+    holdout.py            # 几何拟合前冻结留出观测
+    calibration.py        # 复用全局特征做局部标定
+    reconstruction.py    # 全局建图、轨迹筛选、BA 与报告
+  sfm/
+    geometry.py           # 两视图几何与旋转闭环检查
+    tracks.py             # 时序配对、原始成轨与留出抽样
+    reconstruction.py    # 数据库、种子模型与有界 BA
+    depth_guard.py        # 正深度约束
+    track_filter.py       # 训练轨迹一致性筛选
+    evaluation.py         # 冻结查询的几何预测评估
+    statistics.py         # 成对轨迹统计
 ```
 
-依赖从实验指向正式管线和共享部件；正式管线不导入实验。根命令仍对历史实验命令提供兼容转发，新实验使用 `geosunpre-exp`。LFS 专用点云筛选和训练配置生成已经归入实验目录，正式导出不依赖它们。
+基础模块不依赖阶段编排。`pipeline/` 组合这些部件；`colmap.py` 可独立使用，读取已有模型和场景即可导出。没有实验模块、命令兼容转发或下游软件配置依赖。
 
-`export_colmap(model_path, scene, output, ...)` 不限制篮球场帧号或 536 张图，不绑定下游软件。它要求提供的场景图像成员与已注册模型一致，支持链接/拷贝原图，附加掩码和 PLY。`build-baseline` 仍是篮球场的具体流程配方；后续参数化不能通过放松模型检查来掩盖缺失图像。
+## 工作目录
 
-新构建顺序为全局数据准备、留出冻结、局部标定、全局重建。前端读取归于 `global_data`，留出冻结不依赖标定或全局几何结果；局部标定直接复用全局缓存。规则和文件身份见[跨阶段留出协议](unified_holdout.md)。
+```text
+WORK/
+  pipeline_config.json     # 场景选择配置及身份
+  pipeline_status.json     # 最近一次调用的阶段状态
+  run_result.json          # 最近成功调用的结果
+  .pipeline.lock           # flock 锁；文件留存不表示进程仍运行
+  manifest.json            # 初始输入清单
+  images.txt
+  fov_masks/
+  features/                # 内容寻址的特征与匹配缓存
+  calibration/
+    manifest.json
+    frontend.json
+    split.json
+    run_contract.json
+    mapping/
+    stages/
+    calibration_identity.json
+    summary.json
+  sfm/
+    manifest.json
+    masks_v2/              # 版本 2 的语义、设备掩码和原因图
+    mask_review.html
+    frontend.json
+    holdout_protocol.json
+    split.json
+    triangle_validation_split.json
+    geometry_protocol.json
+    mapping/
+    stages/
+    final/sparse/0/        # 最终原生鱼眼模型
+    final/validation_summary.json
+    index.html
+  colmap/                  # 可交付数据集
+```
 
-## 发布与审计
+工作目录使用绝对路径引用原始数据和缓存，不承诺可搬迁。`colmap/` 的复制模式用于可搬迁交付。
 
-正式导出写入 `WORK/colmap/`，临时目录中的完整结果校验通过后发布。已有不同身份的目录拒绝覆盖；旧 `baseline_colmap/` 不迁移。默认五份二进制模型保留源模型内容，PLY 是可选的完整点云。协议见[COLMAP 输出契约](colmap_contract.md)。
+## 运行与恢复
 
-`check-colmap --output ...` 只检查导出包。拷贝模式可在原工作目录和输入离线后独立使用；链接模式仍依赖原图。来源协议哈希用于追踪，不要求接收方持有全部中间产物。校验检查格式、模型引用、成员、图像尺寸与内容身份；几何质量由附带诊断及后续验收规则评价。
+1. `run` 获得 Linux `flock` 排他锁，再写入配置和阶段产物。另一个进程使用相同目录时立即失败。
+2. 新目录保存配置；续跑加载已保存配置。命令行传入不同配置、不同输入根目录，或未由新流程管理的非空目录，均拒绝混用。
+3. JSON 先写同级临时文件再替换。冻结协议逐项比对内容；特征和匹配的内容哈希继续贯穿标定、全局几何和最终导出。
+4. 状态文件只是执行记录。是否能复用结果由实际产物、完成身份和依赖检查决定。
+5. 全量重跑会检查并复用完整缓存或阶段；`--stage` 只运行指定阶段。状态标记为 `completed` 仅表示本次请求的阶段完成。
+6. Python 异常或 Ctrl-C 会记录失败或中断。进程被强制杀死时可能仍显示 `running`；进程退出后系统会释放锁，重跑将核对实际产物。
 
-历史 `baselines/basketball/baseline.json` 与 `lfs_config.json` 继续记录原有实验身份。`baseline-check` 保留历史全链路审计；`export-baseline` 只需要冻结场景和源模型，再生成新的通用 COLMAP 包。历史联合 BA 实验在发现冻结 LFS 协议时拒绝运行，防止原地覆盖已采用的源模型。
+恢复支持存在明确边界：全局建图可归档中断的数据库后重建；局部标定遇到不完整数据库、模型或报告时保守报错；最终 BA 若留下不完整模型也拒绝直接覆盖。遇到此类提示应使用新工作目录重新运行，并保留失败目录用于定位。导出采用整目录发布，不暴露未校验的数据集。
 
-`input/` 与 `work/` 的大型产物保持原位置，不纳入 Git。原始证据、人工标注和历史训练产物仍需独立备份。新基线通过明确的晋升操作建立新身份，实验产物不自动覆盖已采用基线。
+## 固定的数值流程
 
-## 已验证范围与后续工作
+保留已实跑的视觉流程：1536 检测尺寸、每图最多 3072 个 LoMa 特征，时序加描述子检索候选配对；全局留出先于所有几何拟合；局部依次优化固定内参、焦距与低阶径向、全部径向、主点；全局依次固定标定 BA、训练轨迹筛选 BA、共享标定 BA，最后执行最多 40 次迭代的有界 BA。
 
-此前的导出改造修复评估目录缺失及空留出集的类型错误，并通过 wheel 安装、源码目录外导出和拷贝包迁移检查。当前 45 项测试通过，新增覆盖跨阶段排除、缓存/划分/标定内容变化、旧几何拒绝和续跑检查。集成测试调用真实缓存读取、评估与 COLMAP 序列化，对完整建图和 BA 使用替身。
+相机共享内参，每次曝光使用独立 frame。正深度与 160° 单调投影检查、训练覆盖检查、全部图像注册要求均保留。标定片段选择属于配置；不根据留出误差搜索参数或选择模型。
 
-本轮 wheel 构建和安装通过，已从源码目录外执行四图样例的 `--stage holdout`，冻结 4 条轨迹、16 个排除观测和 8 个查询。历史 `baseline-check` 常规检查通过，未运行 `--full` 原图全量哈希检查。
+## 当前边界
 
-完整 536 张图的新构建和下游训练尚未重跑。仍需继续解决：
+- 输入适配 Geosun 的 `.pro`、CameraPos 和 L/R 原图命名；设备遮挡规则针对当前设备。
+- SfM 无人工标注依赖，掩码预览只供检查，不阻塞流程。
+- 导出保持原生 `OPENCV_FISHEYE`；使用方需要支持该相机模型。
+- 视觉结果为任意尺度，不提供导航对齐、米制尺度、地面约束或 LAS 融合。
+- 数值与阶段测试包含真实 PyCOLMAP 模型读写和小模型 BA；管线集成测试对大规模建图与 BA 使用替身。
+- 本次结构改造前，536 张篮球场图像已经完成自动化全流程。该结果用于检查 COLMAP 契约连续性，不能替代改造后代码的完整 GPU 重跑。
 
-1. **新隔离协议的完整重建验证**：代码及 CPU 集成验证已实现统一排除，但尚未重新计算 536 张图的标定和重建，需观察新的训练约束量、注册覆盖与误差分布。历史产物仍只能描述阶段级观测留出。
-2. **设备及场景配置**：将图像数量、局部标定片段、设备遮挡、FOV、配对与质量门槛从篮球场配方中提取出来。
-3. **阶段恢复与身份**：统一数据库/种子/模型的完成状态、上游依赖签名及工作目录并发保护；当前原子发布只覆盖导出阶段。
-4. **几何质量判定**：建立跨场景、静态结构和最差图像的验收资料，区分数据完整、诊断不足和质量不合格。
-5. **性能测量**：依据实际 profile 处理平方级配对、Python 成轨对象和正深度回调开销。
+## 本次重构验证（2026-09-28）
 
-实验报告索引与历史命令分别位于 [reports/](../reports/README.md) 和 [experiments/basketball/](../experiments/basketball/HISTORY.md)。历史记录中的旧输出路径和 LFS 参数表达当时试验，不作为当前正式交付契约。
+- 39 项测试通过，包含小模型实际 BA、留出隔离、配置冻结、工作目录锁、失败记录与 COLMAP 迁移校验。
+- 依赖锁检查通过，0.2.0 wheel 和源码包构建成功；源码包包含配置、文档与测试，不包含运行数据。
+- wheel 安装到独立目录，从源码目录外执行命令。真实篮球场 `prepare` 选出 536 张图和 50 张标定图。
+- 新 `check` 对此前完整运行的交付包执行内容校验通过：536 张图、61,495 个点，包含组合掩码。
+- 本轮未重新执行完整 GPU 掩码推理、特征匹配和全场重建；不据此声称重构后的数值结果已经全量复现。

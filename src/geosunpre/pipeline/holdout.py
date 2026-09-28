@@ -5,23 +5,15 @@ from pathlib import Path
 
 import numpy as np
 
-from ..local_data import split_tracks
-from ..local_evaluation import triangle_validation_split
-from ..scene import digest, file_digest, write_json
+from geosunpre.sfm.tracks import split_tracks
+from geosunpre.sfm.evaluation import triangle_validation_split
+from geosunpre.artifacts import digest
+from geosunpre.artifacts import file_digest
+from geosunpre.artifacts import write_frozen_json
 
 
 POLICY = {'fraction': .2, 'seed': 314159, 'triangle_direct_match_confidence': .9}
 ISOLATION_SCOPE = 'before_local_and_global_geometry'
-
-
-def write_frozen_json(path, value):
-    """Keep completed identities immutable; publish individual JSON files atomically."""
-    path = Path(path)
-    if path.exists():
-        if digest(json.loads(path.read_text())) != digest(value):
-            raise ValueError(f'Frozen inputs changed; use a fresh work directory: {path}')
-    else:
-        write_json(path, value)
 
 
 def _input_identity(root, data):
@@ -40,7 +32,7 @@ def _input_identity(root, data):
 
 def load_frozen_holdout(work, data):
     """Verify the frozen split and its feature/match identities without rewriting it."""
-    root = Path(work).resolve() / 'global_sfm'
+    root = Path(work).resolve() / 'sfm'
     path = root / 'holdout_protocol.json'
     if not path.is_file():
         raise ValueError('Missing pre-calibration holdout; run the holdout stage in a fresh work directory')
@@ -59,25 +51,25 @@ def load_frozen_holdout(work, data):
 
 
 def _reject_existing_geometry(work):
-    root = work / 'global_sfm'
+    root = work / 'sfm'
     if any((root / name).exists() for name in (
             'geometry_protocol.json', 'database.db', 'seed', 'mapping', 'mapper_output',
-            'stages', 'baseline_equal', 'ground_joint_ba', 'lfs_ab')):
+            'stages', 'final')):
         raise ValueError('Geometry predates the unified holdout; use a fresh work directory')
-    local = work / 'local_sfm'
-    if any(local.glob('*/run_contract.json')) or any(local.rglob('database.db')) or any(local.rglob('cameras.bin')):
+    local = work / 'calibration'
+    if (local / 'run_contract.json').exists() or any(local.rglob('database.db')) or any(local.rglob('cameras.bin')):
         raise ValueError('Local calibration predates the unified holdout; use a fresh work directory')
 
 
-def freeze_global_holdout(work):
+def freeze_holdout(work):
     """Select raw tracks and triangle queries using matches only, before calibration."""
-    from .global_data import load_global
+    from geosunpre.pipeline.data import load_frontend
 
     work = Path(work).resolve()
-    root = work / 'global_sfm'
+    root = work / 'sfm'
     if not (root / 'holdout_protocol.json').exists():
         _reject_existing_geometry(work)
-    root, scene, data, features = load_global(work)
+    root, scene, data, features = load_frontend(work)
     if (root / 'holdout_protocol.json').exists():
         protocol, _, _ = load_frozen_holdout(work, data)
         return protocol

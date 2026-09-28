@@ -1,0 +1,3 @@
+# Reproduce the selection used by the completed 536-image basketball run.
+expected_images = 536
+calibration_frames = [70, 94]

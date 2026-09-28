@@ -1,6 +1,5 @@
 """Validate a PCC project without promoting vendor poses to reconstruction poses."""
 from collections import Counter
-import hashlib
 import json
 from pathlib import Path
 import re
@@ -8,30 +7,11 @@ import re
 import numpy as np
 from PIL import Image
 
-from .camera import Camera
+from geosunpre.camera import Camera
+from geosunpre.artifacts import digest, file_digest, write_frozen_json
 
 NAME = re.compile(r'(\d+)-(\d+)-(\d+)_(\d+)-([LRM])\.JPG', re.I)
 CONTRACT_VERSION = 1
-
-
-def digest(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-
-
-def file_digest(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as f:
-        while block := f.read(1024*1024):
-            h.update(block)
-    return h.hexdigest()
-
-
-def write_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix+'.tmp')
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)+'\n')
-    tmp.replace(path)
 
 
 def parse_name(name):
@@ -85,21 +65,8 @@ def load_poses(path):
     return poses
 
 
-def time_audit(root, stem):
-    paths = [root/f'{stem}_pos.txt', root/f'{stem}_pos_ENH.txt']
-    if not all(p.exists() for p in paths):
-        return {'status': 'navigation tables unavailable'}
-    a, b = [np.loadtxt(p) for p in paths]
-    result = {'status': 'unresolved time convention', 'shapes': [list(a.shape), list(b.shape)]}
-    if a.shape == b.shape and a.shape[1] == 11:
-        delta = a[:, 1]-b[:, 1]
-        result.update(row_aligned_time_difference_seconds={
-            'min': float(delta.min()), 'median': float(np.median(delta)), 'max': float(delta.max())},
-            identical_velocity_and_attitude=bool(np.array_equal(a[:, 5:], b[:, 5:])))
-    return result
-
-
-def prepare(input_root, work, fov=160, principal_y='up', mask_root=None):
+def prepare(input_root, work):
+    fov, principal_y = 160, 'up'
     root, work = Path(input_root).resolve(), Path(work).resolve()
     projects = sorted(root.glob('*.pro'))
     if len(projects) != 1:
@@ -134,14 +101,6 @@ def prepare(input_root, work, fov=160, principal_y='up', mask_root=None):
             exposure = im.getexif().get(33434)
         relative = path.relative_to(root/'Image').as_posix()
         semantic_mask = None
-        if mask_root:
-            candidate = Path(mask_root).resolve()/(relative+'.png')
-            if not candidate.is_file():
-                raise ValueError(f'Missing requested semantic mask: {candidate}')
-            with Image.open(candidate) as mask:
-                if mask.size != (cam.width, cam.height):
-                    raise ValueError(f'Mask/image size mismatch: {candidate}')
-            semantic_mask = str(candidate)
         stat = path.stat()
         images.append({'name': relative, 'source': str(path), 'camera': camera, 'frame_index': frame,
                        'week': week, 'seconds': seconds, 'exposure_seconds': float(exposure) if exposure else None,
@@ -160,16 +119,16 @@ def prepare(input_root, work, fov=160, principal_y='up', mask_root=None):
         'pixel_coordinates': 'corner coordinates; top-left pixel centre (0.5, 0.5)',
         'fov_degrees': fov, 'principal_y_axis': principal_y, 'principal_convention_verified': False,
         'distortion_mapping': ['k1', 'k2', 'k3', 'p3'], 'pose_values_used_for_geometry': False,
-        'semantic_masks_available': bool(mask_root), 'navigation_time_audit': time_audit(root, pro_path.stem),
+        'semantic_masks_available': False,
         'source_hashes': {'project': file_digest(pro_path), 'camera_pose': file_digest(pose_path)},
         'cameras': {k: c.to_dict() for k,c in cameras.items()}, 'images': images,
     }
     manifest['fingerprint'] = digest(manifest)
+    write_frozen_json(work/'manifest.json', manifest)
     for label, cam in cameras.items():
         mask_path = work/'fov_masks'/f'{label}.png'
         mask_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(cam.mask(fov)).save(mask_path)
-    write_json(work/'manifest.json', manifest)
     (work/'images.txt').write_text('\n'.join(im['name'] for im in images)+'\n')
     return manifest
 

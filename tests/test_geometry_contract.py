@@ -5,8 +5,11 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 
 from geosunpre.camera import Camera
-from geosunpre.geometry import (build_tracks, epipolar_pixel_error, fit_pair,
-                               rotation_graph_diagnostics, skew)
+from geosunpre.sfm.geometry import build_tracks
+from geosunpre.sfm.geometry import epipolar_pixel_error
+from geosunpre.sfm.geometry import fit_pair
+from geosunpre.sfm.geometry import rotation_graph_diagnostics
+from geosunpre.sfm.geometry import skew
 from geosunpre.scene import prepare
 
 

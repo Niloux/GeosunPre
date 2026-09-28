@@ -1,3 +1,3 @@
-from .cli import main
+from geosunpre.cli import main
 
 main()

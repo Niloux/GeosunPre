@@ -7,12 +7,14 @@ import pycolmap
 import pytest
 
 from geosunpre.cli import main
-from geosunpre.local_evaluation import evaluate_reconstruction
-from geosunpre.pipeline import baseline_build as build
-from geosunpre.pipeline.baseline import export_baseline
-from geosunpre.pipeline.colmap_export import MODEL_FILES, export_colmap, verify_colmap_export
-from geosunpre.scene import file_digest, write_json
-from test_baseline_build import tiny_visual_work
+from geosunpre.sfm.evaluation import evaluate_reconstruction
+from geosunpre.pipeline import runner as build
+from geosunpre.colmap import MODEL_FILES
+from geosunpre.colmap import export_colmap
+from geosunpre.colmap import verify_colmap_export
+from geosunpre.artifacts import file_digest
+from geosunpre.artifacts import write_json
+from test_pipeline import tiny_visual_work
 
 
 def test_copy_export_is_portable_and_preserves_full_model(tmp_path):
@@ -62,56 +64,34 @@ def test_failed_export_does_not_publish_a_partial_dataset(tmp_path):
     assert not list(tmp_path.glob('.export-*'))
 
 
-def test_existing_export_is_immutable_and_legacy_directory_is_protected(tmp_path):
+def test_existing_export_is_immutable_and_nonempty_directory_is_protected(tmp_path):
     work, _, scene, _, _ = tiny_visual_work(tmp_path)
     output = tmp_path / 'export'
     original = export_colmap(work / build.SOURCE, scene, output)
     assert export_colmap(work / build.SOURCE, scene, output) == original
     identity_hash = file_digest(output / 'colmap_export.json')
     with pytest.raises(ValueError, match='Existing COLMAP export differs'):
-        export_colmap(work / build.SOURCE, scene, output, image_mode='copy')
+        export_colmap(work / build.SOURCE, scene, output, image_mode='link')
     assert file_digest(output / 'colmap_export.json') == identity_hash
-    legacy = tmp_path / 'legacy'
-    write_json(legacy / 'baseline_export.json', {'status': 'frozen'})
+    foreign = tmp_path / 'foreign'
+    write_json(foreign / 'other.json', {'status': 'frozen'})
     with pytest.raises(ValueError, match='choose a new output directory'):
-        export_colmap(work / build.SOURCE, scene, legacy)
-    assert list(legacy.iterdir()) == [legacy / 'baseline_export.json']
+        export_colmap(work / build.SOURCE, scene, foreign)
+    assert list(foreign.iterdir()) == [foreign / 'other.json']
 
 
-def test_frozen_source_export_needs_no_lfs_files(tmp_path):
-    work, root, scene, _, _ = tiny_visual_work(tmp_path)
-    manifest = tmp_path / 'baseline.json'
-    write_json(manifest, {
-        'schema_version': 1, 'status': 'development_baseline', 'name': 'tiny',
-        'work_root': str(work), 'scene_manifest': 'global_sfm/manifest.json',
-        'scene_manifest_sha256': file_digest(root / 'manifest.json'),
-        'scene_fingerprint': scene['fingerprint'], 'source_model': str(build.SOURCE),
-        'model_sha256': {name: file_digest(work / build.SOURCE / name) for name in MODEL_FILES},
-        'image_count': 2, 'lenses': {'L': 1, 'R': 1},
-        **{key: 'missing/' + key for key in ('lfs_dataset', 'lfs_shared', 'lfs_protocol', 'lfs_config')},
-    })
-    result = export_baseline(manifest_path=manifest)
-    assert result['images'] == 2
-    assert not (work / 'colmap/lfs_config.json').exists()
 
 
-def test_joint_experiment_refuses_to_overwrite_the_frozen_baseline(tmp_path):
-    from geosunpre.experiments.ground_joint_ba import run_ground_joint_ba
-
-    write_json(tmp_path / 'global_sfm/lfs_ab/protocol.json', {'status': 'frozen'})
-    with pytest.raises(ValueError, match='frozen historical baseline'):
-        run_ground_joint_ba(tmp_path)
-    assert not (tmp_path / 'global_sfm/ground_joint_ba').exists()
 
 
 def test_cli_exports_and_checks_without_a_work_directory(tmp_path, capsys):
     work, root, _, _, _ = tiny_visual_work(tmp_path)
     output = tmp_path / 'export'
-    main(['export-colmap', '--scene', str(root / 'manifest.json'),
+    main(['export', '--scene', str(root / 'manifest.json'),
           '--model', str(work / build.SOURCE), '--output', str(output), '--image-mode', 'copy'])
     assert json.loads(capsys.readouterr().out)['images'] == 2
     shutil.rmtree(work)
-    main(['check-colmap', '--output', str(output)])
+    main(['check', '--output', str(output)])
     assert json.loads(capsys.readouterr().out)['full_content_check'] is True
 
 
