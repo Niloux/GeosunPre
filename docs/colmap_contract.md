@@ -14,7 +14,7 @@ colmap/
     rigs.bin
     frames.bin
   colmap_export.json       # 本项目的附加内容身份
-  quality.json             # 完整流程附带的评估；通用导出可省略
+  quality.json             # 生产诊断或验证留出评估；通用导出可省略
   masks/                   # --include-masks
   sparse/0/points3D.ply     # --include-ply
 ```
@@ -40,3 +40,6 @@ geosunpre check --output /path/to/colmap
 导出在目标同级临时目录中生成、回读并校验，成功后发布整个目录。失败不发布半成品；强制终止可能留下隐藏临时目录，续跑不复用它。已有目录只在身份和选项相同时复用；不同内容或无导出身份的非空目录拒绝覆盖。
 
 `colmap_export.json` 使用版本 1，COLMAP 本身无需解析它。旧版流程已经交付的同版本数据集仍可独立验证。内部一致性与内容校验不代替几何质量验收。
+
+生产模式的 `quality.json` 明确标识 `mode = "production"`，重投影残差来自拟合观测，不代表留出精度。
+验证模式继续保存原始与高置信留出查询统计。两种来源记录见 [模式说明](production_pipeline.md)。

@@ -1,5 +1,8 @@
 # 篮球场性能优化
 
+本文计时和留出对照来自模式拆分前的验证流程。当前默认已改为 production，
+不划分留出集；本轮生产运行结果见 [生产模式说明](production_pipeline.md)。
+
 后续内存与显存优化见 [资源记录](resources.md)。下文保留历史三轮对照，缓存大小对应当时实现。
 
 ## 计时与质量口径
@@ -43,6 +46,17 @@ FlashAttention 保留原模型、特征数量、配对和阈值，但浮点舍�
 
 ## 安装和复现
 
+复现本文历史验证流程时，将下列内容保存为 `basketball_validation.toml`，
+不能直接使用已经切换为生产模式的正式配置：
+
+```toml
+expected_images = 536
+calibration_frames = [70, 94]
+matcher_attention = "flash"
+pipeline_mode = "validation"
+calibration_mode = "local"
+```
+
 ```bash
 uv sync --locked --extra loma --extra segmentation
 
@@ -51,7 +65,7 @@ HF_HUB_OFFLINE=1 \
   uv run --no-sync geosunpre run \
     --input input/篮球场 \
     --work work/basketball_fast_fresh \
-    --config configs/basketball.toml \
+    --config basketball_validation.toml \
     --model-cache /path/to/cached/huggingface/weights \
     --include-masks > work/basketball_fast.log 2>&1
 

@@ -19,13 +19,15 @@ src/geosunpre/
     runner.py             # 阶段顺序、最终 BA、正式导出
     runtime.py            # 工作目录锁、阶段状态与耗时
     data.py               # 全场掩码、特征、候选配对和匹配
-    holdout.py            # 几何拟合前冻结留出观测
+    observations.py       # 生产全量观测身份与模式分发
+    holdout.py            # 验证模式冻结留出观测
+    quality.py            # 生产质量诊断与报告
     calibration.py        # 复用全局特征做局部标定
-    reconstruction.py    # 全局建图、轨迹筛选、BA 与报告
+    reconstruction.py     # 全局建图、轨迹筛选、BA 与报告
   sfm/
     geometry.py           # 两视图几何、紧凑成轨与旋转闭环检查
     tracks.py             # 时序配对与留出抽样
-    reconstruction.py    # 数据库、种子模型与有界 BA
+    reconstruction.py     # 数据库、种子模型与有界 BA
     depth_guard.py        # 正深度约束
     track_filter.py       # 训练轨迹一致性筛选
     evaluation.py         # 冻结查询的几何预测评估
@@ -50,7 +52,7 @@ WORK/
   calibration/
     manifest.json
     frontend.json
-    split.json
+    split.json             # 仅验证模式
     run_contract.json
     mapping/
     stages/
@@ -61,24 +63,30 @@ WORK/
     masks_v2/              # 版本 2 的语义、设备掩码和原因图
     mask_review.html
     frontend.json
-    holdout_protocol.json
+    observation_protocol.json  # 生产模式
+    holdout_protocol.json      # 以下三项仅验证模式
     split.json
     triangle_validation_split.json
     geometry_protocol.json
     mapping/
     stages/
+    optimization_summary.json  # 生产模式
+    comparison.json            # 验证模式
     final/sparse/0/        # 最终原生鱼眼模型
-    final/validation_summary.json
+    final/quality_summary.json     # 生产模式
+    final/validation_summary.json  # 验证模式
     index.html
   colmap/                  # 可交付数据集
 ```
+
+上表展示 local 标定模式；input 模式的标定阶段仅冻结输入内参身份，不生成局部建图与 BA 产物。
 
 工作目录使用绝对路径引用原始数据和缓存，不承诺可搬迁。`colmap/` 的复制模式用于可搬迁交付。
 
 ## 运行与恢复
 
 1. `run` 获得 Linux `flock` 排他锁，再写入配置和阶段产物。另一个进程使用相同目录时立即失败。
-2. 新目录保存版本 2 配置，默认 flash；续跑加载已保存配置。版本 1 未写匹配后端时解释为 math，显式 flash 不变；旧文件保持原字节。命令行传入不同配置、不同输入根目录，或未由新流程管理的非空目录，均拒绝混用。
+2. 新目录保存版本 4 配置，默认 production + local + flash；版本 1/2/3 继续按 validation 运行；续跑加载已保存配置。版本 1 未写匹配后端时解释为 math，显式 flash 不变；旧文件保持原字节。命令行传入不同配置、不同输入根目录，或未由新流程管理的非空目录，均拒绝混用。
 3. JSON 先写同级临时文件再替换。冻结协议逐项比对内容；特征和匹配的内容哈希继续贯穿标定、全局几何和最终导出。
 4. 状态文件只是执行记录。是否能复用结果由实际产物、完成身份和依赖检查决定。
 5. 全量重跑会检查并复用完整缓存或阶段；`--stage` 只运行指定阶段。状态标记为 `completed` 仅表示本次请求的阶段完成。
@@ -92,9 +100,11 @@ WORK/
 
 ## 固定的数值流程
 
-保留已实跑的视觉流程：1536 检测尺寸、每图最多 3072 个 LoMa 特征，时序加描述子检索候选配对；全局留出先于所有几何拟合；局部依次优化固定内参、焦距与低阶径向、全部径向、主点；全局依次固定标定 BA、训练轨迹筛选 BA、共享标定 BA，最后执行最多 40 次迭代的有界 BA。
+保留已实跑的视觉流程：1536 检测尺寸、每图最多 3072 个 LoMa 特征，时序加描述子检索候选配对；生产模式使用全部质量筛选后的观测；验证模式在所有几何拟合前冻结全局留出；局部依次优化固定内参、焦距与低阶径向、全部径向、主点；全局依次固定标定 BA、训练轨迹筛选 BA、共享标定 BA，最后执行最多 40 次迭代的有界 BA。
 
 相机共享内参，每次曝光使用独立 frame。正深度与 160° 单调投影检查、训练覆盖检查、全部图像注册要求均保留。标定片段选择属于配置；不根据留出误差搜索参数或选择模型。
+
+生产与验证模式的差异和来源契约见 [模式说明](production_pipeline.md)。
 
 ## 当前边界
 
@@ -103,7 +113,7 @@ WORK/
 - 导出保持原生 `OPENCV_FISHEYE`；使用方需要支持该相机模型。
 - 视觉结果为任意尺度，不提供导航对齐、米制尺度、地面约束或 LAS 融合。
 - 数值与阶段测试包含真实 PyCOLMAP 模型读写和小模型 BA；管线集成测试对大规模建图与 BA 使用替身。
-- 历史三轮完整验证见 [性能记录](performance.md)，后续内存、显存和评估优化见 [资源记录](resources.md)。19 分 51.30 秒是单次结果，不是稳定上限。
+- 当前生产完整运行见 [生产报告](production_pipeline.md)：20 分 31.30 秒，未达到 20 分钟目标；未验证下游渲染质量。历史性能、资源与消融记录见 [验证摘要索引](benchmarks/README.md)。
 
 ## 历史重构验证（2026-09-28）
 

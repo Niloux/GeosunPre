@@ -6,11 +6,13 @@
 flowchart LR
     A[输入与图像选择] --> B[自动掩码]
     B --> C[LoMa 特征与匹配]
-    C --> D[冻结留出观测]
+    C --> D[冻结全量观测来源]
     D --> E[局部视觉标定]
     E --> F[全局 SfM 与 BA]
     F --> G[COLMAP 导出与校验]
 ```
+
+新运行默认生产模式，使用全部通过质量筛选的观测，不划分留出集；局部标定保留。研发对照可显式选择验证模式，详见 [模式说明](docs/production_pipeline.md)。
 
 每次曝光独立求位姿，每个镜头共享一组 `OPENCV_FISHEYE` 内参。导出保持原图和原生鱼眼模型，不去畸变。流程无需逐场景人工标注；设备遮挡使用代码中版本化的固定规则。
 
@@ -55,26 +57,29 @@ input/场景/
 ```toml
 expected_images = 536
 calibration_frames = [70, 94]  # 包含首尾
-matcher_attention = "flash"  # 正式默认
+matcher_attention = "flash"
+pipeline_mode = "production"
+calibration_mode = "local"
 ```
 
 省略配置时，不限制总图像数，自动取前 25 个不同帧号作为标定片段；可用 `calibration_frame_count` 调整。显式 `calibration_frames` 优先。标定片段必须包含 L/R 两个镜头，并有至少两个不同帧号；这些只是输入检查，实际是否能标定由视觉匹配与建图决定。
+
+正式默认 `calibration_mode = "local"`。局部标定消融支持保留这一步；
+`input` 初始化及对照结果见 [局部标定消融](docs/calibration_ablation.md)。
+研发对照使用 `pipeline_mode = "validation"` 和新工作目录，详见 [模式说明](docs/production_pipeline.md)。
 
 160° FOV、设备遮挡、特征和求解规则沿用当前 Geosun 设备配方。更换设备需要适配其标定与遮挡规则；当前并非任意相机输入框架。
 
 ### 当前默认与验证结果
 
-`configs/basketball.toml` 是唯一正式篮球场配置，采用 FlashAttention、CUDA Graph、
-特征缓存、CPU 并行处理及原生深度约束 BA。无需额外的 fast 配置或加速环境变量。
-原生扩展固定兼容 pyceres 2.6 / Ceres 2.2.0，随主工程安装；缺失时直接报错。
+当前生产模式已完成一次 536 张图的完整冷启动：**20 分 31.30 秒**，全部注册、
+75,893 点、482,968 条拟合观测、0 无效深度，独立交付校验通过。本次未达到 20 分钟目标。
+未划分留出集；拟合残差不等于测试精度。详见 [生产运行记录](docs/production_pipeline.md)。
 
-536 张图像的一次完整冷启动实测 **19 分 51.30 秒**，包含原图复制、掩码导出和交付包校验，
-仅复用预训练权重。全部图像注册，共同留出检查通过；距 20 分钟仅约 9 秒，不代表重复运行的稳定上限。
-详细分项、质量变化及诊断方式见 [性能记录](docs/performance.md)，后续内存与显存优化见 [资源记录](docs/resources.md)。
 
-资源优化已正式采用，普通 `run` 默认启用紧凑轨迹、评估数组化、运行内哈希复用及阶段内存回收，
-无需额外开关。完整实测峰值 RSS 从 5.93 GiB 降至 4.42 GiB，质量核对通过。
-显存峰值未证实降低；匹配结束后会释放空闲 CUDA 缓存。该轮受并行训练影响，不作耗时对比。
+`configs/basketball.toml` 是唯一正式篮球场配置，默认启用特征缓存、CPU 并行处理和
+原生深度约束 BA。原生扩展固定兼容 pyceres 2.6 / Ceres 2.2.0，随主工程安装；缺失时直接报错。
+历史验证模式的性能、资源和消融结果见 [验证记录索引](docs/benchmarks/README.md)。
 
 ### 权重缓存
 
@@ -88,25 +93,25 @@ matcher_attention = "flash"  # 正式默认
 
 ```bash
 # 继续同一轮运行，自动读取已保存的输入路径和配置
-geosunpre run --work work/basketball_pipeline_01 --include-masks
+uv run --no-sync geosunpre run --work work/basketball_pipeline_01 --include-masks
 
 # 仅执行一个阶段；其上游产物须已完成
-geosunpre run --work work/basketball_pipeline_01 --stage calibration
+uv run --no-sync geosunpre run --work work/basketball_pipeline_01 --stage calibration
 ```
 
-可选阶段：`prepare → masks → features → matches → holdout → calibration → sfm → finalize → export`，默认 `all`。导出选项不属于场景配置，续跑到 `export` 时应保持一致；改变导出选项可指定新的 `--output`。
+生产阶段：`prepare → masks → features → matches → observations → calibration → sfm → finalize → export`，默认 `all`。验证模式将 `observations` 替换为 `holdout`。配置版本 1/2/3 的旧工作目录继续按验证模式运行；新目录默认生产模式。导出选项不属于场景配置，续跑到 `export` 时应保持一致；改变导出选项可指定新的 `--output`。
 
 `pipeline_status.json` 记录最近一次调用的阶段、耗时和失败原因；`run_result.json` 记录最近成功调用的结果。恢复粒度为已完成的缓存或阶段，不承诺任意文件写入时刻均能自动恢复。无完成身份的部分模型会报错，处理方式见[工程结构与运行说明](docs/engineering_structure.md)。
 
 ## 单独导出已有模型
 
 ```bash
-geosunpre export \
+uv run --no-sync geosunpre export \
   --scene /path/to/manifest.json \
   --model /path/to/sparse/0 \
   --output /path/to/colmap \
   --include-masks
-geosunpre check --output /path/to/colmap
+uv run --no-sync geosunpre check --output /path/to/colmap
 ```
 
 导出先在临时目录中回读校验，再发布完整目录。`check` 在复制模式下只需交付包，不依赖原始工作目录。模型和图像内容校验通过，代表交付完整；几何质量仍需参考附带评估和应用效果。
@@ -116,12 +121,12 @@ geosunpre check --output /path/to/colmap
 | 目录 | 内容 |
 | --- | --- |
 | `src/geosunpre/` | 输入、相机、自动掩码、特征、配置、COLMAP 交付 |
-| `src/geosunpre/pipeline/` | 阶段编排、标定、重建、留出与运行状态 |
+| `src/geosunpre/pipeline/` | 阶段编排、标定、重建、生产诊断与验证评估 |
 | `src/geosunpre/sfm/` | 几何、轨迹、BA、深度约束和评估 |
 | `configs/` | 正式场景配置 |
 | `native/` | 原生 Ceres 深度约束扩展及第三方许可证 |
 | `tests/` | 数值、阶段身份、恢复保护和导出测试 |
-| `docs/` | [工程说明](docs/engineering_structure.md)、[COLMAP 契约](docs/colmap_contract.md)、[留出协议](docs/unified_holdout.md) |
+| `docs/` | [文档索引](docs/README.md)、流程与交付契约、验证记录 |
 
 ```bash
 uv run --no-sync pytest -q tests

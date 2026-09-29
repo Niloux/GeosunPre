@@ -66,8 +66,13 @@ def _reject_existing_geometry(work):
 def freeze_holdout(work):
     """Select raw tracks and triangle queries using matches only, before calibration."""
     from geosunpre.pipeline.data import load_frontend
+    from geosunpre.config import load_config
 
     work = Path(work).resolve()
+    if load_config(work).pipeline_mode != 'validation':
+        raise ValueError('Holdouts require validation mode; production uses the observations stage')
+    if (work / 'sfm/observation_protocol.json').exists():
+        raise ValueError('Production observations already frozen; use a fresh work directory')
     root = work / 'sfm'
     if not (root / 'holdout_protocol.json').exists():
         _reject_existing_geometry(work)

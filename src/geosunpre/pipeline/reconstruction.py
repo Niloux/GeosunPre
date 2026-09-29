@@ -23,9 +23,11 @@ from geosunpre.sfm.track_filter import filter_mapped_tracks
 from geosunpre.sfm.track_filter import training_adjacency
 from geosunpre.pipeline.holdout import ISOLATION_SCOPE
 from geosunpre.pipeline.holdout import POLICY
-from geosunpre.pipeline.holdout import load_frozen_holdout
+from geosunpre.pipeline.observations import (is_validation, load_observations, partitions,
+                                           protocol_identity)
 from geosunpre.artifacts import write_frozen_json
 from geosunpre.pipeline.data import load_frontend
+from geosunpre.config import load_config
 
 OUTPUT = 'sfm'
 
@@ -36,13 +38,13 @@ def freeze_geometry(work, *, require_existing=False):
     work = Path(work).resolve()
     from geosunpre.pipeline.calibration import verify_calibration
 
-    _, split, _ = load_frozen_holdout(work, data)
+    _, split, _ = load_observations(work, data)
     local = work / 'calibration/stages/principal/sparse/0'
     calibration = verify_calibration(work, split)
     params = {i: camera.params.tolist() for i, camera in calibration.cameras.items()}
     protocol = {'version': 2, 'scene_fingerprint': scene['fingerprint'],
                 'frontend_fingerprint': data['fingerprint'],
-                'holdout_protocol_sha256': file_digest(out / 'holdout_protocol.json'),
+                **protocol_identity(work, 'holdout_protocol_sha256'),
                 'calibration_identity_sha256': file_digest(work / 'calibration/calibration_identity.json'),
                 'pair_protocol_sha256': file_digest(out / 'pair_protocol.json'),
                 'calibration_source_model_sha256': {p.name: file_digest(p) for p in local.glob('*.bin')},
@@ -54,6 +56,15 @@ def freeze_geometry(work, *, require_existing=False):
                 'shared_calibration_limits': 'Same bounded visual-only principal-stage limits as local SfM; final parameters must pass 160-degree monotonicity and positive-depth checks.',
                 'independent_exposure_poses': True, 'input_pose_values_used': False, 'las_used': False,
                 'scope': 'Full selected L/R sequence, candidate shared calibration from local visual fit. No navigation/LAS alignment or photometric acceptance.'}
+    if load_config(work).calibration_mode == 'input':
+        protocol['calibration_mode'] = 'input'
+        protocol['calibration_source_model_sha256'] = {}
+        protocol['scope'] = ('Full selected L/R sequence, supplied input intrinsics without local visual fitting. '
+                             'No navigation/LAS alignment or photometric acceptance.')
+    if not is_validation(work):
+        del protocol['holdout']
+        protocol['pipeline_mode'] = 'production'
+        protocol['observation_policy'] = 'All eligible observations; no validation exclusions.'
     path = out / 'geometry_protocol.json'
     if not path.exists():
         if require_existing:
@@ -74,7 +85,7 @@ def geometric_scene(scene, params):
 @profiled
 def build_mapping(work):
     out, scene, data, features, protocol, params = freeze_geometry(work)
-    split = json.loads((out / 'split.json').read_text())
+    split, _ = partitions(work)
     mapping = out / 'mapping'
     if (mapping / 'cameras.bin').exists():
         rec = pycolmap.Reconstruction(mapping)
@@ -113,6 +124,8 @@ def build_mapping(work):
 @profiled
 def evaluate_mapping(work):
     """Score the saved mapper result on the same frozen queries as later BA."""
+    if not is_validation(work):
+        raise ValueError('Mapping holdout evaluation requires validation mode')
     out, scene, data, features, _, _ = freeze_geometry(work, require_existing=True)
     rec = pycolmap.Reconstruction(out / 'mapping')
     split = json.loads((out / 'split.json').read_text())
@@ -142,19 +155,19 @@ def evaluate_mapping(work):
 def optimize(work, *, stop_after='shared_calibration'):
     out, scene, data, features, protocol, _ = freeze_geometry(work, require_existing=True)
     mapping = pycolmap.Reconstruction(out / 'mapping')
-    split = json.loads((out / 'split.json').read_text())
-    triangle = json.loads((out / 'triangle_validation_split.json').read_text())
+    validation = is_validation(work)
+    split, triangle = partitions(work)
     assert_holdout_isolated(mapping, split)
     del mapping
     params = {int(i): np.asarray(p, dtype=float) for i, p in protocol['calibration'].items()}
-    comparison_path = out / 'comparison.json'
+    comparison_path = out / ('comparison.json' if validation else 'optimization_summary.json')
     existing = json.loads(comparison_path.read_text()) if comparison_path.exists() else {'stages': {}}
     stages = {'mapping': existing['stages']['mapping']} if 'mapping' in existing['stages'] else {}
     for stage in ['fixed_calibration', 'triangle_supported', 'shared_calibration']:
         path = out / 'stages' / stage; path.mkdir(parents=True, exist_ok=True)
         if (stage in existing['stages'] and (path / 'ba.json').exists()
-                and (path / 'validation.json').exists()
-                and (path / 'triangle_validation/validation.json').exists()):
+                and (not validation or ((path / 'validation.json').exists()
+                     and (path / 'triangle_validation/validation.json').exists()))):
             rec = pycolmap.Reconstruction(path / 'sparse/0')
             assert_holdout_isolated(rec, split)
             if stage != 'shared_calibration':
@@ -198,18 +211,24 @@ def optimize(work, *, stop_after='shared_calibration'):
         assert_holdout_isolated(rec, split)
         if stage != 'shared_calibration':
             for cid, p in params.items(): np.testing.assert_array_equal(rec.cameras[cid].params, p)
-        raw = evaluate_reconstruction(rec, scene, features, split, path)
-        tri = path / 'triangle_validation'; tri.mkdir(exist_ok=True)
-        high = evaluate_reconstruction(rec, scene, features, triangle, tri)
+        evaluation = {}
+        if validation:
+            raw = evaluate_reconstruction(rec, scene, features, split, path)
+            tri = path / 'triangle_validation'; tri.mkdir(exist_ok=True)
+            high = evaluate_reconstruction(rec, scene, features, triangle, tri)
+            evaluation = {'raw': raw, 'triangle': high}
         stages[stage] = {'ba': ba, 'registered': rec.num_reg_images(), 'points': rec.num_points3D(),
-                         'observations': rec.compute_num_observations(), 'raw': raw, 'triangle': high,
+                         'observations': rec.compute_num_observations(), **evaluation,
                          'camera_params': {cid: c.params.tolist() for cid, c in rec.cameras.items()}}
-        write_json(comparison_path, {'stages': stages, 'scope': 'Full-scene observation holdout, not independent capture or 3DGS acceptance.'})
+        write_json(comparison_path, {'stages': stages, 'scope': (
+            'Full-scene observation holdout, not independent capture or 3DGS acceptance.' if validation else
+            'Production optimization on all eligible observations; no test-set metrics.')})
         write_report(out, scene, data)
-        print('Global heldout', stage, high['all_candidate_queries'], flush=True)
+        if validation:
+            print('Global heldout', stage, high['all_candidate_queries'], flush=True)
         if stage == stop_after:
             break
-    if 'triangle_supported' in stages:
+    if validation and 'triangle_supported' in stages:
         compare_stages(work)
     return stages
 
@@ -217,6 +236,8 @@ def optimize(work, *, stop_after='shared_calibration'):
 @profiled
 def compare_stages(work):
     """Compare identical high-confidence queries with valid support in all saved stages."""
+    if not is_validation(work):
+        raise ValueError('Paired stage comparisons require validation mode')
     out = Path(work).resolve() / OUTPUT
     path = out / 'comparison.json'
     comparison = json.loads(path.read_text())
@@ -239,6 +260,9 @@ def compare_stages(work):
 
 
 def write_report(out, scene, data):
+    if not is_validation(out.parent):
+        from geosunpre.pipeline.quality import write_production_report
+        return write_production_report(out, scene)
     mapping = json.loads((out / 'mapping_summary.json').read_text())
     geo = json.loads((out / 'geometry_summary.json').read_text())
     split = json.loads((out / 'split_summary.json').read_text())
@@ -270,10 +294,13 @@ def write_report(out, scene, data):
 <style>body{font:16px system-ui;background:#171b23;color:#ddd;margin:24px}a{color:#8bc5ff}p{line-height:1.7}table{border-collapse:collapse}td,th{border:1px solid #576070;padding:10px}.timeline{overflow:auto;max-width:100%;white-space:nowrap}.timeline p{display:flex;gap:1px;margin:4px 0}.timeline span{display:inline-block;flex:0 0 5px;height:22px}.registered{background:#56bf85}.missing{background:#eb755f}</style>
 <h1>全部入选 L/R 图像的视觉重建</h1>'''
     isolation = '留出集在局部标定前冻结，相同观测同时排除于局部标定和全局重建。'
+    calibration_note = ('内参以 input 标定初始化，未做局部视觉标定；全局 BA 仍可优化内参。'
+                        if load_config(out.parent).calibration_mode == 'input'
+                        else '内参来自局部视觉候选，不认定为真值。')
     intro = (f'<p>仅精确同名 CameraPos 记录的 L/R 共 {len(scene["images"])} 张，逐张独立曝光；'
              '不使用输入 pose 数值或 LAS 来拟合。'
              f'{isolation}闭合三图子集与全部原始查询同时报告。'
-             '内参来自局部视觉候选，不认定为真值。</p>'
+             f'{calibration_note}</p>'
              f'<p>候选图像对 {len(data["pairs"])}；E 成功 {geo["successful_E_pairs"]}；'
              f'写入数据库 {geo["database_pairs"]}。留出原始轨迹 {split["raw_heldout_tracks"]} 条、'
              f'查询 {split["raw_queries"]} 个；直接闭合三图查询 {split["triangle_queries"]} 个。</p>'

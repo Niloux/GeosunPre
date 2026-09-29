@@ -10,7 +10,7 @@ from geosunpre.artifacts import digest, write_frozen_json
 
 
 CONFIG_FILE = 'pipeline_config.json'
-CONFIG_VERSION = 2
+CONFIG_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -19,8 +19,14 @@ class PipelineConfig:
     calibration_frames: tuple[int, int] | None = None
     calibration_frame_count: int = 25
     matcher_attention: str = 'flash'
+    calibration_mode: str = 'local'
+    pipeline_mode: str = 'production'
 
     def __post_init__(self):
+        if self.pipeline_mode not in ('production', 'validation'):
+            raise ValueError('pipeline_mode must be production or validation')
+        if self.calibration_mode not in ('local', 'input'):
+            raise ValueError('calibration_mode must be local or input')
         if self.matcher_attention not in ('math', 'flash'):
             raise ValueError('matcher_attention must be math or flash')
         if self.expected_images is not None and (
@@ -55,6 +61,8 @@ class PipelineConfig:
 
     def calibration_images(self, scene):
         self.check_scene(scene)
+        if self.calibration_mode == 'input':
+            return []
         if self.calibration_frames is None:
             frames = sorted({row['frame_index'] for row in scene['images']})
             if len(frames) < 2:
@@ -88,7 +96,7 @@ def load_config(work):
     if not path.is_file():
         raise ValueError('Missing pipeline_config.json; start a run in a fresh work directory')
     value = json.loads(path.read_text())
-    if (value.get('version') not in (1, CONFIG_VERSION) or value.get('fingerprint') != digest(
+    if (value.get('version') not in (1, 2, 3, CONFIG_VERSION) or value.get('fingerprint') != digest(
             {key: val for key, val in value.items() if key != 'fingerprint'})):
         raise ValueError('Pipeline configuration identity changed')
     settings = dict(value['settings'])
@@ -96,4 +104,16 @@ def load_config(work):
         settings.setdefault('matcher_attention', 'math')
     elif 'matcher_attention' not in settings:
         raise ValueError('Missing frozen matcher_attention')
+    if value['version'] < 3:
+        if settings.get('calibration_mode', 'local') != 'local':
+            raise ValueError('Legacy configuration cannot select input calibration')
+        settings.setdefault('calibration_mode', 'local')
+    elif 'calibration_mode' not in settings:
+        raise ValueError('Missing frozen calibration_mode')
+    if value['version'] < 4:
+        if settings.get('pipeline_mode', 'validation') != 'validation':
+            raise ValueError('Legacy configuration cannot select production mode')
+        settings.setdefault('pipeline_mode', 'validation')
+    elif 'pipeline_mode' not in settings:
+        raise ValueError('Missing frozen pipeline_mode')
     return PipelineConfig(**settings)

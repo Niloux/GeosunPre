@@ -2,3 +2,5 @@
 expected_images = 536
 calibration_frames = [70, 94]
 matcher_attention = "flash"
+pipeline_mode = "production"
+calibration_mode = "local"

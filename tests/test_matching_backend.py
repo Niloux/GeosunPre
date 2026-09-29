@@ -19,13 +19,13 @@ def test_attention_is_frozen_in_pipeline_config(tmp_path):
 
 
 def test_legacy_math_configuration_keeps_its_frozen_bytes(tmp_path):
-    settings = asdict(PipelineConfig())
+    settings = asdict(PipelineConfig(pipeline_mode='validation'))
     del settings['matcher_attention']
     value = {'version': 1, 'settings': settings}
     path = tmp_path / 'pipeline_config.json'
     write_json(path, {**value, 'fingerprint': digest(value)})
     before = path.read_bytes()
-    save_config(tmp_path, PipelineConfig(matcher_attention='math'))
+    save_config(tmp_path, PipelineConfig(matcher_attention='math', pipeline_mode='validation'))
     assert path.read_bytes() == before
     assert load_config(tmp_path).matcher_attention == 'math'
     with pytest.raises(ValueError):
@@ -33,13 +33,13 @@ def test_legacy_math_configuration_keeps_its_frozen_bytes(tmp_path):
 
 
 def test_version_one_explicit_flash_is_preserved(tmp_path):
-    value = {'version': 1, 'settings': asdict(PipelineConfig(matcher_attention='flash'))}
+    value = {'version': 1, 'settings': asdict(PipelineConfig(matcher_attention='flash', pipeline_mode='validation'))}
     write_json(tmp_path / 'pipeline_config.json', {**value, 'fingerprint': digest(value)})
     assert load_config(tmp_path).matcher_attention == 'flash'
 
 
 def test_version_two_requires_explicit_frozen_backend(tmp_path):
-    settings = asdict(PipelineConfig())
+    settings = asdict(PipelineConfig(pipeline_mode='validation'))
     del settings['matcher_attention']
     value = {'version': 2, 'settings': settings}
     write_json(tmp_path / 'pipeline_config.json', {**value, 'fingerprint': digest(value)})

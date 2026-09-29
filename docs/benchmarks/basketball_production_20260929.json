@@ -1,0 +1,210 @@
+{
+  "date": "2026-09-29",
+  "pipeline_mode": "production",
+  "calibration_mode": "local",
+  "run": "/home/wuyou/GeosunPre/work/basketball_production_20260929_01",
+  "protocol_sha256": "22038676b7b94069dc074192f8ca28ecae05b4e6950c63851e4fdc4e1c13ee94",
+  "checks": {
+    "all_stages_completed": true,
+    "production_stages": true,
+    "registration": true,
+    "no_validation_exclusions": true,
+    "no_holdout_artifacts": true,
+    "no_holdout_evaluation": true,
+    "depth": true,
+    "monotonicity": true,
+    "no_bounds": true,
+    "coverage": true,
+    "no_feature_cache_reuse": true,
+    "no_match_cache_reuse": true,
+    "code_unchanged": true,
+    "config_unchanged": true,
+    "independent_export": true
+  },
+  "passed": true,
+  "forbidden_artifacts": [],
+  "process_elapsed_seconds": 1231.3,
+  "under_20_minutes_this_run": false,
+  "stage_seconds": {
+    "prepare": 0.22843870100041386,
+    "masks": 138.44495034800093,
+    "features": 92.28833807299998,
+    "matches": 96.51356581200162,
+    "observations": 3.030006737999429,
+    "calibration": 29.772681921000185,
+    "sfm": 858.6759829589992,
+    "finalize": 15.099429787998815,
+    "export": 27.616151659000025
+  },
+  "registered": 536,
+  "points": 75893,
+  "observations": 482968,
+  "training_reprojection": {
+    "count": 482968,
+    "finite_count": 482968,
+    "median": 1.0724725679034248,
+    "p90": 2.3492992606798597,
+    "p99": 3.7294890855567866,
+    "fraction_le_1px": 0.4603244935482268,
+    "fraction_le_2px": 0.8477124778453231,
+    "fraction_le_3px": 0.9604445843202862
+  },
+  "training_reprojection_by_camera": {
+    "R": {
+      "count": 225393,
+      "finite_count": 225393,
+      "median": 1.0544093431933614,
+      "p90": 2.3068435050261122,
+      "p99": 3.740460813947155,
+      "fraction_le_1px": 0.4696685345152689,
+      "fraction_le_2px": 0.8551152875200206,
+      "fraction_le_3px": 0.962004143873146
+    },
+    "L": {
+      "count": 257575,
+      "finite_count": 257575,
+      "median": 1.088610887496342,
+      "p90": 2.3859640714168973,
+      "p99": 3.7230374915884763,
+      "fraction_le_1px": 0.452147918082112,
+      "fraction_le_2px": 0.8412345918664467,
+      "fraction_le_3px": 0.9590798796467048
+    }
+  },
+  "camera_health": {
+    "R": {
+      "params": [
+        966.7504614374044,
+        965.9915920301645,
+        1489.6956717961343,
+        2008.3255293886232,
+        -0.028723379451596705,
+        -0.006393936902727197,
+        0.002816927950830252,
+        -0.0008321773801118856
+      ],
+      "monotonic_in_160deg": true
+    },
+    "L": {
+      "params": [
+        965.1407399230839,
+        964.470322843743,
+        1515.3297799481813,
+        1999.5638499779043,
+        -0.02852379070197642,
+        -0.0056406333595542145,
+        0.0022660246098464352,
+        -0.0006899846259157613
+      ],
+      "monotonic_in_160deg": true
+    }
+  },
+  "camera_parameter_bounds": {
+    "2": {
+      "params": [
+        966.7504614374044,
+        965.9915920301645,
+        1489.6956717961343,
+        2008.3255293886232,
+        -0.028723379451596705,
+        -0.006393936902727197,
+        0.002816927950830252,
+        -0.0008321773801118856
+      ],
+      "delta": [
+        0.11052919346843737,
+        -0.7445824974684001,
+        2.323404730792845,
+        4.752826826971614,
+        -0.0010645434601428486,
+        0.0015594567026797025,
+        -0.0006503373290230176,
+        6.557296089356498e-05
+      ],
+      "monotonic_in_160deg": true,
+      "parameters_at_bounds": []
+    },
+    "1": {
+      "params": [
+        965.1407399230839,
+        964.470322843743,
+        1515.3297799481813,
+        1999.5638499779043,
+        -0.02852379070197642,
+        -0.0056406333595542145,
+        0.0022660246098464352,
+        -0.0006899846259157613
+      ],
+      "delta": [
+        -0.26873519577748084,
+        -0.17725459447865433,
+        0.3963618705652152,
+        -1.2316979271688524,
+        -1.8997720950288816e-05,
+        0.0010357194315555518,
+        -0.001094469553920081,
+        0.0003059242338635435
+      ],
+      "monotonic_in_160deg": true,
+      "parameters_at_bounds": []
+    }
+  },
+  "coverage": {
+    "min_observations": 244,
+    "min_occupied_cells": 19
+  },
+  "components": 1,
+  "feature_cache": {
+    "feature_hits": 0,
+    "feature_misses": 536,
+    "match_hits": 0,
+    "match_misses": 0,
+    "gpu_feature_hits": 0,
+    "gpu_feature_misses": 0,
+    "gpu_upload_bytes": 0,
+    "gpu_feature_peak_bytes": 0,
+    "gpu_feature_limit_bytes": 2147483648
+  },
+  "match_cache": {
+    "feature_hits": 0,
+    "feature_misses": 0,
+    "match_hits": 0,
+    "match_misses": 8025,
+    "gpu_feature_hits": 15514,
+    "gpu_feature_misses": 536,
+    "gpu_upload_bytes": 1699282944,
+    "gpu_feature_peak_bytes": 1699282944,
+    "gpu_feature_limit_bytes": 2147483648
+  },
+  "independent_export_check": {
+    "output": "/home/wuyou/GeosunPre/work/basketball_production_20260929_01/colmap",
+    "identity": "/home/wuyou/GeosunPre/work/basketball_production_20260929_01/colmap/colmap_export.json",
+    "model": "/home/wuyou/GeosunPre/work/basketball_production_20260929_01/colmap/sparse/0",
+    "images": 536,
+    "points": 75893,
+    "image_mode": "copy",
+    "include_masks": true,
+    "full_content_check": true
+  },
+  "peak_stage_rss_bytes": 4968468480,
+  "scope": "Cold scene run, pretrained weights reused only. Fitted-data diagnostics are not heldout or 3DGS accuracy.",
+  "tests": {
+    "command": ".venv/bin/python -m pytest -q tests",
+    "passed": 72
+  },
+  "evidence": {
+    "work/production_validation_20260929/protocol.json": "22038676b7b94069dc074192f8ca28ecae05b4e6950c63851e4fdc4e1c13ee94",
+    "work/production_validation_20260929/result.json": "5b3cb1a455c65ca212aaf28b2347f7fc7ba11a2723e45071dbbd668c1d0eb34f",
+    "work/production_validation_20260929/process_time.txt": "524b15608f3c921810518fd41414c2dd19322e5eb7776bbc084f1d50cee03d21",
+    "work/production_validation_20260929/pipeline.log": "f6b1c20c5494a5a6db0fba341f0625b2c5711f0a2e983bf7c90c801a8ab4bd9b",
+    "work/production_validation_20260929/run.py": "03dad19600e6ef3952e007346dae9d779b8843be1c3900149276b8e5941d84ba",
+    "work/basketball_production_20260929_01/pipeline_config.json": "a419c3169093c11630ab74bf2e322bbe18c4ceb1cb908e1bb9648ea9f3144c9d",
+    "work/basketball_production_20260929_01/pipeline_status.json": "9d37f2d37c2dedfb789700390060aef14051b1ca062adbe6c655e9782a18af8a",
+    "work/basketball_production_20260929_01/sfm/observation_protocol.json": "e762c3b758c0d4068946be403e16c07fb5c200d4db9f4fa327b5e6e1906deed3",
+    "work/basketball_production_20260929_01/calibration/calibration_identity.json": "f94c4d91557dd6a67295e457780cc5a6b5f233232cc9387378b893b6bfec5501",
+    "work/basketball_production_20260929_01/sfm/geometry_protocol.json": "1c4c3dfab525c720d54bf9628d92ab6bc3026aa69860d1b644d404f02f75a620",
+    "work/basketball_production_20260929_01/sfm/final/result.json": "8d77dad94287abad4ab7879813fe10d9a717e96b9b358427e6e98f707702b8fe",
+    "work/basketball_production_20260929_01/sfm/final/quality_summary.json": "20001da955a54cb27954836894434d42811f4004c6aa402f97cec0b647b6f825",
+    "work/basketball_production_20260929_01/colmap/colmap_export.json": "9066f0f6547aa22b9293a7d8de59505b016de0dbf3b06d40a6f605ee0a818c8a"
+  }
+}

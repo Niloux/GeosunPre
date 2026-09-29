@@ -50,7 +50,8 @@ def database_and_seed(directory, scene, images, entries, features, split):
         metrics,arrays=fit_pair(cameras[a['camera']],cameras[b['camera']],pa,pb,max_error=3,seed=271828)
         name=f'{a["camera"]}{a["frame_index"]:05d}__{b["camera"]}{b["frame_index"]:05d}'
         row={'label':name,'a':a['name'],'b':b['name'],'raw_count':len(matches),
-             'after_holdout_removal':len(train),**metrics}
+             ('eligible_matches' if split.get('isolation_scope') == 'all_eligible_observations'
+              else 'after_holdout_removal'):len(train),**metrics}
         candidate=None
         if metrics['success']:
             inliers=train[arrays['verified_mask']]
@@ -78,7 +79,8 @@ def database_and_seed(directory, scene, images, entries, features, split):
     write_json(directory/'geometry_summary.json',{
         'pairs':len(entries),'successful_E_pairs':len(candidates),'database_pairs':len(accepted),
         'rotation_consensus_excluded':[r['label'] for r in candidates if r['excluded_by_rotation_consensus']],
-        'heldout_observations':len(held),'holdout_isolated_before_geometry':True,
+        **({'observations_excluded_for_validation': 0} if split.get('isolation_scope') == 'all_eligible_observations'
+           else {'heldout_observations':len(held),'holdout_isolated_before_geometry':True}),
         'note':'Rotation-median screening is a robust heuristic, not a ground-truth edge label.'})
     # Prefer a same-camera baseline with large support. No navigation pose enters.
     seeds=[r for r in accepted if records[r['a']]['camera']==records[r['b']]['camera']

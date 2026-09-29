@@ -17,7 +17,9 @@ from geosunpre.artifacts import write_json
 from geosunpre.colmap import MODEL_FILES
 from geosunpre.colmap import export_colmap
 from geosunpre.pipeline.holdout import ISOLATION_SCOPE
-from geosunpre.pipeline import STAGES
+from geosunpre.pipeline import STAGES, PRODUCTION_STAGES, VALIDATION_STAGES
+from geosunpre.pipeline.observations import (is_validation, partitions, protocol_identity,
+                                           geometry_partition_identity)
 from geosunpre.config import CONFIG_FILE, PipelineConfig, load_config, save_config
 from geosunpre.pipeline.runtime import StageRecorder, work_lock
 
@@ -66,8 +68,8 @@ def finalize(work):
     source_path = work / SOURCE
     source = pycolmap.Reconstruction(source_path)
     _check_model(source, scene)
-    split_path = root / 'split.json'
-    split = json.loads(split_path.read_text())
+    split, triangle = partitions(work)
+    validation_mode = is_validation(work)
     assert_holdout_isolated(source, split)
     geometry_path = root / 'geometry_protocol.json'
     geometry = json.loads(geometry_path.read_text())
@@ -83,7 +85,7 @@ def finalize(work):
         'scene_manifest_sha256': file_digest(root / 'manifest.json'),
         'scene_fingerprint': scene['fingerprint'],
         'geometry_protocol_sha256': file_digest(geometry_path),
-        'split_sha256': file_digest(split_path),
+        **geometry_partition_identity(work),
         'solver': {'stage': 'principal', 'protect_depth': True,
                    'max_iterations': BA_ITERATIONS},
         'manual_annotations_used': False,
@@ -131,13 +133,12 @@ def finalize(work):
         write_json(result_path, result)
     _check_model(candidate, scene)
     assert_holdout_isolated(candidate, split)
-    validation_path = output / 'validation_summary.json'
+    validation_path = output / ('validation_summary.json' if validation_mode else 'quality_summary.json')
     if validation_path.exists():
         validation = json.loads(validation_path.read_text())
         if validation['model_sha256'] != result['model_sha256']:
             raise ValueError('Final BA validation belongs to another model')
-    else:
-        triangle = json.loads((root / 'triangle_validation_split.json').read_text())
+    elif validation_mode:
         raw = evaluate_reconstruction(candidate, scene, features, split,
                                       output / 'validation')
         high = evaluate_reconstruction(candidate, scene, features, triangle,
@@ -146,10 +147,17 @@ def finalize(work):
                       'raw': raw, 'triangle': high,
                       'manual_annotations_used': False}
         write_json(validation_path, validation)
+    else:
+        from geosunpre.pipeline.quality import production_quality
+        validation = {'model_sha256': result['model_sha256'],
+                      **production_quality(candidate), 'manual_annotations_used': False}
+        validation['camera_parameter_bounds'] = result['ba'].get('cameras', {})
+        write_json(validation_path, validation)
     return {'model': str(model_path), 'registered': candidate.num_reg_images(),
             'points': candidate.num_points3D(),
             'protocol_fingerprint': protocol['fingerprint'],
-            'triangle_holdout': validation['triangle']['all_candidate_queries']}
+            **({'triangle_holdout': validation['triangle']['all_candidate_queries']} if validation_mode else
+               {'training_reprojection': validation['training_reprojection'], 'pipeline_mode': 'production'})}
 
 
 def export_result(work, *, output=None, image_mode='copy',
@@ -162,7 +170,8 @@ def export_result(work, *, output=None, image_mode='copy',
     model_path = final / 'sparse/0'
     protocol_path = final / 'protocol.json'
     result_path = final / 'result.json'
-    validation_path = final / 'validation_summary.json'
+    validation_mode = is_validation(work)
+    validation_path = final / ('validation_summary.json' if validation_mode else 'quality_summary.json')
     protocol = json.loads(protocol_path.read_text())
     result = json.loads(result_path.read_text())
     validation = json.loads(validation_path.read_text())
@@ -172,14 +181,14 @@ def export_result(work, *, output=None, image_mode='copy',
             or protocol['scene_manifest_sha256'] != file_digest(root / 'manifest.json')
             or protocol['source_model_sha256'] != _model_hashes(work / SOURCE)
             or protocol['geometry_protocol_sha256'] != file_digest(root / 'geometry_protocol.json')
-            or protocol['split_sha256'] != file_digest(root / 'split.json')
+            or any(protocol.get(k) != v for k, v in geometry_partition_identity(work).items())
             or protocol['manual_annotations_used'] is not False):
         raise ValueError('Computed final BA identity differs')
     from geosunpre.pipeline.reconstruction import freeze_geometry
     freeze_geometry(work, require_existing=True)
     rec = pycolmap.Reconstruction(model_path)
     _check_model(rec, scene)
-    assert_holdout_isolated(rec, json.loads((root / 'split.json').read_text()))
+    assert_holdout_isolated(rec, partitions(work)[0])
     output = Path(output).resolve() if output else work / DEFAULT_OUTPUT
     if output == work or output.is_relative_to(root):
         raise ValueError('Choose a separate COLMAP export directory')
@@ -190,12 +199,18 @@ def export_result(work, *, output=None, image_mode='copy',
         'final_ba_protocol_sha256': file_digest(protocol_path),
         'final_ba_result_sha256': file_digest(result_path),
         'final_ba_validation_sha256': file_digest(validation_path),
-        'holdout_protocol_sha256': file_digest(root / 'holdout_protocol.json'),
+        **protocol_identity(work, 'holdout_protocol_sha256'),
         'calibration_identity_sha256': file_digest(work / 'calibration/calibration_identity.json'),
-        'holdout_isolation': ISOLATION_SCOPE,
+        **({'holdout_isolation': ISOLATION_SCOPE} if validation_mode else
+           {'pipeline_mode': 'production', 'observations_excluded_for_validation': 0,
+            'quality_metrics': 'fitted_observation_diagnostics'}),
         'independent_exposure_poses': True,
         'manual_annotations_used': False, 'navigation_pose_values_or_las_used': False,
     }
+    if load_config(work).calibration_mode == 'input':
+        provenance['calibration_mode'] = 'input'
+    if not validation_mode:
+        provenance['final_ba_quality_sha256'] = provenance.pop('final_ba_validation_sha256')
     return export_colmap(model_path, scene, output, image_mode=image_mode,
                          include_masks=include_masks, include_ply=include_ply,
                          provenance=provenance, quality_report=validation_path)
@@ -224,6 +239,10 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
                 raise ValueError('A new run requires --input and the prepare/all stage')
             config = config or PipelineConfig()
             save_config(work, config)
+        mode_stages = VALIDATION_STAGES if config.pipeline_mode == 'validation' else PRODUCTION_STAGES
+        selected = mode_stages if stage == 'all' else (stage,)
+        if any(name not in mode_stages for name in selected):
+            raise ValueError(f'Stage {stage} is unavailable in {config.pipeline_mode} mode')
         if 'prepare' in selected and input_root is None:
             if not (work / 'manifest.json').exists():
                 raise ValueError('--input is required until the prepare stage completes')
@@ -257,13 +276,19 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
                     protocol = freeze_holdout(work)
                     summary['holdout'] = {key: protocol[key]
                                           for key in ('fingerprint', 'isolation_scope')}
+                elif current == 'observations':
+                    from geosunpre.pipeline.observations import freeze_observations
+                    protocol = freeze_observations(work)
+                    summary['observations'] = {key: protocol[key] for key in
+                                               ('fingerprint', 'scope', 'excluded_for_validation')}
                 elif current == 'calibration':
                     from geosunpre.pipeline.calibration import calibrate
                     calibrate(work)
                 elif current == 'sfm':
                     from geosunpre.pipeline.reconstruction import build_mapping, evaluate_mapping, optimize
                     build_mapping(work)
-                    evaluate_mapping(work)
+                    if config.pipeline_mode == 'validation':
+                        evaluate_mapping(work)
                     optimize(work)
                 elif current == 'finalize':
                     summary['model'] = finalize(work)

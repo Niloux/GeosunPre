@@ -67,7 +67,7 @@ class StageRecorder:
                     release_gpu_cache()
                 except RuntimeError as exc:
                     entry['gpu_cleanup_error'] = str(exc)
-            if name in ('features', 'matches', 'holdout'):
+            if name in ('features', 'matches', 'holdout', 'observations'):
                 entry['host_memory_reclaim'] = reclaim_host_memory()
             entry['resources'] = resources.stop()
             entry['operations'] = resources.operations
