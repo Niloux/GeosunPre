@@ -13,3 +13,7 @@ input/
 work/
 .cache/
 .pytest_cache/
+
+# Local code index and compiled native modules
+.codegraph/
+*.so

@@ -1,0 +1,136 @@
+{
+  "date": "2026-09-29",
+  "dataset": "basketball",
+  "hardware": {
+    "gpu": "RTX 4090 24 GB",
+    "logical_cpus": 8
+  },
+  "adopted_as_default": true,
+  "run_directory": "work/basketball_fast_20260929_03",
+  "wall_seconds": 1191.3,
+  "target_seconds": 1200,
+  "repeatability_verified": false,
+  "pretrained_weights_reused": true,
+  "scene_artifacts_reused": false,
+  "backend": {
+    "attention": "flash",
+    "cuda_graph": true,
+    "depth": "native",
+    "ba_threads": 4
+  },
+  "stages_seconds": {
+    "prepare": 0.21980490300029487,
+    "masks": 142.39382809299968,
+    "features": 99.10675969799922,
+    "matches": 93.84817043200019,
+    "holdout": 30.50518161799937,
+    "calibration": 32.547227613999894,
+    "sfm": 736.2121147069993,
+    "finalize": 30.186031070000354,
+    "export": 27.092486231000294
+  },
+  "model": {
+    "registered": 536,
+    "points": 61755,
+    "observations": 390050
+  },
+  "invalid_depth": 0,
+  "feature_cache": {
+    "feature_hits": 0,
+    "feature_misses": 536,
+    "match_hits": 0,
+    "match_misses": 0
+  },
+  "match_cache": {
+    "feature_hits": 0,
+    "feature_misses": 0,
+    "match_hits": 0,
+    "match_misses": 8025
+  },
+  "export_full_content_check": true,
+  "common_holdout": {
+    "math": {
+      "count": 4492,
+      "finite_count": 4458,
+      "median": 1.753506755692866,
+      "p90": 5.912076143613003,
+      "p99": 40.468427914376804,
+      "fraction_le_1px": 0.2439893143365984,
+      "fraction_le_2px": 0.5661175422974176,
+      "fraction_le_3px": 0.7321905609973286
+    },
+    "flash": {
+      "count": 4492,
+      "finite_count": 4458,
+      "median": 1.7375777840331856,
+      "p90": 5.987126547633788,
+      "p99": 41.54821860741648,
+      "fraction_le_1px": 0.2439893143365984,
+      "fraction_le_2px": 0.563446126447017,
+      "fraction_le_3px": 0.7306322350845948
+    }
+  },
+  "quality_checks": {
+    "median": true,
+    "p90": true,
+    "finite_fraction": true,
+    "registered_images": true,
+    "invalid_depth": true,
+    "points_ratio": true,
+    "monotonic_cameras": true,
+    "export": true
+  },
+  "runtime_source_snapshot": {
+    "base_commit": "97ad66b43d0fe99d58ff01d82e70166fc26eda65",
+    "source_sha256": {
+      "src/geosunpre/features.py": "757c70769c07fe7c1e08f8734281b2f774d096a40e87847079991607c611712e",
+      "src/geosunpre/masks.py": "8d918baf46188218a3d5508c29cc3ff28e7f02950c98b9fed1c3655c2b27a2d0",
+      "src/geosunpre/__init__.py": "725fbf90285b1753a43c2accb7d81ea91cb29074143467d3b465b8e977482c3d",
+      "src/geosunpre/scene.py": "574676997e7726b434200e286a4d76a8380840839a5909d523f83e07257b20a3",
+      "src/geosunpre/config.py": "b7b38e0cfdc0e9e764ba95bc9ae4dec4f6da6845ec313e8c04a0571a26f7c562",
+      "src/geosunpre/matching.py": "ab84afcf9c4f8d01c40d9598b7906341935532d1c1cc4a9375a67d3034e29942",
+      "src/geosunpre/cli.py": "612eebe2caed939d7ebf36dd4ae9065bff9a614927224bdc311d9fc1f8799cf7",
+      "src/geosunpre/__main__.py": "c975f4c575121b1b7eac2e58ced37b0a5a54733db95e2c2ef59711b0d57ac695",
+      "src/geosunpre/artifacts.py": "30ae52586342a9fbb5608f89e948d948d2dec371f8f2215e73f592763c4569e9",
+      "src/geosunpre/colmap.py": "f286f9df063a64dc39a578fb7f84a49c2c00fd1d33abbcee943121c05bc6f01a",
+      "src/geosunpre/parallel.py": "80e3d4b2a108351e16655ac918e244d2b18623e2d747c6c1b8dd749d9ccfa2c2",
+      "src/geosunpre/camera.py": "b54f56cff746a7f49769fde3832b1774e86a6b27288c00850eb65f5e7744d30f",
+      "src/geosunpre/sfm/tracks.py": "c7601e71c55afaa7df73d5d1d5c440a6f123a49093c639c3ce33afa114169a2d",
+      "src/geosunpre/sfm/__init__.py": "1fedd50e2e8b723549a0288fea27b4f1b0a79541b64feca77c3ae5352e42aa82",
+      "src/geosunpre/sfm/reconstruction.py": "e7a59cb16b16b1d2e76824f91b5d1188bc0254623f78fff91ba27922e599752c",
+      "src/geosunpre/sfm/statistics.py": "99abba7d9fd3ef0b6292b2727661744733776b26342d5a9061148cfa5b322279",
+      "src/geosunpre/sfm/track_filter.py": "2f845b8912dd170816120f15cdb564ab9363f5d38b4f8063bd63e1cf28a38a93",
+      "src/geosunpre/sfm/depth_guard.py": "69f4455f799b91c3482512f50177f90ed18e1678a8707b0cf6fd3bb2ae2c58c0",
+      "src/geosunpre/sfm/geometry.py": "bf72d715b6d7e458f20fdf4294ef103ba4fa569d0c9965c2ae0d0d27a1805dbe",
+      "src/geosunpre/sfm/evaluation.py": "ac7da1f6b0343e1cf8ff8f1ca14b1f099e54b60e7ea371452061e2797fdc8259",
+      "src/geosunpre/pipeline/runner.py": "afaf230e714b9a938f5daf41e0fe26d472ebaafb4e4d38252d003eff68bccb3b",
+      "src/geosunpre/pipeline/__init__.py": "c388e52884b1b8c63b4b96938cfbf92fc3edd50e7ea1793ca18ea2aef748621c",
+      "src/geosunpre/pipeline/reconstruction.py": "a0f696d1d2451485929a0c26f565f6e1428f2f62e3b7a462fb2d2feb4734e6a7",
+      "src/geosunpre/pipeline/calibration.py": "61a5e91e4eb4be31f578b404a73e0fb036769ea14c04ecdd2f0baffebd29f3b8",
+      "src/geosunpre/pipeline/runtime.py": "3872e446906704114d243c3091783d3d623880cc18ebc6f3ad33e31a8ab61558",
+      "src/geosunpre/pipeline/data.py": "7b5741d6e7d34442c4e77c98f24a17c2719f929ccc5ae2443251066008f51b17",
+      "src/geosunpre/pipeline/holdout.py": "9a349f001e895b6e06e462897088069a53e3236e77ab7a4d290c8ed1e590ff86"
+    },
+    "native_implementation_version": 1,
+    "reference": "work/basketball_auto_20260928_01",
+    "candidate": "work/basketball_fast_20260929_03",
+    "pretrained_weights_reused": true,
+    "scene_artifacts_reused": false,
+    "matching_math": "optimized",
+    "matching_graph": true,
+    "matching_attention": "flash",
+    "configuration": "configs/basketball_fast.toml"
+  },
+  "evidence_sha256": {
+    "work/perf_20260929_01/cold_run_03_time.txt": "7f1434b92465c409dd8998a678b108f4e538f6d465b07f5247847a8f6ac23074",
+    "work/perf_20260929_01/run_sources_03.json": "64f02655aef1845586c07382f371f1d9e04898d9bdeb7db9a3b37fb2ee739813",
+    "work/perf_20260929_01/full_comparison_03.json": "682bd400dd8a3cbfec93b73838f75dab7a2238cadc5fa93467044a55c64faf78",
+    "work/perf_20260929_01/common_flash_holdout/protocol.json": "bac747cc9c2bfe928cd4784d826da476e69d50d8f16d9f0dbf5ab27c0288c274",
+    "work/perf_20260929_01/common_flash_holdout/comparison.json": "b35ffcf9cb6b2fec69b696e26ba78f37f6fd19e894ff80347fa21b2164589bae"
+  },
+  "limits": [
+    "Single full runtime measurement for the adopted backend.",
+    "No downstream 3DGS rendering evaluation.",
+    "Default promotion and repository organization are not another timed run."
+  ]
+}

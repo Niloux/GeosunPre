@@ -86,6 +86,7 @@ def evaluate_reconstruction(rec,scene,features,split,directory):
     cameras={cid:Camera('L' if cid==1 else 'R',c.width,c.height,tuple(c.params),(0,0))
              for cid,c in rec.cameras.items()}
     original={k:Camera.from_dict(v) for k,v in scene['cameras'].items()}
+    radii={k:cam.distorted_radius(160) for k,cam in original.items()}
     images={im.name:im for im in rec.images.values() if im.has_pose}
     records={im['name']:im for im in scene['images']}
     rows=[]
@@ -110,7 +111,7 @@ def evaluate_reconstruction(rec,scene,features,split,directory):
                     predicted=cameras[im.camera_id].project(local[None])[0]
                     error=float(np.linalg.norm(predicted-observed))
             label=records[name]['camera'];base=original[label]
-            rho=float(np.linalg.norm((observed-base.params[2:4])/base.params[:2])/base.distorted_radius(160))
+            rho=float(np.linalg.norm((observed-base.params[2:4])/base.params[:2])/radii[label])
             zone='center' if rho<.5 else 'middle' if rho<.8 else 'edge'
             rows.append({'track_id':track['id'],'name':name,'feature_index':idx,'camera':label,
                 'zone':zone,'rho':rho,'observed':observed,'predicted':predicted,'error':error,

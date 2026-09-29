@@ -1,5 +1,7 @@
 """Pinned LoMa frontend with per-image identity and configuration-aware caches."""
 from dataclasses import asdict, dataclass
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -45,12 +47,17 @@ def balanced_selection(pixels, scores, target, width, height, grid_size=8):
 
 
 class LoMaFrontend:
-    def __init__(self, work, scene, config):
+    def __init__(self, work, scene, config, *, matching_attention='flash'):
         self.work = Path(work)
         self.scene = scene
         self.config = config
+        self.matching_attention = matching_attention
         self.model = None
         self.device = None
+        self._gpu_features = OrderedDict()
+        self._gpu_feature_bytes = 0
+        self._gpu_feature_limit = 512 * 1024 * 1024
+        self._matcher = None
         self.cache_stats = {'feature_hits': 0, 'feature_misses': 0, 'match_hits': 0, 'match_misses': 0}
         self.cache = self.work/'features'/digest(asdict(config))[:20]
         self.cache.mkdir(parents=True, exist_ok=True)
@@ -66,9 +73,41 @@ class LoMaFrontend:
             self.device = device
             self.model = LoMa(LoMaB(compile=False, num_keypoints=self.config.num_keypoints)).eval()
             self.model._detector.resize = self.config.detector_size
+            from geosunpre.matching import configure_matcher
+            configure_matcher(self.model, self.matching_attention)
         return self.model
 
-    def extract(self, record):
+    def prepare_image(self, record):
+        """Decode once and reproduce the pinned LoMa PIL preprocessing on CPU."""
+        import torch
+        with Image.open(record['source']) as source:
+            rgb = source.convert('RGB')
+        width, height = rgb.size
+        size = self.config.detector_size
+        if self.model._detector.keep_aspect_ratio:
+            scale = size / max(width, height)
+            detector_size = (int((scale * width) // 8 * 8), int((scale * height) // 8 * 8))
+        else:
+            detector_size = (size, size)
+        def tensor(size):
+            return torch.from_numpy(np.array(rgb.resize(size)) / 255.0).permute(2, 0, 1).float()[None]
+        return tensor(detector_size), tensor((784, 784))
+
+    def extract_all(self, records):
+        """At most two prepared images; propagate worker failures to the caller."""
+        self.load_model()
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix='image-prepare') as pool:
+            pending = OrderedDict()
+            iterator = iter(enumerate(records))
+            for index, record in iterator:
+                pending[index] = (record, pool.submit(self.prepare_image, record))
+                if len(pending) == 2:
+                    _, (first, prepared) = pending.popitem(last=False)
+                    yield self.extract(first, prepared=prepared.result())
+            for record, prepared in pending.values():
+                yield self.extract(record, prepared=prepared.result())
+
+    def extract(self, record, *, prepared=None):
         cam = Camera.from_dict(self.scene['cameras'][record['camera']])
         stat = Path(record['source']).stat()
         if stat.st_size != record['size_bytes'] or stat.st_mtime_ns != record['mtime_ns']:
@@ -86,9 +125,10 @@ class LoMaFrontend:
         self.cache_stats['feature_misses'] += 1
         import torch
         model = self.load_model()
+        detector_image, descriptor_image = prepared if prepared is not None else self.prepare_image(record)
         with torch.inference_mode():
-            result = model._detector.detect_from_path(
-                record['source'], num_keypoints=self.config.num_keypoints*self.config.oversample)
+            result = model._detector.detect(
+                detector_image, num_keypoints=self.config.num_keypoints*self.config.oversample)
             normalized = result['keypoints'][0].float().cpu().numpy()
             probabilities = result['keypoint_probs'][0].float().cpu().numpy().reshape(-1)
             pixels = (normalized+1)*np.array([cam.width, cam.height], dtype=np.float32)/2
@@ -107,8 +147,8 @@ class LoMaFrontend:
             if len(indices) < 32:
                 raise RuntimeError(f'{record["name"]}: only {len(indices)} valid keypoints')
             keypoints = result['keypoints'][:, torch.as_tensor(indices, device=self.device)]
-            descriptors = model._descriptor.describe_keypoints_from_path(
-                record['source'], keypoints)['descriptions'][0].float().cpu().numpy()
+            descriptors = model._descriptor.describe_keypoints(
+                descriptor_image, keypoints)['descriptions'][0].float().cpu().numpy()
         meta = {**identity, 'token': token, 'name': record['name'], 'detected': len(pixels),
                 'valid_before_quota': len(candidates), 'selected': len(indices),
                 'descriptor_resolution': [784, 784], 'pixel_coordinates': self.scene['pixel_coordinates']}
@@ -117,12 +157,32 @@ class LoMaFrontend:
                   'descriptors': descriptors.astype(np.float32), 'scores': probabilities[indices],
                   'metadata': np.array(json.dumps(meta, ensure_ascii=False)), 'token': np.array(token)}
         tmp = path.with_suffix('.tmp.npz')
-        np.savez_compressed(tmp, **output)
+        np.savez(tmp, **output)
         tmp.replace(path)
         return output
 
+    def _matching_tensors(self, features):
+        import torch
+        token = str(features['token'])
+        if token in self._gpu_features:
+            self._gpu_features.move_to_end(token)
+            return self._gpu_features[token]
+        value = tuple(torch.from_numpy(features[key])[None].to(self.device)
+                      for key in ('normalized_keypoints', 'descriptors'))
+        size = sum(t.numel() * t.element_size() for t in value)
+        while self._gpu_features and self._gpu_feature_bytes + size > self._gpu_feature_limit:
+            _, old = self._gpu_features.popitem(last=False)
+            self._gpu_feature_bytes -= sum(t.numel() * t.element_size() for t in old)
+        if size <= self._gpu_feature_limit:
+            self._gpu_features[token] = value
+            self._gpu_feature_bytes += size
+        return value
+
     def match(self, features_a, features_b):
-        token = digest({'a': str(features_a['token']), 'b': str(features_b['token']), 'config': asdict(self.config)})
+        identity = {'a': str(features_a['token']), 'b': str(features_b['token']), 'config': asdict(self.config)}
+        if self.matching_attention != 'math':
+            identity['attention_backend'] = self.matching_attention + '_v1'
+        token = digest(identity)
         path = self.work/'matches'/f'{token}.npz'
         if path.exists():
             self.cache_stats['match_hits'] += 1
@@ -130,14 +190,14 @@ class LoMaFrontend:
                 return {k: f[k] for k in f.files}
         self.cache_stats['match_misses'] += 1
         import torch
-        from loma.loma import filter_matches
         model = self.load_model()
+        if self._matcher is None:
+            from geosunpre.matching import MatcherGraph
+            self._matcher = MatcherGraph(model, self.config.match_threshold)
         with torch.inference_mode():
-            a = torch.from_numpy(features_a['normalized_keypoints'])[None].to(self.device)
-            b = torch.from_numpy(features_b['normalized_keypoints'])[None].to(self.device)
-            da = torch.from_numpy(features_a['descriptors'])[None].to(self.device)
-            db = torch.from_numpy(features_b['descriptors'])[None].to(self.device)
-            m0, _, scores, _ = filter_matches(model(a, b, da, db)['scores'], self.config.match_threshold)
+            a, da = self._matching_tensors(features_a)
+            b, db = self._matching_tensors(features_b)
+            m0, scores = self._matcher(a, b, da, db)
             ia = torch.where(m0[0] >= 0)[0]
             indices = torch.stack((ia, m0[0, ia]), dim=-1).cpu().numpy().astype(np.uint32)
             confidence = scores[0, ia].float().cpu().numpy()

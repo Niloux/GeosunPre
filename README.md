@@ -16,7 +16,7 @@ flowchart LR
 
 ## 安装与运行
 
-运行完整流程需要 Linux、可用的 NVIDIA GPU，以及 LoMa 和 SegFormer 权重。Python 版本为 3.13 或更高，依赖由 `uv.lock` 固定。
+运行完整流程需要 Linux、可用的 NVIDIA GPU，以及 LoMa 和 SegFormer 权重。Python 版本为 3.13 或更高，依赖由 `uv.lock` 固定。安装原生 BA 需要 C++17 编译器和 Python 开发头文件。新运行默认使用 FlashAttention、CUDA Graph 和 4 线程原生 BA。
 
 ```bash
 uv sync --locked --extra loma --extra segmentation
@@ -55,11 +55,22 @@ input/场景/
 ```toml
 expected_images = 536
 calibration_frames = [70, 94]  # 包含首尾
+matcher_attention = "flash"  # 正式默认
 ```
 
 省略配置时，不限制总图像数，自动取前 25 个不同帧号作为标定片段；可用 `calibration_frame_count` 调整。显式 `calibration_frames` 优先。标定片段必须包含 L/R 两个镜头，并有至少两个不同帧号；这些只是输入检查，实际是否能标定由视觉匹配与建图决定。
 
 160° FOV、设备遮挡、特征和求解规则沿用当前 Geosun 设备配方。更换设备需要适配其标定与遮挡规则；当前并非任意相机输入框架。
+
+### 当前默认与验证结果
+
+`configs/basketball.toml` 是唯一正式篮球场配置，采用 FlashAttention、CUDA Graph、
+特征缓存、CPU 并行处理及原生深度约束 BA。无需额外的 fast 配置或加速环境变量。
+原生扩展固定兼容 pyceres 2.6 / Ceres 2.2.0，随主工程安装；缺失时直接报错。
+
+536 张图像的一次完整冷启动实测 **19 分 51.30 秒**，包含原图复制、掩码导出和交付包校验，
+仅复用预训练权重。全部图像注册，共同留出检查通过；距 20 分钟仅约 9 秒，不代表重复运行的稳定上限。
+详细分项、质量变化及诊断方式见 [性能记录](docs/performance.md)。
 
 ### 权重缓存
 
@@ -69,7 +80,7 @@ calibration_frames = [70, 94]  # 包含首尾
 
 ## 续跑与分阶段运行
 
-同一个工作目录会保存配置、输入身份、阶段状态和缓存。重跑会验证上游身份并复用完整产物。配置或输入改变时使用新目录；工作目录有进程锁，防止两个运行同时写入。
+同一个工作目录会保存配置、输入身份、阶段状态和缓存。重跑会验证上游身份并复用完整产物。旧工作目录按冻结配置续跑：版本 1 未写匹配后端时按 math 解释，显式 flash 仍按 flash 执行。新默认不改写旧配置；续跑时省略 `--config`。配置或输入改变时使用新目录；工作目录有进程锁，防止两个运行同时写入。
 
 ```bash
 # 继续同一轮运行，自动读取已保存的输入路径和配置
@@ -103,7 +114,8 @@ geosunpre check --output /path/to/colmap
 | `src/geosunpre/` | 输入、相机、自动掩码、特征、配置、COLMAP 交付 |
 | `src/geosunpre/pipeline/` | 阶段编排、标定、重建、留出与运行状态 |
 | `src/geosunpre/sfm/` | 几何、轨迹、BA、深度约束和评估 |
-| `configs/` | 场景选择配置 |
+| `configs/` | 正式场景配置 |
+| `native/` | 原生 Ceres 深度约束扩展及第三方许可证 |
 | `tests/` | 数值、阶段身份、恢复保护和导出测试 |
 | `docs/` | [工程说明](docs/engineering_structure.md)、[COLMAP 契约](docs/colmap_contract.md)、[留出协议](docs/unified_holdout.md) |
 
@@ -111,4 +123,4 @@ geosunpre check --output /path/to/colmap
 uv run --no-sync pytest -q tests
 ```
 
-本次整理将正式工程链路独立保留，移除了实验入口、历史实验实现、基线管理和下游训练配置生成。旧命令不再转发；既有 `input/`、`work/` 和权重缓存保留。新工作目录采用新布局，旧中间目录不直接续跑；已有 COLMAP 交付包仍可用 `check` 验证。
+仓库保留正式 `run / export / check` 入口。数据、完整实验日志和权重分别保存在忽略跟踪的 `input/`、`work/`、`.cache/`；验证摘要随文档保存。目录职责、保留范围及迁移规则见 [仓库整理说明](docs/repository.md)。

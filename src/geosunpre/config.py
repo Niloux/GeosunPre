@@ -1,4 +1,4 @@
-"""Scene selection settings; the validated fisheye solver recipe is fixed."""
+"""Scene selection and matching backend, frozen for each pipeline run."""
 
 from collections import Counter
 from dataclasses import asdict, dataclass, fields
@@ -10,7 +10,7 @@ from geosunpre.artifacts import digest, write_frozen_json
 
 
 CONFIG_FILE = 'pipeline_config.json'
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -18,8 +18,11 @@ class PipelineConfig:
     expected_images: int | None = None
     calibration_frames: tuple[int, int] | None = None
     calibration_frame_count: int = 25
+    matcher_attention: str = 'flash'
 
     def __post_init__(self):
+        if self.matcher_attention not in ('math', 'flash'):
+            raise ValueError('matcher_attention must be math or flash')
         if self.expected_images is not None and (
                 type(self.expected_images) is not int or self.expected_images < 2):
             raise ValueError('expected_images must be an integer >= 2')
@@ -69,8 +72,15 @@ class PipelineConfig:
 
 
 def save_config(work, config):
+    path = Path(work) / CONFIG_FILE
+    if path.exists():
+        # Older frozen configurations imply math attention. Compare decoded
+        # settings so their bytes and downstream identity remain unchanged.
+        if load_config(work) != config:
+            raise ValueError('Frozen inputs changed: pipeline configuration; use a fresh work directory')
+        return
     value = {'version': CONFIG_VERSION, 'settings': asdict(config)}
-    write_frozen_json(Path(work) / CONFIG_FILE, {**value, 'fingerprint': digest(value)})
+    write_frozen_json(path, {**value, 'fingerprint': digest(value)})
 
 
 def load_config(work):
@@ -78,7 +88,12 @@ def load_config(work):
     if not path.is_file():
         raise ValueError('Missing pipeline_config.json; start a run in a fresh work directory')
     value = json.loads(path.read_text())
-    if (value.get('version') != CONFIG_VERSION or value.get('fingerprint') != digest(
+    if (value.get('version') not in (1, CONFIG_VERSION) or value.get('fingerprint') != digest(
             {key: val for key, val in value.items() if key != 'fingerprint'})):
         raise ValueError('Pipeline configuration identity changed')
-    return PipelineConfig(**value['settings'])
+    settings = dict(value['settings'])
+    if value['version'] == 1:
+        settings.setdefault('matcher_attention', 'math')
+    elif 'matcher_attention' not in settings:
+        raise ValueError('Missing frozen matcher_attention')
+    return PipelineConfig(**settings)

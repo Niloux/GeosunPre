@@ -1,0 +1,2 @@
+recursive-include vendor *.h *.cc *.md
+include vendor/LICENSE.ceres

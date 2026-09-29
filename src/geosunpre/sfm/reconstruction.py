@@ -12,6 +12,7 @@ from geosunpre.sfm.geometry import fit_pair
 from geosunpre.sfm.geometry import rotation_graph_diagnostics
 from geosunpre.sfm.tracks import train_edge_mask
 from geosunpre.artifacts import write_json
+from geosunpre.parallel import ordered_map
 
 STAGES = ('fixed','focal_low_radial','all_radial','principal')
 
@@ -36,7 +37,7 @@ def database_and_seed(directory, scene, images, entries, features, split):
     candidates=[]
     directory.mkdir(parents=True,exist_ok=True)
     (directory/'geometry').mkdir(exist_ok=True)
-    for i,entry in enumerate(entries,1):
+    def verify(entry):
         a,b=records[entry['a']],records[entry['b']]
         with np.load(entry['path']) as raw:
             matches=raw['matches']
@@ -48,13 +49,18 @@ def database_and_seed(directory, scene, images, entries, features, split):
         name=f'{a["camera"]}{a["frame_index"]:05d}__{b["camera"]}{b["frame_index"]:05d}'
         row={'label':name,'a':a['name'],'b':b['name'],'raw_count':len(matches),
              'after_holdout_removal':len(train),**metrics}
+        candidate=None
         if metrics['success']:
             inliers=train[arrays['verified_mask']]
             candidate={**row,'inliers':inliers,'pose':arrays['pose_cam_b_from_a'],
                        'essential':arrays['essential'],
                        'angles':arrays['triangulation_angle_degrees'][arrays['verified_mask']]}
-            candidates.append(candidate)
-        write_json(directory/'geometry'/f'{name}.json',row)
+        return row,candidate
+    # Each fit owns its camera objects and explicit RANSAC seed. Preserve pair
+    # order so graph filtering, ties in seed selection, and database IDs agree.
+    for i,(row,candidate) in enumerate(ordered_map(verify,entries),1):
+        if candidate is not None:candidates.append(candidate)
+        write_json(directory/'geometry'/f'{row["label"]}.json',row)
         if i%40==0 or i==len(entries):
             print(f'{directory.name}: train E verification {i}/{len(entries)}',flush=True)
     graph=rotation_graph_diagnostics([(r['a'],r['b'],r['pose'][:,:3],r['label']) for r in candidates],records)
@@ -178,6 +184,7 @@ def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False,
     options.ceres.solver_options.max_num_iterations=100
     options.ceres.solver_options.minimizer_progress_to_stdout=show_progress
     guarded=stage=='principal' or protect_depth
+    cost_class=None
     if guarded:
         # Native COLMAP residuals can become zero for non-projectable points.
         # Limit steps when releasing principal point and audit cheirality after
@@ -185,9 +192,10 @@ def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False,
         options.ceres.solver_options.initial_trust_region_radius=10
         options.ceres.solver_options.max_trust_region_radius=10000
         options.ceres.solver_options.max_num_iterations=400
-        # Python cost callbacks execute on one thread. The geometric factors
-        # remain native Ceres; only the positivity guard has a Python callback.
-        options.ceres.solver_options.num_threads=1
+        from geosunpre.sfm.depth_guard import depth_cost_class, PositiveDepthCost
+        cost_class=depth_cost_class()
+        # Only the reference implementation crosses the Python callback boundary.
+        options.ceres.solver_options.num_threads=1 if cost_class is PositiveDepthCost else 4
     if trust_region is not None:
         options.ceres.solver_options.initial_trust_region_radius=float(trust_region[0])
         options.ceres.solver_options.max_trust_region_radius=float(trust_region[1])
@@ -203,7 +211,7 @@ def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False,
     depth_costs=[]
     if guarded:
         from geosunpre.sfm.depth_guard import add_positive_depth_guards
-        depth_costs=add_positive_depth_guards(problem,rec)
+        depth_costs=add_positive_depth_guards(problem,rec,cost_class=cost_class)
     manifolds=[]
     bounds={}
     if free:
@@ -258,6 +266,8 @@ def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False,
                 'full_report':summary.ceres_summary.FullReport()},
             'cheirality':depth,
             'positive_depth_barriers':len(depth_costs),
+            'depth_backend':cost_class.__module__ if cost_class else None,
+            'solver_threads':options.ceres.solver_options.num_threads,
             'positive_depth_barrier_health':barrier_health,
             'termination_type':str(summary.termination_type),
             'max_iterations':options.ceres.solver_options.max_num_iterations,

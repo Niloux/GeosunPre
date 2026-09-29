@@ -1,6 +1,25 @@
 """Positive-depth barriers for front-hemisphere fisheye reconstruction."""
 import numpy as np
 import pyceres
+import os
+import warnings
+
+
+def depth_cost_class():
+    """Require native BA by default; slower paths must be selected explicitly."""
+    backend = os.environ.get('GEOSUNPRE_DEPTH_BACKEND', 'native')
+    if backend not in ('auto', 'native', 'python'):
+        raise ValueError('GEOSUNPRE_DEPTH_BACKEND must be auto, native, or python')
+    if backend != 'python':
+        try:
+            from geosunpre_native import PositiveDepthCost as NativeCost
+            return NativeCost
+        except ImportError:
+            if backend == 'native':
+                raise
+            warnings.warn('Native depth guard unavailable; using slower single-thread Python BA. '
+                          'Install ./native for accelerated BA.', RuntimeWarning, stacklevel=2)
+    return PositiveDepthCost
 
 
 class PositiveDepthCost(pyceres.CostFunction):
@@ -32,7 +51,8 @@ class PositiveDepthCost(pyceres.CostFunction):
         return True
 
 
-def add_positive_depth_guards(problem,rec):
+def add_positive_depth_guards(problem,rec, *, cost_class=None):
+    cost_class = cost_class or depth_cost_class()
     costs=[]
     for image in rec.images.values():
         if not image.has_pose:continue
@@ -46,8 +66,8 @@ def add_positive_depth_guards(problem,rec):
             if not obs.has_point3D():continue
             point=rec.points3D[obs.point3D_id]
             depth=float((matrix[:,:3]@point.xyz+matrix[:,3])[2])
-            if depth<=1e-9:raise ValueError('Initial depth must be positive')
-            cost=PositiveDepthCost(depth)
+            if not np.isfinite(depth) or depth<=1e-9:raise ValueError('Initial depth must be positive')
+            cost=cost_class(depth)
             costs.append(cost)
             problem.add_residual_block(cost,None,[point.xyz,pose.params])
         if not was_variable:

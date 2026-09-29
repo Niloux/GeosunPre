@@ -13,6 +13,7 @@ dependencies = [
     "pillow>=12",
     "pycolmap==4.2.0",
     "pyceres==2.6",
+    "geosunpre-native==0.1.0",
     "scipy>=1.15",
 ]
 
@@ -35,9 +36,11 @@ requires = ["uv_build>=0.12.14,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-source-include = ["configs/**", "docs/**", "tests/**"]
+source-include = ["configs/**", "docs/**", "tests/**", "native/pyproject.toml",
+                  "native/setup.py", "native/MANIFEST.in", "native/*.cpp", "native/*.md", "native/vendor/**"]
 
 [tool.uv.sources]
+geosunpre-native = { path = "native" }
 torch = [{ index = "pytorch-cu128", extra = "loma" }]
 torchvision = [{ index = "pytorch-cu128", extra = "loma" }]
 

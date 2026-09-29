@@ -13,6 +13,7 @@ import pycolmap
 from geosunpre.camera import Camera
 from geosunpre.artifacts import file_digest
 from geosunpre.artifacts import write_json
+from geosunpre.parallel import ordered_map
 
 
 MODEL_FILES = ('cameras.bin', 'images.bin', 'points3D.bin', 'rigs.bin', 'frames.bin')
@@ -165,8 +166,11 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
         else:
             # Older COLMAP models omit rigs/frames. Emit the complete current model.
             model.write(sparse)
-        images = []
-        for name, record in sorted(records.items()):
+        camera_details = {name: (image.camera_id, model.cameras[image.camera_id].width,
+                                model.cameras[image.camera_id].height)
+                          for name, image in by_name.items()}
+        def copy_image(item):
+            name, record = item
             source = Path(record['source']).resolve()
             destination = stage / 'images' / _relative_path(name)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -176,15 +180,15 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
             else:
                 # Staging and final directories have the same depth and parent.
                 destination.symlink_to(os.path.relpath(source, destination.parent))
-            image = by_name[name]
-            camera = model.cameras[image.camera_id]
-            row = {'name': name, 'camera_id': image.camera_id,
-                   'size': [camera.width, camera.height], 'sha256': source_hash}
+            camera_id, width, height = camera_details[name]
+            row = {'name': name, 'camera_id': camera_id,
+                   'size': [width, height], 'sha256': source_hash}
             if include_masks:
                 mask_path = stage / 'masks' / (name + '.png')
                 _export_mask(record, scene, mask_path)
                 row['mask_sha256'] = file_digest(mask_path)
-            images.append(row)
+            return row
+        images = list(ordered_map(copy_image, sorted(records.items())))
         supplements = {}
         if include_ply:
             model.export_PLY(sparse / 'points3D.ply')

@@ -176,6 +176,7 @@ name = "geosunpre"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "geosunpre-native" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "pillow" },
@@ -201,6 +202,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "geosunpre-native", directory = "native" },
     { name = "lomatch", marker = "extra == 'loma'", git = "https://github.com/davnords/LoMa.git?rev=8fb59c458f2a2ef44314f462467b229c27786bf0" },
     { name = "numpy", specifier = ">=2.2" },
     { name = "opencv-python", specifier = ">=4.12,<5" },
@@ -216,6 +218,17 @@ provides-extras = ["segmentation", "loma"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]
+
+[[package]]
+name = "geosunpre-native"
+version = "0.1.0"
+source = { directory = "native" }
+dependencies = [
+    { name = "pyceres" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pyceres", specifier = "==2.6" }]
 
 [[package]]
 name = "hf-xet"

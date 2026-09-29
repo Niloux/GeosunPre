@@ -1,6 +1,7 @@
 import numpy as np
 from PIL import Image
 import pycolmap
+import pytest
 
 from geosunpre.camera import Camera
 from geosunpre.sfm.tracks import split_tracks
@@ -12,6 +13,37 @@ from geosunpre.sfm.reconstruction import bounded_bundle_adjustment
 from geosunpre.sfm.reconstruction import mapper_options
 from geosunpre.sfm.reconstruction import cheirality_health
 from geosunpre.sfm.depth_guard import PositiveDepthCost
+
+
+def test_native_depth_barrier_matches_reference_and_finite_differences():
+    native = pytest.importorskip('geosunpre_native')
+    rng = np.random.default_rng(193)
+    for depth in (0.01, 1., 100.):
+        reference = PositiveDepthCost(depth)
+        cost = native.PositiveDepthCost(depth)
+        for active in (False, True):
+            for _ in range(8):
+                point = rng.normal(size=3)
+                pose = rng.normal(size=7)
+                pose[:4] /= np.linalg.norm(pose[:4])
+                pose[-1] = -20. if active else 20.
+                residual = np.zeros(1)
+                jac = [np.zeros(3), np.zeros(7)]
+                reference.Evaluate([point, pose], residual, jac)
+                actual = cost.evaluate_arrays(point, pose)
+                for a, b in zip(actual, [residual, *jac]):
+                    np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-10)
+                for block, values in enumerate((point, pose)):
+                    for k in range(len(values)):
+                        plus = [point.copy(), pose.copy()]
+                        minus = [point.copy(), pose.copy()]
+                        plus[block][k] += 1e-6
+                        minus[block][k] -= 1e-6
+                        numeric = (cost.evaluate_arrays(*plus)[0] - cost.evaluate_arrays(*minus)[0]) / 2e-6
+                        np.testing.assert_allclose(actual[block+1][k], numeric[0], rtol=1e-5, atol=1e-3)
+    for bad in (0., -1., float('nan'), float('inf')):
+        with pytest.raises(ValueError):
+            native.PositiveDepthCost(bad)
 
 
 def test_depth_barrier_penalizes_invalid_projection_and_has_correct_jacobians():
