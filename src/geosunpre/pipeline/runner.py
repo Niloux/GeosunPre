@@ -10,6 +10,7 @@ from geosunpre.sfm.evaluation import evaluate_reconstruction
 from geosunpre.sfm.reconstruction import assert_holdout_isolated
 from geosunpre.sfm.reconstruction import bounded_bundle_adjustment
 from geosunpre.artifacts import digest
+from geosunpre.artifacts import digest_cache
 from geosunpre.artifacts import file_digest
 from geosunpre.scene import load_scene
 from geosunpre.artifacts import write_json
@@ -210,7 +211,7 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
     selected = STAGES if stage == 'all' else (stage,)
     if config is not None and not isinstance(config, PipelineConfig):
         config = PipelineConfig.from_file(config)
-    with work_lock(work):
+    with work_lock(work), digest_cache():
         if (work / CONFIG_FILE).exists():
             saved = load_config(work)
             if config is not None:

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 import json
 from pathlib import Path
+from geosunpre.profiling import profiled
 
 import numpy as np
 
@@ -19,6 +20,7 @@ from geosunpre.artifacts import write_json, write_frozen_json
 OUTPUT = 'sfm'
 
 
+@profiled
 def load_frontend(work):
     """Read global feature IDs after checking their image, mask and camera inputs."""
     work = Path(work).resolve()
@@ -152,13 +154,16 @@ def match_features(work):
     else: write_json(out / 'pair_protocol.json', {**pair_protocol, 'fingerprint': fingerprint})
     attention = load_config(work).matcher_attention
     frontend = LoMaFrontend(work, scene, CONFIG, matching_attention=attention)
-    @lru_cache(maxsize=128)
-    def get_features(name):
-        with np.load(catalog['features'][name]['path'], allow_pickle=False) as f:
+    by_token = {row['token']: row['path'] for row in catalog['features'].values()}
+    @lru_cache(maxsize=32)
+    def get_features(token):
+        with np.load(by_token[token], allow_pickle=False) as f:
             return {k: f[k] for k in ('normalized_keypoints', 'descriptors', 'token')}
     entries = []
     for i, pair in enumerate(pairs, 1):
-        raw = frontend.match(get_features(pair['a']), get_features(pair['b']))
+        raw = frontend.match({'token': catalog['features'][pair['a']]['token']},
+                             {'token': catalog['features'][pair['b']]['token']},
+                             feature_loader=get_features)
         entries.append({**pair, 'token': str(raw['token']), 'path': str(work / 'matches' / f'{str(raw["token"])}.npz')})
         if i % 40 == 0 or i == len(pairs): print(f'global matches {i}/{len(pairs)}', flush=True)
     result = {**catalog, 'pairs': entries, 'pair_protocol_fingerprint': fingerprint,

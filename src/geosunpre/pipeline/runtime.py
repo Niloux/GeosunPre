@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 
 from geosunpre.artifacts import write_json
+from geosunpre.profiling import StageResources, release_gpu_cache, reclaim_host_memory
 
 
 def utc_now():
@@ -49,6 +50,8 @@ class StageRecorder:
         write_json(self.path, self.value)
         print(f'Pipeline stage: {name}', flush=True)
         started = time.monotonic()
+        resources = StageResources()
+        resources.start()
         try:
             yield
         except BaseException as exc:
@@ -59,6 +62,15 @@ class StageRecorder:
         else:
             entry['status'] = 'completed'
         finally:
+            if name == 'matches':
+                try:
+                    release_gpu_cache()
+                except RuntimeError as exc:
+                    entry['gpu_cleanup_error'] = str(exc)
+            if name in ('features', 'matches', 'holdout'):
+                entry['host_memory_reclaim'] = reclaim_host_memory()
+            entry['resources'] = resources.stop()
+            entry['operations'] = resources.operations
             entry.update(finished_at_utc=utc_now(), elapsed_seconds=time.monotonic() - started)
             self.value['active_stage'] = None
             write_json(self.path, self.value)

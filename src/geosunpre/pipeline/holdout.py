@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from geosunpre.profiling import profiled
 
 import numpy as np
 
@@ -30,6 +31,7 @@ def _input_identity(root, data):
     }
 
 
+@profiled
 def load_frozen_holdout(work, data):
     """Verify the frozen split and its feature/match identities without rewriting it."""
     root = Path(work).resolve() / 'sfm'

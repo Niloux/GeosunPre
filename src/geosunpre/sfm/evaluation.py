@@ -1,6 +1,7 @@
 """Predict withheld tracks from two support views; no query enters fitting."""
 import csv
 from pathlib import Path
+from geosunpre.profiling import profiled
 
 import cv2
 import numpy as np
@@ -66,12 +67,25 @@ def triangulate_support(cams,poses,pixels):
     if abs(h[3])<1e-12:
         return None,np.inf,0.
     point=h[:3]/h[3]
+    projection=[(cam.K,cam.D,pose,xy) for cam,pose,xy in zip(cams,poses,pixels)]
+    zero=np.zeros(3)
     def residual(xyz):
-        return np.concatenate([cam.project((pose[:,:3]@xyz+pose[:,3])[None])[0]-xy
-                               for cam,pose,xy in zip(cams,poses,pixels)])
+        return np.concatenate([cv2.fisheye.projectPoints((pose[:,:3]@xyz+pose[:,3]).reshape(1,1,3),zero,zero,K,D)[0].reshape(2)-xy
+                               for K,D,pose,xy in projection])
+    def jacobian(xyz):
+        # Specialize SciPy float64 unbounded 2-point differences to 3 unknowns.
+        # Keep the signed step and actual representable dx used by _numdiff;
+        # LM method, evaluation budget and all convergence tolerances are unchanged.
+        f0=residual(xyz)
+        h=np.finfo(np.float64).eps**.5*((xyz>=0).astype(float)*2-1)*np.maximum(1.,np.abs(xyz))
+        result=np.empty((3,4))
+        for i in range(3):
+            x1=xyz.copy();x1[i]=xyz[i]+h[i]
+            result[i]=(residual(x1)-f0)/(x1[i]-xyz[i])
+        return result.T
     if not np.isfinite(point).all():
         return None,np.inf,0.
-    fitted=least_squares(residual,point,method='lm',max_nfev=20,ftol=1e-6,xtol=1e-6,gtol=1e-6)
+    fitted=least_squares(residual,point,jac=jacobian,method='lm',max_nfev=20,ftol=1e-6,xtol=1e-6,gtol=1e-6)
     point=fitted.x
     positive=all((pose[:,:3]@point+pose[:,3])[2]>1e-9 for pose in poses)
     world_rays=[pose[:,:3].T@ray for pose,ray in zip(poses,rays)]
@@ -80,6 +94,7 @@ def triangulate_support(cams,poses,pixels):
     return (point if positive else None),support_error,angle
 
 
+@profiled
 def evaluate_reconstruction(rec,scene,features,split,directory):
     directory=Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -89,42 +104,62 @@ def evaluate_reconstruction(rec,scene,features,split,directory):
     radii={k:cam.distorted_radius(160) for k,cam in original.items()}
     images={im.name:im for im in rec.images.values() if im.has_pose}
     records={im['name']:im for im in scene['images']}
-    rows=[]
-    for track in split['tracks']:
-        if not track['queries']:
-            continue
+    poses={name:im.cam_from_world().matrix() for name,im in images.items()}
+    tracks=[track for track in split['tracks'] if track['queries']]
+    count=sum(len(track['queries']) for track in tracks)
+    name_width=max((len(name) for track in tracks for name,idx in track['queries']),default=1)
+    track_width=max((len(str(track['id'])) for track in tracks),default=1)
+    arrays={
+        'track_id':np.empty(count,dtype=f'U{track_width}'),
+        'name':np.fromiter((name for track in tracks for name,idx in track['queries']),
+                           dtype=f'U{name_width}',count=count),
+        'feature_index':np.fromiter((idx for track in tracks for name,idx in track['queries']),
+                                    dtype=np.int64,count=count),
+        'camera':np.empty(count,dtype=f'U{max(map(len,original),default=1)}'),
+        'zone':np.empty(count,dtype='U6'), 'rho':np.empty(count),
+        'observed':np.empty((count,2)), 'predicted':np.full((count,2),np.nan),
+        'error':np.full(count,np.inf), 'support_error':np.empty(count),
+        'support_angle':np.empty(count), 'support_ok':np.zeros(count,dtype=bool)}
+    points=np.full((count,3),np.nan)
+    offset=0
+    for track in tracks:
         support=track['support']
         point=None;support_error=np.inf;angle=0.
         if all(name in images for name,idx in support):
-            ims=[images[name] for name,idx in support]
-            cs=[cameras[im.camera_id] for im in ims]
-            ps=[im.cam_from_world().matrix() for im in ims]
+            cs=[cameras[images[name].camera_id] for name,idx in support]
+            ps=[poses[name] for name,idx in support]
             xy=[features[name]['keypoints'][idx].astype(float) for name,idx in support]
             point,support_error,angle=triangulate_support(cs,ps,xy)
-        for name,idx in track['queries']:
-            observed=features[name]['keypoints'][idx].astype(float)
-            predicted=np.full(2,np.nan);error=np.inf
-            if point is not None and name in images:
-                im=images[name];pose=im.cam_from_world().matrix()
-                local=pose[:,:3]@point+pose[:,3]
-                if local[2]>1e-9:
-                    predicted=cameras[im.camera_id].project(local[None])[0]
-                    error=float(np.linalg.norm(predicted-observed))
-            label=records[name]['camera'];base=original[label]
-            rho=float(np.linalg.norm((observed-base.params[2:4])/base.params[:2])/radii[label])
-            zone='center' if rho<.5 else 'middle' if rho<.8 else 'edge'
-            rows.append({'track_id':track['id'],'name':name,'feature_index':idx,'camera':label,
-                'zone':zone,'rho':rho,'observed':observed,'predicted':predicted,'error':error,
-                'support_error':support_error,'support_angle':angle,
-                'support_ok':bool(point is not None and support_error<=3 and angle>=1)})
-    dtypes = {'track_id': str, 'name': str, 'feature_index': np.int64,
-              'camera': str, 'zone': str, 'rho': float, 'observed': float,
-              'predicted': float, 'error': float, 'support_error': float,
-              'support_angle': float, 'support_ok': bool}
-    arrays = {key: np.asarray([row[key] for row in rows], dtype=dtype)
-              for key, dtype in dtypes.items()}
-    for key in ('observed', 'predicted'):
-        arrays[key] = arrays[key].reshape(-1, 2)
+        stop=offset+len(track['queries']);sl=slice(offset,stop)
+        arrays['track_id'][sl]=track['id']
+        arrays['support_error'][sl]=support_error
+        arrays['support_angle'][sl]=angle
+        arrays['support_ok'][sl]=bool(point is not None and support_error<=3 and angle>=1)
+        if point is not None:points[sl]=point
+        offset=stop
+    # Group only projection work by image; output order and failure denominators
+    # remain in the original frozen track/query order.
+    grouped={}
+    for index,name in enumerate(arrays['name']):grouped.setdefault(str(name),[]).append(index)
+    for name,indices in grouped.items():
+        indices=np.asarray(indices,dtype=np.int64)
+        observed=features[name]['keypoints'][arrays['feature_index'][indices]].astype(float)
+        arrays['observed'][indices]=observed
+        label=records[name]['camera'];base=original[label]
+        arrays['camera'][indices]=label
+        rho=np.linalg.norm((observed-base.params[2:4])/base.params[:2],axis=1)/radii[label]
+        arrays['rho'][indices]=rho
+        arrays['zone'][indices]=np.where(rho<.5,'center',np.where(rho<.8,'middle','edge'))
+        if name not in images:continue
+        pose=poses[name]
+        local=points[indices]@pose[:,:3].T+pose[:,3]
+        valid=local[:,2]>1e-9
+        selected=indices[valid]
+        if len(selected):
+            predicted=cameras[images[name].camera_id].project(local[valid])
+            arrays['predicted'][selected]=predicted
+            arrays['error'][selected]=np.linalg.norm(predicted-observed[valid],axis=1)
+    del points
     np.savez_compressed(directory/'validation_observations.npz',**arrays)
     errors=arrays['error']
     groups={}
@@ -132,7 +167,8 @@ def evaluate_reconstruction(rec,scene,features,split,directory):
         groups[label]=error_summary(errors[arrays['camera']==label])
         for zone in ['center','middle','edge']:
             groups[f'{label}/{zone}']=error_summary(errors[(arrays['camera']==label)&(arrays['zone']==zone)])
-    per_image={name:error_summary(errors[arrays['name']==name]) for name in sorted(set(arrays['name']))}
+    per_image={name:error_summary(errors[grouped[name]]) for name in sorted(grouped)}
+    del grouped
     training=[];coverage={}
     for name,im in images.items():
         obs=[];xyz=[]
@@ -148,7 +184,7 @@ def evaluate_reconstruction(rec,scene,features,split,directory):
         occupied=len(np.unique(np.floor(xy/[cameras[im.camera_id].width,cameras[im.camera_id].height]*8).astype(int),axis=0))
         coverage[name]={'training_observations':len(obs),'occupied_8x8_cells':occupied,
                         'top_half_fraction':float(np.mean(xy[:,1]<cameras[im.camera_id].height/2))}
-    summary={'status': 'evaluated' if rows else 'no_queries',
+    summary={'status': 'evaluated' if count else 'no_queries',
         'holdout_isolation': split.get('isolation_scope', 'stage_only'),
         'all_candidate_queries':error_summary(errors),'by_camera_and_radius':groups,'per_image':per_image,
         'support_qualified_queries':error_summary(errors[arrays['support_ok']]),
@@ -157,7 +193,8 @@ def evaluate_reconstruction(rec,scene,features,split,directory):
     write_json(directory/'validation.json',summary)
     with (directory/'validation.csv').open('w',newline='') as f:
         writer=csv.writer(f);writer.writerow(['track','image','feature','camera','zone','error_px','support_error_px','support_angle_deg','support_ok'])
-        for r in rows:writer.writerow([r['track_id'],r['name'],r['feature_index'],r['camera'],r['zone'],r['error'],r['support_error'],r['support_angle'],r['support_ok']])
+        keys=('track_id','name','feature_index','camera','zone','error','support_error','support_angle','support_ok')
+        writer.writerows(zip(*(arrays[key] for key in keys)))
     return summary
 
 

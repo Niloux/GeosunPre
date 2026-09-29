@@ -2,6 +2,7 @@
 from itertools import combinations
 
 import numpy as np
+from geosunpre.profiling import profiled
 import cv2
 import pycolmap
 from scipy.spatial.transform import Rotation
@@ -176,47 +177,52 @@ def rotation_graph_diagnostics(edges, image_names, review_threshold_degrees=5.0)
             'limitation': 'A failed cycle does not identify which edge is wrong. The review threshold is not a 3DGS acceptance threshold.'}
 
 
+@profiled
 def build_tracks(pair_data, images):
-    """Union stable feature IDs, rejecting merges with two features in one image."""
+    """Preserve score/name/index merge order using compact IDs and image bitsets."""
+    pair_data=list(pair_data)
+    images=list(images)
+    # Lexical image rank in the high 32 bits preserves the original tuple order.
+    names=sorted(im['name'] for im in images)
+    ranks={name:i for i,name in enumerate(names)}
+    total=sum(len(matches) for _,_,matches,_ in pair_data)
+    a_nodes=np.empty(total,dtype=np.uint64)
+    b_nodes=np.empty(total,dtype=np.uint64)
+    scores=np.empty(total,dtype=np.float64)
+    offset=0
+    for a,b,matches,confidence in pair_data:
+        end=offset+len(matches)
+        if len(matches) and (np.any(matches<0) or np.max(matches)>np.iinfo(np.uint32).max):
+            raise ValueError('Feature IDs must fit uint32')
+        a_nodes[offset:end]=(np.uint64(ranks[a])<<np.uint64(32))|matches[:,0].astype(np.uint64)
+        b_nodes[offset:end]=(np.uint64(ranks[b])<<np.uint64(32))|matches[:,1].astype(np.uint64)
+        scores[offset:end]=confidence
+        offset=end
+    # Finite float64 scores reproduce float(score) in the original stable sort.
+    order=np.lexsort((b_nodes,a_nodes,-scores))
+    del scores
     parent, image_sets, sizes = {}, {}, {}
+    image_bits=[1<<i for i in range(len(names))]
     def find(node):
         if node not in parent:
-            parent[node], image_sets[node], sizes[node] = node, {node[0]}, 1
-        root = node
-        while parent[root] != root:
-            root = parent[root]
-        while parent[node] != node:
-            next_node = parent[node]
-            parent[node] = root
-            node = next_node
+            parent[node],image_sets[node],sizes[node]=node,image_bits[node>>32],1
+        root=node
+        while parent[root]!=root:root=parent[root]
+        while parent[node]!=node:
+            next_node=parent[node];parent[node]=root;node=next_node
         return root
-    edges = []
-    for a,b,matches,scores in pair_data:
-        edges.extend((float(score), (a,int(ia)), (b,int(ib))) for (ia,ib),score in zip(matches,scores))
-    rejected, accepted = 0, 0
-    for _,a,b in sorted(edges, key=lambda e: (-e[0], e[1], e[2])):
-        ra, rb = find(a), find(b)
-        if ra == rb:
-            continue
-        if image_sets[ra] & image_sets[rb]:
-            rejected += 1
-            continue
-        if sizes[ra] < sizes[rb]:
-            ra, rb = rb, ra
-        parent[rb] = ra
-        image_sets[ra] |= image_sets.pop(rb)
-        sizes[ra] += sizes.pop(rb)
-        accepted += 1
-    grouped = {}
-    for node in parent:
-        grouped.setdefault(find(node), []).append(node)
-    tracks = [sorted(nodes) for nodes in grouped.values() if len(nodes) >= 2]
-    labels = {im['name']: im['camera'] for im in images}
-    histogram = {}
-    for nodes in tracks:
-        histogram[str(len(nodes))] = histogram.get(str(len(nodes)), 0)+1
-    return {'tracks': len(tracks), 'tracks_length_ge3': sum(len(t)>=3 for t in tracks),
-            'cross_camera_tracks': sum(len({labels[n] for n,k in t})>1 for t in tracks),
-            'length_histogram': histogram, 'conflicting_edge_merges_rejected': rejected,
-            'accepted_merges': accepted, 'triangulated_multiview_points': 0,
-            'note': 'Feature tracks only; no multi-view SfM/BA has been run.'}, tracks
+    rejected=accepted=0
+    for index in order:
+        a,b=int(a_nodes[index]),int(b_nodes[index]);ra,rb=find(a),find(b)
+        if ra==rb:continue
+        if image_sets[ra]&image_sets[rb]:rejected+=1;continue
+        if sizes[ra]<sizes[rb]:ra,rb=rb,ra
+        parent[rb]=ra;image_sets[ra]|=image_sets.pop(rb);sizes[ra]+=sizes.pop(rb);accepted+=1
+    # All nodes now exist: final find() calls only compress existing paths.
+    del a_nodes,b_nodes,order,image_sets,sizes
+    grouped={}
+    for node in parent:grouped.setdefault(find(node),[]).append(node)
+    tracks=[[(names[n>>32],n&0xffffffff) for n in sorted(nodes)] for nodes in grouped.values() if len(nodes)>=2]
+    labels={im['name']:im['camera'] for im in images};histogram={}
+    for nodes in tracks:histogram[str(len(nodes))]=histogram.get(str(len(nodes)),0)+1
+    return {'tracks':len(tracks),'tracks_length_ge3':sum(len(t)>=3 for t in tracks),'cross_camera_tracks':sum(len({labels[n] for n,k in t})>1 for t in tracks),'length_histogram':histogram,'conflicting_edge_merges_rejected':rejected,'accepted_merges':accepted,'triangulated_multiview_points':0,'note':'Feature tracks only; no multi-view SfM/BA has been run.'},tracks

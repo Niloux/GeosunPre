@@ -13,6 +13,7 @@ src/geosunpre/
   features.py             # LoMa 与内容缓存
   matching.py             # FlashAttention、诊断 math 路径及 CUDA Graph
   parallel.py             # 有界、有序的 CPU 并行任务
+  profiling.py            # RSS / CUDA 采样、嵌套计时与空闲内存回收
   colmap.py               # COLMAP 原子发布和独立校验
   pipeline/
     runner.py             # 阶段顺序、最终 BA、正式导出
@@ -22,8 +23,8 @@ src/geosunpre/
     calibration.py        # 复用全局特征做局部标定
     reconstruction.py    # 全局建图、轨迹筛选、BA 与报告
   sfm/
-    geometry.py           # 两视图几何与旋转闭环检查
-    tracks.py             # 时序配对、原始成轨与留出抽样
+    geometry.py           # 两视图几何、紧凑成轨与旋转闭环检查
+    tracks.py             # 时序配对与留出抽样
     reconstruction.py    # 数据库、种子模型与有界 BA
     depth_guard.py        # 正深度约束
     track_filter.py       # 训练轨迹一致性筛选
@@ -85,6 +86,10 @@ WORK/
 
 恢复支持存在明确边界：全局建图可归档中断的数据库后重建；局部标定遇到不完整数据库、模型或报告时保守报错；最终 BA 若留下不完整模型也拒绝直接覆盖。遇到此类提示应使用新工作目录重新运行，并保留失败目录用于定位。导出采用整目录发布，不暴露未校验的数据集。
 
+阶段结束后，状态文件的 `resources` 保存 RSS、CPU 时间和 PyTorch CUDA 分配器指标；
+`operations` 保存子操作的包含子调用耗时，父子耗时不能相加。
+`host_memory_reclaim` 记录空闲堆页回收前后的 RSS；指标口径及缓存预算见 [资源报告](resources.md)。
+
 ## 固定的数值流程
 
 保留已实跑的视觉流程：1536 检测尺寸、每图最多 3072 个 LoMa 特征，时序加描述子检索候选配对；全局留出先于所有几何拟合；局部依次优化固定内参、焦距与低阶径向、全部径向、主点；全局依次固定标定 BA、训练轨迹筛选 BA、共享标定 BA，最后执行最多 40 次迭代的有界 BA。
@@ -98,7 +103,7 @@ WORK/
 - 导出保持原生 `OPENCV_FISHEYE`；使用方需要支持该相机模型。
 - 视觉结果为任意尺度，不提供导航对齐、米制尺度、地面约束或 LAS 融合。
 - 数值与阶段测试包含真实 PyCOLMAP 模型读写和小模型 BA；管线集成测试对大规模建图与 BA 使用替身。
-- 当前优化实现已经过三轮完整冷启动验证，正式默认对应第三轮 19 分 51.30 秒的方案；详见 [性能记录](performance.md)。默认方案的采用与仓库整理没有额外重跑完整流水线。
+- 历史三轮完整验证见 [性能记录](performance.md)，后续内存、显存和评估优化见 [资源记录](resources.md)。19 分 51.30 秒是单次结果，不是稳定上限。
 
 ## 历史重构验证（2026-09-28）
 

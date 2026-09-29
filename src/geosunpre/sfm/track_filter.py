@@ -5,6 +5,7 @@ Validation observations must be removed before building the support graph.
 """
 from collections import defaultdict
 from pathlib import Path
+from geosunpre.profiling import profiled
 
 import numpy as np
 import pycolmap
@@ -17,6 +18,7 @@ CONFIG = {'match_confidence': .5, 'minimum_component_images': 3,
           'minimum_occupied_8x8_cells_per_image': 12}
 
 
+@profiled
 def training_adjacency(entries, held, threshold=.5, mapped_points=None):
     adjacency = defaultdict(dict)
     edges = 0
@@ -95,6 +97,7 @@ def reconstruction_coverage(rec):
             'min_occupied_cells': min((r['occupied_8x8_cells'] for r in rows.values()), default=0)}
 
 
+@profiled
 def filter_mapped_tracks(rec, adjacency, directory):
     names = {i: im.name for i, im in rec.images.items()}
     ids = {im.name: i for i, im in rec.images.items()}

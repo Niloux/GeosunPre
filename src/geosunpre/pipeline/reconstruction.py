@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import html
 import json
 from pathlib import Path
+from geosunpre.profiling import profiled, operation
 
 import numpy as np
 import pycolmap
@@ -29,6 +30,7 @@ from geosunpre.pipeline.data import load_frontend
 OUTPUT = 'sfm'
 
 
+@profiled
 def freeze_geometry(work, *, require_existing=False):
     out, scene, data, features = load_frontend(work)
     work = Path(work).resolve()
@@ -69,6 +71,7 @@ def geometric_scene(scene, params):
     return result
 
 
+@profiled
 def build_mapping(work):
     out, scene, data, features, protocol, params = freeze_geometry(work)
     split = json.loads((out / 'split.json').read_text())
@@ -84,8 +87,9 @@ def build_mapping(work):
             db, seed = database_and_seed(out, geometric_scene(scene, params), scene['images'],
                                          data['pairs'], features, split)
         opts = mapper_options()
-        maps = pycolmap.incremental_mapping(db, Path(scene['input_root']) / 'Image',
-                                            out / 'mapper_output', options=opts, input_path=seed)
+        with operation('incremental_mapping'):
+            maps = pycolmap.incremental_mapping(db, Path(scene['input_root']) / 'Image',
+                                                out / 'mapper_output', options=opts, input_path=seed)
         if not maps: raise RuntimeError('Full mapping did not reconstruct a component')
         rec = max(maps.values(), key=lambda r: r.num_reg_images())
         assert_holdout_isolated(rec, split)
@@ -106,6 +110,7 @@ def build_mapping(work):
     return rec, summary
 
 
+@profiled
 def evaluate_mapping(work):
     """Score the saved mapper result on the same frozen queries as later BA."""
     out, scene, data, features, _, _ = freeze_geometry(work, require_existing=True)
@@ -133,12 +138,14 @@ def evaluate_mapping(work):
     return result
 
 
+@profiled
 def optimize(work, *, stop_after='shared_calibration'):
     out, scene, data, features, protocol, _ = freeze_geometry(work, require_existing=True)
     mapping = pycolmap.Reconstruction(out / 'mapping')
     split = json.loads((out / 'split.json').read_text())
     triangle = json.loads((out / 'triangle_validation_split.json').read_text())
     assert_holdout_isolated(mapping, split)
+    del mapping
     params = {int(i): np.asarray(p, dtype=float) for i, p in protocol['calibration'].items()}
     comparison_path = out / 'comparison.json'
     existing = json.loads(comparison_path.read_text()) if comparison_path.exists() else {'stages': {}}
@@ -176,6 +183,7 @@ def optimize(work, *, stop_after='shared_calibration'):
                 adjacency, count = training_adjacency(data['pairs'], held,
                     TRACK_CONFIG['match_confidence'], mapped_points=mapped_points)
                 filtration = filter_mapped_tracks(rec, adjacency, path)
+                del adjacency, mapped_points, held
                 filtration['input_graph_edges'] = count
                 write_json(path / 'track_filter.json', filtration)
                 if not filtration['coverage_admissible']:
@@ -206,6 +214,7 @@ def optimize(work, *, stop_after='shared_calibration'):
     return stages
 
 
+@profiled
 def compare_stages(work):
     """Compare identical high-confidence queries with valid support in all saved stages."""
     out = Path(work).resolve() / OUTPUT

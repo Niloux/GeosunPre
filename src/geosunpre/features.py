@@ -56,9 +56,14 @@ class LoMaFrontend:
         self.device = None
         self._gpu_features = OrderedDict()
         self._gpu_feature_bytes = 0
-        self._gpu_feature_limit = 512 * 1024 * 1024
+        cache_mib = int(os.environ.get('GEOSUNPRE_GPU_FEATURE_CACHE_MIB', '2048'))
+        if cache_mib < 0:
+            raise ValueError('GEOSUNPRE_GPU_FEATURE_CACHE_MIB must be nonnegative')
+        self._gpu_feature_limit = cache_mib * 1024 * 1024
         self._matcher = None
         self.cache_stats = {'feature_hits': 0, 'feature_misses': 0, 'match_hits': 0, 'match_misses': 0}
+        self.cache_stats.update(gpu_feature_hits=0, gpu_feature_misses=0,
+                                gpu_upload_bytes=0, gpu_feature_peak_bytes=0)
         self.cache = self.work/'features'/digest(asdict(config))[:20]
         self.cache.mkdir(parents=True, exist_ok=True)
 
@@ -71,6 +76,9 @@ class LoMaFrontend:
             from loma import LoMa, LoMaB
             from loma.device import device
             self.device = device
+            self._gpu_feature_limit = min(self._gpu_feature_limit,
+                                         torch.cuda.get_device_properties(device).total_memory // 8)
+            self.cache_stats['gpu_feature_limit_bytes'] = self._gpu_feature_limit
             self.model = LoMa(LoMaB(compile=False, num_keypoints=self.config.num_keypoints)).eval()
             self.model._detector.resize = self.config.detector_size
             from geosunpre.matching import configure_matcher
@@ -161,24 +169,31 @@ class LoMaFrontend:
         tmp.replace(path)
         return output
 
-    def _matching_tensors(self, features):
+    def _matching_tensors(self, features, feature_loader=None):
         import torch
         token = str(features['token'])
         if token in self._gpu_features:
+            self.cache_stats['gpu_feature_hits'] += 1
             self._gpu_features.move_to_end(token)
             return self._gpu_features[token]
+        self.cache_stats['gpu_feature_misses'] += 1
+        if feature_loader is not None:
+            features = feature_loader(token)
         value = tuple(torch.from_numpy(features[key])[None].to(self.device)
                       for key in ('normalized_keypoints', 'descriptors'))
         size = sum(t.numel() * t.element_size() for t in value)
+        self.cache_stats['gpu_upload_bytes'] += size
         while self._gpu_features and self._gpu_feature_bytes + size > self._gpu_feature_limit:
             _, old = self._gpu_features.popitem(last=False)
             self._gpu_feature_bytes -= sum(t.numel() * t.element_size() for t in old)
         if size <= self._gpu_feature_limit:
             self._gpu_features[token] = value
             self._gpu_feature_bytes += size
+            self.cache_stats['gpu_feature_peak_bytes'] = max(
+                self.cache_stats['gpu_feature_peak_bytes'], self._gpu_feature_bytes)
         return value
 
-    def match(self, features_a, features_b):
+    def match(self, features_a, features_b, *, feature_loader=None):
         identity = {'a': str(features_a['token']), 'b': str(features_b['token']), 'config': asdict(self.config)}
         if self.matching_attention != 'math':
             identity['attention_backend'] = self.matching_attention + '_v1'
@@ -195,8 +210,8 @@ class LoMaFrontend:
             from geosunpre.matching import MatcherGraph
             self._matcher = MatcherGraph(model, self.config.match_threshold)
         with torch.inference_mode():
-            a, da = self._matching_tensors(features_a)
-            b, db = self._matching_tensors(features_b)
+            a, da = self._matching_tensors(features_a, feature_loader)
+            b, db = self._matching_tensors(features_b, feature_loader)
             m0, scores = self._matcher(a, b, da, db)
             ia = torch.where(m0[0] >= 0)[0]
             indices = torch.stack((ia, m0[0, ia]), dim=-1).cpu().numpy().astype(np.uint32)

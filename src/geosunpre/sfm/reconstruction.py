@@ -3,6 +3,7 @@ import time
 
 import cv2
 import numpy as np
+from geosunpre.profiling import profiled
 import pyceres
 import pycolmap
 from PIL import Image
@@ -30,6 +31,7 @@ def cheirality_health(rec):
     return {'observations':total,'positive_depth':positive,'invalid_depth':total-positive}
 
 
+@profiled
 def database_and_seed(directory, scene, images, entries, features, split):
     cameras={k:Camera.from_dict(v) for k,v in scene['cameras'].items()}
     records={im['name']:im for im in images}
@@ -172,6 +174,7 @@ def mapper_options():
     return opts
 
 
+@profiled
 def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False, trust_region=None,
                               show_progress=False, max_iterations=None):
     options=pycolmap.BundleAdjustmentOptions()
