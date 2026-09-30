@@ -1,0 +1,415 @@
+{
+  "schema_version": 1,
+  "kind": "post_sfm_visual_to_las_registration_diagnostic",
+  "date": "2026-09-30",
+  "repository_head_before_changes": "b18c6994c5a20b865f6b8d9d88b56f8be6de3ed1",
+  "status": "candidate_requires_review",
+  "absolute_accuracy_validated": false,
+  "source_inputs": {
+    "dataset": "/home/wuyou/GeosunPre/work/basketball_industrial_01/colmap",
+    "las": "/home/wuyou/GeosunPre/input/篮球场/ResultOut/篮球场.las",
+    "las_sha256": "401282acafff0102915347a60958d05a0800118dac04f310f6429fcafe6e29dc",
+    "visual_model_sha256": {
+      "cameras.bin": "c0eea7e1a9e0cdb0b99bb370f8934eeaf95e76e9ff861a2e2affbe7a0d2a7772",
+      "images.bin": "8601cece2f32a05623a1de645227c38238aa21541854f750297aeb30861142fd",
+      "points3D.bin": "8b59788101c43f0dfe33b02488dec73c3e34b8d5f6abc035b5cc60a95d0b6ab0",
+      "rigs.bin": "3e0480c890e6ccd659a062df110c3f3ca8839a1ae8d17d5a96eb87676f83035e",
+      "frames.bin": "ec02c5d10053348d405b0b9ba022fd4dd097922e1d7485ff735306e7cd1734a2"
+    },
+    "colmap_export_sha256": "3214bc5eb71ab4166d9c8bfa0949780f8f1136af6cc3cf5bb8fea8b19300ceca",
+    "initialization": {
+      "/home/wuyou/GeosunPre/input/篮球场/篮球场_CameraPos_C2E.txt": "a7bf67cbcd284f841a2fce751444460d25159d7f74cce534eca4f87b1bd22966",
+      "/home/wuyou/GeosunPre/input/篮球场/篮球场_pos.txt": "3604ee6bc9f1fc644a34bf5d9a1b612b000a0df4db35f89ae53f0c0af9f61a83",
+      "/home/wuyou/GeosunPre/input/篮球场/篮球场_pos_ENH.txt": "1de19dffdd85c976ad8bfbfe8ee640ca4b2147984aaa083dfc5a4a92b3ae430a"
+    }
+  },
+  "implementation_sha256": {
+    "runner.py": "3f961d2315f56eb4e88fb4b5990f6b9e3452fa423d1e65a5df9b9bfb6a2104a7",
+    "geometry.py": "d6e7ac307feff86b1d3cf7630436afa84e32719545b55692aa3a2a1e38ced286",
+    "las.py": "9196ac87646397b4f02d949f8a4fb092ccdbe6a0c7b4b3afae2b1c70ba8f72a9",
+    "report.py": "7875d7aba1f0d43767e2f5dc7bd56bad6b8bb24b5586dfe50808bec1285b06f8"
+  },
+  "versions": {
+    "numpy": "2.5.3",
+    "pycolmap": "4.2.0"
+  },
+  "recipe": {
+    "max_las_points": 1500000,
+    "workers": 4,
+    "voxel_sizes": [
+      0.4,
+      0.2,
+      0.1
+    ],
+    "correspondence_distances": [
+      0.8,
+      0.4,
+      0.2
+    ],
+    "maximum_iterations_per_scale": 12,
+    "surface_support_distance": 0.3,
+    "pixel_error_max": 2.0,
+    "track_length_min": 4,
+    "sparse_selection": "visual quality and initial LAS header bounding box; no residual gate"
+  },
+  "coordinate_initialization": {
+    "kind": "vendor_navigation_frame_hypothesis",
+    "hypothesis": "LAS XYZ approximately equals ENH minus first ENH navigation position",
+    "vendor_coordinate_convention_verified": false,
+    "las_origin_verified": false,
+    "row_association_scope": "coordinate conversion only; not temporal synchronization",
+    "timestamps_modified": false,
+    "quaternions_used": false,
+    "navigation_row_time_difference_seconds": {
+      "min": 0.35499999998137355,
+      "median": 0.3561500000068918,
+      "max": 0.3572000000276603
+    },
+    "camera_pose_minus_filename_seconds": {
+      "min": 0.0009999999892897904,
+      "median": 0.0009999999892897904,
+      "max": 0.0010000000474974513
+    },
+    "enh_origin": [
+      500000.0,
+      3371787.52344,
+      32.0053
+    ],
+    "navigation_to_candidate_las_matrix": [
+      [
+        -0.9106946877133371,
+        -0.4130673747419297,
+        1.1214077472973143e-06,
+        -14.049689625808314
+      ],
+      [
+        0.20943843618019434,
+        -0.46174913906807274,
+        0.8619238622564221,
+        18683.214196730012
+      ],
+      [
+        -0.3560339836698767,
+        0.784953850108682,
+        0.5070273424367306,
+        -6372644.7438948825
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "coordinate_conversion_error": {
+      "count": 53727,
+      "median": 7.2122088815803265e-06,
+      "p90": 1.3426759553811365e-05,
+      "max": 2.0645261081884237e-05
+    },
+    "coordinate_conversion_scale": 0.9999947351395101,
+    "camera_position_fit": {
+      "threshold": 0.5,
+      "inliers": 536,
+      "positions": 536,
+      "position_error": {
+        "count": 536,
+        "median": 0.026603818349549373,
+        "p90": 0.0519870855163201,
+        "max": 0.11267319233880725
+      },
+      "trajectory_singular_values": [
+        71.8299721851798,
+        46.47817957949985,
+        0.529135385141664
+      ]
+    },
+    "unmatched_images": 0
+  },
+  "las": {
+    "version": "1.2",
+    "point_format": 3,
+    "point_count": 56941990,
+    "record_size": 34,
+    "point_data_offset": 227,
+    "global_encoding": 0,
+    "vlr_count": 0,
+    "scales": [
+      0.0001,
+      0.0001,
+      0.0001
+    ],
+    "offsets": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "bounds_min": [
+      -80.64138001215179,
+      -58.76465258607641,
+      -6.265529145486653
+    ],
+    "bounds_max": [
+      55.745580016693566,
+      59.91918457811698,
+      49.241076179780066
+    ],
+    "crs": "absent",
+    "coordinate_units": "unverified; registration thresholds assume metres",
+    "sampling": "one random record per ordinal stratum; fixed seed",
+    "sample_seed": 0,
+    "record_stride": 38,
+    "sampled_records": 1498474,
+    "sampled_points": 1498474,
+    "excluded_withheld_or_noise": 0,
+    "chunk_points": 500000,
+    "gps_time": {
+      "finite_count": 1498474,
+      "min": 352995.3243810715,
+      "max": 353263.935438531,
+      "encoding": "gps_week"
+    }
+  },
+  "visual_points": {
+    "total": 75749,
+    "quality_selected": 44201,
+    "quality_outside_initial_las_bounds": 1912,
+    "eligible": 42289,
+    "model_points_removed": 0
+  },
+  "split": {
+    "tile_size": 4.0,
+    "fraction_requested": 0.2,
+    "seed": 0,
+    "tiles": 1783,
+    "heldout_tiles": 357,
+    "fit_points": 34902,
+    "holdout_points": 7387,
+    "frozen_in_initial_frame": true,
+    "scope": "LAS surface refinement only; initialization uses all matching camera positions"
+  },
+  "initial_scale": 3.5545806680694594,
+  "refined_scale": 3.549786543623028,
+  "fit_and_holdout_errors": {
+    "fit": {
+      "initial": {
+        "points": 34902,
+        "nearest_distance": {
+          "count": 34902,
+          "median": 0.058504020765853065,
+          "p90": 0.5210570586063941,
+          "max": 39.210769489352934
+        },
+        "surface_support_count": 17818,
+        "surface_support_fraction": 0.510515156724543,
+        "support_distance": 0.3,
+        "point_to_plane_on_supported": {
+          "count": 17818,
+          "median": 0.008581807139723271,
+          "p90": 0.0566552319251833,
+          "max": 0.40615800595797885
+        },
+        "fraction_all_points_supported_within_5cm": 0.4539854449601742,
+        "fraction_all_points_supported_within_10cm": 0.4798005844937253
+      },
+      "refined": {
+        "points": 34902,
+        "nearest_distance": {
+          "count": 34902,
+          "median": 0.05936584919405308,
+          "p90": 0.5153798946815948,
+          "max": 39.11471862835762
+        },
+        "surface_support_count": 17932,
+        "surface_support_fraction": 0.5137814451893874,
+        "support_distance": 0.3,
+        "point_to_plane_on_supported": {
+          "count": 17932,
+          "median": 0.008530516750500837,
+          "p90": 0.058138089149188305,
+          "max": 0.3779416596232996
+        },
+        "fraction_all_points_supported_within_5cm": 0.4559337573778007,
+        "fraction_all_points_supported_within_10cm": 0.48298091799896853
+      }
+    },
+    "holdout": {
+      "initial": {
+        "points": 7387,
+        "nearest_distance": {
+          "count": 7387,
+          "median": 0.06271812469821267,
+          "p90": 0.6523184593923635,
+          "max": 39.178133259367236
+        },
+        "surface_support_count": 3546,
+        "surface_support_fraction": 0.48003248950859617,
+        "support_distance": 0.3,
+        "point_to_plane_on_supported": {
+          "count": 3546,
+          "median": 0.00813230019039424,
+          "p90": 0.048926927063268566,
+          "max": 0.35285792269856464
+        },
+        "fraction_all_points_supported_within_5cm": 0.4329227020441316,
+        "fraction_all_points_supported_within_10cm": 0.4513334235819683
+      },
+      "refined": {
+        "points": 7387,
+        "nearest_distance": {
+          "count": 7387,
+          "median": 0.06311035153964277,
+          "p90": 0.6548865931434413,
+          "max": 39.07307203684505
+        },
+        "surface_support_count": 3556,
+        "surface_support_fraction": 0.48138621903343715,
+        "support_distance": 0.3,
+        "point_to_plane_on_supported": {
+          "count": 3556,
+          "median": 0.005998240293885608,
+          "p90": 0.05075117578554185,
+          "max": 0.3389984992207987
+        },
+        "fraction_all_points_supported_within_5cm": 0.43278732909164747,
+        "fraction_all_points_supported_within_10cm": 0.452281034249357
+      }
+    }
+  },
+  "holdout_common_surface_support": {
+    "points": 3505,
+    "initial_absolute_plane_error": {
+      "count": 3505,
+      "median": 0.00805918619615727,
+      "p90": 0.044756612550069234,
+      "max": 0.35285792269856464
+    },
+    "refined_absolute_plane_error": {
+      "count": 3505,
+      "median": 0.005912283813133383,
+      "p90": 0.044029606733202255,
+      "max": 0.31593083112337705
+    },
+    "median_change_spatial_bootstrap": {
+      "tiles": 73,
+      "replicates": 500,
+      "seed": 0,
+      "estimate": -0.002146902383023888,
+      "ci95": [
+        -0.004212277246109315,
+        0.000604540016303662
+      ],
+      "sign": "negative means refinement reduces the supported point-to-plane median"
+    }
+  },
+  "surface_orientations": {
+    "horizontal": {
+      "supported_points": 18680,
+      "holdout": {
+        "count": 3074,
+        "median": 0.004958079346273787,
+        "p90": 0.016135823511641414,
+        "max": 0.31593083112337705
+      }
+    },
+    "vertical": {
+      "supported_points": 2396,
+      "holdout": {
+        "count": 423,
+        "median": 0.07680575752394272,
+        "p90": 0.2262732906998224,
+        "max": 0.3389984992207987
+      }
+    },
+    "inclined": {
+      "supported_points": 412,
+      "holdout": {
+        "count": 59,
+        "median": 0.0678086157009055,
+        "p90": 0.20632406936850867,
+        "max": 0.30440311257462077
+      }
+    }
+  },
+  "reprojection_invariance": {
+    "sampled_observations": 10720,
+    "maximum_pixel_difference": 1.367270340631231e-11,
+    "intrinsics_and_all_observation_tracks_unchanged": true
+  },
+  "observability": {
+    "minimum_numerical_rank": 7,
+    "full_rank_at_all_solved_iterations": true
+  },
+  "validation": {
+    "tests_passed": 103,
+    "test_command": "OPENBLAS_NUM_THREADS=4 PYTHONPATH=src /home/wuyou/GeosunPre/.venv/bin/python -m pytest -q tests",
+    "candidate_colmap_independent_full_content_check": true,
+    "registered_images": 536,
+    "model_points": 75749,
+    "source_model_unchanged": true,
+    "offline_viewer_javascript_syntax_checked": true,
+    "offline_viewer_data_and_interaction_handlers_checked_in_node_vm": true,
+    "browser_rendering_checked": false,
+    "native_projection_pairs_generated": 8,
+    "native_projection_preview_visually_inspected": true
+  },
+  "process_peak_rss_mib": 598.0390625,
+  "performance_comparison_performed": false,
+  "artifact_directory": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03",
+  "artifact_sha256": {
+    "report.json": "92a13d5330b64554455811c29c6feebdbaa855574857de320ce6062abca73953",
+    "transform.json": "bbe8759e7788219ebc42ff7ebf76cc208b899955e19ebf4b9c2b29864737a5f8",
+    "inspection.html": "27f4d18907fc22a5fd3d20cf59ea9eec1c39a7a8df6250db8c422503883e6e22",
+    "regions.csv": "00fdd10c359fcb5dccf55fd4a6ad16f18d9a96c5a1ca2abb000ca9df78388661",
+    "registration_points.npz": "47a22abbf6ee92137972650253e683ca208409a3104ae256839f120d604000a8",
+    "aligned_colmap/colmap_export.json": "7c2a830bb74bb612f179b06a0708dc358d1f6c887ef6d5e11235ef134a8270ac"
+  },
+  "run_log": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/las_alignment_20260930_03.log",
+  "run_log_sha256": "b70c77da67af51f152da9ba633ac84d9dd9c685dc0582091ee4579f46ee92a6c",
+  "limitations": [
+    "坐标单位按米假设；导航到 LAS 的坐标关系仍为待验证候选。",
+    "空间留出只隔离表面细化；pose 初值使用全部对应相机位置。",
+    "点到面指标仅覆盖稳定表面支持点；覆盖之外的点没有被证明配准成功。",
+    "LAS 与视觉几何的一致性不代表绝对精度，也不能单独定位哪套数据存在局部误差。",
+    "仅优化一个全局相似变换；未修正扫描轨迹、局部形变或内参。",
+    "导出的 COLMAP 是诊断候选；图像使用链接，依赖原始视觉交付目录。",
+    "留出共同支持点的 median 改变量区间包含零；未检出明确细化收益。"
+  ],
+  "source_sfm_provenance": {
+    "kind": "visual_sfm_pipeline",
+    "source_model_sha256": {
+      "cameras.bin": "c0eea7e1a9e0cdb0b99bb370f8934eeaf95e76e9ff861a2e2affbe7a0d2a7772",
+      "images.bin": "8601cece2f32a05623a1de645227c38238aa21541854f750297aeb30861142fd",
+      "points3D.bin": "8b59788101c43f0dfe33b02488dec73c3e34b8d5f6abc035b5cc60a95d0b6ab0",
+      "rigs.bin": "3e0480c890e6ccd659a062df110c3f3ca8839a1ae8d17d5a96eb87676f83035e",
+      "frames.bin": "ec02c5d10053348d405b0b9ba022fd4dd097922e1d7485ff735306e7cd1734a2"
+    },
+    "scene_manifest_sha256": "d37e45ed08250aa58f1d72241c069466df4d63adda6662605692470c051e9202",
+    "final_ba_protocol_sha256": "c5310bf71953a7e2bf729d46a85819ca15aba211dd9b9f67cddd6395f6ceaa0d",
+    "final_ba_result_sha256": "65a8bf31fe97476ff4f1ed37600ade7b23da11a15e0a22e863a3e9054fe1af66",
+    "observation_protocol_sha256": "d6b431a7f2898b2ab6b4bfb11bfdd98abf523a870f7cf220e210c43de6deb95b",
+    "calibration_identity_sha256": "47b38088ecb4500fb4c20d9c33ff4aff67dd10d04e96f575ec8d9e50d20b28f6",
+    "pipeline_mode": "production",
+    "observations_excluded_for_validation": 0,
+    "quality_metrics": "fitted_observation_diagnostics",
+    "independent_exposure_poses": true,
+    "manual_annotations_used": false,
+    "navigation_pose_values_or_las_used": false,
+    "final_ba_quality_sha256": "4116e60badced4276687d7fc5a68e1b28111a0b7b7acd7c8f9b57286b5b7b184",
+    "pipeline_task_sha256": "d747427200218e030db9259ad87faba8a824cb3b8553da1f6f687bd79d294774"
+  },
+  "independent_check": {
+    "result": {
+      "output": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03/aligned_colmap",
+      "identity": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03/aligned_colmap/colmap_export.json",
+      "model": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03/aligned_colmap/sparse/0",
+      "images": 536,
+      "points": 75749,
+      "image_mode": "link",
+      "include_masks": false,
+      "full_content_check": true
+    },
+    "record": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/las_alignment_20260930_03_check.json",
+    "sha256": "40d11241e3fde0a0740531193fa84cd8ca330d609d7d29166f8b2e156ce5db54"
+  }
+}

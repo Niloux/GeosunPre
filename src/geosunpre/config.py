@@ -11,7 +11,7 @@ from geosunpre.artifacts import digest, write_frozen_json
 
 
 CONFIG_FILE = 'pipeline_config.json'
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -25,8 +25,49 @@ class PipelineConfig:
     quality_max_median_px: float | None = None
     quality_max_p90_px: float | None = None
     quality_bounds_policy: str = 'warn'
+    registration_mode: str = 'joint'
+    registration_las: str | None = None
+    registration_pose_frame: str = 'enh_first'
+    registration_workers: int = 4
+    registration_max_las_points: int = 1_500_000
+    registration_pose_std_m: float = .5
+    registration_las_std_m: float = .05
+    registration_pose_weight: float = .001
+    registration_las_weight: float = .005
+    registration_outer_iterations: int = 2
+    registration_ba_iterations: int = 20
+    registration_min_support_fraction: float = .25
+    registration_max_median_m: float = .1
+    registration_max_p90_m: float = .3
 
     def __post_init__(self):
+        if self.registration_mode not in ('joint', 'visual'):
+            raise ValueError('registration_mode must be joint or visual')
+        if self.registration_pose_frame != 'enh_first':
+            raise ValueError('registration_pose_frame currently supports only enh_first')
+        if self.registration_las is not None and (not isinstance(self.registration_las, str)
+                                                  or not self.registration_las.strip()):
+            raise ValueError('registration_las must be a nonempty path')
+        limits = {
+            'registration_workers': (1, 16), 'registration_max_las_points': (1000, 5_000_000),
+            'registration_outer_iterations': (1, 5), 'registration_ba_iterations': (1, 100),
+        }
+        for key, (low, high) in limits.items():
+            value = getattr(self, key)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f'{key} must be an integer in [{low}, {high}]')
+        limits = {
+            'registration_pose_std_m': (.1, 10), 'registration_las_std_m': (.01, 1),
+            'registration_pose_weight': (1e-9, .1), 'registration_las_weight': (1e-9, .1),
+            'registration_min_support_fraction': (.01, 1),
+            'registration_max_median_m': (.001, 1), 'registration_max_p90_m': (.001, 2),
+        }
+        for key, (low, high) in limits.items():
+            value = getattr(self, key)
+            if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f'{key} must be finite and in [{low}, {high}]')
+        if self.registration_max_median_m > self.registration_max_p90_m:
+            raise ValueError('registration median limit must not exceed the P90 limit')
         if self.quality_bounds_policy not in ('warn', 'reject'):
             raise ValueError('quality_bounds_policy must be warn or reject')
         for key in ('quality_max_median_px', 'quality_max_p90_px'):
@@ -111,7 +152,7 @@ def load_config(work):
     if not path.is_file():
         raise ValueError('Missing pipeline_config.json; start a run in a fresh work directory')
     value = json.loads(path.read_text())
-    if (value.get('version') not in (1, 2, 3, CONFIG_VERSION) or value.get('fingerprint') != digest(
+    if (value.get('version') not in (1, 2, 3, 4, CONFIG_VERSION) or value.get('fingerprint') != digest(
             {key: val for key, val in value.items() if key != 'fingerprint'})):
         raise ValueError('Pipeline configuration identity changed')
     settings = dict(value['settings'])
@@ -131,4 +172,11 @@ def load_config(work):
         settings.setdefault('pipeline_mode', 'validation')
     elif 'pipeline_mode' not in settings:
         raise ValueError('Missing frozen pipeline_mode')
+    if value['version'] < 5:
+        if settings.get('registration_mode', 'visual') != 'visual':
+            raise ValueError('Legacy configuration cannot enable LAS registration')
+        settings.setdefault('registration_mode', 'visual')
+    elif any(field.name not in settings for field in fields(PipelineConfig)
+             if field.name.startswith('registration_')):
+        raise ValueError('Missing frozen registration settings')
     return PipelineConfig(**settings)

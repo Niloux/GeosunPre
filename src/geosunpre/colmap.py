@@ -115,6 +115,13 @@ def verify_colmap_export(output):
 
 def _export_mask(record, scene, destination):
     camera = Camera.from_dict(scene['cameras'][record['camera']])
+    if record.get('combined_mask'):
+        with Image.open(record['combined_mask']) as mask:
+            if mask.size != (camera.width, camera.height) or mask.mode != 'L':
+                raise ValueError(f'Combined mask/image dimensions or mode differ: {record["name"]}')
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(record['combined_mask'], destination)
+        return
     valid = camera.mask(scene['fov_degrees']) > 0
     if record.get('semantic_mask'):
         with Image.open(record['semantic_mask']) as mask:
@@ -166,7 +173,9 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
                'images': [{'name': name, 'sha256': file_digest(row['source']),
                            'source': str(Path(row['source']).resolve()) if image_mode == 'link' else None,
                            'mask_sha256': file_digest(row['semantic_mask'])
-                               if include_masks and row.get('semantic_mask') else None}
+                               if include_masks and row.get('semantic_mask') else None,
+                           **({'combined_mask_sha256': file_digest(row['combined_mask'])}
+                              if include_masks and row.get('combined_mask') else {})}
                           for name, row in sorted(records.items())]}
     request_fingerprint = digest(request)
     if existing and existing.get('request_fingerprint') == request_fingerprint:

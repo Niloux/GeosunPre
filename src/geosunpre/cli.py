@@ -1,4 +1,4 @@
-"""Public commands for reconstruction, COLMAP packaging, and independent checking."""
+"""Reconstruction, COLMAP packaging, checking, and post-SfM registration diagnostics."""
 
 import argparse
 import json
@@ -40,6 +40,38 @@ def main(argv=None):
     location = check.add_mutually_exclusive_group(required=True)
     location.add_argument('--output', help='COLMAP export directory')
     location.add_argument('--work', help='Check WORK/colmap')
+
+    align = sub.add_parser('align', help='Diagnose a global visual-to-LAS registration candidate')
+    align.add_argument('--colmap', required=True, help='Existing delivered visual COLMAP dataset')
+    align.add_argument('--las', required=True, help='Uncompressed LAS 1.2 file (point formats 0--3)')
+    align.add_argument('--output', required=True, help='Fresh alignment diagnostic directory')
+    initialization = align.add_mutually_exclusive_group(required=True)
+    initialization.add_argument('--input', help='Raw Geosun input with CameraPos and both navigation files')
+    initialization.add_argument('--initial-transform', help='JSON with a 4x4 visual-to-LAS matrix')
+    align.add_argument('--max-las-points', type=int, default=1_500_000, help='Maximum LAS sample count')
+    align.add_argument('--workers', type=int, default=4, help='CPU workers for spatial queries (default 4)')
+
+    inspect = sub.add_parser('inspect-alignment', help='Inspect structures and low support in a frozen alignment')
+    inspect.add_argument('--alignment', required=True, help='Completed alignment diagnostic directory')
+    inspect.add_argument('--output', required=True, help='Fresh structural inspection directory')
+    inspect.add_argument('--workers', type=int, default=4, help='CPU workers for spatial queries (default 4)')
+
+    refine = sub.add_parser('refine-alignment', help='Refine a reviewed candidate using coherent structures')
+    refine.add_argument('--alignment', required=True, help='Existing alignment candidate; frozen points/split are retained')
+    refine.add_argument('--output', required=True, help='Fresh refinement diagnostic directory')
+    refine.add_argument('--workers', type=int, default=4, help='CPU workers for spatial queries (default 4)')
+
+    joint = sub.add_parser('joint-alignment', help='Compare fixed-intrinsics image / pose / LAS joint BA candidates')
+    joint.add_argument('--alignment', required=True, help='Existing visual-to-LAS candidate with frozen points and split')
+    joint.add_argument('--input', required=True, help='Raw input with named CameraPos and navigation coordinate files')
+    joint.add_argument('--output', required=True, help='Fresh joint BA experiment directory')
+    joint.add_argument('--workers', type=int, default=4)
+    joint.add_argument('--outer-iterations', type=int, default=2)
+    joint.add_argument('--iterations', type=int, default=20, help='Ceres iterations per fixed-correspondence solve')
+    joint.add_argument('--pose-std', type=float, default=.5, help='Conservative position noise proxy in metres')
+    joint.add_argument('--las-std', type=float, default=.05, help='Conservative surface noise proxy in metres')
+    joint.add_argument('--pose-weight', type=float, default=.001, help='Position objective budget relative to image observations')
+    joint.add_argument('--las-weight', type=float, default=.005, help='LAS objective budget relative to image observations')
     args = parser.parse_args(argv)
     if args.command == 'run':
         from geosunpre.pipeline.runner import run_pipeline
@@ -56,6 +88,22 @@ def main(argv=None):
             args.model, scene, args.output, image_mode=args.image_mode,
             include_masks=args.include_masks, include_ply=args.include_ply,
             provenance={'scene_manifest_sha256': file_digest(args.scene)})
+    elif args.command == 'align':
+        from geosunpre.alignment.runner import run_alignment
+        result = run_alignment(args.colmap, args.las, args.output, input_root=args.input,
+                               initial_transform=args.initial_transform,
+                               max_las_points=args.max_las_points, workers=args.workers)
+    elif args.command == 'inspect-alignment':
+        from geosunpre.alignment.inspection import inspect_alignment
+        result = inspect_alignment(args.alignment, args.output, workers=args.workers)
+    elif args.command == 'refine-alignment':
+        from geosunpre.alignment.runner import refine_alignment
+        result = refine_alignment(args.alignment, args.output, workers=args.workers)
+    elif args.command == 'joint-alignment':
+        from geosunpre.alignment.joint import run_joint_alignment
+        result = run_joint_alignment(args.alignment, args.input, args.output, workers=args.workers,
+            outer_iterations=args.outer_iterations, iterations=args.iterations,
+            pose_std=args.pose_std, las_std=args.las_std, pose_weight=args.pose_weight, las_weight=args.las_weight)
     else:
         from geosunpre.colmap import verify_colmap_export
         result = verify_colmap_export(args.output or Path(args.work) / 'colmap')

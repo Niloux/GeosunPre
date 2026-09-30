@@ -1,7 +1,7 @@
 # 仓库管理
 
 一键入口为根目录的 `run.sh`，正式命令为 `run / export / check`，唯一正式篮球场配置为
-[`configs/basketball.toml`](../configs/basketball.toml)。新运行默认 production + local + flash。
+[`configs/basketball.toml`](../configs/basketball.toml)。新运行默认 production + local + joint + flash。
 完整使用说明从 [首页](../README.md) 进入，各专题见 [文档索引](README.md)。
 
 ## 目录职责
@@ -32,6 +32,7 @@
 | 观测来源 | 冻结全量观测身份 | 几何拟合前冻结留出协议 |
 | 留出划分、预测评估、共同查询与 bootstrap | 不执行 | 执行 |
 | 深度、单调性、覆盖与完整注册检查 | 执行 | 执行 |
+| LAS 配准、固定内参联合 BA 与回退验收 | 默认执行 | 默认执行 |
 | 导出与独立交付校验 | 执行 | 执行 |
 
 两种模式均沿用默认 FlashAttention、CUDA Graph、特征缓存、CPU 并行处理、
@@ -41,20 +42,22 @@
 
 ## 冻结配置与续跑
 
-| 冻结配置版本 | 匹配后端 | 标定模式 | 流程模式 |
-| --- | --- | --- | --- |
-| 1 | 未写字段时 math，显式值保留 | local | validation |
-| 2 | 使用已保存值 | local | validation |
-| 3 | 使用已保存值 | 使用已保存值 | validation |
-| 4 | 使用已保存值 | 使用已保存值 | 使用已保存值 |
+| 冻结配置版本 | 匹配后端 | 标定模式 | 流程模式 | 配准模式 |
+| --- | --- | --- | --- | --- |
+| 1 | 未写字段时 math，显式值保留 | local | validation | visual |
+| 2 | 使用已保存值 | local | validation | visual |
+| 3 | 使用已保存值 | 使用已保存值 | validation | visual |
+| 4 | 使用已保存值 | 使用已保存值 | 使用已保存值 | visual |
+| 5 | 使用已保存值 | 使用已保存值 | 使用已保存值 | 使用已保存值，必须保存全部 registration 设置 |
 
-新目录写入版本 4。保存相同配置不改写旧文件，避免改变已有下游身份。
+新目录写入版本 5，配准默认 joint。保存相同配置不改写旧文件，避免改变已有下游身份。
 旧目录续跑省略 `--config`；切换模式、输入或场景配置时使用新工作目录。
 Flash 与 math 的匹配缓存身份独立，生产与验证的观测协议互斥。
 
 `pipeline_task.json` 冻结数值源码、依赖、后端和交付选项。仅资源预检与任务身份管理
 模块的变更允许记录审计后继续；原任务文件保持不变。具体规则见
 [运行与恢复](engineering_structure.md#运行与恢复)。
+旧配置可以保持 visual 语义，但数值源码变化仍须新建任务；不将旧视觉产物直接重标为 joint 交付。
 
 ## 验证证据管理
 

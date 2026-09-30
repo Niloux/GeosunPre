@@ -38,6 +38,15 @@ def preflight(work, stages, delivery, *, model_cache=None):
         missing_matches = not data.get('pairs') or any(not Path(p['path']).is_file() for p in data.get('pairs', []))
     gpu_needed = missing_masks or missing_features or missing_matches
     result = {'gpu_needed': gpu_needed, 'device_profile': DEVICE_PROFILE, 'warnings': []}
+    config = load_config(work)
+    if config.registration_mode == 'joint' and any(s in stages for s in ('register', 'export')):
+        from geosunpre.alignment.joint_solver import native_costs
+        from geosunpre.pipeline.registration import freeze_inputs
+        native = native_costs()
+        inputs = freeze_inputs(work)
+        result['registration'] = {'las': inputs['las'], 'inputs_fingerprint': inputs['fingerprint'],
+                                  'native_implementation': native.implementation_version,
+                                  'target_frame': 'input_las_xyz'}
     if any(s in stages for s in ('calibration', 'sfm', 'finalize')):
         from geosunpre.sfm.depth_guard import depth_cost_class
         cost = depth_cost_class()

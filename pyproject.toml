@@ -37,7 +37,7 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 source-include = ["run.sh", "configs/**", "docs/**", "tests/**", "native/pyproject.toml",
-                  "native/setup.py", "native/MANIFEST.in", "native/*.cpp", "native/*.md", "native/vendor/**"]
+                  "native/setup.py", "native/MANIFEST.in", "native/*.cpp", "native/*.h", "native/*.md", "native/vendor/**"]
 
 [tool.uv.sources]
 geosunpre-native = { path = "native" }

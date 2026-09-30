@@ -166,8 +166,8 @@ def finalize(work):
                 'acceptance': acceptance})}
 
 
-def export_result(work, *, output=None, image_mode='copy',
-                  include_masks=False, include_ply=False):
+def _export_visual_result(work, *, output=None, image_mode='copy',
+                          include_masks=False, include_ply=False):
     """Validate the computed candidate and export a consumer-independent dataset."""
     work = Path(work).resolve()
     root = work / 'sfm'
@@ -229,6 +229,18 @@ def export_result(work, *, output=None, image_mode='copy',
                          provenance=provenance, quality_report=validation_path)
 
 
+def export_result(work, *, output=None, image_mode='copy', include_masks=False, include_ply=False):
+    """Deliver the frozen task's coordinate frame, requiring registration when enabled."""
+    if load_config(work).registration_mode == 'joint':
+        from geosunpre.pipeline.registration import ROOT, export_registered
+        if not (Path(work) / ROOT / 'final/result.json').is_file():
+            raise ValueError('Complete the register stage before exporting the joint pipeline')
+        return export_registered(work, output=output, image_mode=image_mode,
+                                 include_masks=include_masks, include_ply=include_ply)
+    return _export_visual_result(work, output=output, image_mode=image_mode,
+                                 include_masks=include_masks, include_ply=include_ply)
+
+
 def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None,
                  image_mode=None, include_masks=None, include_ply=None,
                  model_cache=None):
@@ -254,6 +266,8 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
             config = config or PipelineConfig()
             save_config(work, config)
         mode_stages = VALIDATION_STAGES if config.pipeline_mode == 'validation' else PRODUCTION_STAGES
+        if config.registration_mode == 'visual':
+            mode_stages = tuple(name for name in mode_stages if name != 'register')
         selected = mode_stages if stage == 'all' else (stage,)
         if any(name not in mode_stages for name in selected):
             raise ValueError(f'Stage {stage} is unavailable in {config.pipeline_mode} mode')
@@ -318,6 +332,9 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
                         optimize(work)
                     elif current == 'finalize':
                         summary['model'] = finalize(work)
+                    elif current == 'register':
+                        from geosunpre.pipeline.registration import register
+                        summary['registration'] = register(work)
                     elif current == 'export':
                         bind_task(work, **delivery, model_cache=model_cache)
                         summary['export'] = export_result(

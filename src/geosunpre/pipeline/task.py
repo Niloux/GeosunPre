@@ -28,9 +28,10 @@ def execution_identity():
             packages[name] = None
     sources = {p.relative_to(package).as_posix(): file_digest(p)
                for p in sorted(package.rglob('*.py'))}
-    native_source = package.parent.parent / 'native/depth_guard.cpp'
-    if native_source.is_file():
-        sources['native/depth_guard.cpp'] = file_digest(native_source)
+    for name in ('depth_guard.cpp', 'joint_costs.h'):
+        native_source = package.parent.parent / 'native' / name
+        if native_source.is_file():
+            sources['native/' + name] = file_digest(native_source)
     spec = find_spec('geosunpre_native')
     if spec and spec.origin and Path(spec.origin).is_file():
         sources['native_extension'] = file_digest(spec.origin)

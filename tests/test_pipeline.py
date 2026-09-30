@@ -256,14 +256,14 @@ def test_scene_config_selects_frames_and_rejects_incompatible_inputs(tmp_path):
         PipelineConfig.from_file(path)
 
 
-def test_cli_exposes_only_pipeline_commands(capsys):
+def test_cli_exposes_pipeline_and_alignment_commands(capsys):
     import pytest
     from geosunpre.cli import main
 
     with pytest.raises(SystemExit) as error:
         main(['--help'])
     assert error.value.code == 0
-    assert '{run,export,check}' in capsys.readouterr().out
+    assert '{run,export,check,align,inspect-alignment,refine-alignment,joint-alignment}' in capsys.readouterr().out
     with pytest.raises(SystemExit) as error:
         main(['build-baseline'])
     assert error.value.code == 2

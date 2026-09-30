@@ -2,9 +2,11 @@
 
 ## 当前默认
 
-新运行默认 `pipeline_mode = "production"`、`calibration_mode = "local"`。
+新运行默认 `pipeline_mode = "production"`、`calibration_mode = "local"`、`registration_mode = "joint"`。
 保留局部标定，以及全局固定内参 BA、三图支持轨迹筛选、共享内参 BA 和最终 BA。
-生产模式使用全部通过质量筛选的观测，不划分留出集，不按比例排除可用轨迹。
+生产模式使用全部通过质量筛选的图像观测，不划分图像留出集，不按比例排除可用轨迹。
+视觉建图之后，用输入位置初始化 LAS 全局配准，再固定内参执行图像主导的 pose / LAS 联合 BA。
+默认输出输入 LAS 的 XYZ 坐标；图像及几何验收不通过的联合候选回退到已验收的全局配准模型。
 
 | 行为 | production（默认） | validation |
 | --- | --- | --- |
@@ -12,14 +14,17 @@
 | 几何拟合前冻结来源 | 全量观测身份 | 统一留出协议 |
 | 留出轨迹 | 无 | 符合条件的原始轨迹中抽取 20% |
 | 每阶段留出预测评估 | 无 | 保留 |
-| 共同支持查询与 bootstrap | 无 | 保留 |
+| 图像留出的共同支持查询与 bootstrap | 无 | 保留 |
 | 掩码、两视图几何验证、轨迹筛选 | 保留 | 保留 |
 | 深度、鱼眼单调性与覆盖检查 | 保留 | 保留 |
+| LAS 配准及固定内参联合 BA | 默认保留 | 默认保留 |
 | 最终指标 | 拟合观测重投影残差与健康诊断 | 原始/高置信留出预测误差 |
 | COLMAP 导出及独立校验 | 保留 | 保留 |
 
 生产模式中的“全部”不意味着保留错配；掩码、匹配几何验证、旋转一致性和三图支持筛选仍然生效。
 拟合观测的残差不是测试集精度，不能与此前留出 median/P90 直接比较并宣称质量提高。
+LAS 空间留出仅隔离表面拟合，作描述性诊断，不参与交付选择。主流程的配准门槛使用拟合区域，
+检查支持覆盖、整体及局部点到面误差，以及联合更新相对全局配准的退化；见 [配准验收](las_alignment.md#默认主流程与交付选择)。
 
 ## 运行
 
@@ -34,18 +39,21 @@ uv run --no-sync geosunpre run \
 仅复用权重时可显式传入 `--model-cache /path/to/huggingface/cache`。
 要执行研发对照，在新的 TOML 中设置 `pipeline_mode = "validation"`，使用新工作目录。
 `calibration_mode` 是独立选项；正式默认 local，input 初始化仅用于显式消融。
+`registration_mode = "visual"` 可在新目录保留纯图像消融，跳过 `register`，其结果使用视觉坐标。
 
 生产阶段：
 
-`prepare → masks → features → matches → observations → calibration → sfm → finalize → export`
+`prepare → masks → features → matches → observations → calibration → sfm → finalize → register → export`
 
 验证模式将 `observations` 替换为 `holdout`。调用另一模式专属阶段会报错。
 
 ## 身份与续跑
 
-配置版本 4 必须保存 `pipeline_mode`。版本 1/2/3 的旧工作目录解释为 validation，
+配置版本 5 必须保存全部 `registration_*` 设置和 `pipeline_mode`。版本 1/2/3 的旧工作目录解释为 validation，
+版本 4 保留已保存的流程模式；版本 1–4 均解释为 visual，不自动加入 LAS 优化。
 旧配置和已有几何协议不改写，续跑时省略 `--config`。
 切换模式或修改配置须使用新工作目录，不能把旧留出模型重新标记为生产模型。
+旧配置兼容不放宽数值源码、依赖和原生模块的冻结身份；新代码不能直接续跑来源身份不一致的旧任务。
 
 生产模式在 `sfm/observation_protocol.json` 冻结前端缓存内容哈希、场景、配对和配置身份，
 声明为验证排除的观测数为 0；不生成 `split.json`、`triangle_validation_split.json` 或
@@ -56,23 +64,84 @@ uv run --no-sync geosunpre run \
 
 ## 交付与诊断
 
-生产最终模型仍位于 `sfm/final/sparse/0`；质量报告为 `sfm/final/quality_summary.json`，
+joint 模式的最终模型位于 `registration/final/sparse/0`；`sfm/final/sparse/0` 是视觉初始化中间模型。
+最终质量报告 `registration/final/quality_summary.json` 重新计算所选模型的图像诊断，
 复制到交付包 `quality.json`。包含注册数、点数、观测数、每图覆盖、拟合观测重投影残差、
 正深度及鱼眼单调性检查、内参及触界记录。最终生产模型还必须保持连通，
 每图至少 100 条观测并覆盖 8×8 网格中的至少 12 个网格，与既有轨迹筛选要求一致。
 
-验证模式继续使用 `sfm/final/validation_summary.json`。
+visual 模式继续使用 `sfm/final/` 的报告；joint + validation 重新计算所选 LAS 坐标模型的
+留出预测评估，保存在 `registration/final/validation_summary.json`。
 生产拟合残差门槛由 `quality_max_median_px`、`quality_max_p90_px` 配置，对整体及 L/R 分别检查；
 `quality_bounds_policy` 可选 `warn` 或 `reject`。篮球场新配方使用 2 / 4 px 和 reject，
 通用默认不设置残差上限、触界告警；所有生产结果均拒绝空或非有限残差。
 这些是交付操作门槛，不是独立几何精度。失败会阻止导出，不自动修改阈值。
 两种模式均输出 `colmap_export.json` 来源记录，生产来源明确记录 mode 和零留出排除。
+joint 交付记录 LAS 哈希、坐标目标、全局配准/联合结果的实际选择及输入和协议身份。
+最终目录仍唯一为 `WORK/colmap/`；相机与三维点都已在 LAS 坐标中，下游不要再次套用 Sim3。
 `check` 校验交付内容完整性，不重新计算几何精度。
 
-## 完整运行验证
+## 默认联合流程完整运行验证（2026-09-30）
 
-以下记录对应 2026-09-29 当次源码与冻结配置。当前任务契约、恢复、缓存复用与交付门槛改进
-尚未重跑完整冷启动，不能把该计时作为新版本的性能成绩。
+新目录为 `work/basketball_joint_pipeline_20260930_01`，只复用预训练权重，
+掩码、536 份特征、8,025 份匹配和全部几何重新计算。完整执行含全局配准、两分支联合 BA、
+图像及局部 LAS 回归门槛、原图复制、组合掩码、PLY 与交付回读校验，退出码 0。
+
+| 项目 | 最终结果 |
+| --- | ---: |
+| 注册图像 / 稀疏点 / 拟合观测 | 536 / 75,835 / 483,034 |
+| 最终采用分支 | global_registration |
+| 坐标框架 | 输入 LAS XYZ，相机与三维点均已变换 |
+| 无效深度 / 内参触界 | 0 / 无 |
+| 每图最少观测 / 最少占用 8×8 网格 | 243 / 19 |
+| 最终拟合 residual median / P90 | 1.07104 / 2.34762 px |
+| 配准 fit 区域稳定支持 | 17,984 / 34,535 点，52.07%，315 个瓦片 |
+| 获支持 fit 点到面 median / P90 | 7.94 / 57.25 mm |
+| 独立验包与完整投影核对 | 通过 |
+
+pose + LAS 分支通过全部图像及更新幅度检查；其 fit 支持点到面 median / P90 为
+7.26 / 55.08 mm，整体统计略有改善。但 4 个固定瓦片超出预先冻结的局部退化容限，
+其中最大 median 增加约 27.03 mm，最大 P90 增加约 23.20 mm，
+因此按策略回退到通过验收的全局配准模型。这次实跑验证了退化拦截，不能据整体指标
+宣称联合候选更适合交付。LAS 留出没有参与这项决策，内参始终固定，原始 LAS 未变动。
+
+流程统一 `perf_counter` 为 **27:45.13**，GNU time 为 **26:54.56**；二者本轮存在约 51 秒差异，
+原始 UTC 阶段时间及两份计时均保留，不推断差异原因，也不作为受控速度对照。
+两种计时均未达到 20 分钟目标。进程峰值 RSS 约 4.57 GiB；具体各阶段资源见摘要。
+
+| 阶段 | 统一流程时钟 / 秒 |
+| --- | ---: |
+| prepare | 10.13 |
+| masks | 149.47 |
+| features | 102.05 |
+| matches | 96.32 |
+| observations | 3.21 |
+| calibration | 46.71 |
+| sfm | 988.74 |
+| finalize | 15.37 |
+| register | 228.30 |
+| export | 24.82 |
+
+验证证据：
+
+- 137 项测试通过，覆盖原生解析导数与 Ceres 求解、图像/局部几何退化拦截、输入变更、旧配置和中断恢复。
+- 最终包独立验收通过。用独立鱼眼公式重新投影全部 483,034 条观测；两分支也全部重投影，
+  与保存误差的最大差异约 `3.03e-11 px`。
+- 相机与全部三维点独立核对 LAS 坐标；与选中配准模型及最终模型的五份二进制字节一致。
+  原始 LAS、三份导航、图像与组合掩码哈希核对通过。
+- 整条流程缓存续跑通过，536 份特征、8,025 份匹配全部命中；8,765 个模型、数值缓存与冻结文件不变。
+- 两分支离线报告的筛选、排序及本地链接通过 Node VM 检查；没有真实浏览器渲染或 3DGS 验收。
+- 可追溯摘要：[basketball_joint_pipeline_20260930.json](benchmarks/basketball_joint_pipeline_20260930.json)。
+
+工作目录位于当次工作树的 `work/`，摘要保留其绝对位置。正式交付为该目录的 `colmap/`，
+验收入口为 `registration/final/inspection.html`；完整日志与独立审计见
+`work/joint_pipeline_validation_20260930/`。这些证据证明当前场景的功能、回退和交付契约，
+不代表独立地理精度、任意场景适用性或高斯训练后几何保持。
+
+## 历史纯图像完整运行验证
+
+以下记录对应 2026-09-29 当次源码与冻结配置，尚未包含 LAS 配准与联合优化，
+不能把该计时作为新版本的性能成绩。
 
 本轮使用新目录 `work/basketball_production_20260929_01`，只复用预训练权重，
 掩码、特征、匹配及全部几何重新计算；包含原图复制、掩码导出及交付校验。

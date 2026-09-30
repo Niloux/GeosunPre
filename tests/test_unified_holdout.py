@@ -24,12 +24,14 @@ from geosunpre.artifacts import file_digest
 from geosunpre.artifacts import write_json
 
 
-def global_frontend(tmp_path, *, frames=(70, 72, 110, 112), calibration_mode='local', pipeline_mode='validation'):
+def global_frontend(tmp_path, *, frames=(70, 72, 110, 112), calibration_mode='local',
+                    pipeline_mode='validation', registration_mode='visual'):
     """Small real image/cache fixture; no LoMa, GPU or reconstruction is run."""
     work = tmp_path / 'run'
     root = work / 'sfm'
     root.mkdir(parents=True)
-    save_config(work, PipelineConfig(calibration_frames=(70, 94), calibration_mode=calibration_mode, pipeline_mode=pipeline_mode))
+    save_config(work, PipelineConfig(calibration_frames=(70, 94), calibration_mode=calibration_mode,
+                                     pipeline_mode=pipeline_mode, registration_mode=registration_mode))
     cameras = {lens: Camera(lens, 8, 8, (4., 4., 4., 4., 0., 0., 0., 0.), (0., 0.))
                for lens in ('L', 'R')}
     xyz = np.random.default_rng(4).uniform([-.8, -.8, 3.], [.8, .8, 5.], (20, 3))
@@ -250,7 +252,8 @@ def test_build_orders_holdout_before_any_calibration(tmp_path, monkeypatch):
         monkeypatch.setattr(global_reconstruction, name, record(name))
     monkeypatch.setattr(runner, 'finalize', record('equal'))
     monkeypatch.setattr(runner, 'export_result', record('export'))
-    runner.run_pipeline(tmp_path, input_root='unused', config=PipelineConfig(pipeline_mode='validation'))
+    runner.run_pipeline(tmp_path, input_root='unused',
+                        config=PipelineConfig(pipeline_mode='validation', registration_mode='visual'))
     assert events.index('match_features') < events.index('holdout')
     assert events.index('holdout') < events.index('calibration') < events.index('build_mapping')
 

@@ -4,7 +4,7 @@
 
 ```text
 src/geosunpre/
-  cli.py                  # run / export / check
+  cli.py                  # run / export / check；独立 align / inspect-alignment / refine-alignment / joint-alignment
   config.py               # 场景选择、匹配后端及冻结身份
   device.py               # 版本化 FOV、主点约定与设备遮挡配方
   artifacts.py            # 内容哈希、原子 JSON 写入、不可变协议
@@ -16,6 +16,19 @@ src/geosunpre/
   parallel.py             # 有界、有序的 CPU 并行任务
   profiling.py            # RSS / CUDA 采样、嵌套计时与空闲内存回收
   colmap.py               # COLMAP 原子发布和独立校验
+  alignment/              # LAS 配准、联合 BA 与独立诊断部件
+    runner.py             # 坐标假设、输入身份、空间留出、候选导出
+    geometry.py           # 鲁棒相似变换、表面细化与误差统计
+    structural.py         # 多尺度平面、视觉精度代理、方向权重与自由度覆盖保护
+    joint.py              # 固定内参的图像 / pose / LAS 对照、源身份、独立候选导出
+    joint_solver.py       # 全局 Sim3、原生 Ceres 残差、图像及几何接受条件、回退
+    joint_report.py       # 离线逐图像对照、LAS 分组统计和原生投影
+    publication.py        # 配准阶段的原子发布、完整内容身份与恢复校验
+    las.py                # LAS 1.2 分块采样与格式检查
+    report.py             # 离线点云查看器及原生投影对照
+    inspection.py         # 冻结变换、支持重现、独立结构诊断
+    diagnostics.py        # 支持拒绝原因、三角化角、重复扫描与观察侧代理
+    structure_report.py   # 分区点云定位、真实二维观测与局部原图
   pipeline/
     runner.py             # 阶段顺序、最终 BA、正式导出
     runtime.py            # 工作目录锁、阶段状态与耗时
@@ -25,6 +38,7 @@ src/geosunpre/
     observations.py       # 生产全量观测身份与模式分发
     holdout.py            # 验证模式冻结留出观测
     quality.py            # 生产质量诊断与报告
+    registration.py       # 输入冻结、LAS 验收、联合/全局回退选择及正式导出
     calibration.py        # 复用全局特征做局部标定
     reconstruction.py     # 全局建图、轨迹筛选、BA 与报告
   sfm/
@@ -77,10 +91,20 @@ WORK/
     stages/
     optimization_summary.json  # 生产模式
     comparison.json            # 验证模式
-    final/sparse/0/        # 最终原生鱼眼模型
+    final/sparse/0/        # 视觉原生鱼眼模型；joint 模式的初始化
     final/quality_summary.json     # 生产模式
     final/validation_summary.json  # 验证模式
     index.html
+  registration/            # joint 模式
+    inputs.json            # LAS/导航内容身份、显式坐标假设与验收设置
+    protocol.json          # 视觉源模型、联合配方和冻结门槛
+    visual_colmap/         # 内部视觉源交付，含组合掩码
+    global/                # 验收的全局配准及内容提交标记
+    joint/                 # 纯 BA 对照和 pose + LAS 分支，或约束不足记录
+    final/sparse/0/        # 最终选中的 LAS 坐标模型
+    final/result.json      # 实际选择、回退原因和上游身份
+    final/quality_summary.json
+    final/inspection.html
   colmap/                  # 可交付数据集
 ```
 
@@ -91,7 +115,7 @@ WORK/
 ## 运行与恢复
 
 1. `run` 获得 Linux `flock` 排他锁，再写入配置和阶段产物。另一个进程使用相同目录时立即失败。
-2. 新目录保存版本 4 配置，默认 production + local + flash；版本 1/2/3 继续按 validation 运行；续跑加载已保存配置。版本 1 未写匹配后端时解释为 math，显式 flash 不变；旧文件保持原字节。命令行传入不同配置、不同输入根目录，或未由新流程管理的非空目录，均拒绝混用。
+2. 新目录保存版本 5 配置，默认 production + local + joint + flash；版本 1/2/3 继续按 validation 运行，版本 4 保留其模式，所有旧版本保留 visual 配准模式。续跑加载已保存配置。版本 1 未写匹配后端时解释为 math，显式 flash 不变；旧文件保持原字节。旧配置兼容不绕过数值源码身份检查。命令行传入不同配置、不同输入根目录，或未由新流程管理的非空目录，均拒绝混用。
 3. JSON 先写同级临时文件再替换。任务记录全部源码、原生模块、依赖、后端和交付选项，启动及导出前复核。数值相关源码、依赖或后端变化均拒绝继续，并列出变化项；仅不参与拟合的 `pipeline/preflight.py` 和 `pipeline/task.py` 可兼容，原任务身份不改写，变化哈希单独记入 `pipeline_execution_audit.json`。旧任务补建身份时明确记录历史执行版本缺失；旧配置和几何协议保持原字节。特征和匹配的内容哈希继续贯穿标定、全局几何和最终导出。
 4. 状态文件只是执行记录。是否能复用结果由实际产物、完成身份和依赖检查决定。
 5. 全量重跑会检查并复用完整缓存或阶段；`--stage` 只运行指定阶段。状态标记为 `completed` 仅表示本次请求的阶段完成；`run_result.json` 的 `delivery_complete` 明确表示本次是否发布交付。每次调用有独立 `invocation_id`。
@@ -122,7 +146,7 @@ UTC 只用于显示日期，不用于计时。总耗时范围为阶段执行与�
 - 输入适配 Geosun 的 `.pro`、CameraPos 和 L/R 原图命名；设备遮挡规则针对当前设备。
 - SfM 无人工标注依赖，掩码预览只供检查，不阻塞流程。
 - 导出保持原生 `OPENCV_FISHEYE`；使用方需要支持该相机模型。
-- 视觉结果为任意尺度，不提供导航对齐、米制尺度、地面约束或 LAS 融合。
+- 视觉中间结果为任意尺度。默认 joint 模式另行完成 LAS 配准与固定内参联合 BA，正式交付位于输入 LAS 的 XYZ 框架。当前米制单位与 ENH 原点是显式假设，未经独立地理精度验收；原始 LAS 不改变。
 - 数值与阶段测试包含真实 PyCOLMAP 模型读写和小模型 BA；管线集成测试对大规模建图与 BA 使用替身。
 - 数值配方最近一次完整运行见 [生产报告](production_pipeline.md)：20 分 31.30 秒，未达到 20 分钟目标；本轮流程改进未重测完整冷启动，也未验证下游渲染质量。历史性能、资源与消融记录见 [验证摘要索引](benchmarks/README.md)。
 

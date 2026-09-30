@@ -20,12 +20,13 @@ def test_attention_is_frozen_in_pipeline_config(tmp_path):
 
 def test_legacy_math_configuration_keeps_its_frozen_bytes(tmp_path):
     settings = asdict(PipelineConfig(pipeline_mode='validation'))
+    settings = {k: v for k, v in settings.items() if not k.startswith('registration_')}
     del settings['matcher_attention']
     value = {'version': 1, 'settings': settings}
     path = tmp_path / 'pipeline_config.json'
     write_json(path, {**value, 'fingerprint': digest(value)})
     before = path.read_bytes()
-    save_config(tmp_path, PipelineConfig(matcher_attention='math', pipeline_mode='validation'))
+    save_config(tmp_path, PipelineConfig(matcher_attention='math', pipeline_mode='validation', registration_mode='visual'))
     assert path.read_bytes() == before
     assert load_config(tmp_path).matcher_attention == 'math'
     with pytest.raises(ValueError):
@@ -33,7 +34,8 @@ def test_legacy_math_configuration_keeps_its_frozen_bytes(tmp_path):
 
 
 def test_version_one_explicit_flash_is_preserved(tmp_path):
-    value = {'version': 1, 'settings': asdict(PipelineConfig(matcher_attention='flash', pipeline_mode='validation'))}
+    settings = asdict(PipelineConfig(matcher_attention='flash', pipeline_mode='validation'))
+    value = {'version': 1, 'settings': {k: v for k, v in settings.items() if not k.startswith('registration_')}}
     write_json(tmp_path / 'pipeline_config.json', {**value, 'fingerprint': digest(value)})
     assert load_config(tmp_path).matcher_attention == 'flash'
 

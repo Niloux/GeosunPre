@@ -1,0 +1,1729 @@
+{
+  "schema_version": 1,
+  "kind": "structural_similarity_refinement_exploration",
+  "date": "2026-09-30",
+  "status": "candidate_requires_review",
+  "absolute_accuracy_validated": false,
+  "validation_scope": "exploratory_reuses_previously_reviewed_data",
+  "sfm_rerun": false,
+  "joint_ba_run": false,
+  "training_run": false,
+  "output": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_refinement_20260930_04",
+  "reference_alignment": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03",
+  "source_inputs": {
+    "dataset": "/home/wuyou/GeosunPre/work/basketball_industrial_01/colmap",
+    "las": "/home/wuyou/GeosunPre/input/篮球场/ResultOut/篮球场.las",
+    "las_sha256": "401282acafff0102915347a60958d05a0800118dac04f310f6429fcafe6e29dc",
+    "visual_model_sha256": {
+      "cameras.bin": "c0eea7e1a9e0cdb0b99bb370f8934eeaf95e76e9ff861a2e2affbe7a0d2a7772",
+      "images.bin": "8601cece2f32a05623a1de645227c38238aa21541854f750297aeb30861142fd",
+      "points3D.bin": "8b59788101c43f0dfe33b02488dec73c3e34b8d5f6abc035b5cc60a95d0b6ab0",
+      "rigs.bin": "3e0480c890e6ccd659a062df110c3f3ca8839a1ae8d17d5a96eb87676f83035e",
+      "frames.bin": "ec02c5d10053348d405b0b9ba022fd4dd097922e1d7485ff735306e7cd1734a2"
+    },
+    "colmap_export_sha256": "3214bc5eb71ab4166d9c8bfa0949780f8f1136af6cc3cf5bb8fea8b19300ceca",
+    "initialization": {
+      "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03/report.json": "92a13d5330b64554455811c29c6feebdbaa855574857de320ce6062abca73953",
+      "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03/transform.json": "bbe8759e7788219ebc42ff7ebf76cc208b899955e19ebf4b9c2b29864737a5f8",
+      "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03/registration_points.npz": "47a22abbf6ee92137972650253e683ca208409a3104ae256839f120d604000a8"
+    }
+  },
+  "source_verification": {
+    "output": "/home/wuyou/GeosunPre/work/basketball_industrial_01/colmap",
+    "identity": "/home/wuyou/GeosunPre/work/basketball_industrial_01/colmap/colmap_export.json",
+    "model": "/home/wuyou/GeosunPre/work/basketball_industrial_01/colmap/sparse/0",
+    "images": 536,
+    "points": 75749,
+    "image_mode": "copy",
+    "include_masks": true,
+    "full_content_check": true
+  },
+  "implementation_sha256": {
+    "runner.py": "0e49541e21882bed8165e07f2d20e0faf28ddf8ff1027064356d8b44629d987e",
+    "geometry.py": "d7c53f046f39fb6e6a2212836e54b4f31b64d1ea60b0b3fa0dd93b2999681493",
+    "las.py": "517a0650a02f714f54fc7476d385bc76179a3105797e4c8f577c319e004453aa",
+    "report.py": "4b195304e6266719c1b81e5dd7f2fc15eba72a19a70f63c27238e930d72d83fe",
+    "structural.py": "998475b3aa9f5db4627291e2644d29a457339ea08a01c8765f3afacb80b82fff"
+  },
+  "versions": {
+    "numpy": "2.5.3",
+    "pycolmap": "4.2.0"
+  },
+  "candidate_sha256": {
+    "report.json": "d185e875508a36892061b8898285bd5634705a2004507f30afad96ff7a88f20b",
+    "transform.json": "be06a7ee408c049dc56a63d8cea303c984f6861560de17fbee4b538b585c6281",
+    "registration_points.npz": "d876b4767f937ed2506aacda91c49cb54e44c8f6e31e666715ca42664dec3459",
+    "structural_fit_points.npz": "38d1f66e7193b682ddeb7e788653fb4db386988b83c350ae8b3f30b45fa48e2d"
+  },
+  "visual_points": {
+    "total": 75749,
+    "quality_selected": 44201,
+    "quality_outside_initial_las_bounds": 1912,
+    "eligible": 42289,
+    "model_points_removed": 0
+  },
+  "split": {
+    "tile_size": 4.0,
+    "fraction_requested": 0.2,
+    "seed": 0,
+    "tiles": 1783,
+    "heldout_tiles": 357,
+    "fit_points": 34902,
+    "holdout_points": 7387,
+    "frozen_in_initial_frame": true,
+    "scope": "LAS surface refinement only; initialization uses all matching camera positions",
+    "partition_matrix": [
+      [
+        1.7612262153027907,
+        0.5428654527618814,
+        -3.0394774295166207,
+        -13.296066255875258
+      ],
+      [
+        3.017665990931123,
+        0.43775997469545846,
+        1.826773630624614,
+        7.068225788576898
+      ],
+      [
+        0.6533130272090177,
+        -3.4854995381674327,
+        -0.24396471820064572,
+        1.5816086705639743
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  },
+  "recipe": {
+    "max_las_points": 1500000,
+    "workers": 4,
+    "voxel_sizes": [
+      0.1
+    ],
+    "correspondence_distances": [
+      0.4,
+      0.25
+    ],
+    "maximum_iterations_per_scale": 15,
+    "surface_support_distance": 0.3,
+    "pixel_error_max": 2.0,
+    "track_length_min": 4,
+    "sparse_selection": "visual quality and initial LAS header bounding box; no residual gate",
+    "method": "structural",
+    "optimization": {
+      "method": "structural",
+      "evaluation_voxel_size": 0.1,
+      "plane_scales": [
+        0.1,
+        0.2
+      ],
+      "maximum_surface_noise": 0.025,
+      "maximum_scale_normal_angle_deg": 15.0,
+      "maximum_scale_plane_separation": 0.025,
+      "visual_neighbours": [
+        16,
+        32
+      ],
+      "maximum_visual_neighbourhood_radius": 1.5,
+      "maximum_visual_surface_noise": 0.05,
+      "maximum_visual_plane_ratio": 0.025,
+      "maximum_visual_normal_angle_deg": 25.0,
+      "maximum_point_precision_proxy_std": 0.3,
+      "pixel_noise_proxy_floor": 1.0,
+      "maximum_point_only_precision_proxy_std": 0.1,
+      "candidate_neighbours": 8,
+      "correspondence_distances": [
+        0.4,
+        0.25
+      ],
+      "parallel_face_ambiguity_distance_margin": 0.1,
+      "parallel_face_separation": 0.05,
+      "normal_precision_weight_floor": 0.02,
+      "surface_noise_weight_floor": 0.01,
+      "orientation_total_weights": {
+        "horizontal": 0.45,
+        "vertical": 0.45,
+        "inclined": 0.1
+      },
+      "minimum_vertical_matches_for_sim3": 100,
+      "minimum_vertical_tiles_for_sim3": 5,
+      "minimum_vertical_normal_spread_ratio": 0.2,
+      "minimum_horizontal_matches": 100,
+      "minimum_horizontal_tiles": 5,
+      "huber_cutoff": 0.025,
+      "iterations_per_distance": 15,
+      "maximum_total_rotation_deg": 1.0,
+      "maximum_total_scale_log_change": 0.005,
+      "maximum_total_pivot_displacement": 0.15,
+      "semantic_classes_used": false,
+      "pose_residuals_used": false
+    }
+  },
+  "optimization": {
+    "recipe": {
+      "method": "structural",
+      "evaluation_voxel_size": 0.1,
+      "plane_scales": [
+        0.1,
+        0.2
+      ],
+      "maximum_surface_noise": 0.025,
+      "maximum_scale_normal_angle_deg": 15.0,
+      "maximum_scale_plane_separation": 0.025,
+      "visual_neighbours": [
+        16,
+        32
+      ],
+      "maximum_visual_neighbourhood_radius": 1.5,
+      "maximum_visual_surface_noise": 0.05,
+      "maximum_visual_plane_ratio": 0.025,
+      "maximum_visual_normal_angle_deg": 25.0,
+      "maximum_point_precision_proxy_std": 0.3,
+      "pixel_noise_proxy_floor": 1.0,
+      "maximum_point_only_precision_proxy_std": 0.1,
+      "candidate_neighbours": 8,
+      "correspondence_distances": [
+        0.4,
+        0.25
+      ],
+      "parallel_face_ambiguity_distance_margin": 0.1,
+      "parallel_face_separation": 0.05,
+      "normal_precision_weight_floor": 0.02,
+      "surface_noise_weight_floor": 0.01,
+      "orientation_total_weights": {
+        "horizontal": 0.45,
+        "vertical": 0.45,
+        "inclined": 0.1
+      },
+      "minimum_vertical_matches_for_sim3": 100,
+      "minimum_vertical_tiles_for_sim3": 5,
+      "minimum_vertical_normal_spread_ratio": 0.2,
+      "minimum_horizontal_matches": 100,
+      "minimum_horizontal_tiles": 5,
+      "huber_cutoff": 0.025,
+      "iterations_per_distance": 15,
+      "maximum_total_rotation_deg": 1.0,
+      "maximum_total_scale_log_change": 0.005,
+      "maximum_total_pivot_displacement": 0.15,
+      "semantic_classes_used": false,
+      "pose_residuals_used": false
+    },
+    "iterations": [
+      {
+        "maximum_distance": 0.4,
+        "iteration": 0,
+        "status": "updated",
+        "matches": 14374,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3463129644342247,
+          1.212888453320499,
+          1.0171700001663073,
+          1.0017850608647945,
+          0.8401985466556137,
+          0.7660744116359619,
+          0.6207505797196982
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13914,
+            "weight": 0.42583772165683953
+          },
+          "vertical": {
+            "points": 455,
+            "weight": 0.08863892687482026
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009432238447424985
+          }
+        },
+        "weighted_cost_before": 0.00017460225060398607,
+        "weighted_cost_after": 0.00016303237006807896
+      },
+      {
+        "maximum_distance": 0.4,
+        "iteration": 1,
+        "status": "updated",
+        "matches": 14361,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.352605366993112,
+          1.2249675434069802,
+          1.0161457377043006,
+          0.999410163864772,
+          0.8357597883337653,
+          0.7655902489797841,
+          0.59490969882953
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13897,
+            "weight": 0.42744082634770864
+          },
+          "vertical": {
+            "points": 459,
+            "weight": 0.0860625298439959
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434588004478727
+          }
+        },
+        "weighted_cost_before": 0.00016395793694935285,
+        "weighted_cost_after": 0.00016210634413435455
+      },
+      {
+        "maximum_distance": 0.4,
+        "iteration": 2,
+        "status": "updated",
+        "matches": 14359,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.343116873608856,
+          1.240980765048745,
+          1.0170607963951546,
+          0.9987634854396891,
+          0.8329454032122297,
+          0.7632188729176946,
+          0.5897131069295314
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13901,
+            "weight": 0.42749352443959443
+          },
+          "vertical": {
+            "points": 453,
+            "weight": 0.08583999562976877
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434669894438743
+          }
+        },
+        "weighted_cost_before": 0.000160476769586216,
+        "weighted_cost_after": 0.00016011651169247718
+      },
+      {
+        "maximum_distance": 0.4,
+        "iteration": 3,
+        "status": "updated",
+        "matches": 14356,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3254933882878182,
+          1.2365323981682284,
+          1.0163098964322173,
+          0.996157020358964,
+          0.8441921263806207,
+          0.7697248616511893,
+          0.6194381181378185
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13896,
+            "weight": 0.42728477696229833
+          },
+          "vertical": {
+            "points": 455,
+            "weight": 0.08723455173828133
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.00943455993613104
+          }
+        },
+        "weighted_cost_before": 0.00015923908202814842,
+        "weighted_cost_after": 0.00015915525947317877
+      },
+      {
+        "maximum_distance": 0.4,
+        "iteration": 4,
+        "status": "updated",
+        "matches": 14351,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3244880099042031,
+          1.2366331925855176,
+          1.0159482654925696,
+          0.996008646973349,
+          0.8455300525130438,
+          0.770045289238206,
+          0.6199959180769267
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13892,
+            "weight": 0.4272535968295095
+          },
+          "vertical": {
+            "points": 454,
+            "weight": 0.0875406651583032
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434576503721483
+          }
+        },
+        "weighted_cost_before": 0.00015954595791804483,
+        "weighted_cost_after": 0.0001595265614919089
+      },
+      {
+        "maximum_distance": 0.4,
+        "iteration": 5,
+        "status": "updated",
+        "matches": 14353,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3242981365973334,
+          1.2366381394397763,
+          1.0156935503030087,
+          0.995840177677492,
+          0.8463521305823043,
+          0.770111704287536,
+          0.6198754260833628
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13894,
+            "weight": 0.42727448227970805
+          },
+          "vertical": {
+            "points": 454,
+            "weight": 0.08768023609425903
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434574811664407
+          }
+        },
+        "weighted_cost_before": 0.00015967804054984033,
+        "weighted_cost_after": 0.0001596748130463944
+      },
+      {
+        "maximum_distance": 0.4,
+        "iteration": 6,
+        "status": "updated",
+        "matches": 14353,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3233490657354254,
+          1.236529412754567,
+          1.0156396058161168,
+          0.9969515330517711,
+          0.8464383172805157,
+          0.7699690738221375,
+          0.620480373460948
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13894,
+            "weight": 0.42734215106942386
+          },
+          "vertical": {
+            "points": 454,
+            "weight": 0.08772888594838779
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434558967081544
+          }
+        },
+        "weighted_cost_before": 0.00015983248441292814,
+        "weighted_cost_after": 0.00015983143054429342
+      },
+      {
+        "maximum_distance": 0.4,
+        "iteration": 7,
+        "status": "updated",
+        "matches": 14355,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3232683919522386,
+          1.236860425654546,
+          1.0156707357806989,
+          0.9966985547031454,
+          0.8464470527773914,
+          0.7699439960332053,
+          0.6203673328424334
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13896,
+            "weight": 0.4274582543238914
+          },
+          "vertical": {
+            "points": 454,
+            "weight": 0.08771422077905522
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434537663792085
+          }
+        },
+        "weighted_cost_before": 0.00015959160588951813,
+        "weighted_cost_after": 0.00015959141718686727
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 0,
+        "status": "updated",
+        "matches": 14316,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3398789488461376,
+          1.2337664757591662,
+          1.0091091517548219,
+          1.0023239060311266,
+          0.8413071206936457,
+          0.7570308083352898,
+          0.6153835201533505
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13891,
+            "weight": 0.42721154550028617
+          },
+          "vertical": {
+            "points": 420,
+            "weight": 0.09357898467754291
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434530314305287
+          }
+        },
+        "weighted_cost_before": 0.00015483657498622106,
+        "weighted_cost_after": 0.00015472026058192085
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 1,
+        "status": "updated",
+        "matches": 14316,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3293082843281496,
+          1.2188504785818628,
+          1.0047662605183278,
+          0.9943815206757376,
+          0.8915562376493561,
+          0.7594713291147503,
+          0.6142669814511751
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13889,
+            "weight": 0.4270235238693747
+          },
+          "vertical": {
+            "points": 422,
+            "weight": 0.09458506269290146
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434725802094346
+          }
+        },
+        "weighted_cost_before": 0.00015549754603680355,
+        "weighted_cost_after": 0.00015522103637853293
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 2,
+        "status": "updated",
+        "matches": 14323,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.334196618890512,
+          1.2386320562058208,
+          1.009340448425665,
+          1.001627374524286,
+          0.8439553117419087,
+          0.7564778497292144,
+          0.6157638897398976
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13895,
+            "weight": 0.42716954750313596
+          },
+          "vertical": {
+            "points": 423,
+            "weight": 0.09371831104825101
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434347567739495
+          }
+        },
+        "weighted_cost_before": 0.00015527944383672963,
+        "weighted_cost_after": 0.00015514167050182916
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 3,
+        "status": "updated",
+        "matches": 14319,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.32860111645027,
+          1.2190876310356848,
+          1.0047239461297575,
+          0.994259792582316,
+          0.8927028318348736,
+          0.7593216667259495,
+          0.6141123175975561
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13891,
+            "weight": 0.4270867909804652
+          },
+          "vertical": {
+            "points": 423,
+            "weight": 0.09450324496281015
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.00943471287678378
+          }
+        },
+        "weighted_cost_before": 0.00015540143060227958,
+        "weighted_cost_after": 0.00015517350984910528
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 4,
+        "status": "updated",
+        "matches": 14325,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.334102437888769,
+          1.2389984846248387,
+          1.009503831594126,
+          1.0014705774092483,
+          0.8436656633104364,
+          0.7564898205534896,
+          0.6156001436377931
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13897,
+            "weight": 0.42711524319249256
+          },
+          "vertical": {
+            "points": 423,
+            "weight": 0.09364767925282363
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.00943432850786868
+          }
+        },
+        "weighted_cost_before": 0.0001552656796513768,
+        "weighted_cost_after": 0.00015510628287192246
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 5,
+        "status": "updated",
+        "matches": 14318,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3285019369539957,
+          1.2190508197512446,
+          1.0047095862752344,
+          0.9942897281440688,
+          0.8929429919712905,
+          0.7593034834307003,
+          0.614048303691579
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13890,
+            "weight": 0.42708977114830815
+          },
+          "vertical": {
+            "points": 423,
+            "weight": 0.09450322368688516
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434711671348711
+          }
+        },
+        "weighted_cost_before": 0.00015540332254388356,
+        "weighted_cost_after": 0.0001551825643637316
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 6,
+        "status": "updated",
+        "matches": 14324,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3341148629629305,
+          1.2390167762938367,
+          1.0095542462508442,
+          1.001466379460468,
+          0.8435939760917105,
+          0.7564625568731529,
+          0.6155922991085682
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13896,
+            "weight": 0.4271123811970192
+          },
+          "vertical": {
+            "points": 423,
+            "weight": 0.09364764586495646
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434326320744252
+          }
+        },
+        "weighted_cost_before": 0.00015526346517687577,
+        "weighted_cost_after": 0.00015510142894938013
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 7,
+        "status": "updated",
+        "matches": 14317,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3285068818658203,
+          1.2188802095024438,
+          1.0046503990134068,
+          0.9942351138565426,
+          0.8935353318135068,
+          0.7592541518029572,
+          0.6137608309644738
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13890,
+            "weight": 0.42709479155633223
+          },
+          "vertical": {
+            "points": 422,
+            "weight": 0.09456037808505396
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434710984562713
+          }
+        },
+        "weighted_cost_before": 0.00015544157512702956,
+        "weighted_cost_after": 0.00015522172625224179
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 8,
+        "status": "updated",
+        "matches": 14324,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.334114822360813,
+          1.2390211386073768,
+          1.0095550766530064,
+          1.0014668309352075,
+          0.8435914444410971,
+          0.7564602860137463,
+          0.615587770453392
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13896,
+            "weight": 0.42711238086357267
+          },
+          "vertical": {
+            "points": 423,
+            "weight": 0.09364763709714558
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434325805934616
+          }
+        },
+        "weighted_cost_before": 0.00015526408111907563,
+        "weighted_cost_after": 0.00015510150089637453
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 9,
+        "status": "updated",
+        "matches": 14317,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3285049623460479,
+          1.2188798452049572,
+          1.0046504817276063,
+          0.9942336752867402,
+          0.8935421605619169,
+          0.7592535983974873,
+          0.613758647258174
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13890,
+            "weight": 0.42709479140683715
+          },
+          "vertical": {
+            "points": 422,
+            "weight": 0.09456037363010811
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434710740176514
+          }
+        },
+        "weighted_cost_before": 0.00015544128141146111,
+        "weighted_cost_after": 0.00015522165356256484
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 10,
+        "status": "updated",
+        "matches": 14324,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3341148390131057,
+          1.2390218327997427,
+          1.0095552458080261,
+          1.0014668933592143,
+          0.8435911417424297,
+          0.7564598848404569,
+          0.6155868659567127
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13896,
+            "weight": 0.4271123807805427
+          },
+          "vertical": {
+            "points": 423,
+            "weight": 0.09364763467858611
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434325675513578
+          }
+        },
+        "weighted_cost_before": 0.00015526419156212698,
+        "weighted_cost_after": 0.00015510151801508871
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 11,
+        "status": "updated",
+        "matches": 14317,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3285046786821788,
+          1.2188797880209896,
+          1.0046504955871076,
+          0.9942334177163781,
+          0.8935433386380899,
+          0.7592534639056205,
+          0.6137582206446361
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13890,
+            "weight": 0.4270947913681381
+          },
+          "vertical": {
+            "points": 422,
+            "weight": 0.09456037248597664
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434710687367346
+          }
+        },
+        "weighted_cost_before": 0.0001554412320110251,
+        "weighted_cost_after": 0.00015522164104652677
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 12,
+        "status": "updated",
+        "matches": 14324,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3341148696165672,
+          1.2390219284958368,
+          1.0095552643828867,
+          1.0014668940236982,
+          0.8435911271472447,
+          0.7564598096343674,
+          0.6155866878938592
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13896,
+            "weight": 0.42711238076076774
+          },
+          "vertical": {
+            "points": 423,
+            "weight": 0.09364763410503929
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434325649047929
+          }
+        },
+        "weighted_cost_before": 0.00015526420878658398,
+        "weighted_cost_after": 0.000155101519992635
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 13,
+        "status": "updated",
+        "matches": 14317,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3285046356652652,
+          1.2188797779782317,
+          1.0046504981053357,
+          0.9942333694358934,
+          0.8935435470878617,
+          0.7592534368031104,
+          0.6137581378432361
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13890,
+            "weight": 0.4270947913592998
+          },
+          "vertical": {
+            "points": 422,
+            "weight": 0.0945603722287744
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434710676549073
+          }
+        },
+        "weighted_cost_before": 0.00015544122344425825,
+        "weighted_cost_after": 0.00015522163882890512
+      },
+      {
+        "maximum_distance": 0.25,
+        "iteration": 14,
+        "status": "updated",
+        "matches": 14324,
+        "ambiguous_parallel_faces": 0,
+        "rank": 7,
+        "singular_values": [
+          1.3341148776957548,
+          1.2390219429492015,
+          1.0095552658717166,
+          1.0014668934736772,
+          0.8435911307925632,
+          0.7564597950106147,
+          0.6155866527213845
+        ],
+        "orientation_groups": {
+          "horizontal": {
+            "points": 13896,
+            "weight": 0.42711238075642
+          },
+          "vertical": {
+            "points": 423,
+            "weight": 0.09364763397947422
+          },
+          "inclined": {
+            "points": 5,
+            "weight": 0.009434325643718055
+          }
+        },
+        "weighted_cost_before": 0.0001552642117251641,
+        "weighted_cost_after": 0.0001551015203167177
+      }
+    ],
+    "mode": "sim3",
+    "initial_coverage": {
+      "vertical_points": 455,
+      "vertical_tiles": 92,
+      "vertical_normal_spread_ratio": 0.8743134911270802,
+      "horizontal_points": 13914,
+      "horizontal_tiles": 93
+    },
+    "estimated_dofs": 7,
+    "all_seven_similarity_dofs_reestimated": true,
+    "minimum_rank": 7,
+    "full_rank_at_all_solved_iterations": true,
+    "pose_residuals_used_for_refinement": false,
+    "holdout_used_for_optimization": false,
+    "fit_points": 34902,
+    "precision_reliable_fit_points": 28413,
+    "visual_planar_fit_points": 11942,
+    "precise_point_only_fit_points": 11513,
+    "coherent_las_patches": 125116,
+    "final_fit_matches": 14317,
+    "fit_point_precision_proxy_std": {
+      "count": 34902,
+      "median": 0.021289999491690366,
+      "p90": 0.6612694211228408,
+      "max": 57.1821561084739
+    },
+    "precision_scope": "fixed visual cameras and intrinsics; relative weighting only; not full BA covariance"
+  },
+  "holdout_errors": {
+    "initial": {
+      "points": 7387,
+      "nearest_distance": {
+        "count": 7387,
+        "median": 0.06311035153964277,
+        "p90": 0.6548865931434413,
+        "max": 39.07307203684505
+      },
+      "surface_support_count": 3556,
+      "surface_support_fraction": 0.48138621903343715,
+      "support_distance": 0.3,
+      "point_to_plane_on_supported": {
+        "count": 3556,
+        "median": 0.005998240293885608,
+        "p90": 0.05075117578554185,
+        "max": 0.3389984992207987
+      },
+      "fraction_all_points_supported_within_5cm": 0.43278732909164747,
+      "fraction_all_points_supported_within_10cm": 0.452281034249357
+    },
+    "refined": {
+      "points": 7387,
+      "nearest_distance": {
+        "count": 7387,
+        "median": 0.06448110460327211,
+        "p90": 0.6535069629284661,
+        "max": 39.02377687479043
+      },
+      "surface_support_count": 3555,
+      "surface_support_fraction": 0.48125084608095303,
+      "support_distance": 0.3,
+      "point_to_plane_on_supported": {
+        "count": 3555,
+        "median": 0.006225587186618636,
+        "p90": 0.05095283072551644,
+        "max": 0.357883736310553
+      },
+      "fraction_all_points_supported_within_5cm": 0.4325165831866793,
+      "fraction_all_points_supported_within_10cm": 0.4518749153919047
+    }
+  },
+  "holdout_common_surface_support": {
+    "points": 3499,
+    "initial_absolute_plane_error": {
+      "count": 3499,
+      "median": 0.005899444683235141,
+      "p90": 0.044138612902959944,
+      "max": 0.31593083112337705
+    },
+    "refined_absolute_plane_error": {
+      "count": 3499,
+      "median": 0.006091388250886328,
+      "p90": 0.04319056710257711,
+      "max": 0.3306893555790555
+    },
+    "median_change_spatial_bootstrap": {
+      "tiles": 75,
+      "replicates": 500,
+      "seed": 0,
+      "estimate": 0.00019194356765118645,
+      "ci95": [
+        -0.0012844486278289307,
+        0.0026112984972154083
+      ],
+      "sign": "negative means refinement reduces the supported point-to-plane median"
+    }
+  },
+  "reference_comparison": {
+    "evaluation_scope": "exploratory_reuses_previously_reviewed_data",
+    "reference": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03",
+    "orientation_groups_frozen_from_reference_correspondence": true,
+    "groups": {
+      "horizontal": {
+        "points": 3060,
+        "initial_absolute_plane_error": {
+          "count": 3060,
+          "median": 0.004938140290550905,
+          "p90": 0.01597865197435126,
+          "max": 0.31593083112337705
+        },
+        "refined_absolute_plane_error": {
+          "count": 3060,
+          "median": 0.004951344204058443,
+          "p90": 0.01661704381471786,
+          "max": 0.30866246212097626
+        },
+        "median_change_spatial_bootstrap": {
+          "tiles": 23,
+          "replicates": 500,
+          "seed": 0,
+          "estimate": 1.320391350753767e-05,
+          "ci95": [
+            -0.001238071224470829,
+            0.002371541960786996
+          ],
+          "sign": "negative means refinement reduces the supported point-to-plane median"
+        }
+      },
+      "vertical": {
+        "points": 387,
+        "initial_absolute_plane_error": {
+          "count": 387,
+          "median": 0.07680575752394272,
+          "p90": 0.21765690783594976,
+          "max": 0.2984690239638801
+        },
+        "refined_absolute_plane_error": {
+          "count": 387,
+          "median": 0.07160447160878003,
+          "p90": 0.22853753637661656,
+          "max": 0.3306893555790555
+        },
+        "median_change_spatial_bootstrap": {
+          "tiles": 56,
+          "replicates": 500,
+          "seed": 0,
+          "estimate": -0.0052012859151626956,
+          "ci95": [
+            -0.013363996858782767,
+            0.005312502904370191
+          ],
+          "sign": "negative means refinement reduces the supported point-to-plane median"
+        }
+      },
+      "inclined": {
+        "points": 52,
+        "initial_absolute_plane_error": {
+          "count": 52,
+          "median": 0.06746268078588658,
+          "p90": 0.20292000423934017,
+          "max": 0.30440311257462077
+        },
+        "refined_absolute_plane_error": {
+          "count": 52,
+          "median": 0.07350191956940982,
+          "p90": 0.21570175578913475,
+          "max": 0.31123826344528926
+        },
+        "median_change_spatial_bootstrap": {
+          "tiles": 21,
+          "replicates": 500,
+          "seed": 0,
+          "estimate": 0.006039238783523249,
+          "ci95": [
+            -0.011849459183404904,
+            0.017178450980476375
+          ],
+          "sign": "negative means refinement reduces the supported point-to-plane median"
+        }
+      }
+    }
+  },
+  "reprojection_invariance": {
+    "sampled_observations": 10720,
+    "maximum_pixel_difference": 2.036359449680949e-11,
+    "intrinsics_and_all_observation_tracks_unchanged": true
+  },
+  "source_model_unchanged": true,
+  "decision": {
+    "reference_retained": true,
+    "automatic_candidate_selection": false,
+    "overall_improvement_demonstrated": false,
+    "note": "Vertical common-support median decreased about 5.2 mm, P90 increased about 10.9 mm; overall median-change interval includes zero. Previously reviewed holdout is exploratory."
+  },
+  "validation": {
+    "pytest": {
+      "passed": 114,
+      "elapsed_seconds": 5.0
+    },
+    "independent_export_check": {
+      "output": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_refinement_20260930_04/aligned_colmap",
+      "identity": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_refinement_20260930_04/aligned_colmap/colmap_export.json",
+      "model": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_refinement_20260930_04/aligned_colmap/sparse/0",
+      "images": 536,
+      "points": 75749,
+      "image_mode": "link",
+      "include_masks": false,
+      "full_content_check": true
+    },
+    "inspection_replay": {
+      "output": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_refinement_structure_20260930_01",
+      "report_sha256": "04227d947eccfc24b1729920183009d4e2c247615b5e4ca2549a06a9d0ef3e87",
+      "points": 42289,
+      "holdout_points": 7387,
+      "las_sample_reproduced": true,
+      "support_and_residuals_reproduced": true
+    },
+    "html_vm_data_drawing_and_interactions_checked": true,
+    "browser_rendering_checked": false,
+    "projection_overlay_pair_visually_inspected": "overlays/camera_1_0089.jpg",
+    "implementation_hashes_rechecked": true
+  },
+  "earlier_exploratory_candidates": [
+    {
+      "output": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_refinement_20260930_01",
+      "interpretation": "Strict visual-plane gating without coverage protection; vertical constraints nearly absent; exploratory update worsened vertical errors.",
+      "report_sha256": "a169006a8441c93261290c028bd509f3b8442569025b03157906a80ec63a9255",
+      "implementation_sha256": {
+        "runner.py": "e1621a958827aa92053dc3fcd542df715b6dc7a0cbc102e6664bb2666405b421",
+        "geometry.py": "d7c53f046f39fb6e6a2212836e54b4f31b64d1ea60b0b3fa0dd93b2999681493",
+        "las.py": "517a0650a02f714f54fc7476d385bc76179a3105797e4c8f577c319e004453aa",
+        "report.py": "d9bb1ee595231990d1e6c4731b691bbd841753590694ad4f59de90e8ceace4cc",
+        "structural.py": "4b760c234c1259e98a29eb03e5954cadc1a1b4068a79b988750af51685fb7a28"
+      },
+      "mode": "sim3_before_coverage_guard",
+      "initial_coverage": null,
+      "holdout_errors": {
+        "initial": {
+          "points": 7387,
+          "nearest_distance": {
+            "count": 7387,
+            "median": 0.06311035153964277,
+            "p90": 0.6548865931434413,
+            "max": 39.07307203684505
+          },
+          "surface_support_count": 3556,
+          "surface_support_fraction": 0.48138621903343715,
+          "support_distance": 0.3,
+          "point_to_plane_on_supported": {
+            "count": 3556,
+            "median": 0.005998240293885608,
+            "p90": 0.05075117578554185,
+            "max": 0.3389984992207987
+          },
+          "fraction_all_points_supported_within_5cm": 0.43278732909164747,
+          "fraction_all_points_supported_within_10cm": 0.452281034249357
+        },
+        "refined": {
+          "points": 7387,
+          "nearest_distance": {
+            "count": 7387,
+            "median": 0.06865768496588409,
+            "p90": 0.6677460867460758,
+            "max": 39.48313066564676
+          },
+          "surface_support_count": 3495,
+          "surface_support_fraction": 0.4731284689319074,
+          "support_distance": 0.3,
+          "point_to_plane_on_supported": {
+            "count": 3495,
+            "median": 0.006519308141983517,
+            "p90": 0.07224597314646099,
+            "max": 0.34190184682858316
+          },
+          "fraction_all_points_supported_within_5cm": 0.4169486936510085,
+          "fraction_all_points_supported_within_10cm": 0.4340056856640043
+        }
+      },
+      "holdout_common_surface_support": {
+        "points": 3373,
+        "initial_absolute_plane_error": {
+          "count": 3373,
+          "median": 0.005597400386753236,
+          "p90": 0.030459457045291797,
+          "max": 0.31593083112337705
+        },
+        "refined_absolute_plane_error": {
+          "count": 3373,
+          "median": 0.006201386081122316,
+          "p90": 0.04506910791553829,
+          "max": 0.3368252438004058
+        },
+        "median_change_spatial_bootstrap": {
+          "tiles": 68,
+          "replicates": 500,
+          "seed": 0,
+          "estimate": 0.0006039856943690801,
+          "ci95": [
+            -0.0003590518621610705,
+            0.002302282598040289
+          ],
+          "sign": "negative means refinement reduces the supported point-to-plane median"
+        }
+      },
+      "reference_comparison": {
+        "evaluation_scope": "exploratory_reuses_previously_reviewed_data",
+        "reference": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03",
+        "orientation_groups_frozen_from_reference_correspondence": true,
+        "groups": {
+          "horizontal": {
+            "points": 3038,
+            "initial_absolute_plane_error": {
+              "count": 3038,
+              "median": 0.004896879093507771,
+              "p90": 0.015840714026501536,
+              "max": 0.31593083112337705
+            },
+            "refined_absolute_plane_error": {
+              "count": 3038,
+              "median": 0.005417476437709956,
+              "p90": 0.01701810298251683,
+              "max": 0.3153732501562472
+            },
+            "median_change_spatial_bootstrap": {
+              "tiles": 23,
+              "replicates": 500,
+              "seed": 0,
+              "estimate": 0.0005205973442021852,
+              "ci95": [
+                -0.0005333577476846254,
+                0.0019333868442551949
+              ],
+              "sign": "negative means refinement reduces the supported point-to-plane median"
+            }
+          },
+          "vertical": {
+            "points": 290,
+            "initial_absolute_plane_error": {
+              "count": 290,
+              "median": 0.058531720357115194,
+              "p90": 0.17049755649513693,
+              "max": 0.2984690239638801
+            },
+            "refined_absolute_plane_error": {
+              "count": 290,
+              "median": 0.12687742935592444,
+              "p90": 0.22952832350809407,
+              "max": 0.3368252438004058
+            },
+            "median_change_spatial_bootstrap": {
+              "tiles": 50,
+              "replicates": 500,
+              "seed": 0,
+              "estimate": 0.06834570899880925,
+              "ci95": [
+                0.05094917381990796,
+                0.0848337629647647
+              ],
+              "sign": "negative means refinement reduces the supported point-to-plane median"
+            }
+          },
+          "inclined": {
+            "points": 45,
+            "initial_absolute_plane_error": {
+              "count": 45,
+              "median": 0.06053581441873918,
+              "p90": 0.18550004151194546,
+              "max": 0.2902832814353167
+            },
+            "refined_absolute_plane_error": {
+              "count": 45,
+              "median": 0.06405361772124384,
+              "p90": 0.2177706626259284,
+              "max": 0.2620198229163112
+            },
+            "median_change_spatial_bootstrap": {
+              "tiles": 18,
+              "replicates": 500,
+              "seed": 0,
+              "estimate": 0.003517803302504653,
+              "ci95": [
+                -0.035471095646453774,
+                0.045491130202596035
+              ],
+              "sign": "negative means refinement reduces the supported point-to-plane median"
+            }
+          }
+        }
+      },
+      "automatically_promoted": false
+    },
+    {
+      "output": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_refinement_20260930_02",
+      "interpretation": "Strict visual-plane gating with coverage protection; only ground tilt and height released; no clear overall benefit.",
+      "report_sha256": "832af1d2e81050abbf1aa35d20049cdddf6ca8e7453050f8d2e1c7f58c84f961",
+      "implementation_sha256": {
+        "runner.py": "af504e13b7186ce02d558655ab83d3cafda55a4f8466f863aeb14ea211d66ddd",
+        "geometry.py": "d7c53f046f39fb6e6a2212836e54b4f31b64d1ea60b0b3fa0dd93b2999681493",
+        "las.py": "517a0650a02f714f54fc7476d385bc76179a3105797e4c8f577c319e004453aa",
+        "report.py": "d9bb1ee595231990d1e6c4731b691bbd841753590694ad4f59de90e8ceace4cc",
+        "structural.py": "1df8276c3876a327b0e05763b9895d85ad5a9b1c115f54d86f761fca5991161a"
+      },
+      "mode": "ground_tilt_z_only",
+      "initial_coverage": {
+        "vertical_points": 7,
+        "vertical_tiles": 1,
+        "vertical_normal_spread_ratio": 0.08221397565019166,
+        "horizontal_points": 11719,
+        "horizontal_tiles": 71
+      },
+      "holdout_errors": {
+        "initial": {
+          "points": 7387,
+          "nearest_distance": {
+            "count": 7387,
+            "median": 0.06311035153964277,
+            "p90": 0.6548865931434413,
+            "max": 39.07307203684505
+          },
+          "surface_support_count": 3556,
+          "surface_support_fraction": 0.48138621903343715,
+          "support_distance": 0.3,
+          "point_to_plane_on_supported": {
+            "count": 3556,
+            "median": 0.005998240293885608,
+            "p90": 0.05075117578554185,
+            "max": 0.3389984992207987
+          },
+          "fraction_all_points_supported_within_5cm": 0.43278732909164747,
+          "fraction_all_points_supported_within_10cm": 0.452281034249357
+        },
+        "refined": {
+          "points": 7387,
+          "nearest_distance": {
+            "count": 7387,
+            "median": 0.06302760863932919,
+            "p90": 0.6533174233814966,
+            "max": 39.06731076578407
+          },
+          "surface_support_count": 3560,
+          "surface_support_fraction": 0.4819277108433735,
+          "support_distance": 0.3,
+          "point_to_plane_on_supported": {
+            "count": 3560,
+            "median": 0.007069083448846658,
+            "p90": 0.05015269276761336,
+            "max": 0.337944835713575
+          },
+          "fraction_all_points_supported_within_5cm": 0.433464193854068,
+          "fraction_all_points_supported_within_10cm": 0.452281034249357
+        }
+      },
+      "holdout_common_surface_support": {
+        "points": 3553,
+        "initial_absolute_plane_error": {
+          "count": 3553,
+          "median": 0.005997252101565472,
+          "p90": 0.050495604205810125,
+          "max": 0.3389984992207987
+        },
+        "refined_absolute_plane_error": {
+          "count": 3553,
+          "median": 0.0070591067715269325,
+          "p90": 0.04969881097578142,
+          "max": 0.337944835713575
+        },
+        "median_change_spatial_bootstrap": {
+          "tiles": 75,
+          "replicates": 500,
+          "seed": 0,
+          "estimate": 0.0010618546699614605,
+          "ci95": [
+            -0.001000072556847831,
+            0.002445903158382609
+          ],
+          "sign": "negative means refinement reduces the supported point-to-plane median"
+        }
+      },
+      "reference_comparison": {
+        "evaluation_scope": "exploratory_reuses_previously_reviewed_data",
+        "reference": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03",
+        "orientation_groups_frozen_from_reference_correspondence": true,
+        "groups": {
+          "horizontal": {
+            "points": 3073,
+            "initial_absolute_plane_error": {
+              "count": 3073,
+              "median": 0.004956136189283333,
+              "p90": 0.016128272720850573,
+              "max": 0.31593083112337705
+            },
+            "refined_absolute_plane_error": {
+              "count": 3073,
+              "median": 0.005808097628145449,
+              "p90": 0.016329887764111047,
+              "max": 0.3203203932823123
+            },
+            "median_change_spatial_bootstrap": {
+              "tiles": 23,
+              "replicates": 500,
+              "seed": 0,
+              "estimate": 0.000851961438862116,
+              "ci95": [
+                -0.0007957109572779464,
+                0.0024316485411268484
+              ],
+              "sign": "negative means refinement reduces the supported point-to-plane median"
+            }
+          },
+          "vertical": {
+            "points": 421,
+            "initial_absolute_plane_error": {
+              "count": 421,
+              "median": 0.07823423008757524,
+              "p90": 0.22633806141811622,
+              "max": 0.3389984992207987
+            },
+            "refined_absolute_plane_error": {
+              "count": 421,
+              "median": 0.07543598298691927,
+              "p90": 0.2279060776755146,
+              "max": 0.337944835713575
+            },
+            "median_change_spatial_bootstrap": {
+              "tiles": 57,
+              "replicates": 500,
+              "seed": 0,
+              "estimate": -0.0027982471006559734,
+              "ci95": [
+                -0.004420335446775767,
+                0.002263978115274807
+              ],
+              "sign": "negative means refinement reduces the supported point-to-plane median"
+            }
+          },
+          "inclined": {
+            "points": 59,
+            "initial_absolute_plane_error": {
+              "count": 59,
+              "median": 0.0678086157009055,
+              "p90": 0.20632406936850867,
+              "max": 0.30440311257462077
+            },
+            "refined_absolute_plane_error": {
+              "count": 59,
+              "median": 0.06792253078849703,
+              "p90": 0.20946541469949645,
+              "max": 0.30661346058051187
+            },
+            "median_change_spatial_bootstrap": {
+              "tiles": 22,
+              "replicates": 500,
+              "seed": 0,
+              "estimate": 0.00011391508759152347,
+              "ci95": [
+                -0.004730061507221078,
+                0.005806492233044663
+              ],
+              "sign": "negative means refinement reduces the supported point-to-plane median"
+            }
+          }
+        }
+      },
+      "automatically_promoted": false
+    },
+    {
+      "output": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_refinement_20260930_03",
+      "interpretation": "Precise visual points lacking normals allowed; same geometry as final run, before HTML comparison-table and diagnostic-wording updates.",
+      "report_sha256": "58329a3c4484869d3580584c3f1e358d1d65348aea8b3bcbb9e1bd643e9cd51f",
+      "implementation_sha256": {
+        "runner.py": "af504e13b7186ce02d558655ab83d3cafda55a4f8466f863aeb14ea211d66ddd",
+        "geometry.py": "d7c53f046f39fb6e6a2212836e54b4f31b64d1ea60b0b3fa0dd93b2999681493",
+        "las.py": "517a0650a02f714f54fc7476d385bc76179a3105797e4c8f577c319e004453aa",
+        "report.py": "d9bb1ee595231990d1e6c4731b691bbd841753590694ad4f59de90e8ceace4cc",
+        "structural.py": "998475b3aa9f5db4627291e2644d29a457339ea08a01c8765f3afacb80b82fff"
+      },
+      "mode": "sim3",
+      "initial_coverage": {
+        "vertical_points": 455,
+        "vertical_tiles": 92,
+        "vertical_normal_spread_ratio": 0.8743134911270802,
+        "horizontal_points": 13914,
+        "horizontal_tiles": 93
+      },
+      "holdout_errors": {
+        "initial": {
+          "points": 7387,
+          "nearest_distance": {
+            "count": 7387,
+            "median": 0.06311035153964277,
+            "p90": 0.6548865931434413,
+            "max": 39.07307203684505
+          },
+          "surface_support_count": 3556,
+          "surface_support_fraction": 0.48138621903343715,
+          "support_distance": 0.3,
+          "point_to_plane_on_supported": {
+            "count": 3556,
+            "median": 0.005998240293885608,
+            "p90": 0.05075117578554185,
+            "max": 0.3389984992207987
+          },
+          "fraction_all_points_supported_within_5cm": 0.43278732909164747,
+          "fraction_all_points_supported_within_10cm": 0.452281034249357
+        },
+        "refined": {
+          "points": 7387,
+          "nearest_distance": {
+            "count": 7387,
+            "median": 0.06448110460327211,
+            "p90": 0.6535069629284661,
+            "max": 39.02377687479043
+          },
+          "surface_support_count": 3555,
+          "surface_support_fraction": 0.48125084608095303,
+          "support_distance": 0.3,
+          "point_to_plane_on_supported": {
+            "count": 3555,
+            "median": 0.006225587186618636,
+            "p90": 0.05095283072551644,
+            "max": 0.357883736310553
+          },
+          "fraction_all_points_supported_within_5cm": 0.4325165831866793,
+          "fraction_all_points_supported_within_10cm": 0.4518749153919047
+        }
+      },
+      "holdout_common_surface_support": {
+        "points": 3499,
+        "initial_absolute_plane_error": {
+          "count": 3499,
+          "median": 0.005899444683235141,
+          "p90": 0.044138612902959944,
+          "max": 0.31593083112337705
+        },
+        "refined_absolute_plane_error": {
+          "count": 3499,
+          "median": 0.006091388250886328,
+          "p90": 0.04319056710257711,
+          "max": 0.3306893555790555
+        },
+        "median_change_spatial_bootstrap": {
+          "tiles": 75,
+          "replicates": 500,
+          "seed": 0,
+          "estimate": 0.00019194356765118645,
+          "ci95": [
+            -0.0012844486278289307,
+            0.0026112984972154083
+          ],
+          "sign": "negative means refinement reduces the supported point-to-plane median"
+        }
+      },
+      "reference_comparison": {
+        "evaluation_scope": "exploratory_reuses_previously_reviewed_data",
+        "reference": "/home/wuyou/.codex/worktrees/7985/GeosunPre/work/basketball_las_alignment_20260930_03",
+        "orientation_groups_frozen_from_reference_correspondence": true,
+        "groups": {
+          "horizontal": {
+            "points": 3060,
+            "initial_absolute_plane_error": {
+              "count": 3060,
+              "median": 0.004938140290550905,
+              "p90": 0.01597865197435126,
+              "max": 0.31593083112337705
+            },
+            "refined_absolute_plane_error": {
+              "count": 3060,
+              "median": 0.004951344204058443,
+              "p90": 0.01661704381471786,
+              "max": 0.30866246212097626
+            },
+            "median_change_spatial_bootstrap": {
+              "tiles": 23,
+              "replicates": 500,
+              "seed": 0,
+              "estimate": 1.320391350753767e-05,
+              "ci95": [
+                -0.001238071224470829,
+                0.002371541960786996
+              ],
+              "sign": "negative means refinement reduces the supported point-to-plane median"
+            }
+          },
+          "vertical": {
+            "points": 387,
+            "initial_absolute_plane_error": {
+              "count": 387,
+              "median": 0.07680575752394272,
+              "p90": 0.21765690783594976,
+              "max": 0.2984690239638801
+            },
+            "refined_absolute_plane_error": {
+              "count": 387,
+              "median": 0.07160447160878003,
+              "p90": 0.22853753637661656,
+              "max": 0.3306893555790555
+            },
+            "median_change_spatial_bootstrap": {
+              "tiles": 56,
+              "replicates": 500,
+              "seed": 0,
+              "estimate": -0.0052012859151626956,
+              "ci95": [
+                -0.013363996858782767,
+                0.005312502904370191
+              ],
+              "sign": "negative means refinement reduces the supported point-to-plane median"
+            }
+          },
+          "inclined": {
+            "points": 52,
+            "initial_absolute_plane_error": {
+              "count": 52,
+              "median": 0.06746268078588658,
+              "p90": 0.20292000423934017,
+              "max": 0.30440311257462077
+            },
+            "refined_absolute_plane_error": {
+              "count": 52,
+              "median": 0.07350191956940982,
+              "p90": 0.21570175578913475,
+              "max": 0.31123826344528926
+            },
+            "median_change_spatial_bootstrap": {
+              "tiles": 21,
+              "replicates": 500,
+              "seed": 0,
+              "estimate": 0.006039238783523249,
+              "ci95": [
+                -0.011849459183404904,
+                0.017178450980476375
+              ],
+              "sign": "negative means refinement reduces the supported point-to-plane median"
+            }
+          }
+        }
+      },
+      "automatically_promoted": false
+    }
+  ],
+  "next_design": "Image-led joint BA with robust input-position priors and trusted fixed LAS surfaces; fix intrinsics first, bounded shared calibration later, independent image acceptance gates.",
+  "limitations": [
+    "坐标单位按米假设；导航到 LAS 的坐标关系仍为待验证候选。",
+    "空间留出只隔离表面细化；pose 初值使用全部对应相机位置。",
+    "点到面指标仅覆盖稳定表面支持点；覆盖之外的点没有被证明配准成功。",
+    "LAS 与视觉几何的一致性不代表绝对精度，也不能单独定位哪套数据存在局部误差。",
+    "仅优化一个全局相似变换；未修正扫描轨迹、局部形变或内参。",
+    "导出的 COLMAP 是诊断候选；图像使用链接，依赖原始视觉交付目录。",
+    "本轮重用已检查的旧留出区域；优化器仍只收到 fit 点，但这些对照不能作为独立精度验收。",
+    "视觉点精度代理假定相机与内参固定，仅用于相对筛选和权重，不是完整 BA 协方差或真实深度精度。",
+    "筛选使用几何一致性，未识别语义类别，也不能保证平行薄板来自同一侧面。",
+    "留出共同支持点的 median 改变量区间包含零；未检出明确细化收益。"
+  ]
+}

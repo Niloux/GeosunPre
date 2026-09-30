@@ -14,6 +14,7 @@ from test_unified_holdout import global_frontend
 @pytest.mark.parametrize('version', [1, 2])
 def test_legacy_config_remains_local_and_byte_identical(tmp_path, version):
     settings = asdict(PipelineConfig(matcher_attention='math', pipeline_mode='validation'))
+    settings = {k: v for k, v in settings.items() if not k.startswith('registration_')}
     del settings['calibration_mode']
     value = {'version': version, 'settings': settings}
     write_json(tmp_path / CONFIG_FILE, {**value, 'fingerprint': digest(value)})

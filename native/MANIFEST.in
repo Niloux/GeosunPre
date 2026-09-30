@@ -1,2 +1,3 @@
 recursive-include vendor *.h *.cc *.md
 include vendor/LICENSE.ceres
+include joint_costs.h

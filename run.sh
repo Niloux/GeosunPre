@@ -21,7 +21,7 @@ if [[ ! -x "$repo_dir/.venv/bin/python" ]]; then
 fi
 
 forwarded=("$@")
-work_dir="$repo_dir/work/basketball_industrial_01"
+work_dir="$repo_dir/work/basketball_joint_pipeline_01"
 while (($#)); do
     case "$1" in
         --work)

@@ -17,6 +17,7 @@ from test_unified_holdout import global_frontend, complete_calibration
 @pytest.mark.parametrize('version', [1, 2, 3])
 def test_legacy_runs_remain_validation_without_rewriting(tmp_path, version):
     settings = asdict(PipelineConfig())
+    settings = {k: v for k, v in settings.items() if not k.startswith('registration_')}
     del settings['pipeline_mode']
     if version < 3:
         del settings['calibration_mode']
@@ -182,6 +183,8 @@ def test_default_pipeline_orders_observations_and_skips_mapping_evaluation(tmp_p
         raise AssertionError('Production must not evaluate mapping holdouts')
     monkeypatch.setattr(reconstruction, 'evaluate_mapping', forbidden)
     monkeypatch.setattr(runner, 'finalize', record('finalize'))
+    from geosunpre.pipeline import registration
+    monkeypatch.setattr(registration, 'register', record('register'))
     monkeypatch.setattr(runner, 'export_result', record('export'))
     runner.run_pipeline(tmp_path, input_root='unused')
     assert events == list(PRODUCTION_STAGES)
