@@ -3,6 +3,8 @@
 import hashlib
 import json
 import os
+from tempfile import TemporaryDirectory
+from uuid import uuid4
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -72,3 +74,31 @@ def write_frozen_json(path, value):
             raise ValueError(f'Frozen inputs changed; use a fresh work directory: {path}')
     else:
         write_json(path, value)
+
+
+def archive_interrupted(path):
+    """Preserve an uncommitted, pipeline-owned artifact before rebuilding it."""
+    path = Path(path)
+    if path.exists():
+        archive = path.with_name(f'{path.name}.interrupted-{uuid4().hex[:12]}')
+        path.rename(archive)
+        for suffix in ('-wal', '-shm', '-journal'):
+            companion = path.with_name(path.name + suffix)
+            if companion.exists():
+                companion.rename(archive.with_name(archive.name + suffix))
+        return archive
+
+
+@contextmanager
+def staged_directory(destination):
+    """Publish a complete stage; callers must only replace uncommitted outputs."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(prefix=f'.{destination.name}-', dir=destination.parent) as temporary:
+        stage = Path(temporary)
+        yield stage
+        if destination.is_dir() and not any(destination.iterdir()):
+            destination.rmdir()
+        else:
+            archive_interrupted(destination)
+        stage.rename(destination)

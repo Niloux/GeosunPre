@@ -3,6 +3,7 @@
 from collections import Counter
 from dataclasses import asdict, dataclass, fields
 import json
+import math
 from pathlib import Path
 import tomllib
 
@@ -21,8 +22,17 @@ class PipelineConfig:
     matcher_attention: str = 'flash'
     calibration_mode: str = 'local'
     pipeline_mode: str = 'production'
+    quality_max_median_px: float | None = None
+    quality_max_p90_px: float | None = None
+    quality_bounds_policy: str = 'warn'
 
     def __post_init__(self):
+        if self.quality_bounds_policy not in ('warn', 'reject'):
+            raise ValueError('quality_bounds_policy must be warn or reject')
+        for key in ('quality_max_median_px', 'quality_max_p90_px'):
+            value = getattr(self, key)
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
+                raise ValueError(f'{key} must be a finite positive number')
         if self.pipeline_mode not in ('production', 'validation'):
             raise ValueError('pipeline_mode must be production or validation')
         if self.calibration_mode not in ('local', 'input'):
@@ -67,8 +77,13 @@ class PipelineConfig:
             frames = sorted({row['frame_index'] for row in scene['images']})
             if len(frames) < 2:
                 raise ValueError('Calibration requires at least two distinct frame indices')
-            selected = set(frames[:self.calibration_frame_count])
-            images = [row for row in scene['images'] if row['frame_index'] in selected]
+            images = []
+            for start in range(len(frames) - 1):
+                selected = set(frames[start:start + self.calibration_frame_count])
+                candidate = [row for row in scene['images'] if row['frame_index'] in selected]
+                if {row['camera'] for row in candidate} == {'L', 'R'}:
+                    images = candidate
+                    break
         else:
             low, high = self.calibration_frames
             images = [row for row in scene['images'] if low <= row['frame_index'] <= high]

@@ -102,20 +102,24 @@ class LoMaFrontend:
         return tensor(detector_size), tensor((784, 784))
 
     def extract_all(self, records):
-        """At most two prepared images; propagate worker failures to the caller."""
-        self.load_model()
+        """Prepare only cache misses, with at most two images in flight."""
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix='image-prepare') as pool:
             pending = OrderedDict()
             iterator = iter(enumerate(records))
             for index, record in iterator:
-                pending[index] = (record, pool.submit(self.prepare_image, record))
+                _, _, _, path = self._feature_input(record)
+                prepared = None
+                if not path.is_file():
+                    self.load_model()
+                    prepared = pool.submit(self.prepare_image, record)
+                pending[index] = (record, prepared)
                 if len(pending) == 2:
                     _, (first, prepared) = pending.popitem(last=False)
-                    yield self.extract(first, prepared=prepared.result())
+                    yield self.extract(first, prepared=prepared.result() if prepared else None)
             for record, prepared in pending.values():
-                yield self.extract(record, prepared=prepared.result())
+                yield self.extract(record, prepared=prepared.result() if prepared else None)
 
-    def extract(self, record, *, prepared=None):
+    def _feature_input(self, record):
         cam = Camera.from_dict(self.scene['cameras'][record['camera']])
         stat = Path(record['source']).stat()
         if stat.st_size != record['size_bytes'] or stat.st_mtime_ns != record['mtime_ns']:
@@ -126,10 +130,17 @@ class LoMaFrontend:
                     'camera': cam.to_dict(), 'fov': self.scene['fov_degrees'], 'config': asdict(self.config)}
         token = digest(identity)
         path = self.cache/f'{token}.npz'
+        return cam, identity, token, path
+
+    def extract(self, record, *, prepared=None):
+        cam, identity, token, path = self._feature_input(record)
         if path.exists():
             self.cache_stats['feature_hits'] += 1
             with np.load(path, allow_pickle=False) as f:
-                return {k: f[k] for k in f.files}
+                cached = {k: f[k] for k in f.files}
+            if str(cached['token']) != token:
+                raise ValueError(f'Cached feature identity changed: {record["name"]}')
+            return cached
         self.cache_stats['feature_misses'] += 1
         import torch
         model = self.load_model()

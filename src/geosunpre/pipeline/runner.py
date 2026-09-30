@@ -13,7 +13,7 @@ from geosunpre.artifacts import digest
 from geosunpre.artifacts import digest_cache
 from geosunpre.artifacts import file_digest
 from geosunpre.scene import load_scene
-from geosunpre.artifacts import write_json
+from geosunpre.artifacts import write_json, staged_directory
 from geosunpre.colmap import MODEL_FILES
 from geosunpre.colmap import export_colmap
 from geosunpre.pipeline.holdout import ISOLATION_SCOPE
@@ -22,6 +22,8 @@ from geosunpre.pipeline.observations import (is_validation, partitions, protocol
                                            geometry_partition_identity)
 from geosunpre.config import CONFIG_FILE, PipelineConfig, load_config, save_config
 from geosunpre.pipeline.runtime import StageRecorder, work_lock
+from geosunpre.pipeline.task import TASK_FILE, bind_task
+from geosunpre.pipeline.preflight import preflight
 
 
 BA_ITERATIONS = 40
@@ -97,9 +99,6 @@ def finalize(work):
     if protocol_path.exists():
         if json.loads(protocol_path.read_text())['fingerprint'] != protocol['fingerprint']:
             raise ValueError('Final BA inputs changed; use a fresh work directory')
-    else:
-        write_json(protocol_path, protocol)
-
     model_path = output / 'sparse/0'
     result_path = output / 'result.json'
     if result_path.exists():
@@ -109,13 +108,11 @@ def finalize(work):
             raise ValueError('Saved final BA model changed')
         candidate = pycolmap.Reconstruction(model_path)
     else:
-        if any((model_path / name).exists() for name in MODEL_FILES):
-            raise RuntimeError(f'Interrupted final BA output; inspect {model_path}')
         candidate = pycolmap.Reconstruction(source_path)
         before = (candidate.num_reg_images(), candidate.num_points3D(),
                   candidate.compute_num_observations())
         ba = bounded_bundle_adjustment(candidate, 'principal', initial_cameras,
-                                       protect_depth=True, show_progress=True,
+                                       protect_depth=True, show_progress=False,
                                        max_iterations=BA_ITERATIONS)
         assert_holdout_isolated(candidate, split)
         after = (candidate.num_reg_images(), candidate.num_points3D(),
@@ -123,14 +120,18 @@ def finalize(work):
         if before != after:
             raise RuntimeError('Final BA changed reconstruction topology')
         _check_model(candidate, scene)
-        model_path.mkdir(parents=True, exist_ok=True)
-        candidate.write(model_path)
-        result = {'protocol_fingerprint': protocol['fingerprint'],
-                  'model_sha256': _model_hashes(model_path), 'ba': ba,
-                  'registered': after[0], 'points': after[1],
-                  'observations': after[2],
-                  'manual_annotations_used': False}
-        write_json(result_path, result)
+        with staged_directory(output) as staged:
+            staged_model = staged / 'sparse/0'
+            staged_model.mkdir(parents=True)
+            candidate.write(staged_model)
+            _check_model(pycolmap.Reconstruction(staged_model), scene)
+            result = {'protocol_fingerprint': protocol['fingerprint'],
+                      'model_sha256': _model_hashes(staged_model), 'ba': ba,
+                      'registered': after[0], 'points': after[1],
+                      'observations': after[2],
+                      'manual_annotations_used': False}
+            write_json(staged / 'protocol.json', protocol)
+            write_json(staged / 'result.json', result)
     _check_model(candidate, scene)
     assert_holdout_isolated(candidate, split)
     validation_path = output / ('validation_summary.json' if validation_mode else 'quality_summary.json')
@@ -148,16 +149,21 @@ def finalize(work):
                       'manual_annotations_used': False}
         write_json(validation_path, validation)
     else:
-        from geosunpre.pipeline.quality import production_quality
+        from geosunpre.pipeline.quality import production_quality, production_acceptance
         validation = {'model_sha256': result['model_sha256'],
                       **production_quality(candidate), 'manual_annotations_used': False}
         validation['camera_parameter_bounds'] = result['ba'].get('cameras', {})
+        validation['acceptance'] = production_acceptance(validation, load_config(work))
         write_json(validation_path, validation)
+    if not validation_mode:
+        from geosunpre.pipeline.quality import production_acceptance
+        acceptance = production_acceptance(validation, load_config(work))
     return {'model': str(model_path), 'registered': candidate.num_reg_images(),
             'points': candidate.num_points3D(),
             'protocol_fingerprint': protocol['fingerprint'],
             **({'triangle_holdout': validation['triangle']['all_candidate_queries']} if validation_mode else
-               {'training_reprojection': validation['training_reprojection'], 'pipeline_mode': 'production'})}
+               {'training_reprojection': validation['training_reprojection'], 'pipeline_mode': 'production',
+                'acceptance': acceptance})}
 
 
 def export_result(work, *, output=None, image_mode='copy',
@@ -189,6 +195,9 @@ def export_result(work, *, output=None, image_mode='copy',
     rec = pycolmap.Reconstruction(model_path)
     _check_model(rec, scene)
     assert_holdout_isolated(rec, partitions(work)[0])
+    if not validation_mode:
+        from geosunpre.pipeline.quality import production_acceptance
+        production_acceptance(validation, load_config(work))
     output = Path(output).resolve() if output else work / DEFAULT_OUTPUT
     if output == work or output.is_relative_to(root):
         raise ValueError('Choose a separate COLMAP export directory')
@@ -211,13 +220,17 @@ def export_result(work, *, output=None, image_mode='copy',
         provenance['calibration_mode'] = 'input'
     if not validation_mode:
         provenance['final_ba_quality_sha256'] = provenance.pop('final_ba_validation_sha256')
+    export_identity = output / 'colmap_export.json'
+    if (work / TASK_FILE).is_file() and (not export_identity.is_file() or
+            'pipeline_task_sha256' in json.loads(export_identity.read_text()).get('provenance', {})):
+        provenance['pipeline_task_sha256'] = file_digest(work / TASK_FILE)
     return export_colmap(model_path, scene, output, image_mode=image_mode,
                          include_masks=include_masks, include_ply=include_ply,
                          provenance=provenance, quality_report=validation_path)
 
 
 def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None,
-                 image_mode='copy', include_masks=False, include_ply=False,
+                 image_mode=None, include_masks=None, include_ply=None,
                  model_cache=None):
     """Run all stages, or resume one stage using the work directory's frozen config."""
     if stage not in (*STAGES, 'all'):
@@ -227,6 +240,7 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
     if config is not None and not isinstance(config, PipelineConfig):
         config = PipelineConfig.from_file(config)
     with work_lock(work), digest_cache():
+        legacy = (work / CONFIG_FILE).exists()
         if (work / CONFIG_FILE).exists():
             saved = load_config(work)
             if config is not None:
@@ -251,52 +265,67 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
             if Path(input_root).resolve() != Path(load_scene(work)['input_root']).resolve():
                 raise ValueError('Input directory changed; use a fresh work directory')
 
-        recorder = StageRecorder(work, selected)
-        summary = {'work': str(work), 'stages': [],
-                   'config_sha256': file_digest(work / CONFIG_FILE)}
-        for current in selected:
-            with recorder.stage(current):
-                if current == 'prepare':
-                    from geosunpre.scene import prepare
-                    scene = prepare(input_root, work)
-                    calibration = config.calibration_images(scene)
-                    summary['input'] = {'images': len(scene['images']),
-                                        'calibration_images': len(calibration)}
-                elif current == 'masks':
-                    from geosunpre.pipeline.data import prepare_masks
-                    prepare_masks(work, model_cache=model_cache)
-                elif current == 'features':
-                    from geosunpre.pipeline.data import extract_features
-                    extract_features(work)
-                elif current == 'matches':
-                    from geosunpre.pipeline.data import match_features
-                    match_features(work)
-                elif current == 'holdout':
-                    from geosunpre.pipeline.holdout import freeze_holdout
-                    protocol = freeze_holdout(work)
-                    summary['holdout'] = {key: protocol[key]
-                                          for key in ('fingerprint', 'isolation_scope')}
-                elif current == 'observations':
-                    from geosunpre.pipeline.observations import freeze_observations
-                    protocol = freeze_observations(work)
-                    summary['observations'] = {key: protocol[key] for key in
-                                               ('fingerprint', 'scope', 'excluded_for_validation')}
-                elif current == 'calibration':
-                    from geosunpre.pipeline.calibration import calibrate
-                    calibrate(work)
-                elif current == 'sfm':
-                    from geosunpre.pipeline.reconstruction import build_mapping, evaluate_mapping, optimize
-                    build_mapping(work)
-                    if config.pipeline_mode == 'validation':
-                        evaluate_mapping(work)
-                    optimize(work)
-                elif current == 'finalize':
-                    summary['model'] = finalize(work)
-                elif current == 'export':
-                    summary['export'] = export_result(
-                        work, output=output, image_mode=image_mode,
-                        include_masks=include_masks, include_ply=include_ply)
-                summary['stages'].append(current)
-        write_json(work / 'run_result.json', summary)
-        recorder.complete()
-        return summary
+        task, delivery, model_cache = bind_task(
+            work, output=output, image_mode=image_mode, include_masks=include_masks,
+            include_ply=include_ply, model_cache=model_cache, legacy=legacy)
+        with StageRecorder(work, selected) as recorder:
+            summary = {'work': str(work), 'stages': [],
+                       'config_sha256': file_digest(work / CONFIG_FILE),
+                       'task_fingerprint': task['fingerprint'],
+                       'delivery_complete': False, 'invocation_id': recorder.value['invocation_id']}
+            if task['legacy_source_identity']:
+                summary['warnings'] = ['Legacy artifacts have no frozen execution identity; original provenance is retained']
+            if selected != ('prepare',) and 'prepare' not in selected:
+                with recorder.stage('preflight'):
+                    summary['preflight'] = preflight(work, selected, delivery, model_cache=model_cache)
+            for current in selected:
+                with recorder.stage(current):
+                    if current == 'prepare':
+                        from geosunpre.scene import prepare
+                        scene = prepare(input_root, work)
+                        calibration = config.calibration_images(scene)
+                        summary['input'] = {'images': len(scene['images']),
+                                            'calibration_images': len(calibration)}
+                        if len(selected) > 1:
+                            summary['preflight'] = preflight(work, selected, delivery, model_cache=model_cache)
+                    elif current == 'masks':
+                        from geosunpre.pipeline.data import prepare_masks
+                        prepare_masks(work, model_cache=model_cache)
+                    elif current == 'features':
+                        from geosunpre.pipeline.data import extract_features
+                        extract_features(work)
+                    elif current == 'matches':
+                        from geosunpre.pipeline.data import match_features
+                        match_features(work)
+                    elif current == 'holdout':
+                        from geosunpre.pipeline.holdout import freeze_holdout
+                        protocol = freeze_holdout(work)
+                        summary['holdout'] = {key: protocol[key]
+                                              for key in ('fingerprint', 'isolation_scope')}
+                    elif current == 'observations':
+                        from geosunpre.pipeline.observations import freeze_observations
+                        protocol = freeze_observations(work)
+                        summary['observations'] = {key: protocol[key] for key in
+                                                   ('fingerprint', 'scope', 'excluded_for_validation')}
+                    elif current == 'calibration':
+                        from geosunpre.pipeline.calibration import calibrate
+                        calibrate(work)
+                    elif current == 'sfm':
+                        from geosunpre.pipeline.reconstruction import build_mapping, evaluate_mapping, optimize
+                        build_mapping(work)
+                        if config.pipeline_mode == 'validation':
+                            evaluate_mapping(work)
+                        optimize(work)
+                    elif current == 'finalize':
+                        summary['model'] = finalize(work)
+                    elif current == 'export':
+                        bind_task(work, **delivery, model_cache=model_cache)
+                        summary['export'] = export_result(
+                            work, **delivery)
+                        summary['delivery_complete'] = True
+                    summary['stages'].append(current)
+            timing = recorder.timing()
+            summary.update(status='completed', timing=timing)
+            write_json(work / 'run_result.json', summary)
+            recorder.complete(timing)
+            return summary

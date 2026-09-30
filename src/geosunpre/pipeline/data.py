@@ -74,10 +74,15 @@ def prepare_masks(work, *, model_cache=None):
     scene.pop('fingerprint'); scene['fingerprint'] = digest(scene)
     write_frozen_json(out / 'manifest.json', scene)
     frames = [r['frame_index'] for r in images]
-    mask_review(scene, out, segments={'all': (min(frames), max(frames))})
+    review_complete = ((out / 'mask_review.html').is_file() and (out / 'masks_v2/summary.json').is_file()
+                       and all((out / 'mask_review' / f'{r["camera"]}{r["frame_index"]:05d}.jpg').is_file()
+                               for r in images))
+    if not review_complete:
+        mask_review(scene, out, segments={'all': (min(frames), max(frames))})
     available = sorted(set(frames))
     selected = [available[i] for i in np.linspace(0, len(available) - 1, min(7, len(available)), dtype=int)]
-    mask_contact_sheet(scene, images, out / 'masks_v2/contact_sheet.jpg', selected)
+    if not (out / 'masks_v2/contact_sheet.jpg').is_file():
+        mask_contact_sheet(scene, images, out / 'masks_v2/contact_sheet.jpg', selected)
     return out
 
 
@@ -92,7 +97,8 @@ def extract_features(work):
         vector = f['descriptors'].astype(np.float64).mean(axis=0)
         vector /= max(np.linalg.norm(vector), 1e-12)
         retrieval.append(vector.astype(np.float32))
-        print(f'global features {i}/{len(scene["images"])} {record["name"]}', flush=True)
+        if i == 1 or i % 40 == 0 or i == len(scene['images']):
+            print(f'global features {i}/{len(scene["images"])}', flush=True)
         del f
     path = out / 'retrieval_descriptors.npz'
     names, vectors = np.array(list(catalog)), np.array(retrieval)

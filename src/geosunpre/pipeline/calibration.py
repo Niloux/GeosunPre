@@ -14,7 +14,7 @@ from geosunpre.sfm.reconstruction import database_and_seed
 from geosunpre.sfm.reconstruction import mapper_options
 from geosunpre.artifacts import digest
 from geosunpre.artifacts import file_digest
-from geosunpre.artifacts import write_json
+from geosunpre.artifacts import write_json, archive_interrupted, staged_directory
 from geosunpre.colmap import MODEL_FILES
 from geosunpre.pipeline.holdout import ISOLATION_SCOPE
 from geosunpre.pipeline.observations import (is_validation, load_observations, observation_scope,
@@ -177,13 +177,13 @@ def calibrate(work):
     write_frozen_json(contract_path, contract)
 
     mapping = directory / 'mapping'
-    if (mapping / 'cameras.bin').exists():
+    if all((mapping / name).is_file() for name in MODEL_FILES):
         rec = pycolmap.Reconstruction(mapping)
     else:
         db, seed = directory / 'database.db', directory / 'seed'
-        if not (db.exists() and (seed / 'cameras.bin').exists()):
-            if db.exists():
-                raise RuntimeError(f'Incomplete calibration database; use a fresh work directory: {db}')
+        if not (db.exists() and all((seed / name).is_file() for name in MODEL_FILES)):
+            archive_interrupted(db)
+            archive_interrupted(seed)
             db, seed = database_and_seed(directory, scene, images, data['pairs'], features, split)
         opts = mapper_options()
         maps = pycolmap.incremental_mapping(db, Path(scene['input_root']) / 'Image',
@@ -194,8 +194,10 @@ def calibrate(work):
         rec = max(maps.values(), key=lambda item: item.num_reg_images())
         if rec.num_reg_images() != len(images):
             raise RuntimeError('Local calibration did not register all selected images')
-        mapping.mkdir(parents=True, exist_ok=True)
-        rec.write(mapping)
+        with staged_directory(mapping) as staged:
+            rec.write(staged)
+            if not pycolmap.Reconstruction(staged).is_valid():
+                raise RuntimeError('Incomplete calibration mapping output')
         write_json(directory / 'mapping_summary.json', {
             'registered': rec.num_reg_images(), 'selected': len(images),
             'points': rec.num_points3D(), 'observations': rec.compute_num_observations(),
@@ -211,16 +213,14 @@ def calibrate(work):
         stage_dir = directory / 'stages' / stage
         model = stage_dir / 'sparse/0'
         report_path = stage_dir / 'ba.json'
-        if report_path.exists() and (model / 'cameras.bin').exists():
+        if report_path.is_file() and all((model / name).is_file() for name in MODEL_FILES):
             rec = pycolmap.Reconstruction(model)
             ba = json.loads(report_path.read_text())
             if cheirality_health(rec)['invalid_depth']:
                 raise RuntimeError(f'Cached calibration has invalid depths: {stage}')
         else:
-            if report_path.exists() or (model / 'cameras.bin').exists():
-                raise RuntimeError(f'Incomplete calibration stage: {stage_dir}')
             print(f'Calibration BA {stage}', flush=True)
-            ba = bounded_bundle_adjustment(rec, stage, initial, show_progress=True)
+            ba = bounded_bundle_adjustment(rec, stage, initial, show_progress=False)
             if stage == 'principal' and ba['termination_type'].endswith('NO_CONVERGENCE'):
                 archive = stage_dir.with_name('principal_guarded_400_iterations')
                 archived_model = archive / 'sparse/0'
@@ -228,16 +228,20 @@ def calibrate(work):
                 rec.write(archived_model)
                 write_json(archive / 'ba.json', ba)
                 previous = ba
-                ba = bounded_bundle_adjustment(rec, stage, initial, show_progress=True)
+                ba = bounded_bundle_adjustment(rec, stage, initial, show_progress=False)
                 ba['continuation'] = {
                     'from': str(archive), 'previous_solver': previous['solver'],
                     'previous_elapsed_seconds': previous['elapsed_seconds'],
                     'reason': 'Continue from the iteration limit without using validation errors.',
                 }
-            model.mkdir(parents=True, exist_ok=True)
-            rec.write(model)
-            rec.write_text(model)
-            write_json(report_path, ba)
+            with staged_directory(stage_dir) as staged:
+                staged_model = staged / 'sparse/0'
+                staged_model.mkdir(parents=True)
+                rec.write(staged_model)
+                rec.write_text(staged_model)
+                if not pycolmap.Reconstruction(staged_model).is_valid():
+                    raise RuntimeError(f'Incomplete calibration BA output: {stage}')
+                write_json(staged / 'ba.json', ba)
         assert_holdout_isolated(rec, split)
         evaluation = ({'validation': evaluate_reconstruction(rec, scene, features, split, stage_dir)}
                       if validation else {})

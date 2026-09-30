@@ -229,6 +229,7 @@ def test_build_orders_holdout_before_any_calibration(tmp_path, monkeypatch):
     from geosunpre import scene
     from geosunpre.pipeline import data as global_data
     from geosunpre.pipeline import holdout
+    monkeypatch.setattr(runner, 'preflight', lambda *a, **k: {})
 
     events = []
 

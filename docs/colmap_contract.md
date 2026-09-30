@@ -41,5 +41,9 @@ geosunpre check --output /path/to/colmap
 
 `colmap_export.json` 使用版本 1，COLMAP 本身无需解析它。旧版流程已经交付的同版本数据集仍可独立验证。内部一致性与内容校验不代替几何质量验收。
 
+新交付额外保存 `request_fingerprint` 和身份自身的 `fingerprint`，不改变 COLMAP 文件。
+相同请求在验包通过后直接复用；请求包含源模型、图像/掩码内容、初始有效域、导出选项及质量报告。
+旧交付缺少这些可选字段时继续接受完整校验，不回写其历史身份。
+
 生产模式的 `quality.json` 明确标识 `mode = "production"`，重投影残差来自拟合观测，不代表留出精度。
 验证模式继续保存原始与高置信留出查询统计。两种来源记录见 [模式说明](production_pipeline.md)。

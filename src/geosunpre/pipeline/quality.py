@@ -10,13 +10,14 @@ from geosunpre.camera import Camera
 from geosunpre.sfm.evaluation import error_summary
 from geosunpre.sfm.reconstruction import cheirality_health
 from geosunpre.sfm.track_filter import CONFIG, reconstruction_coverage
+from geosunpre.device import FOV_DEGREES
 
 
 def production_quality(rec):
     cameras = {}
     for cid, cam in rec.cameras.items():
         camera = Camera('L' if cid == 1 else 'R', cam.width, cam.height, tuple(cam.params), (0, 0))
-        camera.distorted_radius(160)
+        camera.distorted_radius(FOV_DEGREES)
         cameras[cid] = camera
     depth = cheirality_health(rec)
     coverage = reconstruction_coverage(rec)
@@ -51,6 +52,31 @@ def production_quality(rec):
             'training_reprojection_by_camera': {cameras[cid].label: summarize(rows)
                                                  for cid, rows in by_camera.items()},
             'note': 'Reprojection residuals use fitted observations, not a test set or independent geometry accuracy.'}
+
+
+def production_acceptance(report, config):
+    """Apply explicit fitted-data limits to both the whole model and each lens."""
+    errors, warnings = [], []
+    summaries = {'all': report['training_reprojection'],
+                 **report.get('training_reprojection_by_camera', {})}
+    for label, values in summaries.items():
+        if not values['count'] or values['finite_count'] != values['count']:
+            errors.append(f'{label}: nonfinite or empty fitted reprojection residuals')
+        for metric, limit in (('median', config.quality_max_median_px),
+                              ('p90', config.quality_max_p90_px)):
+            if limit is not None and (values.get(metric) is None or not np.isfinite(values[metric])
+                                      or values[metric] > limit):
+                errors.append(f'{label}: fitted {metric} {values.get(metric)} exceeds {limit} px')
+    for camera, health in report.get('camera_parameter_bounds', {}).items():
+        if health.get('parameters_at_bounds'):
+            message = f'Camera {camera}: parameters at optimization bounds {health["parameters_at_bounds"]}'
+            (errors if config.quality_bounds_policy == 'reject' else warnings).append(message)
+    if errors:
+        raise ValueError('Production acceptance rejected: ' + '; '.join(errors))
+    return {'status': 'warning' if warnings else 'passed', 'warnings': warnings,
+            'limits': {'median_px': config.quality_max_median_px, 'p90_px': config.quality_max_p90_px,
+                       'bounds_policy': config.quality_bounds_policy},
+            'scope': 'Fitted-data delivery checks; not independent geometry or 3DGS accuracy.'}
 
 
 def write_production_report(out, scene):

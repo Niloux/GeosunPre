@@ -9,6 +9,7 @@ from PIL import Image
 
 from geosunpre.camera import Camera
 from geosunpre.artifacts import digest, file_digest, write_frozen_json
+from geosunpre.device import FOV_DEGREES, PRINCIPAL_Y_AXIS
 
 NAME = re.compile(r'(\d+)-(\d+)-(\d+)_(\d+)-([LRM])\.JPG', re.I)
 CONTRACT_VERSION = 1
@@ -66,7 +67,7 @@ def load_poses(path):
 
 
 def prepare(input_root, work):
-    fov, principal_y = 160, 'up'
+    fov, principal_y = FOV_DEGREES, PRINCIPAL_Y_AXIS
     root, work = Path(input_root).resolve(), Path(work).resolve()
     projects = sorted(root.glob('*.pro'))
     if len(projects) != 1:

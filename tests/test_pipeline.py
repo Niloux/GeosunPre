@@ -180,7 +180,10 @@ def test_preparation_freezes_config_and_can_resume_without_input(tmp_path):
     assert first['input'] == {'images': 4, 'calibration_images': 4}
     before = file_digest(work / 'manifest.json')
     second = build.run_pipeline(work, stage='prepare')
-    assert first == second
+    assert first['input'] == second['input']
+    assert first['task_fingerprint'] == second['task_fingerprint']
+    assert first['invocation_id'] != second['invocation_id']
+    assert not second['delivery_complete']
     assert file_digest(work / 'manifest.json') == before
     assert load_config(work) == config
     status = json.loads((work / 'pipeline_status.json').read_text())
@@ -195,6 +198,7 @@ def test_preparation_freezes_config_and_can_resume_without_input(tmp_path):
 
 def test_pipeline_records_failure_and_releases_work_lock(tmp_path, monkeypatch):
     import pytest
+    monkeypatch.setattr(build, 'preflight', lambda *a, **k: {})
 
     work = tmp_path / 'prepared'
     build.run_pipeline(work, input_root=raw_input(tmp_path), stage='prepare')
@@ -207,8 +211,8 @@ def test_pipeline_records_failure_and_releases_work_lock(tmp_path, monkeypatch):
         build.run_pipeline(work, stage='features')
     status = json.loads((work / 'pipeline_status.json').read_text())
     assert status['status'] == 'failed'
-    assert status['stages'][0]['name'] == 'features'
-    assert 'feature extraction failed' in status['stages'][0]['error']
+    assert status['stages'][-1]['name'] == 'features'
+    assert 'feature extraction failed' in status['stages'][-1]['error']
     # Starting again proves the exception did not retain the lock.
     monkeypatch.setattr(global_data, 'extract_features', lambda work: None)
     build.run_pipeline(work, stage='features')

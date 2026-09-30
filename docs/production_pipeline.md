@@ -27,9 +27,9 @@
 uv run --no-sync geosunpre run \
   --input input/篮球场 --work work/basketball_production_fresh \
   --config configs/basketball.toml --include-masks
-
-uv run --no-sync geosunpre check --work work/basketball_production_fresh
 ```
+
+`run` 已内置交付校验。续跑只需 `geosunpre run --work ...`；输出路径和导出选项读取冻结任务。
 
 仅复用权重时可显式传入 `--model-cache /path/to/huggingface/cache`。
 要执行研发对照，在新的 TOML 中设置 `pipeline_mode = "validation"`，使用新工作目录。
@@ -62,10 +62,17 @@ uv run --no-sync geosunpre check --work work/basketball_production_fresh
 每图至少 100 条观测并覆盖 8×8 网格中的至少 12 个网格，与既有轨迹筛选要求一致。
 
 验证模式继续使用 `sfm/final/validation_summary.json`。
+生产拟合残差门槛由 `quality_max_median_px`、`quality_max_p90_px` 配置，对整体及 L/R 分别检查；
+`quality_bounds_policy` 可选 `warn` 或 `reject`。篮球场新配方使用 2 / 4 px 和 reject，
+通用默认不设置残差上限、触界告警；所有生产结果均拒绝空或非有限残差。
+这些是交付操作门槛，不是独立几何精度。失败会阻止导出，不自动修改阈值。
 两种模式均输出 `colmap_export.json` 来源记录，生产来源明确记录 mode 和零留出排除。
 `check` 校验交付内容完整性，不重新计算几何精度。
 
 ## 完整运行验证
+
+以下记录对应 2026-09-29 当次源码与冻结配置。当前任务契约、恢复、缓存复用与交付门槛改进
+尚未重跑完整冷启动，不能把该计时作为新版本的性能成绩。
 
 本轮使用新目录 `work/basketball_production_20260929_01`，只复用预训练权重，
 掩码、特征、匹配及全部几何重新计算；包含原图复制、掩码导出及交付校验。

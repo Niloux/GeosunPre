@@ -11,7 +11,7 @@ from PIL import Image
 import pycolmap
 
 from geosunpre.camera import Camera
-from geosunpre.artifacts import file_digest
+from geosunpre.artifacts import file_digest, digest
 from geosunpre.artifacts import write_json
 from geosunpre.parallel import ordered_map
 
@@ -66,6 +66,9 @@ def verify_colmap_export(output):
     output = Path(output).resolve()
     identity_path = _contained_file(output, IDENTITY_FILE)
     identity = json.loads(identity_path.read_text())
+    if 'fingerprint' in identity and identity['fingerprint'] != digest(
+            {k: v for k, v in identity.items() if k != 'fingerprint'}):
+        raise ValueError('COLMAP export identity changed')
     if (identity.get('schema_version') != 1 or identity.get('format') != 'COLMAP'
             or identity.get('image_mode') not in ('link', 'copy')
             or set(identity.get('model_sha256', {})) != set(MODEL_FILES)):
@@ -135,10 +138,12 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
     model_path, output = Path(model_path).resolve(), Path(output).resolve()
     if output.is_relative_to(model_path) or model_path.is_relative_to(output):
         raise ValueError('Choose an export directory separate from the source model')
+    existing = verified = None
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         if not (output / IDENTITY_FILE).is_file():
             raise ValueError('Destination is not a COLMAP export; choose a new output directory')
-        verify_colmap_export(output)
+        verified = verify_colmap_export(output)
+        existing = json.loads((output / IDENTITY_FILE).read_text())
     source_hashes = {name: file_digest(model_path / name) for name in MODEL_FILES
                      if (model_path / name).is_file()}
     expected_hashes = (provenance or {}).get('source_model_sha256')
@@ -153,6 +158,19 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
         source = Path(record['source']).resolve()
         if source.is_relative_to(output):
             raise ValueError('Export directory contains a source image')
+    request = {'source_model_sha256': source_hashes, 'provenance': provenance or {},
+               'image_mode': image_mode, 'include_masks': include_masks, 'include_ply': include_ply,
+               'quality_sha256': file_digest(quality_report) if quality_report is not None else None,
+               'mask_cameras': scene['cameras'] if include_masks else None,
+               'mask_fov': scene['fov_degrees'] if include_masks else None,
+               'images': [{'name': name, 'sha256': file_digest(row['source']),
+                           'source': str(Path(row['source']).resolve()) if image_mode == 'link' else None,
+                           'mask_sha256': file_digest(row['semantic_mask'])
+                               if include_masks and row.get('semantic_mask') else None}
+                          for name, row in sorted(records.items())]}
+    request_fingerprint = digest(request)
+    if existing and existing.get('request_fingerprint') == request_fingerprint:
+        return verified
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=f'.{output.name}-', dir=output.parent) as temporary:
         stage = Path(temporary)
@@ -198,14 +216,23 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
             supplements['quality.json'] = file_digest(stage / 'quality.json')
         identity = {
             'schema_version': 1, 'format': 'COLMAP',
+            'request_fingerprint': request_fingerprint,
             'image_mode': image_mode, 'include_masks': include_masks,
             'model_sha256': {name: file_digest(sparse / name) for name in MODEL_FILES},
             'images': images, 'points': model.num_points3D(),
             'supplemental_sha256': supplements, 'provenance': provenance or {},
         }
+        identity['fingerprint'] = digest(identity)
         write_json(stage / IDENTITY_FILE, identity)
         verify_colmap_export(stage)
         if (output / IDENTITY_FILE).exists():
+            # Legacy packages are checked in full without rewriting their identity.
+            if 'request_fingerprint' not in existing:
+                identity.pop('request_fingerprint')
+            if 'fingerprint' not in existing:
+                identity.pop('fingerprint')
+            elif 'request_fingerprint' not in existing:
+                identity['fingerprint'] = digest({k: v for k, v in identity.items() if k != 'fingerprint'})
             if json.loads((output / IDENTITY_FILE).read_text()) != identity:
                 raise ValueError('Existing COLMAP export differs; choose a new output directory')
         else:

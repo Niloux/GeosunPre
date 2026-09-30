@@ -159,6 +159,7 @@ def test_default_pipeline_orders_observations_and_skips_mapping_evaluation(tmp_p
     from geosunpre import scene
     from geosunpre.pipeline import data, observations
     from geosunpre.pipeline import PRODUCTION_STAGES
+    monkeypatch.setattr(runner, 'preflight', lambda *a, **k: {})
 
     events = []
 

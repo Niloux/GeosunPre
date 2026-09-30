@@ -7,12 +7,14 @@ from pathlib import Path
 from geosunpre.pipeline import STAGES
 
 
-def _export_options(parser):
-    parser.add_argument('--image-mode', choices=('copy', 'link'), default='copy',
+def _export_options(parser, *, resume=False):
+    parser.add_argument('--image-mode', choices=('copy', 'link'), default=None if resume else 'copy',
                         help='Copy original images for delivery (default), or link them locally')
-    parser.add_argument('--include-masks', action='store_true',
+    parser.add_argument('--include-masks', action=argparse.BooleanOptionalAction,
+                        default=None if resume else False,
                         help='Include combined FOV, semantic, and device masks')
-    parser.add_argument('--include-ply', action='store_true',
+    parser.add_argument('--include-ply', action=argparse.BooleanOptionalAction,
+                        default=None if resume else False,
                         help='Also write all sparse points as PLY')
 
 
@@ -26,7 +28,7 @@ def main(argv=None):
     run.add_argument('--stage', choices=(*STAGES, 'all'), default='all')
     run.add_argument('--output', help='COLMAP destination; default WORK/colmap')
     run.add_argument('--model-cache', help='Hugging Face cache for SegFormer weights')
-    _export_options(run)
+    _export_options(run, resume=True)
 
     export = sub.add_parser('export', help='Package an existing sparse model and scene as COLMAP')
     export.add_argument('--model', required=True, help='COLMAP sparse model directory')

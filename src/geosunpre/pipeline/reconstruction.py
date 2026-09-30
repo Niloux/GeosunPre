@@ -1,5 +1,4 @@
 """Image-only, asynchronous full-sequence SfM with frozen validation."""
-from datetime import datetime, timezone
 import html
 import json
 from pathlib import Path
@@ -17,7 +16,8 @@ from geosunpre.sfm.reconstruction import database_and_seed
 from geosunpre.sfm.reconstruction import mapper_options
 from geosunpre.artifacts import digest
 from geosunpre.artifacts import file_digest
-from geosunpre.artifacts import write_json
+from geosunpre.artifacts import write_json, archive_interrupted, staged_directory
+from geosunpre.colmap import MODEL_FILES
 from geosunpre.sfm.track_filter import CONFIG as TRACK_CONFIG
 from geosunpre.sfm.track_filter import filter_mapped_tracks
 from geosunpre.sfm.track_filter import training_adjacency
@@ -87,14 +87,13 @@ def build_mapping(work):
     out, scene, data, features, protocol, params = freeze_geometry(work)
     split, _ = partitions(work)
     mapping = out / 'mapping'
-    if (mapping / 'cameras.bin').exists():
+    if all((mapping / name).is_file() for name in MODEL_FILES):
         rec = pycolmap.Reconstruction(mapping)
     else:
         db, seed = out / 'database.db', out / 'seed'
-        if not (db.exists() and (seed / 'cameras.bin').exists()):
-            if db.exists() and not (seed / 'cameras.bin').exists():
-                archive = out / f'database_interrupted_{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")}.db'
-                db.rename(archive)
+        if not (db.exists() and all((seed / name).is_file() for name in MODEL_FILES)):
+            archive_interrupted(db)
+            archive_interrupted(seed)
             db, seed = database_and_seed(out, geometric_scene(scene, params), scene['images'],
                                          data['pairs'], features, split)
         opts = mapper_options()
@@ -107,7 +106,11 @@ def build_mapping(work):
         if cheirality_health(rec)['invalid_depth']: raise RuntimeError('Global mapper model has invalid depths')
         for cid, values in params.items():
             np.testing.assert_array_equal(rec.cameras[cid].params, np.asarray(values))
-        mapping.mkdir(exist_ok=True); rec.write(mapping); rec.write_text(mapping)
+        with staged_directory(mapping) as staged:
+            rec.write(staged)
+            rec.write_text(staged)
+            if not pycolmap.Reconstruction(staged).is_valid():
+                raise RuntimeError('Incomplete global mapping output')
     assert_holdout_isolated(rec, split)
     names = {i.name for i in rec.images.values() if i.has_pose}
     summary = {'selected': len(scene['images']), 'registered': rec.num_reg_images(),
@@ -164,8 +167,23 @@ def optimize(work, *, stop_after='shared_calibration'):
     existing = json.loads(comparison_path.read_text()) if comparison_path.exists() else {'stages': {}}
     stages = {'mapping': existing['stages']['mapping']} if 'mapping' in existing['stages'] else {}
     for stage in ['fixed_calibration', 'triangle_supported', 'shared_calibration']:
-        path = out / 'stages' / stage; path.mkdir(parents=True, exist_ok=True)
-        if (stage in existing['stages'] and (path / 'ba.json').exists()
+        path = out / 'stages' / stage
+        previous = {'fixed_calibration': out / 'mapping',
+                    'triangle_supported': out / 'stages/fixed_calibration/sparse/0',
+                    'shared_calibration': out / 'stages/triangle_supported/sparse/0'}[stage]
+        complete = (path / 'ba.json').is_file() and all(
+            (path / 'sparse/0' / name).is_file() for name in MODEL_FILES)
+        if not complete and (path / 'ba.json').is_file():
+            saved = json.loads((path / 'ba.json').read_text())
+            if 'model_sha256' in saved:
+                raise ValueError(f'Global BA stage identity changed: {stage}: committed model is incomplete')
+        if complete:
+            ba = json.loads((path / 'ba.json').read_text())
+            for key, model_path in (('model_sha256', path / 'sparse/0'),
+                                    ('input_model_sha256', previous)):
+                if key in ba and ba[key] != {name: file_digest(model_path / name) for name in MODEL_FILES}:
+                    raise ValueError(f'Global BA stage identity changed: {stage}: {key}')
+        if (stage in existing['stages'] and complete
                 and (not validation or ((path / 'validation.json').exists()
                      and (path / 'triangle_validation/validation.json').exists()))):
             rec = pycolmap.Reconstruction(path / 'sparse/0')
@@ -177,37 +195,39 @@ def optimize(work, *, stop_after='shared_calibration'):
             if stage == stop_after:
                 break
             continue
-        if (path / 'ba.json').exists():
+        if complete:
             rec = pycolmap.Reconstruction(path / 'sparse/0')
             ba = json.loads((path / 'ba.json').read_text())
         else:
-            previous = {'fixed_calibration': out / 'mapping',
-                        'triangle_supported': out / 'stages/fixed_calibration/sparse/0',
-                        'shared_calibration': out / 'stages/triangle_supported/sparse/0'}[stage]
             rec = pycolmap.Reconstruction(previous)
             assert_holdout_isolated(rec, split)
-            if stage == 'triangle_supported':
-                held = {(n, int(i)) for t in split['tracks'] for n, i in t['observations']}
-                mapped_points = {(im.name, idx): int(p.point3D_id)
-                                 for im in rec.images.values() if im.has_pose
-                                 for idx, p in enumerate(im.points2D) if p.has_point3D()}
-                if held.intersection(mapped_points):
-                    raise RuntimeError('Heldout observation leaked into mapped training points')
-                adjacency, count = training_adjacency(data['pairs'], held,
-                    TRACK_CONFIG['match_confidence'], mapped_points=mapped_points)
-                filtration = filter_mapped_tracks(rec, adjacency, path)
-                del adjacency, mapped_points, held
-                filtration['input_graph_edges'] = count
-                write_json(path / 'track_filter.json', filtration)
-                if not filtration['coverage_admissible']:
-                    write_json(path / 'REJECTED.json', {'reason': 'Training coverage fell below frozen threshold', 'coverage': filtration['after']['coverage']})
-                    raise RuntimeError('Full-scene track filter rejected by training coverage')
-            print('Global BA', stage, rec.num_reg_images(), rec.num_points3D(), rec.compute_num_observations(), flush=True)
-            ba = bounded_bundle_adjustment(rec, 'principal' if stage == 'shared_calibration' else 'fixed',
-                                           params, protect_depth=True, show_progress=True)
-            model = path / 'sparse/0'; model.mkdir(parents=True, exist_ok=True)
-            rec.write(model); rec.write_text(model)
-            write_json(path / 'ba.json', ba)
+            with staged_directory(path) as staged:
+                if stage == 'triangle_supported':
+                    held = {(n, int(i)) for t in split['tracks'] for n, i in t['observations']}
+                    mapped_points = {(im.name, idx): int(p.point3D_id)
+                                     for im in rec.images.values() if im.has_pose
+                                     for idx, p in enumerate(im.points2D) if p.has_point3D()}
+                    if held.intersection(mapped_points):
+                        raise RuntimeError('Heldout observation leaked into mapped training points')
+                    adjacency, count = training_adjacency(data['pairs'], held,
+                        TRACK_CONFIG['match_confidence'], mapped_points=mapped_points)
+                    filtration = filter_mapped_tracks(rec, adjacency, staged)
+                    del adjacency, mapped_points, held
+                    filtration['input_graph_edges'] = count
+                    write_json(staged / 'track_filter.json', filtration)
+                    if not filtration['coverage_admissible']:
+                        write_json(path / 'REJECTED.json', {'reason': 'Training coverage fell below frozen threshold', 'coverage': filtration['after']['coverage']})
+                        raise RuntimeError('Full-scene track filter rejected by training coverage')
+                print('Global BA', stage, rec.num_reg_images(), rec.num_points3D(), rec.compute_num_observations(), flush=True)
+                ba = bounded_bundle_adjustment(rec, 'principal' if stage == 'shared_calibration' else 'fixed',
+                                               params, protect_depth=True, show_progress=False)
+                model = staged / 'sparse/0'; model.mkdir(parents=True)
+                rec.write(model); rec.write_text(model)
+                if not pycolmap.Reconstruction(model).is_valid():
+                    raise RuntimeError(f'Incomplete global BA output: {stage}')
+                ba['input_model_sha256'] = {name: file_digest(previous / name) for name in MODEL_FILES}
+                ba['model_sha256'] = {name: file_digest(model / name) for name in MODEL_FILES}
+                write_json(staged / 'ba.json', ba)
         assert_holdout_isolated(rec, split)
         if stage != 'shared_calibration':
             for cid, p in params.items(): np.testing.assert_array_equal(rec.cameras[cid].params, p)

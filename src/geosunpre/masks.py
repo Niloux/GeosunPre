@@ -12,6 +12,7 @@ from geosunpre.camera import Camera
 from geosunpre.artifacts import file_digest
 from geosunpre.artifacts import write_json, write_frozen_json
 from geosunpre.parallel import ordered_map
+from geosunpre.device import GUARD_POLYGONS, GUARD_REFERENCE_SIZE, GUARD_BOTTOM_FRACTION
 
 MODEL = 'nvidia/segformer-b2-finetuned-ade-512-512'
 MODEL_REVISION = 'de01bae28967510f9ddd496c60a969357195400c'
@@ -21,15 +22,11 @@ MASK_VERSION = 2
 
 def hardware_guard(width, height, camera):
     """Manually inspected overhang outlines in 3000x4000 reference coordinates."""
-    polygons = {
-        'L':[(1500,0),(3000,0),(3000,1500),(2700,1150),(2300,1030),
-             (2000,1020),(1780,860),(1500,690)],
-        'R':[(0,0),(1700,0),(1670,700),(1470,930),(1200,1030),
-             (900,1100),(600,1260),(350,1340),(0,1750)]}
     mask=np.zeros((height,width),dtype=np.uint8)
-    polygon=(np.asarray(polygons[camera])*[width/3000,height/4000]).astype(np.int32)
+    reference_width, reference_height = GUARD_REFERENCE_SIZE
+    polygon=(np.asarray(GUARD_POLYGONS[camera])*[width/reference_width,height/reference_height]).astype(np.int32)
     cv2.fillPoly(mask,[polygon],1)
-    mask[int(.8*height):]=1
+    mask[int(GUARD_BOTTOM_FRACTION*height):]=1
     return mask.astype(bool)
 
 
@@ -164,7 +161,8 @@ def generate_masks(scene, output, frames, *, model_cache=None):
     # queue for two CPU postprocessing/writing workers; completion is ordered.
     for index,record in enumerate(ordered_map(finish_mask,infer(),workers=2),1):
         records.append(record)
-        print(f'masks {index}/{len(images)} {record["camera"]}{record["frame_index"]:05d}',flush=True)
+        if index == 1 or index % 40 == 0 or index == len(images):
+            print(f'masks {index}/{len(images)}',flush=True)
     return records, metadata
 
 
