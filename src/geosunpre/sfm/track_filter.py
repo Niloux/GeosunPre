@@ -1,7 +1,7 @@
 """Training-only closed-triangle support for mapped feature tracks.
 
 Closed matching cycles are a consistency heuristic, not static-point truth.
-Validation observations must be removed before building the support graph.
+All eligible matched observations participate in the support graph.
 """
 from collections import defaultdict
 from pathlib import Path
@@ -10,7 +10,6 @@ from geosunpre.profiling import profiled
 import numpy as np
 import pycolmap
 
-from geosunpre.sfm.tracks import train_edge_mask
 from geosunpre.artifacts import write_json
 
 CONFIG = {'match_confidence': .5, 'minimum_component_images': 3,
@@ -19,13 +18,12 @@ CONFIG = {'match_confidence': .5, 'minimum_component_images': 3,
 
 
 @profiled
-def training_adjacency(entries, held, threshold=.5, mapped_points=None):
+def training_adjacency(entries, threshold=.5, mapped_points=None):
     adjacency = defaultdict(dict)
     edges = 0
     for entry in entries:
         with np.load(entry['path']) as raw:
-            take = train_edge_mask(entry['a'], entry['b'], raw['matches'], held)
-            take &= raw['scores'] >= threshold
+            take = raw['scores'] >= threshold
             for (i, j), score in zip(raw['matches'][take], raw['scores'][take]):
                 a, b = (entry['a'], int(i)), (entry['b'], int(j))
                 # The later filter only asks about edges within one mapped

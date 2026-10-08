@@ -1,6 +1,6 @@
 """Bounded-memory sampling of uncompressed LAS 1.2 point formats 0--3.
 
-The prototype deliberately rejects other versions and LAZ instead of guessing
+The reader rejects other versions and LAZ instead of guessing
 their layouts. Coordinate units and CRS remain caller-provided assumptions.
 """
 
@@ -17,10 +17,10 @@ def read_header(path):
     if len(header) < 227 or header[:4] != b'LASF':
         raise ValueError('Expected a complete LAS header')
     if tuple(header[24:26]) != (1, 2):
-        raise ValueError('Alignment prototype supports only uncompressed LAS 1.2')
+        raise ValueError('LAS registration supports only uncompressed LAS 1.2')
     point_format = header[104]
     if point_format not in (0, 1, 2, 3):
-        raise ValueError('Alignment prototype supports LAS point formats 0--3; LAZ is unsupported')
+        raise ValueError('LAS registration supports point formats 0--3; LAZ is unsupported')
     record_size = struct.unpack_from('<H', header, 105)[0]
     count = struct.unpack_from('<I', header, 107)[0]
     header_size = struct.unpack_from('<H', header, 94)[0]

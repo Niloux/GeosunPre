@@ -1,31 +1,15 @@
-"""Paired summaries for frozen SfM validation queries."""
+"""Fitted-observation residual summaries."""
 
 import numpy as np
 
 
-def paired_track_bootstrap(values, common, baseline='fixed_calibration', replicates=1000):
-    """Uncertainty of paired error changes, resampling complete heldout tracks."""
-    base = values[baseline]
-    result = {}
-    for name, value in values.items():
-        selected = common & np.isfinite(value['error']) & np.isfinite(base['error'])
-        track_ids = np.unique(base['track_id'][selected])
-        deltas = value['error'][selected] - base['error'][selected]
-        selected_tracks = base['track_id'][selected]
-        chunks = [deltas[selected_tracks == track] for track in track_ids]
-        if not chunks:
-            result[name] = {'queries': 0, 'tracks': 0, 'median_delta_px': None,
-                            'interval95_px': None}
-            continue
-        rng = np.random.default_rng(271829)
-        medians = [float(np.median(np.concatenate(
-            [chunks[index] for index in rng.integers(len(chunks), size=len(chunks))])))
-            for _ in range(replicates)]
-        result[name] = {
-            'queries': int(selected.sum()), 'tracks': len(chunks),
-            'median_delta_px': float(np.median(np.concatenate(chunks))),
-            'interval95_px': np.quantile(medians, [.025, .975]).tolist(),
-            'replicates': replicates, 'seed': 271829,
-            'note': 'Conditional paired median error change on finite common-support queries; not calibration uncertainty or a ground-truth accuracy interval.',
-        }
-    return result
+def error_summary(errors):
+    errors=np.asarray(errors,dtype=float)
+    if not len(errors):
+        return {'count':0,'finite_count':0,'median':None,'p90':None,'p99':None,
+                'fraction_le_1px':None,'fraction_le_2px':None,'fraction_le_3px':None}
+    values=np.where(np.isfinite(errors),errors,np.inf)
+    q=np.quantile(values,[.5,.9,.99],method='nearest')
+    return {'count':len(values),'finite_count':int(np.isfinite(values).sum()),
+            **{k:float(v) if np.isfinite(v) else None for k,v in zip(['median','p90','p99'],q)},
+            **{f'fraction_le_{t}px':float(np.mean(values<=t)) for t in [1,2,3]}}

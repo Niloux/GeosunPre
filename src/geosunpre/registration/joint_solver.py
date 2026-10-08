@@ -11,8 +11,8 @@ import pyceres
 import pycolmap
 from scipy.spatial.transform import Rotation
 
-from geosunpre.alignment.geometry import _huber, quantiles, transform_points, validate_similarity
-from geosunpre.alignment.structural import (RECIPE as STRUCTURAL_RECIPE, balanced_weights,
+from geosunpre.registration.geometry import _huber, quantiles, transform_points, validate_similarity
+from geosunpre.registration.structural import (RECIPE as STRUCTURAL_RECIPE, balanced_weights,
     point_precision, structural_matches, visual_planes)
 from geosunpre.camera import Camera
 from geosunpre.sfm.depth_guard import add_positive_depth_guards
@@ -52,8 +52,9 @@ class JointConstraintsUnavailable(ValueError):
 
 def native_costs():
     import geosunpre_native as native
-    if not all(hasattr(native, name) for name in ('Sim3PointPlaneCost', 'Sim3PositionPriorCost')):
-        raise RuntimeError('Rebuild geosunpre-native with the joint BA costs before running joint-alignment')
+    if (getattr(native, 'implementation_version', None) != 2
+            or not all(hasattr(native, name) for name in ('Sim3PointPlaneCost', 'Sim3PositionPriorCost'))):
+        raise RuntimeError('Rebuild geosunpre-native with uv sync --locked --reinstall-package geosunpre-native')
     return native
 
 

@@ -9,9 +9,7 @@ from geosunpre.profiling import profiled
 import numpy as np
 
 from geosunpre.features import LoMaFrontend
-from geosunpre.config import load_config
-from geosunpre.sfm.tracks import CONFIG
-from geosunpre.sfm.tracks import local_pairs
+from geosunpre.features import FRONTEND_CONFIG as CONFIG
 from geosunpre.artifacts import digest
 from geosunpre.artifacts import file_digest
 from geosunpre.scene import load_scene
@@ -119,6 +117,17 @@ def extract_features(work):
     return result
 
 
+def local_pairs(images):
+    pairs = []
+    for i,a in enumerate(images):
+        for b in images[i+1:]:
+            gap = abs(a['frame_index']-b['frame_index'])
+            same = a['camera']==b['camera']
+            if (same and (1<=gap<=5 or (gap in (8,12) and a['frame_index']%3==0))) or (not same and gap<=2):
+                pairs.append((a,b))
+    return pairs
+
+
 def candidate_pairs(images, names, descriptors):
     by_name = {r['name']: r for r in images}
     rank = {r['name']: i for i, r in enumerate(images)}
@@ -158,8 +167,7 @@ def match_features(work):
         if json.loads((out / 'pair_protocol.json').read_text())['fingerprint'] != fingerprint:
             raise ValueError('Global pair protocol changed')
     else: write_json(out / 'pair_protocol.json', {**pair_protocol, 'fingerprint': fingerprint})
-    attention = load_config(work).matcher_attention
-    frontend = LoMaFrontend(work, scene, CONFIG, matching_attention=attention)
+    frontend = LoMaFrontend(work, scene, CONFIG)
     by_token = {row['token']: row['path'] for row in catalog['features'].values()}
     @lru_cache(maxsize=32)
     def get_features(token):
@@ -174,8 +182,7 @@ def match_features(work):
         if i % 40 == 0 or i == len(pairs): print(f'global matches {i}/{len(pairs)}', flush=True)
     result = {**catalog, 'pairs': entries, 'pair_protocol_fingerprint': fingerprint,
               'matching_cache': frontend.cache_stats}
-    if attention != 'math':
-        result['matcher_attention'] = attention
+    result['matcher_attention'] = 'flash'
     result['fingerprint'] = digest({k: v for k, v in result.items() if k not in ['fingerprint', 'cache', 'matching_cache']})
     path = out / 'frontend.json'
     if path.exists() and json.loads(path.read_text())['fingerprint'] != result['fingerprint']:

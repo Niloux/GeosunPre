@@ -1,7 +1,7 @@
 [project]
 name = "geosunpre"
 version = "0.2.0"
-description = "Image-led asynchronous dual-fisheye SfM preprocessing"
+description = "Production Geosun dual-fisheye and LAS preprocessing for 3DGS"
 readme = "README.md"
 authors = [
     { name = "Niloux3d", email = "15072763003@163.com" }
@@ -15,11 +15,7 @@ dependencies = [
     "pyceres==2.6",
     "geosunpre-native==0.1.0",
     "scipy>=1.15",
-]
-
-[project.optional-dependencies]
-segmentation = ["transformers==4.57.6"]
-loma = [
+    "transformers==4.57.6",
     "lomatch @ git+https://github.com/davnords/LoMa.git@8fb59c458f2a2ef44314f462467b229c27786bf0",
     "torch==2.8.0",
     "torchvision==0.23.0",
@@ -41,8 +37,8 @@ source-include = ["run.sh", "configs/**", "docs/**", "tests/**", "native/pyproje
 
 [tool.uv.sources]
 geosunpre-native = { path = "native" }
-torch = [{ index = "pytorch-cu128", extra = "loma" }]
-torchvision = [{ index = "pytorch-cu128", extra = "loma" }]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

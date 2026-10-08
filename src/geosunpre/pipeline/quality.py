@@ -7,10 +7,11 @@ from pathlib import Path
 import numpy as np
 
 from geosunpre.camera import Camera
-from geosunpre.sfm.evaluation import error_summary
+from geosunpre.sfm.statistics import error_summary
 from geosunpre.sfm.reconstruction import cheirality_health
 from geosunpre.sfm.track_filter import CONFIG, reconstruction_coverage
 from geosunpre.device import FOV_DEGREES
+from geosunpre.pipeline.observations import SCOPE
 
 
 def production_quality(rec):
@@ -42,8 +43,7 @@ def production_quality(rec):
         errors.append(residuals)
         by_camera[im.camera_id].append(residuals)
     summarize = lambda rows: error_summary(np.concatenate(rows) if rows else [])
-    return {'mode': 'production', 'heldout_evaluation_performed': False,
-            'observations_excluded_for_validation': 0,
+    return {'observation_scope': SCOPE, 'accuracy_scope': 'fitted_observations',
             'registered': rec.num_reg_images(), 'points': rec.num_points3D(),
             'observations': rec.compute_num_observations(), 'cheirality': depth,
             'camera_health': {c.label: {'params': list(c.params), 'monotonic_in_160deg': True}
@@ -56,7 +56,7 @@ def production_quality(rec):
 
 def production_acceptance(report, config):
     """Apply explicit fitted-data limits to both the whole model and each lens."""
-    errors, warnings = [], []
+    errors = []
     summaries = {'all': report['training_reprojection'],
                  **report.get('training_reprojection_by_camera', {})}
     for label, values in summaries.items():
@@ -64,18 +64,17 @@ def production_acceptance(report, config):
             errors.append(f'{label}: nonfinite or empty fitted reprojection residuals')
         for metric, limit in (('median', config.quality_max_median_px),
                               ('p90', config.quality_max_p90_px)):
-            if limit is not None and (values.get(metric) is None or not np.isfinite(values[metric])
-                                      or values[metric] > limit):
+            if values.get(metric) is None or not np.isfinite(values[metric]) or values[metric] > limit:
                 errors.append(f'{label}: fitted {metric} {values.get(metric)} exceeds {limit} px')
     for camera, health in report.get('camera_parameter_bounds', {}).items():
         if health.get('parameters_at_bounds'):
             message = f'Camera {camera}: parameters at optimization bounds {health["parameters_at_bounds"]}'
-            (errors if config.quality_bounds_policy == 'reject' else warnings).append(message)
+            errors.append(message)
     if errors:
         raise ValueError('Production acceptance rejected: ' + '; '.join(errors))
-    return {'status': 'warning' if warnings else 'passed', 'warnings': warnings,
+    return {'status': 'passed',
             'limits': {'median_px': config.quality_max_median_px, 'p90_px': config.quality_max_p90_px,
-                       'bounds_policy': config.quality_bounds_policy},
+                       'bounds_policy': 'reject'},
             'scope': 'Fitted-data delivery checks; not independent geometry or 3DGS accuracy.'}
 
 

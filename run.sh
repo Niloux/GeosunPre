@@ -1,27 +1,20 @@
 #!/usr/bin/env bash
-# Run or resume the basketball pipeline with existing local weights.
+# Run or resume the production pipeline using the prepared local environment.
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_dir"
 
-export TORCH_HOME="${TORCH_HOME:-$repo_dir/.cache/torch}"
-export HF_HUB_CACHE="${HF_HUB_CACHE:-$repo_dir/.cache/huggingface}"
-export UV_CACHE_DIR="${UV_CACHE_DIR:-$repo_dir/.cache/uv}"
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-
-if ! command -v uv >/dev/null 2>&1; then
-    printf 'uv is required; install it before running this script.\n' >&2
-    exit 1
-fi
 if [[ ! -x "$repo_dir/.venv/bin/python" ]]; then
-    printf 'Prepare the environment first: uv sync --locked --extra loma --extra segmentation\n' >&2
+    printf 'Prepare the environment first: uv sync --locked\n' >&2
     exit 1
 fi
+export PYTHONPATH="$repo_dir/src${PYTHONPATH:+:$PYTHONPATH}"
 
 forwarded=("$@")
-work_dir="$repo_dir/work/basketball_joint_pipeline_01"
+work_dir="$repo_dir/work/basketball"
+has_input=false
+has_config=false
 while (($#)); do
     case "$1" in
         --work)
@@ -33,24 +26,20 @@ while (($#)); do
             shift
             ;;
         --work=*) work_dir="${1#*=}" ;;
-        -h|--help) exec uv run --offline --no-sync geosunpre run --help ;;
+        --input|--input=*) has_input=true ;;
+        --config|--config=*) has_config=true ;;
+        -h|--help) exec "$repo_dir/.venv/bin/python" -m geosunpre run --help ;;
     esac
     shift
 done
 
-# Torch Hub does not honor HF_HUB_OFFLINE; prevent downloads of missing LoMa weights.
-for weight in dad.pth dinov2_vitl14_pretrain.pth loma_B.pt; do
-    if [[ ! -s "$TORCH_HOME/hub/checkpoints/$weight" ]]; then
-        printf 'Missing local weight: %s/hub/checkpoints/%s\n' "$TORCH_HOME" "$weight" >&2
-        exit 1
-    fi
-done
-
 defaults=(--work "$work_dir")
 if [[ ! -f "$work_dir/pipeline_config.json" ]]; then
-    defaults+=(--input "$repo_dir/input/篮球场"
-               --config "$repo_dir/configs/basketball.toml"
-               --include-masks --model-cache "$HF_HUB_CACHE")
+    if [[ "$has_input" == false ]]; then
+        defaults+=(--input "$repo_dir/input/篮球场")
+        if [[ "$has_config" == false ]]; then
+            defaults+=(--config "$repo_dir/configs/basketball.toml")
+        fi
+    fi
 fi
-
-exec uv run --offline --no-sync geosunpre run "${defaults[@]}" "${forwarded[@]}"
+exec "$repo_dir/.venv/bin/python" -m geosunpre run "${defaults[@]}" "${forwarded[@]}"

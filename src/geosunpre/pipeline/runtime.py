@@ -41,7 +41,7 @@ class StageRecorder:
         self.started = time.perf_counter()
         self.path = Path(work) / 'pipeline_status.json'
         self.value = {'version': 2, 'invocation_id': uuid4().hex, 'pid': os.getpid(), 'started_at_utc': utc_now(),
-                      'timing_scope': 'pipeline invocation; excludes CLI import/startup',
+                      'timing_scope': 'recorded stages and orchestration; excludes CLI/config/task initialization',
                       'requested_stages': list(stages), 'status': 'running', 'stages': []}
         write_json(self.path, self.value)
 
@@ -70,7 +70,7 @@ class StageRecorder:
                     release_gpu_cache()
                 except RuntimeError as exc:
                     entry['gpu_cleanup_error'] = str(exc)
-            if name in ('features', 'matches', 'holdout', 'observations'):
+            if name in ('features', 'matches', 'observations'):
                 entry['host_memory_reclaim'] = reclaim_host_memory()
             entry['resources'] = resources.stop()
             entry['operations'] = resources.operations

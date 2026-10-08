@@ -1,12 +1,6 @@
-# Validated production recipe; see docs/performance.md.
+# Scene selection; the algorithm recipe is fixed in the implementation.
 expected_images = 536
 calibration_frames = [70, 94]
-matcher_attention = "flash"
-pipeline_mode = "production"
-calibration_mode = "local"
-registration_mode = "joint"
-registration_pose_frame = "enh_first"
 # Operational limits for fitted residuals; these are not held-out accuracy targets.
 quality_max_median_px = 2.0
 quality_max_p90_px = 4.0
-quality_bounds_policy = "reject"

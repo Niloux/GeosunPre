@@ -80,26 +80,3 @@ def test_feature_cache_hits_do_not_load_cpu_data_and_eviction_is_bounded(tmp_pat
     frontend._matching_tensors({'token': 'b'}, loader)
     assert loaded == ['a', 'b', 'c', 'b']
     assert frontend._gpu_feature_bytes == 32
-
-
-def test_compact_tracks_keep_lexical_ties_and_reject_image_conflicts():
-    import numpy as np
-    from geosunpre.sfm.geometry import build_tracks
-    images=[{'name':name,'camera':'L' if name!='c' else 'R'} for name in ['c','b','a']]
-    pairs=[('b','a',np.array([[0,0],[1,1]]),np.array([.9,.9])),
-           ('a','c',np.array([[0,0],[1,0]]),np.array([.8,.8]))]
-    summary,tracks=build_tracks(iter(pairs),iter(images))
-    assert tracks==[[('a',0),('b',0),('c',0)],[('a',1),('b',1)]]
-    assert summary['accepted_merges']==3
-    assert summary['conflicting_edge_merges_rejected']==1
-    assert summary['cross_camera_tracks']==1
-
-
-def test_compact_tracks_support_more_than_64_images_and_empty_edges():
-    import numpy as np
-    from geosunpre.sfm.geometry import build_tracks
-    images=[{'name':f'{i:03d}','camera':'L'} for i in range(70)]
-    pairs=[('000','064',np.array([[0,0]]),np.array([1.])),
-           ('064','069',np.array([[0,0]]),np.array([1.]))]
-    assert build_tracks(pairs,images)[1]==[[('000',0),('064',0),('069',0)]]
-    assert build_tracks([],images)[1]==[]

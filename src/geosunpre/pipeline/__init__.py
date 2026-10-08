@@ -1,6 +1,4 @@
-"""The supported input-to-COLMAP workflow."""
+"""One input-to-COLMAP production workflow."""
 
-VALIDATION_STAGES = ('prepare', 'masks', 'features', 'matches', 'holdout',
-                     'calibration', 'sfm', 'finalize', 'register', 'export')
-PRODUCTION_STAGES = tuple('observations' if s == 'holdout' else s for s in VALIDATION_STAGES)
-STAGES = (*PRODUCTION_STAGES, 'holdout')
+STAGES = ('prepare', 'masks', 'features', 'matches', 'observations',
+          'calibration', 'sfm', 'finalize', 'register', 'export')

@@ -1,18 +1,15 @@
 from types import SimpleNamespace
-from pathlib import Path
 
 import numpy as np
 import pycolmap
 import pytest
 from scipy.spatial.transform import Rotation
 
-from geosunpre.alignment.joint import run_joint_alignment
-from geosunpre.alignment import joint
-from geosunpre.alignment.joint_solver import (RECIPE, ImageObservations, assert_identity, geometry_gate,
+from geosunpre.registration import joint
+from geosunpre.registration.joint_solver import (RECIPE, ImageObservations, assert_identity, geometry_gate,
     image_gate, interpolate, mixed_objective, native_costs, similarity_matrix, similarity_parameters, solve_fixed)
-from geosunpre.colmap import export_colmap, verify_colmap_export
-from geosunpre.pipeline.runner import SOURCE
-from test_pipeline import tiny_visual_work
+from geosunpre.pipeline.finalization import SOURCE
+from helpers import tiny_visual_work
 
 
 @pytest.mark.parametrize('kind', ['point_plane', 'position'])
@@ -122,34 +119,6 @@ def test_backtracking_interpolates_optical_centres_on_the_rotation_manifold(tmp_
     np.testing.assert_array_equal(matrix, np.eye(4))
 
 
-def test_joint_export_preserves_combined_mask_bytes(tmp_path):
-    from PIL import Image
-    work, _, scene, _, records = tiny_visual_work(tmp_path)
-    for record in scene['images']:
-        mask = tmp_path / (record['name'] + '.combined.png')
-        values = (np.indices((8, 8)).sum(0) % 2 * 255).astype(np.uint8)
-        Image.fromarray(values).save(mask)
-        record['combined_mask'] = str(mask)
-        record.pop('semantic_mask')
-    output = tmp_path / 'joint_export'
-    export_colmap(work / SOURCE, scene, output, image_mode='link', include_masks=True)
-    assert verify_colmap_export(output)['include_masks']
-    for record in scene['images']:
-        assert (output / 'masks' / (record['name'] + '.png')).read_bytes() == Path(record['combined_mask']).read_bytes()
-
-
-def test_joint_alignment_refuses_nested_and_nonempty_outputs(tmp_path):
-    alignment = tmp_path / 'alignment'
-    alignment.mkdir()
-    with pytest.raises(ValueError, match='separate'):
-        run_joint_alignment(alignment, tmp_path / 'input', alignment / 'new')
-    output = tmp_path / 'foreign'
-    output.mkdir(); (output / 'keep').write_text('unchanged')
-    with pytest.raises(ValueError, match='fresh'):
-        run_joint_alignment(alignment, tmp_path / 'input', output)
-    assert (output / 'keep').read_text() == 'unchanged'
-
-
 def test_rejected_joint_step_keeps_the_previous_model_and_saves_the_proposal(tmp_path, monkeypatch):
     base = third_exposure(tmp_path)
     observations = ImageObservations(base, np.eye(4))
@@ -162,6 +131,7 @@ def test_rejected_joint_step_keeps_the_previous_model_and_saves_the_proposal(tmp
         return matrix, {'solution_usable': True, 'solver': 'forced bad camera proposal'}
 
     monkeypatch.setattr(joint, 'solve_fixed', force_bad_pose)
+    monkeypatch.setattr(joint, 'las_correspondences', lambda *a, **k: {'point_ids': np.array([], dtype=int), 'summary': {}})
     recipe = {**RECIPE, 'pose_weight': 0., 'las_weight': 0., 'outer_iterations': 1}
     rec, matrix, errors, result = joint._run_stage('rejection', base, np.eye(4), {}, None, [], [],
         observations, baseline, recipe, tmp_path / 'rejection')

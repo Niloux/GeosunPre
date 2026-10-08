@@ -7,8 +7,7 @@ from importlib.util import find_spec
 from pathlib import Path
 
 from geosunpre.features import LoMaFrontend
-from geosunpre.sfm.tracks import CONFIG
-from geosunpre.config import load_config
+from geosunpre.features import FRONTEND_CONFIG as CONFIG
 from geosunpre.masks import MODEL, MODEL_REVISION
 from geosunpre.device import DEVICE_PROFILE
 
@@ -38,9 +37,8 @@ def preflight(work, stages, delivery, *, model_cache=None):
         missing_matches = not data.get('pairs') or any(not Path(p['path']).is_file() for p in data.get('pairs', []))
     gpu_needed = missing_masks or missing_features or missing_matches
     result = {'gpu_needed': gpu_needed, 'device_profile': DEVICE_PROFILE, 'warnings': []}
-    config = load_config(work)
-    if config.registration_mode == 'joint' and any(s in stages for s in ('register', 'export')):
-        from geosunpre.alignment.joint_solver import native_costs
+    if any(s in stages for s in ('register', 'export')):
+        from geosunpre.registration.joint_solver import native_costs
         from geosunpre.pipeline.registration import freeze_inputs
         native = native_costs()
         inputs = freeze_inputs(work)
@@ -59,11 +57,11 @@ def preflight(work, stages, delivery, *, model_cache=None):
             modules.add('transformers')
         for module in sorted(modules):
             if find_spec(module) is None:
-                raise RuntimeError(f'Missing {module}; install with uv sync --locked --extra loma --extra segmentation')
+                raise RuntimeError(f'Missing {module}; install with uv sync --locked')
         import torch
         if not torch.cuda.is_available():
             raise RuntimeError('Pending masks/features/matches require an available CUDA GPU')
-        if missing_matches and load_config(work).matcher_attention == 'flash':
+        if missing_matches:
             from torch.nn.attention import SDPBackend, sdpa_kernel
             # Test the requested kernel with the pinned matcher dtype/head width.
             with torch.inference_mode(), sdpa_kernel(SDPBackend.FLASH_ATTENTION):
@@ -77,17 +75,15 @@ def preflight(work, stages, delivery, *, model_cache=None):
                    if not (checkpoints / name).is_file()]
         result['loma_weights_cached'] = not missing
         if missing:
-            result['warnings'].append('LoMa weights will be downloaded on first use: ' + ', '.join(missing))
+            raise RuntimeError('Missing offline LoMa weights in ' + str(checkpoints) + ': ' + ', '.join(missing))
     cache = Path(model_cache or os.environ.get('HF_HUB_CACHE', '.cache/huggingface')).expanduser().resolve()
     if missing_masks:
         snapshot = cache / ('models--' + MODEL.replace('/', '--')) / 'snapshots' / MODEL_REVISION
         cached = (snapshot / 'config.json').is_file() and (snapshot / 'preprocessor_config.json').is_file() and any(
             (snapshot / name).is_file() for name in ('model.safetensors', 'pytorch_model.bin'))
         result['segmentation_weights_cached'] = cached
-        if not cached and os.environ.get('HF_HUB_OFFLINE', '').upper() in ('1', 'TRUE', 'YES', 'ON'):
-            raise RuntimeError(f'Offline segmentation weights are incomplete in {cache}')
         if not cached:
-            result['warnings'].append('Segmentation weights will be downloaded on first use')
+            raise RuntimeError(f'Offline segmentation weights are incomplete in {cache}')
     destination = Path(delivery['output'])
     parent = destination.parent
     while not parent.is_dir():
@@ -96,7 +92,18 @@ def preflight(work, stages, delivery, *, model_cache=None):
     minimum = (sum(Path(r['source']).stat().st_size for r in images)
                if 'export' in stages and delivery['image_mode'] == 'copy'
                    and not (destination / 'colmap_export.json').is_file() else 0)
-    if free < minimum:
-        raise RuntimeError(f'Insufficient export disk space: need at least {minimum} bytes, available {free}')
-    result['export_disk'] = {'available_bytes': free, 'minimum_image_copy_bytes': minimum}
+    initialization_bytes = 0
+    if ('export' in stages and delivery['include_ply']
+            and not (destination / 'colmap_export.json').is_file()):
+        from geosunpre.initialization import AGGREGATE, VERTEX
+        initialization_bytes = inputs['las_header']['point_count'] * (AGGREGATE.itemsize + 2 * VERTEX.itemsize)
+    required = minimum + initialization_bytes
+    if free < required:
+        raise RuntimeError(f'Insufficient export disk space: need up to {required} bytes, available {free}')
+    result['export_disk'] = {'available_bytes': free, 'minimum_image_copy_bytes': minimum,
+                             'initialization_peak_bytes_upper_bound': initialization_bytes,
+                             'required_bytes': required}
+    from geosunpre.pipeline.task import bind_weights
+    bind_weights(work, cache, frontend=missing_features or missing_matches,
+                 segmentation=missing_masks)
     return result

@@ -1,4 +1,4 @@
-"""Mandatory LAS-frame delivery with guarded joint BA and a registered fallback."""
+"""Publish one accepted LAS-frame model and its portable COLMAP delivery."""
 
 import html
 import json
@@ -7,20 +7,25 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 
-from geosunpre.alignment.geometry import quantiles, validate_similarity
-from geosunpre.alignment.joint import _scene, run_joint_alignment
-from geosunpre.alignment.joint_solver import IMAGE_GATES, RECIPE, JointConstraintsUnavailable, assert_identity
-from geosunpre.alignment.las import read_header
-from geosunpre.alignment.publication import complete_publication, verify_publication
-from geosunpre.alignment.runner import run_alignment
-from geosunpre.artifacts import (archive_interrupted, digest, file_digest, staged_directory,
-                                write_frozen_json, write_json)
-from geosunpre.colmap import MODEL_FILES, export_colmap, verify_colmap_export
-from geosunpre.config import load_config
+from geosunpre.artifacts import archive_interrupted, digest, file_digest, staged_directory, write_frozen_json, write_json
+from geosunpre.colmap import export_colmap, model_hashes
+from geosunpre.initialization import DEFAULT_VOXEL_SIZE
+from geosunpre.config import CONFIG_FILE, load_config
+from geosunpre.pipeline.finalization import FINAL, _check_model, verify_final
+from geosunpre.pipeline.observations import protocol_identity
+from geosunpre.pipeline.quality import production_acceptance, production_quality
+from geosunpre.pipeline.task import TASK_FILE
+from geosunpre.registration.geometry import quantiles
+from geosunpre.registration.global_alignment import MAX_LAS_POINTS, register_global
+from geosunpre.registration.joint import refine_joint
+from geosunpre.registration.joint_solver import IMAGE_GATES, RECIPE, JointConstraintsUnavailable, assert_identity
+from geosunpre.registration.las import read_header
+from geosunpre.registration.publication import complete_publication, verify_publication
 from geosunpre.scene import load_scene
 
-
 ROOT = Path('registration')
+
+
 POLICY = {
     'minimum_supported_fit_points': 100,
     'minimum_supported_fit_tiles': 5,
@@ -38,16 +43,10 @@ def _read(path):
     return json.loads(Path(path).read_text())
 
 
-def _hashes(model):
-    return {name: file_digest(Path(model) / name) for name in MODEL_FILES}
-
-
 def freeze_inputs(work):
     """Record LAS and the vendor pose-frame assumption before expensive pending work."""
     work = Path(work).resolve()
     config = load_config(work)
-    if config.registration_mode != 'joint':
-        raise ValueError('LAS registration is disabled for this frozen task')
     scene = _read(work / 'manifest.json')
     input_root = Path(scene['input_root']).resolve()
     if config.registration_las:
@@ -70,9 +69,10 @@ def freeze_inputs(work):
     value = {'version': 1, 'input_root': str(input_root), 'las': str(las),
              'input_sha256': {str(path): file_digest(path) for path in inputs},
              'las_header': read_header(las),
-             'settings': {key: val for key, val in vars(config).items() if key.startswith('registration_')},
+             'settings': {key: val for key, val in vars(config).items() if key.startswith('registration_') or key == 'workers'},
+             'max_las_points': MAX_LAS_POINTS,
              'pose_coordinate_convention': {
-                 'name': config.registration_pose_frame,
+                 'name': 'enh_first',
                  'hypothesis': 'LAS XYZ approximately equals ENH minus first ENH navigation position',
                  'units_assumed': 'metres', 'absolute_crs_verified': False,
                  'timestamps_modified': False, 'raw_quaternions_used': False},
@@ -166,10 +166,10 @@ def select_candidate(reference_points, candidate_points, diagnostic, config):
         raise ValueError('LAS registration acceptance rejected: ' + '; '.join(base['failures']))
     candidate = surface_acceptance(candidate_points, config) if candidate_points is not None else None
     regression = geometric_regression(reference_points, candidate_points) if candidate and candidate['passed'] else None
-    accepted = bool(diagnostic and diagnostic['accepted_for_candidate_review'] and candidate['passed']
+    accepted = bool(diagnostic and diagnostic['accepted_for_delivery'] and candidate['passed']
                     and regression['passed'])
     reasons = []
-    if not diagnostic or not diagnostic.get('accepted_for_candidate_review'):
+    if not diagnostic or not diagnostic.get('accepted_for_delivery'):
         reasons.append('Joint BA did not pass all image, geometry and update checks')
     if candidate and not candidate['passed']:
         reasons.extend(candidate['failures'])
@@ -196,39 +196,26 @@ def _stage(work, name, context, compute):
 
 
 def register(work):
-    """Publish exactly one accepted LAS-frame model, or reject the pipeline."""
-    from geosunpre.pipeline.runner import FINAL, _check_model, _export_visual_result
-    from geosunpre.pipeline.quality import production_acceptance, production_quality
-    from geosunpre.pipeline.observations import is_validation, partitions
-    from geosunpre.sfm.reconstruction import assert_holdout_isolated
-
+    """Keep the verified global model if joint refinement fails its quality gates."""
     work = Path(work).resolve()
     config = load_config(work)
     inputs = freeze_inputs(work)
+    visual_scene, visual_result, _ = verify_final(work)
+    source = work / FINAL / 'sparse/0'
     root = work / ROOT
-    source = root / 'visual_colmap'
-    _export_visual_result(work, output=source, image_mode='link', include_masks=True, include_ply=True)
-    protocol = {'version': 1, 'inputs_fingerprint': inputs['fingerprint'],
-                'source_model_sha256': _hashes(source / 'sparse/0'),
-                'source_export_sha256': file_digest(source / 'colmap_export.json'),
-                'solver_recipe': {**RECIPE, 'workers': config.registration_workers,
-                    'outer_iterations': config.registration_outer_iterations,
-                    'iterations_per_solve': config.registration_ba_iterations,
-                    'pose_std_m': config.registration_pose_std_m, 'las_std_m': config.registration_las_std_m,
-                    'pose_weight': config.registration_pose_weight, 'las_weight': config.registration_las_weight},
-                'image_gates': IMAGE_GATES, 'geometry_policy': POLICY,
-                'mode': 'production_joint_with_pure_ba_control', 'intrinsics_optimized': False}
+    protocol = {'version': 2, 'inputs_fingerprint': inputs['fingerprint'],
+                'source_model_sha256': model_hashes(source),
+                'visual_result_sha256': file_digest(work / FINAL / 'result.json'),
+                'scene_manifest_sha256': file_digest(work / 'sfm/manifest.json'),
+                'solver_recipe': {**RECIPE, 'workers': config.workers},
+                'image_gates': IMAGE_GATES, 'geometry_policy': POLICY, 'intrinsics_optimized': False}
     protocol['fingerprint'] = digest(protocol)
     write_frozen_json(root / 'protocol.json', protocol)
     final = root / 'final'
-    final_context = digest({'name': 'final', 'protocol_fingerprint': protocol['fingerprint']})
     if (final / 'completion.json').is_file():
-        verify_registered(work)
-        return _read(final / 'result.json')
+        return verify_registered(work)
     global_stage = _stage(work, 'global', protocol['fingerprint'], lambda path, fingerprint:
-        run_alignment(source, inputs['las'], path, input_root=inputs['input_root'],
-                      max_las_points=config.registration_max_las_points, workers=config.registration_workers,
-                      context_fingerprint=fingerprint))
+        register_global(source, inputs, path, workers=config.workers, context_fingerprint=fingerprint))
     reference = _points(global_stage / 'registration_points.npz')
     base_acceptance = surface_acceptance(reference, config)
     if not base_acceptance['passed']:
@@ -237,52 +224,34 @@ def register(work):
 
     def compute_joint(path, fingerprint):
         try:
-            run_joint_alignment(global_stage, inputs['input_root'], path, mode='production',
-                workers=config.registration_workers, outer_iterations=config.registration_outer_iterations,
-                iterations=config.registration_ba_iterations, pose_std=config.registration_pose_std_m,
-                las_std=config.registration_las_std_m, pose_weight=config.registration_pose_weight,
-                las_weight=config.registration_las_weight, context_fingerprint=fingerprint)
+            refine_joint(global_stage, inputs, path, workers=config.workers, context_fingerprint=fingerprint)
         except JointConstraintsUnavailable as exc:
             with staged_directory(path) as stage:
-                write_json(stage / 'unavailable.json', {'error': str(exc), 'registered_fallback_available': True})
+                write_json(stage / 'unavailable.json', {'error': str(exc)})
                 complete_publication(stage, fingerprint)
 
     joint = _stage(work, 'joint', protocol['fingerprint'], compute_joint)
     unavailable = (joint / 'unavailable.json').is_file()
-    candidate = joint / 'stages/pose_las'
-    diagnostic = None if unavailable else _read(candidate / 'diagnostic.json')
-    decision = select_candidate(reference, None if unavailable else _points(candidate / 'las_points.npz'),
+    diagnostic = None if unavailable else _read(joint / 'diagnostic.json')
+    decision = select_candidate(reference, None if unavailable else _points(joint / 'las_points.npz'),
                                 diagnostic, config)
     if unavailable:
         decision['fallback_reasons'].append(_read(joint / 'unavailable.json')['error'])
-    selected = candidate / 'aligned_model' if decision['joint_accepted'] else global_stage / 'transformed_model'
+    selected = (joint if decision['joint_accepted'] else global_stage) / 'sparse/0'
     rec = pycolmap.Reconstruction(selected)
-    base = pycolmap.Reconstruction(work / FINAL / 'sparse/0')
-    assert_identity(base, rec)
-    scene = load_scene(work / 'sfm')
-    _check_model(rec, scene)
-    split, triangle = partitions(work)
-    assert_holdout_isolated(rec, split)
-    quality = {'model_sha256': _hashes(selected), **production_quality(rec), 'registration': decision,
-               'camera_parameter_bounds': _read(work / FINAL / 'result.json')['ba'].get('cameras', {})}
+    assert_identity(pycolmap.Reconstruction(source), rec)
+    _check_model(rec, visual_scene)
+    quality = {**production_quality(rec), 'registration': decision,
+               'camera_parameter_bounds': visual_result['ba'].get('cameras', {})}
     quality['acceptance'] = production_acceptance(quality, config)
-    if is_validation(work):
-        quality.update(mode='validation', observations_excluded_for_validation=None)
     with staged_directory(final) as stage:
         model = stage / 'sparse/0'
         model.mkdir(parents=True)
         rec.write(model)
-        hashes = _hashes(model)
+        _check_model(pycolmap.Reconstruction(model), visual_scene)
+        hashes = model_hashes(model)
         quality['model_sha256'] = hashes
-        if is_validation(work):
-            from geosunpre.pipeline.reconstruction import freeze_geometry
-            from geosunpre.sfm.evaluation import evaluate_reconstruction
-            _, _, _, features, _, _ = freeze_geometry(work, require_existing=True)
-            validation = {'model_sha256': hashes,
-                'raw': evaluate_reconstruction(rec, scene, features, split, stage / 'validation'),
-                'triangle': evaluate_reconstruction(rec, scene, features, triangle, stage / 'triangle_validation')}
-            write_json(stage / 'validation_summary.json', validation)
-        result = {'version': 1, 'status': 'registered', 'model': str(final / 'sparse/0'),
+        result = {'version': 2, 'status': 'registered', 'model': str(final / 'sparse/0'),
                   'selected': decision['selected'], 'joint_accepted': decision['joint_accepted'],
                   'fallback_reasons': decision['fallback_reasons'], 'target_frame': decision['target_frame'],
                   'model_sha256': hashes, 'protocol_fingerprint': protocol['fingerprint'],
@@ -290,38 +259,34 @@ def register(work):
                   'points': rec.num_points3D(), 'observations': rec.compute_num_observations(),
                   'global_completion_sha256': file_digest(global_stage / 'completion.json'),
                   'joint_completion_sha256': file_digest(joint / 'completion.json'),
-                  'absolute_accuracy_validated': False, 'intrinsics_optimized': False, 'training_run': False}
+                  'absolute_accuracy_validated': False, 'intrinsics_optimized': False}
         write_json(stage / 'quality_summary.json', quality)
         write_json(stage / 'result.json', result)
-        _write_report(stage / 'inspection.html', result, decision, unavailable)
-        complete_publication(stage, final_context)
-    freeze_inputs(work)
+        _write_report(stage / 'inspection.html', result, quality, unavailable)
+        complete_publication(stage, digest({'name': 'final', 'protocol_fingerprint': protocol['fingerprint']}))
     return verify_registered(work)
 
 
 def verify_registered(work):
-    """Recheck completed stages and current sources before export or a resumed run."""
+    """Verify all completed registration stages and their current upstream model."""
     work = Path(work).resolve()
     inputs = freeze_inputs(work)
+    verify_final(work)
     root = work / ROOT
     protocol = _read(root / 'protocol.json')
-    if protocol.get('fingerprint') != digest({k: v for k, v in protocol.items() if k != 'fingerprint'}):
-        raise ValueError('Registration protocol changed')
-    if (protocol['inputs_fingerprint'] != inputs['fingerprint']
-            or protocol['source_export_sha256'] != file_digest(root / 'visual_colmap/colmap_export.json')
-            or protocol['source_model_sha256'] != _hashes(root / 'visual_colmap/sparse/0')):
-        raise ValueError('Registration inputs or source visual model changed')
-    from geosunpre.pipeline.runner import FINAL
-    if protocol['source_model_sha256'] != _hashes(work / FINAL / 'sparse/0'):
-        raise ValueError('Registered model belongs to another visual final model')
-    verify_colmap_export(root / 'visual_colmap')
+    if (protocol.get('version') != 2
+            or protocol.get('fingerprint') != digest({k: v for k, v in protocol.items() if k != 'fingerprint'})
+            or protocol['inputs_fingerprint'] != inputs['fingerprint']
+            or protocol['source_model_sha256'] != model_hashes(work / FINAL / 'sparse/0')
+            or protocol['visual_result_sha256'] != file_digest(work / FINAL / 'result.json')
+            or protocol['scene_manifest_sha256'] != file_digest(work / 'sfm/manifest.json')):
+        raise ValueError('Registration inputs or visual source identity changed')
     for name in ('global', 'joint', 'final'):
-        context = digest({'name': name, 'protocol_fingerprint': protocol['fingerprint']})
-        verify_publication(root / name, context)
+        verify_publication(root / name, digest({'name': name, 'protocol_fingerprint': protocol['fingerprint']}))
     result = _read(root / 'final/result.json')
     if (result['protocol_fingerprint'] != protocol['fingerprint']
             or result['inputs_fingerprint'] != inputs['fingerprint']
-            or result['model_sha256'] != _hashes(root / 'final/sparse/0')
+            or result['model_sha256'] != model_hashes(root / 'final/sparse/0')
             or result['global_completion_sha256'] != file_digest(root / 'global/completion.json')
             or result['joint_completion_sha256'] != file_digest(root / 'joint/completion.json')
             or result['target_frame'] != 'input_las_xyz'):
@@ -329,59 +294,53 @@ def verify_registered(work):
     return result
 
 
-def export_registered(work, *, output=None, image_mode='copy', include_masks=False, include_ply=False):
-    from geosunpre.pipeline.runner import _check_model
-    from geosunpre.pipeline.reconstruction import freeze_geometry
-    from geosunpre.pipeline.observations import is_validation, partitions
-    from geosunpre.pipeline.quality import production_acceptance
-    from geosunpre.sfm.reconstruction import assert_holdout_isolated
-
+def export_registered(work, *, output=None, image_mode='copy', include_masks=True, include_ply=True,
+                      ply_voxel_size=DEFAULT_VOXEL_SIZE):
     work = Path(work).resolve()
     result = verify_registered(work)
-    root = work / ROOT
-    final = root / 'final'
-    _, visual_scene, *_ = freeze_geometry(work, require_existing=True)
-    rec = pycolmap.Reconstruction(final / 'sparse/0')
-    _check_model(rec, visual_scene)
-    assert_holdout_isolated(rec, partitions(work)[0])
+    scene = load_scene(work / 'sfm')
+    final = work / ROOT / 'final'
     quality = _read(final / 'quality_summary.json')
     production_acceptance(quality, load_config(work))
-    source = root / 'visual_colmap'
-    identity = _read(source / 'colmap_export.json')
-    scene = _scene(source, rec, identity)
+    _check_model(pycolmap.Reconstruction(final / 'sparse/0'), scene)
     output = Path(output).resolve() if output else work / 'colmap'
-    if output == work or output.is_relative_to(root) or output.is_relative_to(work / 'sfm'):
-        raise ValueError('Choose a COLMAP export separate from pipeline intermediate models')
-    provenance = {**identity['provenance'], 'kind': 'registered_sfm_pipeline',
-        'source_model_sha256': result['model_sha256'], 'source_visual_model_sha256': identity['model_sha256'],
-        'registration_inputs_sha256': file_digest(root / 'inputs.json'),
-        'registration_protocol_sha256': file_digest(root / 'protocol.json'),
+    inputs = _read(work / ROOT / 'inputs.json')
+    if (output == work or work.is_relative_to(output)
+            or any(output.is_relative_to(work / directory) for directory in
+                   ('registration', 'sfm', 'calibration', 'features', 'matches'))
+            or output.is_relative_to(Path(inputs['input_root']))):
+        raise ValueError('Choose a COLMAP export separate from pipeline models and raw input')
+    provenance = {'kind': 'geosunpre_production', 'source_model_sha256': result['model_sha256'],
+        'pipeline_config_sha256': file_digest(work / CONFIG_FILE),
+        'pipeline_task_sha256': file_digest(work / TASK_FILE),
+        'model_weights_sha256': {name: file_digest(work / name) for name in
+            ('frontend_weights.json', 'segmentation_weights.json') if (work / name).is_file()},
+        'scene_manifest_sha256': file_digest(work / 'sfm/manifest.json'), **protocol_identity(work),
+        'registration_inputs_sha256': file_digest(work / ROOT / 'inputs.json'),
+        'registration_protocol_sha256': file_digest(work / ROOT / 'protocol.json'),
         'registration_result_sha256': file_digest(final / 'result.json'),
-        'registration_quality_sha256': file_digest(final / 'quality_summary.json'),
-        'las_sha256': _read(root / 'inputs.json')['input_sha256'][_read(root / 'inputs.json')['las']],
+        'las_sha256': inputs['input_sha256'][inputs['las']],
         'target_frame': 'input_las_xyz', 'registration_selected': result['selected'],
-        'pose_used_for_registration': True, 'las_used_for_registration': True,
-        'pose_values_used_for_joint_ba': result['joint_accepted'], 'las_used_for_joint_ba': result['joint_accepted'],
-        'navigation_pose_values_or_las_used': True, 'intrinsics_optimized_during_registration': False,
-        'absolute_accuracy_validated': False, 'independent_image_validation': False,
-        'registration_scope': POLICY['scope']}
-    if is_validation(work):
-        provenance['registered_validation_sha256'] = file_digest(final / 'validation_summary.json')
+        'joint_refinement_accepted': result['joint_accepted'],
+        'independent_exposure_poses': True, 'manual_annotations_used': False,
+        'intrinsics_optimized_during_registration': False, 'absolute_accuracy_validated': False}
     return export_colmap(final / 'sparse/0', scene, output, image_mode=image_mode,
-                         include_masks=include_masks, include_ply=include_ply, provenance=provenance,
-                         quality_report=final / 'quality_summary.json')
+                         include_masks=include_masks, include_ply=include_ply,
+                         initialization_las=inputs['las'], ply_voxel_size=ply_voxel_size,
+                         provenance=provenance, quality_report=final / 'quality_summary.json')
 
 
-def _write_report(path, result, decision, unavailable):
-    selected = '图像 + pose + LAS 联合结果' if result['joint_accepted'] else '通过验收的全局配准回退结果'
-    reasons = ''.join(f'<li>{html.escape(reason)}</li>' for reason in decision['fallback_reasons'])
-    joint_link = '<a href="../joint/inspection.html">联合 BA 对照</a> · ' if not unavailable else ''
-    Path(path).write_text(f'''<!doctype html><html lang="zh"><meta charset="utf-8"><title>LAS 坐标交付验收</title>
-<style>body{{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}}p,li{{line-height:1.7}}</style>
-<h1>LAS 坐标交付验收</h1><p>最终采用：{selected}。图像 {result['registered_images']}，稀疏点 {result['points']}。
-三维点和相机世界坐标均为输入 LAS 的 XYZ 框架；内参固定，LAS 未移动。</p>
-<p><a href="result.json">交付决策</a> · <a href="quality_summary.json">图像及配准验收</a> ·
-<a href="../global/inspection.html">全局配准</a> · {joint_link}<a href="../inputs.json">输入与坐标约定</a></p>
-<ul>{reasons}</ul><p>配准门槛使用拟合区域。LAS 留出只作描述，不参与交付选择。
-坐标单位按米假设；绝对地理精度及 3DGS 几何、渲染质量尚未验收。
-最终 COLMAP 目录由主流程的 export 阶段交付，默认 WORK/colmap。</p></html>''', encoding='utf-8')
+def _write_report(path, result, quality, unavailable):
+    selected = 'Pose / LAS 联合优化' if result['joint_accepted'] else '已验收全局配准（联合更新被拒绝）'
+    reasons = ''.join(f'<li>{html.escape(reason)}</li>' for reason in result['fallback_reasons'])
+    residual = quality['training_reprojection']
+    joint_link = '<a href="../joint/diagnostic.json">联合求解记录</a>' if not unavailable else '<a href="../joint/unavailable.json">约束不足记录</a>'
+    Path(path).write_text(f"""<!doctype html><html lang="zh"><meta charset="utf-8"><title>COLMAP 交付验收</title>
+<style>body{{font:16px system-ui;max-width:1000px;margin:32px auto;padding:0 20px}}p,li{{line-height:1.7}}</style>
+<h1>COLMAP 交付验收</h1><p>采用结果：{selected}。</p>
+<p>图像 {result['registered_images']}，稀疏点 {result['points']}，观测 {result['observations']}；
+拟合残差 median / P90：{residual['median']:.3f} / {residual['p90']:.3f} px。</p>
+<p>相机和三维点位于输入 LAS XYZ 框架，内参固定。下游直接读取 COLMAP，不再套用配准变换。</p>
+<ul>{reasons}</ul><p><a href="result.json">交付决策</a> · <a href="quality_summary.json">完整质量记录</a> ·
+<a href="../global/report.json">全局配准记录</a> · {joint_link} · <a href="../inputs.json">输入约定</a></p>
+<p>验收使用拟合观测和获支持的 LAS 表面；绝对地理精度与 3DGS 渲染质量需另行验证。</p></html>""", encoding='utf-8')

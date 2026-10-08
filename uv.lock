@@ -177,21 +177,15 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "geosunpre-native" },
+    { name = "lomatch" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "pillow" },
     { name = "pyceres" },
     { name = "pycolmap" },
     { name = "scipy" },
-]
-
-[package.optional-dependencies]
-loma = [
-    { name = "lomatch" },
     { name = "torch" },
     { name = "torchvision" },
-]
-segmentation = [
     { name = "transformers" },
 ]
 
@@ -203,18 +197,17 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "geosunpre-native", directory = "native" },
-    { name = "lomatch", marker = "extra == 'loma'", git = "https://github.com/davnords/LoMa.git?rev=8fb59c458f2a2ef44314f462467b229c27786bf0" },
+    { name = "lomatch", git = "https://github.com/davnords/LoMa.git?rev=8fb59c458f2a2ef44314f462467b229c27786bf0" },
     { name = "numpy", specifier = ">=2.2" },
     { name = "opencv-python", specifier = ">=4.12,<5" },
     { name = "pillow", specifier = ">=12" },
     { name = "pyceres", specifier = "==2.6" },
     { name = "pycolmap", specifier = "==4.2.0" },
     { name = "scipy", specifier = ">=1.15" },
-    { name = "torch", marker = "extra == 'loma'", specifier = "==2.8.0", index = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128", conflict = { package = "geosunpre", extra = "loma" } },
-    { name = "torchvision", marker = "extra == 'loma'", specifier = "==0.23.0", index = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128", conflict = { package = "geosunpre", extra = "loma" } },
-    { name = "transformers", marker = "extra == 'segmentation'", specifier = "==4.57.6" },
+    { name = "torch", specifier = "==2.8.0", index = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128" },
+    { name = "torchvision", specifier = "==0.23.0", index = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128" },
+    { name = "transformers", specifier = "==4.57.6" },
 ]
-provides-extras = ["segmentation", "loma"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]

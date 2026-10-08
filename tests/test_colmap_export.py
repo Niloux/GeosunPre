@@ -1,30 +1,34 @@
 import json
 from pathlib import Path
 import shutil
+import numpy as np
 
 from PIL import Image
 import pycolmap
 import pytest
 
 from geosunpre.cli import main
-from geosunpre.sfm.evaluation import evaluate_reconstruction
-from geosunpre.pipeline import runner as build
+from geosunpre.pipeline import finalization as build
 from geosunpre.colmap import MODEL_FILES
 from geosunpre.colmap import export_colmap
 from geosunpre.colmap import verify_colmap_export
 from geosunpre.artifacts import file_digest
 from geosunpre.artifacts import write_json
-from test_pipeline import tiny_visual_work
+from helpers import tiny_visual_work, make_las
 
 
 def test_copy_export_is_portable_and_preserves_full_model(tmp_path):
     work, root, scene, _, records = tiny_visual_work(tmp_path)
     output = tmp_path / 'export'
+    las = tmp_path / 'input.las'
+    make_las(las, np.random.default_rng(1).normal(size=(40, 3)))
     original_hashes = {name: file_digest(work / build.SOURCE / name) for name in MODEL_FILES}
     exported = export_colmap(work / build.SOURCE, scene, output, image_mode='copy',
-                             include_masks=True, include_ply=True)
+                             include_masks=True, include_ply=True, initialization_las=las)
     assert exported['points'] == 20
     assert (output / 'sparse/0/points3D.ply').is_file()
+    assert exported['initialization']['source'] == 'las'
+    assert exported['initialization']['points'] == 40
     assert not (output / 'lfs_config.json').exists()
     assert not (output / 'images/L/a.jpg').is_symlink()
     assert {name: file_digest(output / 'sparse/0' / name) for name in MODEL_FILES} == original_hashes
@@ -32,6 +36,7 @@ def test_copy_export_is_portable_and_preserves_full_model(tmp_path):
     relocated.parent.mkdir(parents=True)
     output.rename(relocated)
     shutil.rmtree(work)
+    las.unlink()
     for record in records.values():
         Path(record['source']).unlink()
         Path(record['semantic_mask']).unlink()
@@ -42,11 +47,15 @@ def test_copy_export_is_portable_and_preserves_full_model(tmp_path):
     assert pycolmap.Reconstruction(relocated / 'sparse/0').is_valid()
 
 
-@pytest.mark.parametrize('relative', ['images/L/a.jpg', 'masks/L/a.jpg.png', 'sparse/0/points3D.bin'])
+@pytest.mark.parametrize('relative', ['images/L/a.jpg', 'masks/L/a.jpg.png', 'sparse/0/points3D.bin',
+                                      'sparse/0/points3D.ply', 'initialization.json'])
 def test_content_changes_are_rejected(tmp_path, relative):
     work, _, scene, _, _ = tiny_visual_work(tmp_path)
     output = tmp_path / 'export'
-    export_colmap(work / build.SOURCE, scene, output, image_mode='copy', include_masks=True)
+    las = tmp_path / 'input.las'
+    make_las(las, np.random.default_rng(1).normal(size=(40, 3)))
+    export_colmap(work / build.SOURCE, scene, output, image_mode='copy', include_masks=True,
+                  include_ply=True, initialization_las=las)
     path = output / relative
     with path.open('ab') as stream:
         stream.write(b'changed')
@@ -80,32 +89,24 @@ def test_existing_export_is_immutable_and_nonempty_directory_is_protected(tmp_pa
     assert list(foreign.iterdir()) == [foreign / 'other.json']
 
 
-
-
-
-
-def test_cli_exports_and_checks_without_a_work_directory(tmp_path, capsys):
+def test_cli_checks_portable_delivery_without_a_work_directory(tmp_path, capsys):
     work, root, _, _, _ = tiny_visual_work(tmp_path)
     output = tmp_path / 'export'
-    main(['export', '--scene', str(root / 'manifest.json'),
-          '--model', str(work / build.SOURCE), '--output', str(output), '--image-mode', 'copy'])
-    assert json.loads(capsys.readouterr().out)['images'] == 2
+    export_colmap(work / build.SOURCE, json.loads((root / 'manifest.json').read_text()), output)
     shutil.rmtree(work)
     main(['check', '--output', str(output)])
     assert json.loads(capsys.readouterr().out)['full_content_check'] is True
 
 
-def test_nonempty_evaluation_creates_directory_and_retains_failed_queries(tmp_path):
-    work, _, scene, features, _ = tiny_visual_work(tmp_path)
-    # A missing support view is a legitimate failed query and stays in the denominator.
-    split = {'tracks': [{'id': 'missing-support',
-                         'support': [('L/a.jpg', 0), ('missing.jpg', 0)],
-                         'queries': [('R/b.jpg', 0)]}]}
-    output = tmp_path / 'new/validation'
-    model = pycolmap.Reconstruction(work / build.SOURCE)
-    report = evaluate_reconstruction(model, scene, features, split, output)
-    assert report['status'] == 'evaluated'
-    assert report['all_candidate_queries']['count'] == 1
-    assert report['all_candidate_queries']['finite_count'] == 0
-    assert report['all_candidate_queries']['fraction_le_1px'] == 0
-    assert (output / 'validation_observations.npz').is_file()
+def test_cli_work_check_uses_the_frozen_custom_delivery_path(tmp_path, capsys):
+    from geosunpre.config import PipelineConfig, save_config
+    from geosunpre.pipeline.task import bind_task
+
+    work, _, scene, _, _ = tiny_visual_work(tmp_path)
+    output = tmp_path / 'custom_delivery'
+    save_config(work, PipelineConfig())
+    bind_task(work, output=output)
+    export_colmap(work / build.SOURCE, scene, output)
+    main(['check', '--work', str(work)])
+    result = json.loads(capsys.readouterr().out)
+    assert result['output'] == str(output) and result['full_content_check']

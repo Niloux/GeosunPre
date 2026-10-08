@@ -11,7 +11,6 @@ from PIL import Image
 from geosunpre.camera import Camera
 from geosunpre.sfm.geometry import fit_pair
 from geosunpre.sfm.geometry import rotation_graph_diagnostics
-from geosunpre.sfm.tracks import train_edge_mask
 from geosunpre.artifacts import write_json
 from geosunpre.parallel import ordered_map
 
@@ -32,10 +31,9 @@ def cheirality_health(rec):
 
 
 @profiled
-def database_and_seed(directory, scene, images, entries, features, split):
+def database_and_seed(directory, scene, images, entries, features):
     cameras={k:Camera.from_dict(v) for k,v in scene['cameras'].items()}
     records={im['name']:im for im in images}
-    held={(name,int(idx)) for t in split['tracks'] for name,idx in t['observations']}
     candidates=[]
     directory.mkdir(parents=True,exist_ok=True)
     (directory/'geometry').mkdir(exist_ok=True)
@@ -43,15 +41,13 @@ def database_and_seed(directory, scene, images, entries, features, split):
         a,b=records[entry['a']],records[entry['b']]
         with np.load(entry['path']) as raw:
             matches=raw['matches']
-            keep=train_edge_mask(a['name'],b['name'],matches,held)
-            train=matches[keep]
+            train=matches
         pa=features[a['name']]['keypoints'][train[:,0]].astype(float)
         pb=features[b['name']]['keypoints'][train[:,1]].astype(float)
         metrics,arrays=fit_pair(cameras[a['camera']],cameras[b['camera']],pa,pb,max_error=3,seed=271828)
         name=f'{a["camera"]}{a["frame_index"]:05d}__{b["camera"]}{b["frame_index"]:05d}'
         row={'label':name,'a':a['name'],'b':b['name'],'raw_count':len(matches),
-             ('eligible_matches' if split.get('isolation_scope') == 'all_eligible_observations'
-              else 'after_holdout_removal'):len(train),**metrics}
+             'eligible_matches':len(train),**metrics}
         candidate=None
         if metrics['success']:
             inliers=train[arrays['verified_mask']]
@@ -79,8 +75,6 @@ def database_and_seed(directory, scene, images, entries, features, split):
     write_json(directory/'geometry_summary.json',{
         'pairs':len(entries),'successful_E_pairs':len(candidates),'database_pairs':len(accepted),
         'rotation_consensus_excluded':[r['label'] for r in candidates if r['excluded_by_rotation_consensus']],
-        **({'observations_excluded_for_validation': 0} if split.get('isolation_scope') == 'all_eligible_observations'
-           else {'heldout_observations':len(held),'holdout_isolated_before_geometry':True}),
         'note':'Rotation-median screening is a robust heuristic, not a ground-truth edge label.'})
     # Prefer a same-camera baseline with large support. No navigation pose enters.
     seeds=[r for r in accepted if records[r['a']]['camera']==records[r['b']]['camera']
@@ -111,7 +105,6 @@ def database_and_seed(directory, scene, images, entries, features, split):
             db.write_keypoints(image.image_id,features[im['name']]['keypoints'])
         for row in accepted:
             a,b=records[row['a']],records[row['b']]
-            assert train_edge_mask(row['a'],row['b'],row['inliers'],held).all()
             geometry=pycolmap.TwoViewGeometry(config=pycolmap.TwoViewGeometryConfiguration.CALIBRATED,
                 E=row['essential'],cam2_from_cam1=pycolmap.Rigid3d(row['pose']),
                 inlier_matches=row['inliers'],tri_angle=float(np.deg2rad(np.median(row['angles']))))
@@ -177,7 +170,7 @@ def mapper_options():
 
 
 @profiled
-def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False, trust_region=None,
+def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False,
                               show_progress=False, max_iterations=None):
     options=pycolmap.BundleAdjustmentOptions()
     free=stage!='fixed'
@@ -197,13 +190,9 @@ def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False,
         options.ceres.solver_options.initial_trust_region_radius=10
         options.ceres.solver_options.max_trust_region_radius=10000
         options.ceres.solver_options.max_num_iterations=400
-        from geosunpre.sfm.depth_guard import depth_cost_class, PositiveDepthCost
+        from geosunpre.sfm.depth_guard import depth_cost_class
         cost_class=depth_cost_class()
-        # Only the reference implementation crosses the Python callback boundary.
-        options.ceres.solver_options.num_threads=1 if cost_class is PositiveDepthCost else 4
-    if trust_region is not None:
-        options.ceres.solver_options.initial_trust_region_radius=float(trust_region[0])
-        options.ceres.solver_options.max_trust_region_radius=float(trust_region[1])
+        options.ceres.solver_options.num_threads=4
     if max_iterations is not None:
         options.ceres.solver_options.max_num_iterations=int(max_iterations)
     options.ceres.solver_options.function_tolerance=1e-7
@@ -279,15 +268,4 @@ def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False,
             'initial_trust_region_radius':options.ceres.solver_options.initial_trust_region_radius,
             'max_trust_region_radius':options.ceres.solver_options.max_trust_region_radius,
             'cameras':health,'bounds':bounds,'observations':rec.compute_num_observations(),
-            'bound_note':'Exploratory numerical limits around uncertain calibration, not measured uncertainty or truth.'}
-
-
-def assert_holdout_isolated(rec,split):
-    names={im.name:im for im in rec.images.values()}
-    for track in split['tracks']:
-        for name,idx in track['observations']:
-            if name in names:
-                if not 0 <= idx < len(names[name].points2D):
-                    raise ValueError(f'Validation feature index differs from model: {name}:{idx}')
-                if names[name].points2D[idx].has_point3D():
-                    raise AssertionError(f'Validation observation leaked: {name}:{idx}')
+            'bound_note':'Numerical limits around initial visual calibration; not measured uncertainty.'}

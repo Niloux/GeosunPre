@@ -19,14 +19,16 @@ FRONTEND_VERSION = 1
 
 @dataclass(frozen=True)
 class FrontendConfig:
-    detector_size: int = 1024
-    num_keypoints: int = 2048
+    detector_size: int = 1536
+    num_keypoints: int = 3072
     oversample: int = 4
     grid_size: int = 8
     match_threshold: float = .1
     loma_commit: str = LOMA_COMMIT
     implementation_version: int = FRONTEND_VERSION
 
+
+FRONTEND_CONFIG = FrontendConfig()
 
 def balanced_selection(pixels, scores, target, width, height, grid_size=8):
     """Reserve a quota for occupied cells, then fill unused slots by confidence."""
@@ -47,11 +49,10 @@ def balanced_selection(pixels, scores, target, width, height, grid_size=8):
 
 
 class LoMaFrontend:
-    def __init__(self, work, scene, config, *, matching_attention='flash'):
+    def __init__(self, work, scene, config):
         self.work = Path(work)
         self.scene = scene
         self.config = config
-        self.matching_attention = matching_attention
         self.model = None
         self.device = None
         self._gpu_features = OrderedDict()
@@ -82,7 +83,7 @@ class LoMaFrontend:
             self.model = LoMa(LoMaB(compile=False, num_keypoints=self.config.num_keypoints)).eval()
             self.model._detector.resize = self.config.detector_size
             from geosunpre.matching import configure_matcher
-            configure_matcher(self.model, self.matching_attention)
+            configure_matcher(self.model)
         return self.model
 
     def prepare_image(self, record):
@@ -206,8 +207,7 @@ class LoMaFrontend:
 
     def match(self, features_a, features_b, *, feature_loader=None):
         identity = {'a': str(features_a['token']), 'b': str(features_b['token']), 'config': asdict(self.config)}
-        if self.matching_attention != 'math':
-            identity['attention_backend'] = self.matching_attention + '_v1'
+        identity['attention_backend'] = 'flash_v1'
         token = digest(identity)
         path = self.work/'matches'/f'{token}.npz'
         if path.exists():

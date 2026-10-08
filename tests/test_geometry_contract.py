@@ -5,7 +5,6 @@ from PIL import Image
 from scipy.spatial.transform import Rotation
 
 from geosunpre.camera import Camera
-from geosunpre.sfm.geometry import build_tracks
 from geosunpre.sfm.geometry import epipolar_pixel_error
 from geosunpre.sfm.geometry import fit_pair
 from geosunpre.sfm.geometry import rotation_graph_diagnostics
@@ -52,17 +51,6 @@ def test_epipolar_distance_in_native_pixels_and_independent_holdout():
     assert result['holdout_epipolar_error_px_all_raw']['p90']>10
     error=Rotation.from_matrix(arrays['pose_cam_b_from_a'][:,:3]@R.T).magnitude()
     assert np.rad2deg(error)<.15
-
-
-def test_tracks_reject_duplicate_observations_in_one_image():
-    records=[{'name':'a','camera':'L'},{'name':'b','camera':'R'},{'name':'c','camera':'L'}]
-    pairs=[('a','b',np.array([[0,0]]),np.array([.9])),
-           ('b','c',np.array([[0,0]]),np.array([.8])),
-           ('c','a',np.array([[0,1]]),np.array([.7]))]
-    summary,tracks=build_tracks(pairs,records)
-    assert summary['tracks_length_ge3']==1
-    assert summary['conflicting_edge_merges_rejected']==1
-    assert tracks==[[('a',0),('b',0),('c',0)]]
 
 
 def test_large_rotation_cross_fisheye_never_uses_raw_pixel_f():
