@@ -14,7 +14,7 @@ from geosunpre.artifacts import digest
 from geosunpre.artifacts import file_digest
 from geosunpre.artifacts import write_json, archive_interrupted, staged_directory
 from geosunpre.colmap import MODEL_FILES, model_hashes
-from geosunpre.pipeline.observations import SCOPE, load_observations, protocol_identity
+from geosunpre.pipeline.observations import SCOPE, protocol_identity
 from geosunpre.artifacts import write_frozen_json
 
 
@@ -23,7 +23,6 @@ def prepare_calibration(work):
     from geosunpre.pipeline.data import load_frontend
 
     _, global_scene, global_data, features = load_frontend(work)
-    load_observations(work, global_data)
     out = Path(work).resolve() / 'calibration'
     images = load_config(work).calibration_images(global_scene)
     names = {row['name'] for row in images}

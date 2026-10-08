@@ -14,7 +14,7 @@ from geosunpre.camera import Camera
 from geosunpre.config import PipelineConfig, load_config, save_config
 from geosunpre.pipeline.runner import run_pipeline
 from geosunpre.pipeline.observations import freeze_observations
-from geosunpre.pipeline.registration import select_candidate, surface_acceptance
+from geosunpre.pipeline.registration import _registration_acceptance, surface_acceptance
 from geosunpre.registration import global_alignment, joint
 from geosunpre.registration.joint_solver import JointConstraintsUnavailable, assert_identity
 from geosunpre.registration.publication import verify_publication
@@ -199,7 +199,7 @@ def test_real_global_and_native_joint_registration_handoff(tmp_path, monkeypatch
     assert not (candidate / 'images').exists()
     with np.load(candidate / 'las_points.npz', allow_pickle=False) as archive:
         candidate_points = {key: archive[key] for key in archive.files}
-    decision = select_candidate(reference, candidate_points, result, PipelineConfig())
+    decision = _registration_acceptance(reference, candidate_points, result, PipelineConfig())
     assert decision['target_frame'] == 'input_las_xyz'
     # Unobservable navigation is the same pipeline's guarded fallback condition.
     with monkeypatch.context() as positions_mock:

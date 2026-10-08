@@ -58,10 +58,13 @@ def freeze_observations(work):
             'sfm/geometry_protocol.json', 'sfm/database.db', 'sfm/mapping',
             'sfm/stages', 'sfm/final', 'calibration/run_contract.json')):
         raise ValueError('Geometry predates observation ownership; use a fresh work directory')
-    _, _, data, features = load_frontend(work)
+    _, _, data, features = load_frontend(work, require_observations=False)
     if protocol_path(work).exists():
         return load_observations(work, data)
     value = _identity(work, data)
+    # First publication validates every feature array, including images without
+    # a retained match. Completed protocols need only their content identities.
+    features = dict(features)
     for entry in data['pairs']:
         with np.load(entry['path'], allow_pickle=False) as raw:
             matches, scores = raw['matches'], raw['scores']

@@ -17,7 +17,7 @@ from geosunpre.colmap import MODEL_FILES, model_hashes
 from geosunpre.sfm.track_filter import CONFIG as TRACK_CONFIG
 from geosunpre.sfm.track_filter import filter_mapped_tracks
 from geosunpre.sfm.track_filter import training_adjacency
-from geosunpre.pipeline.observations import load_observations, protocol_identity
+from geosunpre.pipeline.observations import protocol_identity
 from geosunpre.artifacts import write_frozen_json
 from geosunpre.pipeline.data import load_frontend
 
@@ -30,7 +30,6 @@ def freeze_geometry(work, *, require_existing=False):
     work = Path(work).resolve()
     from geosunpre.pipeline.calibration import verify_calibration
 
-    load_observations(work, data)
     local = work / 'calibration/stages/principal/sparse/0'
     calibration = verify_calibration(work)
     params = {i: camera.params.tolist() for i, camera in calibration.cameras.items()}
@@ -78,8 +77,10 @@ def build_mapping(work):
         if not (db.exists() and all((seed / name).is_file() for name in MODEL_FILES)):
             archive_interrupted(db)
             archive_interrupted(seed)
+            # Materialize once before pair workers start; they share these
+            # verified arrays rather than loading and hashing caches per pair.
             db, seed = database_and_seed(out, geometric_scene(scene, params), scene['images'],
-                                         data['pairs'], features)
+                                         data['pairs'], dict(features))
         opts = mapper_options()
         with operation('incremental_mapping'):
             maps = pycolmap.incremental_mapping(db, Path(scene['input_root']) / 'Image',

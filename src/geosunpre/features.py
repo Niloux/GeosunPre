@@ -30,6 +30,41 @@ class FrontendConfig:
 
 FRONTEND_CONFIG = FrontendConfig()
 
+
+def _feature_cache_root(work, config):
+    return Path(work) / 'features' / digest(asdict(config))[:20]
+
+
+def feature_input(work, scene, config, record):
+    """Check prepared inputs and derive the shared extraction identity and path."""
+    cam = Camera.from_dict(scene['cameras'][record['camera']])
+    stat = Path(record['source']).stat()
+    if stat.st_size != record['size_bytes'] or stat.st_mtime_ns != record['mtime_ns']:
+        raise ValueError(f'{record["name"]}: image changed since prepare; use a fresh work directory')
+    identity = {'image_sha256': file_digest(record['source']),
+                'mask_sha256': file_digest(record['semantic_mask']) if record['semantic_mask'] else None,
+                'camera': cam.to_dict(), 'fov': scene['fov_degrees'], 'config': asdict(config)}
+    token = digest(identity)
+    return cam, identity, token, _feature_cache_root(work, config) / f'{token}.npz'
+
+
+def read_feature_cache(path, token, *, name=None, fields=None, expected_sha256=None):
+    """Read requested arrays, checking input identity and any frozen byte identity."""
+    def check_content():
+        if expected_sha256 is not None and file_digest(path) != expected_sha256:
+            raise ValueError(f'Feature cache content changed: {name or path}')
+
+    check_content()
+    with np.load(path, allow_pickle=False) as cached:
+        if str(cached['token']) != token:
+            raise ValueError(f'Cached feature identity changed: {name or path}')
+        if name is not None and json.loads(str(cached['metadata']))['name'] != name:
+            raise ValueError(f'Global feature identity changed: {name}')
+        result = {key: cached[key] for key in (cached.files if fields is None else fields)}
+    check_content()
+    return result
+
+
 def balanced_selection(pixels, scores, target, width, height, grid_size=8):
     """Reserve a quota for occupied cells, then fill unused slots by confidence."""
     if not len(pixels):
@@ -65,7 +100,7 @@ class LoMaFrontend:
         self.cache_stats = {'feature_hits': 0, 'feature_misses': 0, 'match_hits': 0, 'match_misses': 0}
         self.cache_stats.update(gpu_feature_hits=0, gpu_feature_misses=0,
                                 gpu_upload_bytes=0, gpu_feature_peak_bytes=0)
-        self.cache = self.work/'features'/digest(asdict(config))[:20]
+        self.cache = _feature_cache_root(self.work, config)
         self.cache.mkdir(parents=True, exist_ok=True)
 
     def load_model(self):
@@ -108,7 +143,7 @@ class LoMaFrontend:
             pending = OrderedDict()
             iterator = iter(enumerate(records))
             for index, record in iterator:
-                _, _, _, path = self._feature_input(record)
+                _, _, _, path = feature_input(self.work, self.scene, self.config, record)
                 prepared = None
                 if not path.is_file():
                     self.load_model()
@@ -120,28 +155,11 @@ class LoMaFrontend:
             for record, prepared in pending.values():
                 yield self.extract(record, prepared=prepared.result() if prepared else None)
 
-    def _feature_input(self, record):
-        cam = Camera.from_dict(self.scene['cameras'][record['camera']])
-        stat = Path(record['source']).stat()
-        if stat.st_size != record['size_bytes'] or stat.st_mtime_ns != record['mtime_ns']:
-            raise ValueError(f'{record["name"]}: image changed since prepare; use a fresh work directory')
-        source_hash = file_digest(record['source'])
-        mask_hash = file_digest(record['semantic_mask']) if record['semantic_mask'] else None
-        identity = {'image_sha256': source_hash, 'mask_sha256': mask_hash,
-                    'camera': cam.to_dict(), 'fov': self.scene['fov_degrees'], 'config': asdict(self.config)}
-        token = digest(identity)
-        path = self.cache/f'{token}.npz'
-        return cam, identity, token, path
-
     def extract(self, record, *, prepared=None):
-        cam, identity, token, path = self._feature_input(record)
+        cam, identity, token, path = feature_input(self.work, self.scene, self.config, record)
         if path.exists():
             self.cache_stats['feature_hits'] += 1
-            with np.load(path, allow_pickle=False) as f:
-                cached = {k: f[k] for k in f.files}
-            if str(cached['token']) != token:
-                raise ValueError(f'Cached feature identity changed: {record["name"]}')
-            return cached
+            return read_feature_cache(path, token)
         self.cache_stats['feature_misses'] += 1
         import torch
         model = self.load_model()

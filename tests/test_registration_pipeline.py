@@ -55,8 +55,8 @@ def test_local_las_regression_blocks_joint_delivery_despite_good_overall_quantil
     candidate = {k: v.copy() for k, v in base.items()}
     candidate['signed_plane_error'][:50] = .04
     candidate['signed_plane_error'][50:] = .005
-    result = registration.select_candidate(base, candidate, {'accepted_for_delivery': True}, PipelineConfig())
-    assert result['selected'] == 'global_registration'
+    result = registration._registration_acceptance(base, candidate, {'accepted_for_delivery': True}, PipelineConfig())
+    assert not result['joint_eligible']
     assert any('tile/0,0,0' in failure for failure in result['joint_regression']['failures'])
     assert result['target_frame'] == 'input_las_xyz'
 
@@ -65,11 +65,11 @@ def test_las_coverage_loss_and_global_failure_cannot_be_reported_as_joint_succes
     base = supported_points()
     candidate = {k: v.copy() for k, v in base.items()}
     candidate['stable_surface_supported'][:50] = False
-    result = registration.select_candidate(base, candidate, {'accepted_for_delivery': True}, PipelineConfig())
-    assert not result['joint_accepted']
+    result = registration._registration_acceptance(base, candidate, {'accepted_for_delivery': True}, PipelineConfig())
+    assert not result['joint_eligible']
     base['stable_surface_supported'][:] = False
     with pytest.raises(ValueError, match='LAS registration acceptance rejected'):
-        registration.select_candidate(base, None, None, PipelineConfig())
+        registration._registration_acceptance(base, None, None, PipelineConfig())
 
 
 def test_geometry_gates_never_select_using_las_holdout():
@@ -78,8 +78,8 @@ def test_geometry_gates_never_select_using_las_holdout():
     candidate = {k: v.copy() for k, v in base.items()}
     candidate['signed_plane_error'][-50:] = .9
     candidate['stable_surface_supported'][-50:] = False
-    result = registration.select_candidate(base, candidate, {'accepted_for_delivery': True}, PipelineConfig())
-    assert result['joint_accepted']
+    result = registration._registration_acceptance(base, candidate, {'accepted_for_delivery': True}, PipelineConfig())
+    assert result['joint_eligible']
     assert result['joint_acceptance']['fit_points'] == 250
 
 
@@ -87,8 +87,8 @@ def test_nonfinite_joint_geometry_returns_the_registered_fallback():
     base = supported_points()
     candidate = {k: v.copy() for k, v in base.items()}
     candidate['signed_plane_error'][:] = np.nan
-    result = registration.select_candidate(base, candidate, {'accepted_for_delivery': True}, PipelineConfig())
-    assert not result['joint_accepted'] and result['joint_regression'] is None
+    result = registration._registration_acceptance(base, candidate, {'accepted_for_delivery': True}, PipelineConfig())
+    assert not result['joint_eligible'] and result['joint_regression'] is None
     assert 'Nonfinite registration residuals' in result['fallback_reasons']
 
 
@@ -111,12 +111,18 @@ def test_committed_stage_rejects_changed_metadata_and_interrupted_stage_is_rebui
         registration._stage(tmp_path, 'global', 'frozen', compute)
 
 
-def registration_fixture(tmp_path, monkeypatch, *, accept=True, interrupt=False):
+def registration_fixture(tmp_path, monkeypatch, *, accept=True, interrupt=False,
+                         reprojection_offset=None, joint_shift=0.):
     work = global_frontend(tmp_path, frames=(70, 72))
     freeze_observations(work)
     complete_calibration(work, monkeypatch)
     reconstruction.freeze_geometry(work)
     rec = pycolmap.Reconstruction(work / 'calibration/stages/principal/sparse/0')
+    if reprojection_offset is not None:
+        for image in rec.images.values():
+            for index, point in enumerate(image.points2D):
+                if point.has_point3D():
+                    point.xy = point.xy + [reprojection_offset(image, index), 0.]
     source = work / finalization.SOURCE
     source.mkdir(parents=True)
     rec.write(source)
@@ -166,7 +172,12 @@ def registration_fixture(tmp_path, monkeypatch, *, accept=True, interrupt=False)
         candidate = output
         model = candidate / 'sparse/0'
         model.mkdir(parents=True)
-        pycolmap.Reconstruction(global_stage / 'sparse/0').write(model)
+        proposed = pycolmap.Reconstruction(global_stage / 'sparse/0')
+        if joint_shift:
+            for frame in proposed.frames.values():
+                pose = frame.rig_from_world
+                frame.rig_from_world = pycolmap.Rigid3d(pose.rotation, pose.translation + [joint_shift, 0., 0.])
+        proposed.write(model)
         write_json(candidate / 'diagnostic.json', {'accepted_for_delivery': accept})
         with np.load(global_stage / 'registration_points.npz') as archive:
             np.savez(candidate / 'las_points.npz', **{k: archive[k] for k in archive.files})
@@ -218,3 +229,118 @@ def test_interrupted_joint_run_resumes_from_committed_global_registration(tmp_pa
     registration.register(work)
     assert calls == {'global': 1, 'joint': 2}
     assert list((work / registration.ROOT).glob('joint.interrupted-*/partial.json'))
+
+
+@pytest.mark.parametrize('metric,limit', [('median', 2.), ('p90', 4.)])
+@pytest.mark.parametrize('lens', [None, 'L', 'R'])
+def test_absolute_reprojection_rejection_delivers_the_registered_fallback(tmp_path, monkeypatch, metric, limit, lens):
+    from geosunpre.registration.joint_solver import ImageObservations, image_gate
+
+    def offset(image, index):
+        if (lens is not None and image.name.split('/')[0] != lens) or (metric == 'p90' and index % 4):
+            return 1.
+        return limit - 1e-4
+
+    work, calls, _ = registration_fixture(tmp_path, monkeypatch,
+        reprojection_offset=offset, joint_shift=-1e-3)
+    result = registration.register(work)
+    root = work / registration.ROOT
+    reference = pycolmap.Reconstruction(root / 'global/sparse/0')
+    candidate = pycolmap.Reconstruction(root / 'joint/sparse/0')
+    observations = ImageObservations(reference, np.eye(4))
+    baseline_errors, _ = observations.errors(reference)
+    candidate_errors, _ = observations.errors(candidate)
+    assert image_gate(observations, baseline_errors, candidate_errors)['passed']
+    label = lens or 'all'
+    with pytest.raises(ValueError, match=f'{label}: fitted {metric}'):
+        quality.production_acceptance(quality.production_quality(candidate), PipelineConfig())
+    assert result['selected'] == 'global_registration' and not result['joint_accepted']
+    assert any(f'{label}: fitted {metric}' in reason for reason in result['fallback_reasons'])
+    summary = json.loads((root / 'final/quality_summary.json').read_text())
+    assert summary['acceptance']['status'] == 'passed'
+    assert summary['registration']['joint_quality_acceptance']['status'] == 'rejected'
+    assert registration.register(work) == result and calls == {'global': 1, 'joint': 1}
+    registration.export_registered(work)
+    assert verify_colmap_export(work / 'colmap')['full_content_check']
+    exported = pycolmap.Reconstruction(work / 'colmap/sparse/0')
+    for iid, image in reference.images.items():
+        np.testing.assert_allclose(exported.images[iid].projection_center(), image.projection_center())
+
+
+@pytest.mark.parametrize('error_type', [ValueError, RuntimeError])
+def test_unexpected_quality_error_stops_delivery(tmp_path, monkeypatch, error_type):
+    work, _, _ = registration_fixture(tmp_path, monkeypatch)
+
+    def unexpected(rec):
+        raise error_type('Unexpected quality computation error')
+
+    monkeypatch.setattr(registration, 'production_quality', unexpected)
+    with pytest.raises(error_type, match='Unexpected quality computation error'):
+        registration.register(work)
+    assert not (work / registration.ROOT / 'final/completion.json').exists()
+
+
+def test_failed_reference_quality_cannot_be_used_as_fallback(tmp_path, monkeypatch):
+    work, _, _ = registration_fixture(tmp_path, monkeypatch)
+
+    def rejected(report, config):
+        raise quality.ProductionAcceptanceRejected('No model meets the delivery quality limits')
+
+    monkeypatch.setattr(registration, 'production_acceptance', rejected)
+    with pytest.raises(quality.ProductionAcceptanceRejected, match='No model meets'):
+        registration.register(work)
+    assert not (work / registration.ROOT / 'final/completion.json').exists()
+
+
+def test_joint_model_identity_error_stops_delivery(tmp_path, monkeypatch):
+    work, _, _ = registration_fixture(tmp_path, monkeypatch)
+    original = registration.refine_joint
+
+    def changed_intrinsics(global_stage, inputs, output, **kwargs):
+        original(global_stage, inputs, output, **kwargs)
+        candidate = pycolmap.Reconstruction(output / 'sparse/0')
+        candidate.cameras[1].params[0] += .01
+        candidate.write(output / 'sparse/0')
+        complete_publication(output, kwargs['context_fingerprint'])
+
+    monkeypatch.setattr(registration, 'refine_joint', changed_intrinsics)
+    with pytest.raises(ValueError, match='Fixed-intrinsics joint BA changed the camera model'):
+        registration.register(work)
+    assert not (work / registration.ROOT / 'final/completion.json').exists()
+
+
+def test_unavailable_joint_constraints_deliver_and_reuse_the_global_result(tmp_path, monkeypatch):
+    from geosunpre.registration.joint_solver import JointConstraintsUnavailable
+
+    work, calls, _ = registration_fixture(tmp_path, monkeypatch)
+
+    def unavailable(*args, **kwargs):
+        calls['joint'] += 1
+        raise JointConstraintsUnavailable('Insufficient reliable LAS constraints')
+
+    monkeypatch.setattr(registration, 'refine_joint', unavailable)
+    result = registration.register(work)
+    assert result['selected'] == 'global_registration' and not result['joint_accepted']
+    assert 'Insufficient reliable LAS constraints' in result['fallback_reasons']
+    assert registration.register(work) == result and calls == {'global': 1, 'joint': 1}
+    summary = json.loads((work / registration.ROOT / 'final/quality_summary.json').read_text())
+    assert summary['registration']['joint_quality_acceptance']['status'] == 'not_evaluated'
+    assert summary['acceptance']['status'] == 'passed'
+
+
+def test_completed_registration_and_export_do_not_load_feature_arrays(tmp_path, monkeypatch):
+    work, calls, _ = registration_fixture(tmp_path, monkeypatch)
+    expected = registration.register(work)
+    catalog = json.loads((work / 'sfm/frontend.json').read_text())
+    paths = {str(Path(row['path']).resolve()) for row in catalog['features'].values()}
+    original = np.lib.npyio.NpzFile.__getitem__
+
+    def checked(archive, key):
+        if str(Path(archive.zip.filename).resolve()) in paths and key in ('keypoints', 'scores'):
+            raise AssertionError('Completed model checks must not materialize feature arrays')
+        return original(archive, key)
+
+    monkeypatch.setattr(np.lib.npyio.NpzFile, '__getitem__', checked)
+    assert registration.register(work) == expected and calls == {'global': 1, 'joint': 1}
+    registration.export_registered(work)
+    assert verify_colmap_export(work / 'colmap')['full_content_check']

@@ -48,11 +48,12 @@ def test_timing_remains_consistent_when_utc_clock_moves_backwards(tmp_path, monk
 
 
 def test_cached_features_need_neither_model_nor_image_decode(tmp_path, monkeypatch):
+    from geosunpre.features import feature_input
     from geosunpre.scene import prepare
     scene = prepare(raw_input(tmp_path), tmp_path / 'prepared')
     frontend = LoMaFrontend(tmp_path / 'cache', scene, FrontendConfig())
     for row in scene['images']:
-        _, _, token, path = frontend._feature_input(row)
+        _, _, token, path = feature_input(frontend.work, scene, frontend.config, row)
         np.savez(path, token=token, keypoints=np.zeros((4, 2)), descriptors=np.zeros((4, 8)), scores=np.ones(4))
     def forbidden(*a, **k):
         raise AssertionError('Fully cached extraction must not load GPU models or decode images')
@@ -217,13 +218,14 @@ def test_preflight_skips_gpu_for_all_cached_frontend(tmp_path, monkeypatch):
     from geosunpre.pipeline.preflight import preflight
     from geosunpre.scene import prepare
     from geosunpre.features import FRONTEND_CONFIG as CONFIG
+    from geosunpre.features import feature_input
     work = tmp_path / 'work'
     scene = prepare(raw_input(tmp_path), work)
     save_config(work, PipelineConfig())
     write_json(work / 'sfm/manifest.json', scene)
     frontend = LoMaFrontend(work, scene, CONFIG)
     for row in scene['images']:
-        frontend._feature_input(row)[3].write_bytes(b'cached')
+        feature_input(work, scene, CONFIG, row)[3].write_bytes(b'cached')
     pair = work / 'matches/pair.npz'
     pair.parent.mkdir()
     pair.write_bytes(b'cached')

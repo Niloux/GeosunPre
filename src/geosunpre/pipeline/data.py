@@ -2,13 +2,14 @@
 from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
+from collections.abc import Mapping
 import json
 from pathlib import Path
 from geosunpre.profiling import profiled
 
 import numpy as np
 
-from geosunpre.features import LoMaFrontend
+from geosunpre.features import LoMaFrontend, feature_input, read_feature_cache
 from geosunpre.features import FRONTEND_CONFIG as CONFIG
 from geosunpre.artifacts import digest
 from geosunpre.artifacts import file_digest
@@ -18,29 +19,56 @@ from geosunpre.artifacts import write_json, write_frozen_json
 OUTPUT = 'sfm'
 
 
+class _FeatureArrays(Mapping):
+    """A checked catalog whose geometry arrays are read once, when requested."""
+    def __init__(self, sources, hashes):
+        self._sources = sources
+        self._hashes = hashes
+        self._loaded = {}
+
+    def __iter__(self):
+        return iter(self._sources)
+
+    def __len__(self):
+        return len(self._sources)
+
+    def __getitem__(self, name):
+        if name not in self._loaded:
+            row = self._sources[name]
+            self._loaded[name] = read_feature_cache(row['path'], row['token'], name=name,
+                fields=('keypoints', 'scores'),
+                expected_sha256=self._hashes[name] if self._hashes is not None else None)
+        return self._loaded[name]
+
+
 @profiled
-def load_frontend(work):
-    """Read global feature IDs after checking their image, mask and camera inputs."""
+def load_frontend(work, *, require_observations=True):
+    """Verify frozen sources and expose geometry arrays on first named access.
+
+    Only the observation-freezing stage may bootstrap without a frozen protocol.
+    Metadata is always checked; the completed protocol binds later reads to the
+    exact cache bytes it verified.
+    """
     work = Path(work).resolve()
     out = work / OUTPUT
     scene = load_scene(out)
     data = json.loads((out / 'frontend.json').read_text())
     if data['scene_fingerprint'] != scene['fingerprint'] or data['config'] != CONFIG.__dict__:
         raise ValueError('Global frontend does not match current scene/configuration')
-    features = {}
+    sources = {}
     for record in scene['images']:
         name = record['name']
         row = data['features'][name]
-        with np.load(row['path'], allow_pickle=False) as cached:
-            metadata = json.loads(str(cached['metadata']))
-            expected = digest({'image_sha256': file_digest(record['source']),
-                               'mask_sha256': file_digest(record['semantic_mask']),
-                               'camera': scene['cameras'][record['camera']],
-                               'fov': scene['fov_degrees'], 'config': data['config']})
-            if expected != row['token'] or str(cached['token']) != expected or metadata['name'] != name:
-                raise ValueError(f'Global feature identity changed: {name}')
-            features[name] = {'keypoints': cached['keypoints'], 'scores': cached['scores']}
-    return out, scene, data, features
+        _, _, expected, _ = feature_input(work, scene, CONFIG, record)
+        if expected != row['token']:
+            raise ValueError(f'Global feature identity changed: {name}')
+        read_feature_cache(row['path'], expected, name=name, fields=())
+        sources[name] = {'path': row['path'], 'token': expected}
+    hashes = None
+    if require_observations:
+        from geosunpre.pipeline.observations import load_observations
+        hashes = load_observations(work, data)['inputs']['feature_cache_sha256']
+    return out, scene, data, _FeatureArrays(sources, hashes)
 
 
 def prepare_masks(work, *, model_cache=None):
@@ -171,8 +199,8 @@ def match_features(work):
     by_token = {row['token']: row['path'] for row in catalog['features'].values()}
     @lru_cache(maxsize=32)
     def get_features(token):
-        with np.load(by_token[token], allow_pickle=False) as f:
-            return {k: f[k] for k in ('normalized_keypoints', 'descriptors', 'token')}
+        return read_feature_cache(by_token[token], token,
+            fields=('normalized_keypoints', 'descriptors', 'token'))
     entries = []
     for i, pair in enumerate(pairs, 1):
         raw = frontend.match({'token': catalog['features'][pair['a']]['token']},

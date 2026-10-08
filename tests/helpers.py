@@ -128,8 +128,10 @@ def global_frontend(tmp_path, frames=(70, 72)):
         Image.new('RGB', (8, 8), (40, 80, 120)).save(source)
         mask = source.with_suffix('.png')
         Image.new('L', (8, 8), 255).save(mask)
+        stat = source.stat()
         images.append({'name': name, 'camera': lens, 'frame_index': frame,
-                       'image_id': index + 1, 'source': str(source), 'semantic_mask': str(mask)})
+                       'image_id': index + 1, 'source': str(source), 'semantic_mask': str(mask),
+                       'size_bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns})
         token = digest({'image_sha256': file_digest(source), 'mask_sha256': file_digest(mask),
                         'camera': cameras[lens].to_dict(), 'fov': 160, 'config': CONFIG.__dict__})
         # Identical images with the same lens can share extraction inputs, but

@@ -6,7 +6,7 @@ import shutil
 from importlib.util import find_spec
 from pathlib import Path
 
-from geosunpre.features import LoMaFrontend
+from geosunpre.features import feature_input
 from geosunpre.features import FRONTEND_CONFIG as CONFIG
 from geosunpre.masks import MODEL, MODEL_REVISION
 from geosunpre.device import DEVICE_PROFILE
@@ -28,8 +28,7 @@ def preflight(work, stages, delivery, *, model_cache=None):
         if not scene_path.is_file():
             missing_features = True
         else:
-            frontend = LoMaFrontend(work, scene, CONFIG)
-            missing_features = any(not frontend._feature_input(r)[3].is_file() for r in images)
+            missing_features = any(not feature_input(work, scene, CONFIG, r)[3].is_file() for r in images)
     missing_matches = False
     if 'matches' in stages:
         path = root / 'frontend.json'

@@ -13,7 +13,7 @@ from geosunpre.initialization import DEFAULT_VOXEL_SIZE
 from geosunpre.config import CONFIG_FILE, load_config
 from geosunpre.pipeline.finalization import FINAL, _check_model, verify_final
 from geosunpre.pipeline.observations import protocol_identity
-from geosunpre.pipeline.quality import production_acceptance, production_quality
+from geosunpre.pipeline.quality import ProductionAcceptanceRejected, production_acceptance, production_quality
 from geosunpre.pipeline.task import TASK_FILE
 from geosunpre.registration.geometry import quantiles
 from geosunpre.registration.global_alignment import MAX_LAS_POINTS, register_global
@@ -160,7 +160,8 @@ def geometric_regression(reference, candidate):
             'comparisons': comparisons, 'scope': POLICY['scope']}
 
 
-def select_candidate(reference_points, candidate_points, diagnostic, config):
+def _registration_acceptance(reference_points, candidate_points, diagnostic, config):
+    """Evaluate joint eligibility; this alone does not establish delivery quality."""
     base = surface_acceptance(reference_points, config)
     if not base['passed']:
         raise ValueError('LAS registration acceptance rejected: ' + '; '.join(base['failures']))
@@ -175,11 +176,54 @@ def select_candidate(reference_points, candidate_points, diagnostic, config):
         reasons.extend(candidate['failures'])
     if regression and not regression['passed']:
         reasons.extend(regression['failures'])
-    return {'selected': 'pose_las' if accepted else 'global_registration',
-            'joint_accepted': accepted, 'fallback_reasons': reasons if not accepted else [],
+    return {'joint_eligible': accepted, 'fallback_reasons': reasons if not accepted else [],
             'reference_acceptance': base, 'joint_acceptance': candidate, 'joint_regression': regression,
             'target_frame': 'input_las_xyz', 'coordinate_units_assumed': 'metres',
             'absolute_accuracy_validated': False, 'training_run': False}
+
+
+def select_delivery(source, global_stage, joint, scene, config, *, camera_parameter_bounds):
+    """Return a model, decision and quality only after full delivery acceptance.
+
+    Stage identities must already be verified. Explicit fitted-data rejection of
+    an eligible joint candidate falls back to the global model, which must pass
+    the same delivery limits. Identity, model and computation errors propagate.
+    """
+    unavailable = (joint / 'unavailable.json').is_file()
+    diagnostic = None if unavailable else _read(joint / 'diagnostic.json')
+    decision = _registration_acceptance(_points(global_stage / 'registration_points.npz'),
+        None if unavailable else _points(joint / 'las_points.npz'), diagnostic, config)
+    eligible = decision.pop('joint_eligible')
+    if unavailable:
+        decision['fallback_reasons'].append(_read(joint / 'unavailable.json')['error'])
+    original = pycolmap.Reconstruction(source)
+
+    def inspect(stage):
+        rec = pycolmap.Reconstruction(stage / 'sparse/0')
+        assert_identity(original, rec)
+        _check_model(rec, scene)
+        report = {**production_quality(rec), 'camera_parameter_bounds': camera_parameter_bounds}
+        return rec, report
+
+    accepted = False
+    joint_acceptance = {'status': 'not_evaluated'}
+    if eligible:
+        rec, quality = inspect(joint)
+        try:
+            quality['acceptance'] = production_acceptance(quality, config)
+        except ProductionAcceptanceRejected as exc:
+            joint_acceptance = {'status': 'rejected', 'reason': str(exc)}
+            decision['fallback_reasons'].append('Joint delivery quality rejected: ' + str(exc))
+        else:
+            accepted = True
+            joint_acceptance = quality['acceptance']
+    if not accepted:
+        rec, quality = inspect(global_stage)
+        quality['acceptance'] = production_acceptance(quality, config)
+    decision.update(selected='pose_las' if accepted else 'global_registration',
+                    joint_accepted=accepted, joint_quality_acceptance=joint_acceptance)
+    quality['registration'] = decision
+    return rec, decision, quality
 
 
 def _stage(work, name, context, compute):
@@ -232,18 +276,8 @@ def register(work):
 
     joint = _stage(work, 'joint', protocol['fingerprint'], compute_joint)
     unavailable = (joint / 'unavailable.json').is_file()
-    diagnostic = None if unavailable else _read(joint / 'diagnostic.json')
-    decision = select_candidate(reference, None if unavailable else _points(joint / 'las_points.npz'),
-                                diagnostic, config)
-    if unavailable:
-        decision['fallback_reasons'].append(_read(joint / 'unavailable.json')['error'])
-    selected = (joint if decision['joint_accepted'] else global_stage) / 'sparse/0'
-    rec = pycolmap.Reconstruction(selected)
-    assert_identity(pycolmap.Reconstruction(source), rec)
-    _check_model(rec, visual_scene)
-    quality = {**production_quality(rec), 'registration': decision,
-               'camera_parameter_bounds': visual_result['ba'].get('cameras', {})}
-    quality['acceptance'] = production_acceptance(quality, config)
+    rec, decision, quality = select_delivery(source, global_stage, joint, visual_scene, config,
+        camera_parameter_bounds=visual_result['ba'].get('cameras', {}))
     with staged_directory(final) as stage:
         model = stage / 'sparse/0'
         model.mkdir(parents=True)

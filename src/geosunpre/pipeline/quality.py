@@ -14,6 +14,10 @@ from geosunpre.device import FOV_DEGREES
 from geosunpre.pipeline.observations import SCOPE
 
 
+class ProductionAcceptanceRejected(ValueError):
+    """A computed model report violates the fitted-data delivery limits."""
+
+
 def production_quality(rec):
     cameras = {}
     for cid, cam in rec.cameras.items():
@@ -71,7 +75,7 @@ def production_acceptance(report, config):
             message = f'Camera {camera}: parameters at optimization bounds {health["parameters_at_bounds"]}'
             errors.append(message)
     if errors:
-        raise ValueError('Production acceptance rejected: ' + '; '.join(errors))
+        raise ProductionAcceptanceRejected('Production acceptance rejected: ' + '; '.join(errors))
     return {'status': 'passed',
             'limits': {'median_px': config.quality_max_median_px, 'p90_px': config.quality_max_p90_px,
                        'bounds_policy': 'reject'},
