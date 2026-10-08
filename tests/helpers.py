@@ -7,7 +7,7 @@ import numpy as np
 import pycolmap
 from PIL import Image
 
-from geosunpre.artifacts import digest, file_digest, write_json
+from geosunpre.artifacts import digest, file_digest, write_json, staged_directory
 from geosunpre.camera import Camera
 from geosunpre.config import PipelineConfig, save_config
 from geosunpre.features import FRONTEND_CONFIG as CONFIG
@@ -44,7 +44,7 @@ def tiny_visual_work(tmp_path):
     source = work / build.SOURCE
     source.mkdir(parents=True)
     rec.write(source)
-    scene = {'contract_version': 1, 'pose_model': 'independent_exposure',
+    scene = {'contract_version': 2, 'pose_model': 'independent_exposure',
              'fov_degrees': 160, 'cameras': {k: v.to_dict() for k, v in cameras.items()},
              'images': list(records.values()), 'fingerprint': 'tiny-visual-scene'}
     write_json(root / 'manifest.json', scene)
@@ -131,6 +131,7 @@ def global_frontend(tmp_path, frames=(70, 72)):
         stat = source.stat()
         images.append({'name': name, 'camera': lens, 'frame_index': frame,
                        'image_id': index + 1, 'source': str(source), 'semantic_mask': str(mask),
+                       'source_sha256': file_digest(source),
                        'size_bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns})
         token = digest({'image_sha256': file_digest(source), 'mask_sha256': file_digest(mask),
                         'camera': cameras[lens].to_dict(), 'fov': 160, 'config': CONFIG.__dict__})
@@ -141,7 +142,7 @@ def global_frontend(tmp_path, frames=(70, 72)):
         np.savez(cache, token=token, metadata=json.dumps({'name': name}),
                  keypoints=keypoints, scores=np.ones(20))
         catalog[name] = {'token': token, 'path': str(cache), 'keypoints': 20}
-    scene = {'contract_version': 1, 'pose_model': 'independent_exposure',
+    scene = {'contract_version': 2, 'pose_model': 'independent_exposure',
              'input_root': str(tmp_path), 'fov_degrees': 160,
              'cameras': {k: v.to_dict() for k, v in cameras.items()}, 'images': images}
     scene['fingerprint'] = digest(scene)
@@ -166,7 +167,7 @@ def complete_calibration(work, monkeypatch):
     """Use real pipeline contracts and models with only mapping and BA stubbed."""
     calls = []
 
-    def database(directory, scene, images, entries, features):
+    def database(directory, scene, images, entries, features, **kwargs):
         a, b = images[:2]
         matches = np.column_stack((np.arange(20), np.arange(20)))
         seed = {'a': a['name'], 'b': b['name'],
@@ -174,11 +175,13 @@ def complete_calibration(work, monkeypatch):
                 'inliers': matches.astype(np.uint32), 'angles': np.full(len(matches), 5.)}
         model = create_seed({k: Camera.from_dict(v) for k, v in scene['cameras'].items()},
                             {row['name']: row for row in images}, features, seed)
-        db, path = directory / 'database.db', directory / 'seed'
-        path.mkdir()
-        db.write_bytes(b'test database')
-        model.write(path)
-        return db, path
+        destination = directory / 'mapping_inputs'
+        if not destination.is_dir():
+            with staged_directory(destination) as staged:
+                path = staged / 'seed'; path.mkdir()
+                (staged / 'database.db').write_bytes(b'test database')
+                model.write(path)
+        return destination / 'database.db', destination / 'seed'
 
     def mapping(db, image_path, output, *, options, input_path):
         return {0: pycolmap.Reconstruction(input_path)}

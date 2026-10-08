@@ -8,7 +8,7 @@ from pathlib import Path
 
 from geosunpre.features import feature_input
 from geosunpre.features import FRONTEND_CONFIG as CONFIG
-from geosunpre.masks import MODEL, MODEL_REVISION
+from geosunpre.masks import MODEL, MODEL_REVISION, mask_cached
 from geosunpre.device import DEVICE_PROFILE
 
 
@@ -19,10 +19,7 @@ def preflight(work, stages, delivery, *, model_cache=None):
     base_path = work / 'manifest.json'
     scene = json.loads((scene_path if scene_path.is_file() else base_path).read_text())
     images = scene['images']
-    missing_masks = 'masks' in stages and any(not all(
-        (root / 'masks_v2' / folder / (r['name'] + suffix)).is_file()
-        for folder, suffix in (('valid', '.png'), ('labels', '.png'), ('stats', '.json')))
-        for r in images)
+    missing_masks = 'masks' in stages and any(not mask_cached(r, root / 'masks_v2') for r in images)
     missing_features = False
     if 'features' in stages:
         if not scene_path.is_file():

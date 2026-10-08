@@ -1,7 +1,6 @@
 """Conservative local semantic masks, kept distinct from hard fisheye validity."""
 import json
 import os
-from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -9,6 +8,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from geosunpre.camera import Camera
+from geosunpre.scene import prepared_image_digest
 from geosunpre.artifacts import file_digest
 from geosunpre.artifacts import write_json, write_frozen_json
 from geosunpre.parallel import ordered_map
@@ -45,9 +45,8 @@ def virtual_views(cam, size=512, fov=100):
         yield R,f,pixels.astype(np.float32)
 
 
-@lru_cache(maxsize=2)
 def fusion_geometry(cam):
-    """Image-independent sampling maps, bounded to the two active cameras."""
+    """Image-independent sampling maps, owned by the current mask invocation."""
     width,height=900,1200
     yy,xx=np.mgrid[:height,:width]
     pixels=np.stack(((xx+.5)*cam.width/width,(yy+.5)*cam.height/height),axis=-1)
@@ -68,16 +67,14 @@ def fusion_geometry(cam):
     return views,np.maximum(weights[...,None],1e-10)
 
 
-def predict_sky_person(original,cam,model,processor):
+def predict_sky_person(prepared_views,geometry,model,processor):
     import torch
-    views,weights=fusion_geometry(cam)
+    views,weights=geometry
     sky_id=next(int(k) for k,v in model.config.id2label.items() if v=='sky')
     person_id=next(int(k) for k,v in model.config.id2label.items() if v=='person')
     sums=np.zeros((*weights.shape[:2],2),dtype=np.float32)
     # Keep single-view inference order and arithmetic identical to the reference.
-    for source,map_x,map_y,w in views:
-        view=cv2.remap(original,source[...,0],source[...,1],cv2.INTER_LINEAR,
-                       borderMode=cv2.BORDER_CONSTANT)
+    for view,(_,map_x,map_y,w) in zip(prepared_views,views,strict=True):
         with torch.inference_mode():
             inp={k:v.cuda() for k,v in processor(images=Image.fromarray(view),return_tensors='pt').items()}
             probability=model(**inp).logits.softmax(1)[:,[sky_id,person_id]]
@@ -88,10 +85,56 @@ def predict_sky_person(original,cam,model,processor):
     return sums/weights
 
 
-def generate_masks(scene, output, frames, *, model_cache=None):
+def mask_cached(record, output):
+    """Stats commit a complete mask; committed corruption is never a cache miss."""
+    source_sha256 = prepared_image_digest(record)
+    output = Path(output)
+    stats = output / 'stats' / (record['name'] + '.json')
+    if not stats.is_file():
+        return False
+    info = json.loads(stats.read_text())
+    if info.get('source_sha256') != source_sha256:
+        raise ValueError(f'Stale mask source: {record["name"]}')
+    for folder, key in (('valid', 'mask_sha256'), ('labels', 'labels_sha256')):
+        path = output / folder / (record['name'] + '.png')
+        if not path.is_file() or file_digest(path) != info.get(key):
+            raise ValueError(f'Committed mask artifact changed: {record["name"]}: {folder}')
+    return True
+
+
+def _load_segmentation(model_cache):
     import torch
     from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
 
+    if not torch.cuda.is_available():
+        raise RuntimeError('Mask generation requires GPU access')
+    cache = Path(model_cache or os.environ.get('HF_HUB_CACHE', '.cache/huggingface')).expanduser().resolve()
+    processor = AutoImageProcessor.from_pretrained(MODEL, revision=MODEL_REVISION, use_fast=False, cache_dir=str(cache))
+    model = SegformerForSemanticSegmentation.from_pretrained(MODEL, revision=MODEL_REVISION, cache_dir=str(cache)).eval().cuda()
+    return processor, model
+
+
+def _review_path(output, record):
+    return Path(output) / 'mask_review' / f'{record["camera"]}{record["frame_index"]:05d}.jpg'
+
+
+def _write_review(path, original, labels, fov):
+    """Render from the already decoded thumbnail, outside the numeric mask path."""
+    arr = np.asarray(original).copy()
+    arr[~fov] = (arr[~fov] * .18).astype(np.uint8)
+    for reason, color in {1: (60,150,255), 2: (255,65,65), 3: (210,80,245)}.items():
+        take = fov & (labels == reason)
+        arr[take] = (arr[take] * .45 + np.array(color) * .55).astype(np.uint8)
+    canvas = Image.new('RGB', (1200,840), (24,24,24))
+    draw = ImageDraw.Draw(canvas)
+    canvas.paste(original, (0,40)); canvas.paste(Image.fromarray(arr), (600,40))
+    draw.text((8,8), 'Original', fill='white')
+    draw.text((608,8), 'Blue: sky | Red: person | Purple: device | Dark: outside FOV', fill='white')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path, quality=92)
+
+
+def generate_masks(scene, output, frames, *, model_cache=None):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     revision = MODEL_REVISION
@@ -102,37 +145,52 @@ def generate_masks(scene, output, frames, *, model_cache=None):
         'thresholds': {'sky': .90, 'person': .55},
         'boundary_policy': 'Erode excluded sky by 3 grid pixels; dilate person by 3 grid pixels on 900x1200 grid',
         'hardware_guard': 'Fixed device polygons and bottom y>=0.8H; see hardware_guard source',
+        'cameras': scene['cameras'], 'fov_degrees': scene['fov_degrees'],
         'limitation': 'Approximate semantic and device boundaries; vegetation and moving vehicles require geometric filtering.',
     }
     write_frozen_json(output / 'model.json', metadata)
     images = [dict(im) for im in scene['images'] if im['frame_index'] in frames]
     processor = model = None
     records = []
-    camera_masks = {}
+    # Check every committed packet before starting workers or loading a model.
+    jobs = [(record, Camera.from_dict(scene['cameras'][record['camera']]), mask_cached(record, output))
+            for record in images]
+    pending_cameras = {cam for _, cam, cached in jobs if not cached}
+    camera_masks = {cam: (hardware_guard(cam.width, cam.height, cam.label), cam.mask(scene['fov_degrees']) > 0)
+                    for cam in pending_cameras}
+    review_domains = {cam: np.asarray(Image.fromarray(fov.astype(np.uint8)*255)
+                         .resize((600,800), Image.Resampling.NEAREST)) > 0
+                      for cam, (_, fov) in camera_masks.items()}
+    # Share two camera maps within this invocation; none survive into SfM.
+    geometry = {cam: fusion_geometry(cam) for cam in pending_cameras}
+
+    def prepare_image(job):
+        record, cam, cached = job
+        if cached:
+            return record, cam, None, None
+        with Image.open(record['source']) as source:
+            original = source.convert('RGB')
+        rgb = np.asarray(original)
+        views = [cv2.remap(rgb, source[...,0], source[...,1], cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT) for source, _, _, _ in geometry[cam][0]]
+        thumbnail = original.resize((600,800))
+        prepared_image_digest(record)
+        return record, cam, views, thumbnail
+
     def infer():
         nonlocal processor,model
-        for record in images:
-            cam=Camera.from_dict(scene['cameras'][record['camera']])
-            paths=[output/folder/(record['name']+suffix)
-                   for folder,suffix in [('valid','.png'),('labels','.png'),('stats','.json')]]
-            if all(p.exists() for p in paths):
-                yield record,cam,None,None
+        for record, cam, views, thumbnail in ordered_map(prepare_image, jobs, workers=2):
+            if views is None:
+                yield record,cam,None,None,None
                 continue
             if model is None:
-                if not torch.cuda.is_available():
-                    raise RuntimeError('Mask generation requires GPU access')
-                cache=Path(model_cache or os.environ.get('HF_HUB_CACHE','.cache/huggingface')).expanduser().resolve()
-                processor=AutoImageProcessor.from_pretrained(MODEL,revision=revision,use_fast=False,cache_dir=str(cache))
-                model=SegformerForSemanticSegmentation.from_pretrained(MODEL,revision=revision,cache_dir=str(cache)).eval().cuda()
+                processor, model = _load_segmentation(model_cache)
                 write_json(output/'id2label.json',model.config.id2label)
-            if cam not in camera_masks:
-                camera_masks[cam]=(hardware_guard(cam.width,cam.height,cam.label),cam.mask(scene['fov_degrees'])>0)
-            with Image.open(record['source']) as original:
-                probability=predict_sky_person(np.asarray(original.convert('RGB')),cam,model,processor)
-            yield record,cam,probability,camera_masks[cam]
+            probability = predict_sky_person(views, geometry[cam], model, processor)
+            yield record,cam,probability,camera_masks[cam],thumbnail
 
     def finish_mask(item):
-        record,cam,probability,masks=item
+        record,cam,probability,masks,thumbnail=item
         path=output/'valid'/(record['name']+'.png')
         label_path=output/'labels'/(record['name']+'.png')
         info_path=output/'stats'/(record['name']+'.json')
@@ -149,16 +207,21 @@ def generate_masks(scene, output, frames, *, model_cache=None):
             valid=full==0
             for p in (path,label_path,info_path):
                 p.parent.mkdir(parents=True,exist_ok=True)
-            Image.fromarray(valid.astype(np.uint8)*255).save(path)
-            Image.fromarray(full).save(label_path)
-            write_json(info_path, {'name':record['name'],'source_sha256':file_digest(record['source']),
+            for target, array in ((path, valid.astype(np.uint8)*255), (label_path, full)):
+                temporary = target.with_suffix('.tmp.png')
+                Image.fromarray(array).save(temporary)
+                temporary.replace(target)
+            write_json(info_path, {'name':record['name'],'source_sha256':record['source_sha256'],
                 'fov_pixels':int(fov.sum()),'static_valid_pixels_in_fov':int((fov&valid).sum()),
-                'static_fraction_in_fov':float(valid[fov].mean()),'mask_sha256':file_digest(path)})
+                'static_fraction_in_fov':float(valid[fov].mean()),'mask_sha256':file_digest(path),
+                'labels_sha256':file_digest(label_path)})
+            labels = np.asarray(Image.fromarray(full).resize((600,800), Image.Resampling.NEAREST))
+            _write_review(_review_path(output.parent, record), thumbnail, labels, review_domains[cam])
         record['semantic_mask']=str(path.resolve())
         return record
 
-    # GPU inference stays on the calling thread. Up to four probability maps
-    # queue for two CPU postprocessing/writing workers; completion is ordered.
+    # Decode/remap and postprocess/write have separate bounded CPU queues.
+    # GPU inference stays single-view, ordered, and on the calling thread.
     for index,record in enumerate(ordered_map(finish_mask,infer(),workers=2),1):
         records.append(record)
         if index == 1 or index % 40 == 0 or index == len(images):
@@ -168,6 +231,9 @@ def generate_masks(scene, output, frames, *, model_cache=None):
 
 def mask_contact_sheet(scene, images, path, selected_frames):
     cameras = {k:Camera.from_dict(v) for k,v in scene['cameras'].items()}
+    fovs = {label: np.asarray(Image.fromarray(cam.mask(scene['fov_degrees']))
+                  .resize((320,426), Image.Resampling.NEAREST)) == 0
+            for label, cam in cameras.items()}
     canvas = Image.new('RGB',(320*len(selected_frames),440*2),(24,24,24))
     draw = ImageDraw.Draw(canvas)
     for record in images:
@@ -175,9 +241,8 @@ def mask_contact_sheet(scene, images, path, selected_frames):
             continue
         im = Image.open(record['source']).convert('RGB').resize((320,426))
         sem = Image.open(record['semantic_mask']).resize(im.size,Image.Resampling.NEAREST)
-        fov = Image.fromarray(cameras[record['camera']].mask(scene['fov_degrees'])).resize(im.size,Image.Resampling.NEAREST)
         arr = np.asarray(im).copy()
-        invalid = np.asarray(fov)==0
+        invalid = fovs[record['camera']]
         ignored = (np.asarray(sem)==0)&~invalid
         arr[invalid] = (arr[invalid]*.2).astype(np.uint8)
         arr[ignored] = (arr[ignored]*.45+np.array([150,20,20])*.55).astype(np.uint8)
@@ -197,27 +262,21 @@ def mask_review(scene,output, *, segments=None):
     folder=output/'mask_review';folder.mkdir(exist_ok=True)
     frames=defaultdict(list)
     summaries=[]
+    pending = {r['camera'] for r in scene['images'] if not _review_path(output, r).is_file()}
     fovs={label:np.asarray(Image.fromarray(Camera.from_dict(cam).mask(scene['fov_degrees']))
                           .resize((600,800),Image.Resampling.NEAREST))>0
-          for label,cam in scene['cameras'].items()}
+          for label,cam in scene['cameras'].items() if label in pending}
     def render_review(record):
         stats_path=output/'masks_v2/stats'/(record['name']+'.json')
         stats=json.loads(stats_path.read_text())
-        with Image.open(record['source']) as im:original=im.convert('RGB').resize((600,800))
-        labels=np.asarray(Image.open(output/'masks_v2/labels'/(record['name']+'.png')).resize((600,800),Image.Resampling.NEAREST))
-        fov=fovs[record['camera']]
-        arr=np.asarray(original).copy()
-        arr[~fov]=(arr[~fov]*.18).astype(np.uint8)
-        colors={1:(60,150,255),2:(255,65,65),3:(210,80,245)}
-        for reason,color in colors.items():
-            take=fov&(labels==reason)
-            arr[take]=(arr[take]*.45+np.array(color)*.55).astype(np.uint8)
-        canvas=Image.new('RGB',(1200,840),(24,24,24));draw=ImageDraw.Draw(canvas)
-        canvas.paste(original,(0,40));canvas.paste(Image.fromarray(arr),(600,40))
-        draw.text((8,8),'Original',fill='white')
-        draw.text((608,8),'Blue: sky | Red: person | Purple: device | Dark: outside FOV',fill='white')
+        path = _review_path(output, record)
+        if not path.is_file():
+            with Image.open(record['source']) as im:
+                original = im.convert('RGB').resize((600,800))
+            with Image.open(output/'masks_v2/labels'/(record['name']+'.png')) as im:
+                labels = np.asarray(im.resize((600,800),Image.Resampling.NEAREST))
+            _write_review(path, original, labels, fovs[record['camera']])
         label=f'{record["camera"]}{record["frame_index"]:05d}'
-        canvas.save(folder/f'{label}.jpg',quality=92)
         card=(record['camera'],stats['static_fraction_in_fov'],
             f'<article><h3>{label} · FOV 内保留 {stats["static_fraction_in_fov"]:.1%}</h3>'
             f'<a href="mask_review/{label}.jpg" target="_blank"><img loading="lazy" '

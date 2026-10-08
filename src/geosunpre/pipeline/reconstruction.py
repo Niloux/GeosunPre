@@ -9,10 +9,10 @@ import pycolmap
 from geosunpre.sfm.reconstruction import bounded_bundle_adjustment
 from geosunpre.sfm.reconstruction import cheirality_health
 from geosunpre.sfm.reconstruction import database_and_seed
-from geosunpre.sfm.reconstruction import mapper_options
+from geosunpre.sfm.reconstruction import map_from_inputs
 from geosunpre.artifacts import digest
 from geosunpre.artifacts import file_digest
-from geosunpre.artifacts import write_json, archive_interrupted, staged_directory
+from geosunpre.artifacts import write_json, staged_directory
 from geosunpre.colmap import MODEL_FILES, model_hashes
 from geosunpre.sfm.track_filter import CONFIG as TRACK_CONFIG
 from geosunpre.sfm.track_filter import filter_mapped_tracks
@@ -49,7 +49,7 @@ def freeze_geometry(work, *, require_existing=False):
     if not path.exists():
         if require_existing:
             raise ValueError('Missing global geometry protocol; run the mapping stage first')
-        if any((out / name).exists() for name in ('database.db', 'seed', 'mapping', 'mapper_output', 'stages')):
+        if any((out / name).exists() for name in ('mapping_inputs', 'mapping', 'mapper_output', 'stages')):
             raise ValueError('Uncontracted global geometry exists; use a fresh work directory')
     write_frozen_json(path, {**protocol, 'fingerprint': digest(protocol)})
     return out, scene, data, features, protocol, params
@@ -73,18 +73,10 @@ def build_mapping(work):
             raise ValueError('Global mapping identity changed')
         rec = pycolmap.Reconstruction(mapping)
     else:
-        db, seed = out / 'database.db', out / 'seed'
-        if not (db.exists() and all((seed / name).is_file() for name in MODEL_FILES)):
-            archive_interrupted(db)
-            archive_interrupted(seed)
-            # Materialize once before pair workers start; they share these
-            # verified arrays rather than loading and hashing caches per pair.
-            db, seed = database_and_seed(out, geometric_scene(scene, params), scene['images'],
-                                         data['pairs'], dict(features))
-        opts = mapper_options()
+        db, seed = database_and_seed(out, geometric_scene(scene, params), scene['images'],
+                                     data['pairs'], features, protocol_fingerprint=digest(protocol))
         with operation('incremental_mapping'):
-            maps = pycolmap.incremental_mapping(db, Path(scene['input_root']) / 'Image',
-                                                out / 'mapper_output', options=opts, input_path=seed)
+            maps = map_from_inputs(out, scene, db, seed)
         if not maps: raise RuntimeError('Full mapping did not reconstruct a component')
         rec = max(maps.values(), key=lambda r: r.num_reg_images())
         if cheirality_health(rec)['invalid_depth']: raise RuntimeError('Global mapper model has invalid depths')

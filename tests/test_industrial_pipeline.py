@@ -251,6 +251,7 @@ def test_interrupted_calibration_database_is_archived_and_rebuilt(tmp_path, monk
         with pytest.raises(KeyboardInterrupt):
             complete_calibration(work, monkeypatch)
     complete_calibration(work, monkeypatch)
-    assert list((work / 'calibration').glob('database.db.interrupted-*'))
-    assert list((work / 'calibration').glob('seed.interrupted-*/cameras.bin'))
+    assert (work / 'calibration/mapping_inputs/database.db').is_file()
+    assert (work / 'calibration/mapping_inputs/seed/cameras.bin').is_file()
+    assert not list((work / 'calibration').glob('.mapping_inputs-*'))
     assert (work / 'calibration/calibration_identity.json').is_file()

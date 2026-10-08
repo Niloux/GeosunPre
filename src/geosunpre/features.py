@@ -37,11 +37,10 @@ def _feature_cache_root(work, config):
 
 def feature_input(work, scene, config, record):
     """Check prepared inputs and derive the shared extraction identity and path."""
+    from geosunpre.scene import prepared_image_digest
+
     cam = Camera.from_dict(scene['cameras'][record['camera']])
-    stat = Path(record['source']).stat()
-    if stat.st_size != record['size_bytes'] or stat.st_mtime_ns != record['mtime_ns']:
-        raise ValueError(f'{record["name"]}: image changed since prepare; use a fresh work directory')
-    identity = {'image_sha256': file_digest(record['source']),
+    identity = {'image_sha256': prepared_image_digest(record),
                 'mask_sha256': file_digest(record['semantic_mask']) if record['semantic_mask'] else None,
                 'camera': cam.to_dict(), 'fov': scene['fov_degrees'], 'config': asdict(config)}
     token = digest(identity)

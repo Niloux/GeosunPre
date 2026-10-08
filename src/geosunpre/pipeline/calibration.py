@@ -9,10 +9,10 @@ from geosunpre.sfm.reconstruction import STAGES
 from geosunpre.sfm.reconstruction import bounded_bundle_adjustment
 from geosunpre.sfm.reconstruction import cheirality_health
 from geosunpre.sfm.reconstruction import database_and_seed
-from geosunpre.sfm.reconstruction import mapper_options
+from geosunpre.sfm.reconstruction import mapper_options, map_from_inputs
 from geosunpre.artifacts import digest
 from geosunpre.artifacts import file_digest
-from geosunpre.artifacts import write_json, archive_interrupted, staged_directory
+from geosunpre.artifacts import write_json, staged_directory
 from geosunpre.colmap import MODEL_FILES, model_hashes
 from geosunpre.pipeline.observations import SCOPE, protocol_identity
 from geosunpre.artifacts import write_frozen_json
@@ -41,7 +41,7 @@ def prepare_calibration(work):
             'observation_scope': SCOPE}
     data['fingerprint'] = digest(data)
     if not (out / 'run_contract.json').exists() and any(
-            (out / name).exists() for name in ('database.db', 'seed', 'mapping', 'mapper_output', 'stages')):
+            (out / name).exists() for name in ('mapping_inputs', 'mapping', 'mapper_output', 'stages')):
         raise ValueError('Uncontracted local geometry exists; use a fresh work directory')
     write_frozen_json(out / 'manifest.json', scene)
     write_frozen_json(out / 'frontend.json', data)
@@ -111,15 +111,10 @@ def calibrate(work):
             raise ValueError('Calibration mapping identity changed')
         rec = pycolmap.Reconstruction(mapping)
     else:
-        db, seed = directory / 'database.db', directory / 'seed'
-        if not (db.exists() and all((seed / name).is_file() for name in MODEL_FILES)):
-            archive_interrupted(db)
-            archive_interrupted(seed)
-            db, seed = database_and_seed(directory, scene, images, data['pairs'], features)
+        db, seed = database_and_seed(directory, scene, images, data['pairs'], features,
+                                     protocol_fingerprint=contract['fingerprint'])
         opts = mapper_options()
-        maps = pycolmap.incremental_mapping(db, Path(scene['input_root']) / 'Image',
-                                            directory / 'mapper_output', options=opts,
-                                            input_path=seed)
+        maps = map_from_inputs(directory, scene, db, seed)
         if not maps:
             raise RuntimeError('No local calibration reconstruction')
         rec = max(maps.values(), key=lambda item: item.num_reg_images())

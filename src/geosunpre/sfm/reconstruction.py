@@ -1,5 +1,9 @@
 """Image-only local SfM, explicit fisheye seeds and bounded shared calibration."""
 import time
+import json
+from pathlib import Path
+import shutil
+from tempfile import TemporaryDirectory
 
 import cv2
 import numpy as np
@@ -11,7 +15,8 @@ from PIL import Image
 from geosunpre.camera import Camera
 from geosunpre.sfm.geometry import fit_pair
 from geosunpre.sfm.geometry import rotation_graph_diagnostics
-from geosunpre.artifacts import write_json
+from geosunpre.artifacts import write_json, file_digest, staged_directory
+from geosunpre.colmap import MODEL_FILES, model_hashes
 from geosunpre.parallel import ordered_map
 
 STAGES = ('fixed','focal_low_radial','all_radial','principal')
@@ -31,9 +36,61 @@ def cheirality_health(rec):
 
 
 @profiled
-def database_and_seed(directory, scene, images, entries, features):
+def database_and_seed(directory, scene, images, entries, features, *, protocol_fingerprint, initial_model=None):
+    """Publish verified database and seed together; reuse only a complete receipt."""
+    destination = Path(directory) / 'mapping_inputs'
+    request = {'version': 1, 'protocol_fingerprint': protocol_fingerprint,
+               'initial_model_sha256': model_hashes(initial_model) if initial_model is not None else None}
+    receipt = destination / 'completion.json'
+    files = ['database.db', 'seed.json', 'geometry_summary.json', 'rotation_cycles.json']
+    files += [f'seed/{name}' for name in MODEL_FILES]
+    if receipt.is_file():
+        saved = json.loads(receipt.read_text())
+        if saved.get('request') != request or set(saved.get('files', {})) != set(files):
+            raise ValueError('Mapping inputs belong to another geometry protocol')
+        for name in files:
+            path = destination / name
+            if not path.is_file() or file_digest(path) != saved['files'][name]:
+                raise ValueError(f'Committed mapping input changed: {name}')
+    else:
+        # Lazy geometry arrays are materialized once, before pair workers start.
+        with staged_directory(destination) as staged:
+            _build_mapping_inputs(staged, scene, images, entries, dict(features), initial_model)
+            if initial_model is not None and model_hashes(initial_model) != request['initial_model_sha256']:
+                raise ValueError('Initial reconstruction changed during mapping preparation')
+            write_json(staged / 'completion.json', {'request': request,
+                       'files': {name: file_digest(staged / name) for name in files}})
+    return destination / 'database.db', destination / 'seed'
+
+
+def _initial_reconstruction(path, cameras, records, features):
+    """Reuse image-derived poses only when camera, exposure and feature IDs agree."""
+    rec = pycolmap.Reconstruction(path)
+    if not rec.is_valid() or rec.num_reg_images() < 2 or cheirality_health(rec)['invalid_depth']:
+        raise ValueError('Initial reconstruction is incomplete or has invalid depths')
+    expected = {1 if label == 'L' else 2: cam for label, cam in cameras.items()}
+    if set(rec.cameras) != set(expected):
+        raise ValueError('Initial reconstruction camera IDs changed')
+    for cid, cam in rec.cameras.items():
+        reference = expected[cid]
+        if (cam.model_name != 'OPENCV_FISHEYE' or (cam.width, cam.height) != (reference.width, reference.height)
+                or not np.array_equal(cam.params, reference.params)):
+            raise ValueError('Initial reconstruction calibration changed')
+    for im in rec.images.values():
+        row = records.get(im.name)
+        if (row is None or not im.has_pose or im.image_id != row['image_id']
+                or im.frame_id != im.image_id or im.camera_id != (1 if row['camera'] == 'L' else 2)):
+            raise ValueError('Initial reconstruction exposure identity changed')
+        xy = np.array([p.xy for p in im.points2D])
+        if not np.array_equal(xy, features[im.name]['keypoints']):
+            raise ValueError(f'Initial reconstruction feature indices changed: {im.name}')
+    return rec
+
+
+def _build_mapping_inputs(directory, scene, images, entries, features, initial_model):
     cameras={k:Camera.from_dict(v) for k,v in scene['cameras'].items()}
     records={im['name']:im for im in images}
+    initial = _initial_reconstruction(initial_model, cameras, records, features) if initial_model is not None else None
     candidates=[]
     directory.mkdir(parents=True,exist_ok=True)
     (directory/'geometry').mkdir(exist_ok=True)
@@ -111,11 +168,13 @@ def database_and_seed(directory, scene, images, entries, features):
             db.write_matches(a['image_id'],b['image_id'],row['inliers'])
             db.write_two_view_geometry(a['image_id'],b['image_id'],geometry)
         assert db.num_pose_priors()==0 and db.num_frames()==len(images)
-    reconstruction=create_seed(cameras,records,features,seed)
+    reconstruction=initial if initial is not None else create_seed(cameras,records,features,seed)
     seed_path=directory/'seed';seed_path.mkdir(exist_ok=True)
     reconstruction.write(seed_path)
-    write_json(directory/'seed.json',{'pair':seed['label'],'points':reconstruction.num_points3D(),
-        'initialization':'Explicit camera-aware E-only relative pose. Bypasses generic mapper two-view model selection.',
+    write_json(directory/'seed.json',{'pair':seed['label'] if initial is None else None,
+        'registered':reconstruction.num_reg_images(),'points':reconstruction.num_points3D(),
+        'initialization':('Verified locally calibrated image-only reconstruction.' if initial is not None else
+                          'Explicit camera-aware E-only relative pose. Bypasses generic mapper two-view model selection.'),
         'pose_prior_used':False})
     return path,seed_path
 
@@ -167,6 +226,16 @@ def mapper_options():
     opts.triangulation.min_angle=1
     opts.ba_local_max_num_iterations=35;opts.ba_global_max_num_iterations=60
     return opts
+
+
+def map_from_inputs(directory, scene, database, seed):
+    """COLMAP owns a scratch database; the committed input remains immutable."""
+    directory = Path(directory)
+    with TemporaryDirectory(prefix='.mapper-', dir=directory) as temporary:
+        working_database = Path(temporary) / 'database.db'
+        shutil.copyfile(database, working_database)
+        return pycolmap.incremental_mapping(working_database, Path(scene['input_root']) / 'Image',
+            directory / 'mapper_output', options=mapper_options(), input_path=seed)
 
 
 @profiled

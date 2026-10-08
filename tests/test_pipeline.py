@@ -17,7 +17,7 @@ def test_masks_start_fresh_and_resume_using_their_own_cache(tmp_path, monkeypatc
     source = tmp_path / 'L.jpg'
     Image.new('RGB', (8, 8), (1, 2, 3)).save(source)
     camera = Camera('L', 8, 8, (4., 4., 4., 4., 0., 0., 0., 0.), (0., 0.))
-    scene = {'contract_version': 1, 'pose_model': 'independent_exposure',
+    scene = {'contract_version': 2, 'pose_model': 'independent_exposure',
              'cameras': {'L': camera.to_dict()}, 'fov_degrees': 160,
              'images': [{'name': 'L/a.jpg', 'source': str(source), 'camera': 'L',
                          'frame_index': 70, 'semantic_mask': None}],

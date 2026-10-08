@@ -12,7 +12,7 @@ from geosunpre.artifacts import digest, file_digest, write_frozen_json
 from geosunpre.device import FOV_DEGREES, PRINCIPAL_Y_AXIS
 
 NAME = re.compile(r'(\d+)-(\d+)-(\d+)_(\d+)-([LRM])\.JPG', re.I)
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 
 def parse_name(name):
@@ -66,6 +66,18 @@ def load_poses(path):
     return poses
 
 
+def prepared_image_digest(record):
+    """Verify the exposure frozen by prepare before any downstream consumption."""
+    path = Path(record['source'])
+    stat = path.stat()
+    if stat.st_size != record['size_bytes'] or stat.st_mtime_ns != record['mtime_ns']:
+        raise ValueError(f'{record["name"]}: image changed since prepare; use a fresh work directory')
+    actual = file_digest(path)
+    if actual != record['source_sha256']:
+        raise ValueError(f'{record["name"]}: image content changed since prepare; use a fresh work directory')
+    return actual
+
+
 def prepare(input_root, work):
     fov, principal_y = FOV_DEGREES, PRINCIPAL_Y_AXIS
     root, work = Path(input_root).resolve(), Path(work).resolve()
@@ -75,6 +87,8 @@ def prepare(input_root, work):
     pro_path = projects[0]
     pro = json.loads(pro_path.read_text(encoding='utf-8-sig'))
     cameras = parse_cameras(pro, principal_y)
+    for cam in cameras.values():
+        cam.distorted_radius(fov)
     pose_path = root/f'{pro_path.stem}_CameraPos_C2E.txt'
     poses = load_poses(pose_path)
     images, names, excluded, frame_keys = [], set(), Counter(), set()
@@ -106,6 +120,7 @@ def prepare(input_root, work):
         images.append({'name': relative, 'source': str(path), 'camera': camera, 'frame_index': frame,
                        'week': week, 'seconds': seconds, 'exposure_seconds': float(exposure) if exposure else None,
                        'size_bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
+                       'source_sha256': file_digest(path),
                        'semantic_mask': semantic_mask, 'prior': pose})
     missing = [name for name in poses if parse_name(name)[3] in cameras and name not in names]
     if missing or not images:
@@ -126,10 +141,6 @@ def prepare(input_root, work):
     }
     manifest['fingerprint'] = digest(manifest)
     write_frozen_json(work/'manifest.json', manifest)
-    for label, cam in cameras.items():
-        mask_path = work/'fov_masks'/f'{label}.png'
-        mask_path.parent.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(cam.mask(fov)).save(mask_path)
     (work/'images.txt').write_text('\n'.join(im['name'] for im in images)+'\n')
     return manifest
 
