@@ -13,8 +13,6 @@ uv sync --locked --reinstall-package geosunpre-native
 # 独立发行包
 uv build native
 
-# 解析导数、实际 Ceres 求解与生产阶段交接
-.venv/bin/python -m pytest -q tests/test_sfm_contract.py tests/test_joint_solver.py tests/test_production_workflow.py
 ```
 
 没有 Python 深度约束回退。缺失联合约束时会要求重建扩展。`vendor/` 仅包含 Ceres CostFunction 接口及构造/析构实现，不包含另一份求解器；来源见 [vendor/README.md](vendor/README.md)，许可证见 [vendor/LICENSE.ceres](vendor/LICENSE.ceres)，随源码包和 wheel 分发。

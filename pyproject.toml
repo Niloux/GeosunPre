@@ -21,9 +21,6 @@ dependencies = [
     "torchvision==0.23.0",
 ]
 
-[dependency-groups]
-dev = ["pytest>=8"]
-
 [project.scripts]
 geosunpre = "geosunpre:main"
 
@@ -32,7 +29,7 @@ requires = ["uv_build>=0.12.14,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-source-include = ["run.sh", "configs/**", "docs/**", "tests/**", "native/pyproject.toml",
+source-include = ["run.sh", "configs/**", "docs/**", "native/pyproject.toml",
                   "native/setup.py", "native/MANIFEST.in", "native/*.cpp", "native/*.h", "native/*.md", "native/vendor/**"]
 
 [tool.uv.sources]

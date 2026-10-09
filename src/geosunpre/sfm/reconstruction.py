@@ -15,8 +15,8 @@ from PIL import Image
 from geosunpre.camera import Camera
 from geosunpre.sfm.geometry import fit_pair
 from geosunpre.sfm.geometry import rotation_graph_diagnostics
-from geosunpre.artifacts import write_json, file_digest, staged_directory
-from geosunpre.colmap import MODEL_FILES, model_hashes
+from geosunpre.artifacts import write_json, file_metadata, staged_directory
+from geosunpre.colmap import MODEL_FILES, model_files
 from geosunpre.parallel import ordered_map
 
 STAGES = ('fixed','focal_low_radial','all_radial','principal')
@@ -36,11 +36,11 @@ def cheirality_health(rec):
 
 
 @profiled
-def database_and_seed(directory, scene, images, entries, features, *, protocol_fingerprint, initial_model=None):
+def database_and_seed(directory, scene, images, entries, features, *, protocol_file, initial_model=None):
     """Publish verified database and seed together; reuse only a complete receipt."""
     destination = Path(directory) / 'mapping_inputs'
-    request = {'version': 1, 'protocol_fingerprint': protocol_fingerprint,
-               'initial_model_sha256': model_hashes(initial_model) if initial_model is not None else None}
+    request = {'version': 1, 'protocol_file': protocol_file,
+               'initial_model_files': model_files(initial_model) if initial_model is not None else None}
     receipt = destination / 'completion.json'
     files = ['database.db', 'seed.json', 'geometry_summary.json', 'rotation_cycles.json']
     files += [f'seed/{name}' for name in MODEL_FILES]
@@ -50,16 +50,16 @@ def database_and_seed(directory, scene, images, entries, features, *, protocol_f
             raise ValueError('Mapping inputs belong to another geometry protocol')
         for name in files:
             path = destination / name
-            if not path.is_file() or file_digest(path) != saved['files'][name]:
+            if not path.is_file() or file_metadata(path) != saved['files'][name]:
                 raise ValueError(f'Committed mapping input changed: {name}')
     else:
         # Lazy geometry arrays are materialized once, before pair workers start.
         with staged_directory(destination) as staged:
             _build_mapping_inputs(staged, scene, images, entries, dict(features), initial_model)
-            if initial_model is not None and model_hashes(initial_model) != request['initial_model_sha256']:
+            if initial_model is not None and model_files(initial_model) != request['initial_model_files']:
                 raise ValueError('Initial reconstruction changed during mapping preparation')
             write_json(staged / 'completion.json', {'request': request,
-                       'files': {name: file_digest(staged / name) for name in files}})
+                       'files': {name: file_metadata(staged / name) for name in files}})
     return destination / 'database.db', destination / 'seed'
 
 

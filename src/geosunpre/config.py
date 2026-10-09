@@ -7,10 +7,10 @@ import math
 from pathlib import Path
 import tomllib
 
-from geosunpre.artifacts import digest, write_frozen_json
+from geosunpre.artifacts import write_frozen_json
 
 CONFIG_FILE = 'pipeline_config.json'
-CONFIG_VERSION = 6
+CONFIG_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -100,7 +100,7 @@ def save_config(work, config):
             raise ValueError('Frozen inputs changed: pipeline configuration; use a fresh work directory')
         return
     value = {'version': CONFIG_VERSION, 'settings': asdict(config)}
-    write_frozen_json(path, {**value, 'fingerprint': digest(value)})
+    write_frozen_json(path, value)
 
 
 def load_config(work):
@@ -110,7 +110,6 @@ def load_config(work):
     value = json.loads(path.read_text())
     if value.get('version') != CONFIG_VERSION:
         raise ValueError('Unsupported pipeline configuration; use a fresh work directory')
-    if (value.get('fingerprint') != digest({k: v for k, v in value.items() if k != 'fingerprint'})
-            or set(value.get('settings', {})) != {field.name for field in fields(PipelineConfig)}):
-        raise ValueError('Pipeline configuration identity changed')
+    if set(value.get('settings', {})) != {field.name for field in fields(PipelineConfig)}:
+        raise ValueError('Invalid pipeline configuration fields')
     return PipelineConfig(**value['settings'])

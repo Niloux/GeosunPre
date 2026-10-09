@@ -8,11 +8,11 @@ import numpy as np
 from PIL import Image
 
 from geosunpre.camera import Camera
-from geosunpre.artifacts import digest, file_digest, write_frozen_json
+from geosunpre.artifacts import file_metadata, write_frozen_json
 from geosunpre.device import FOV_DEGREES, PRINCIPAL_Y_AXIS
 
 NAME = re.compile(r'(\d+)-(\d+)-(\d+)_(\d+)-([LRM])\.JPG', re.I)
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 3
 
 
 def parse_name(name):
@@ -66,16 +66,13 @@ def load_poses(path):
     return poses
 
 
-def prepared_image_digest(record):
-    """Verify the exposure frozen by prepare before any downstream consumption."""
+def prepared_image_metadata(record):
+    """Check the prepared image's size and modification time before use."""
     path = Path(record['source'])
     stat = path.stat()
     if stat.st_size != record['size_bytes'] or stat.st_mtime_ns != record['mtime_ns']:
         raise ValueError(f'{record["name"]}: image changed since prepare; use a fresh work directory')
-    actual = file_digest(path)
-    if actual != record['source_sha256']:
-        raise ValueError(f'{record["name"]}: image content changed since prepare; use a fresh work directory')
-    return actual
+    return {'size_bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
 
 
 def prepare(input_root, work):
@@ -120,7 +117,6 @@ def prepare(input_root, work):
         images.append({'name': relative, 'source': str(path), 'camera': camera, 'frame_index': frame,
                        'week': week, 'seconds': seconds, 'exposure_seconds': float(exposure) if exposure else None,
                        'size_bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
-                       'source_sha256': file_digest(path),
                        'semantic_mask': semantic_mask, 'prior': pose})
     missing = [name for name in poses if parse_name(name)[3] in cameras and name not in names]
     if missing or not images:
@@ -136,10 +132,9 @@ def prepare(input_root, work):
         'fov_degrees': fov, 'principal_y_axis': principal_y, 'principal_convention_verified': False,
         'distortion_mapping': ['k1', 'k2', 'k3', 'p3'], 'pose_values_used_for_geometry': False,
         'semantic_masks_available': False,
-        'source_hashes': {'project': file_digest(pro_path), 'camera_pose': file_digest(pose_path)},
+        'source_files': {'project': file_metadata(pro_path), 'camera_pose': file_metadata(pose_path)},
         'cameras': {k: c.to_dict() for k,c in cameras.items()}, 'images': images,
     }
-    manifest['fingerprint'] = digest(manifest)
     write_frozen_json(work/'manifest.json', manifest)
     (work/'images.txt').write_text('\n'.join(im['name'] for im in images)+'\n')
     return manifest

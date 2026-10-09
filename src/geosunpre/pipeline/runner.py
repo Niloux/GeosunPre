@@ -3,7 +3,7 @@
 from importlib import import_module
 from pathlib import Path
 
-from geosunpre.artifacts import digest_cache, file_digest, write_json
+from geosunpre.artifacts import file_metadata, write_json
 from geosunpre.config import CONFIG_FILE, PipelineConfig, load_config, save_config
 from geosunpre.pipeline import STAGES
 from geosunpre.pipeline.preflight import preflight
@@ -36,7 +36,7 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
         if work.is_relative_to(input_root) or input_root.is_relative_to(work):
             raise ValueError('Choose a work directory separate from the raw input')
     configure_offline()
-    with work_lock(work), digest_cache():
+    with work_lock(work):
         if (work / CONFIG_FILE).exists():
             saved = load_config(work)
             if config is not None:
@@ -60,8 +60,8 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
             work, output=output, image_mode=image_mode, include_masks=include_masks,
             include_ply=include_ply, ply_voxel_size=ply_voxel_size, model_cache=model_cache)
         with StageRecorder(work, selected) as recorder:
-            summary = {'work': str(work), 'stages': [], 'config_sha256': file_digest(work / CONFIG_FILE),
-                       'task_fingerprint': task['fingerprint'], 'delivery_complete': False,
+            summary = {'work': str(work), 'stages': [], 'config_file': file_metadata(work / CONFIG_FILE),
+                       'task_file': file_metadata(work / 'pipeline_task.json'), 'delivery_complete': False,
                        'invocation_id': recorder.value['invocation_id']}
             if 'prepare' not in selected:
                 with recorder.stage('preflight'):

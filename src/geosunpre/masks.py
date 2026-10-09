@@ -8,26 +8,14 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from geosunpre.camera import Camera
-from geosunpre.scene import prepared_image_digest
-from geosunpre.artifacts import file_digest
+from geosunpre.scene import prepared_image_metadata
+from geosunpre.artifacts import file_metadata
 from geosunpre.artifacts import write_json, write_frozen_json
 from geosunpre.parallel import ordered_map
-from geosunpre.device import GUARD_POLYGONS, GUARD_REFERENCE_SIZE, GUARD_BOTTOM_FRACTION
 
 MODEL = 'nvidia/segformer-b2-finetuned-ade-512-512'
 MODEL_REVISION = 'de01bae28967510f9ddd496c60a969357195400c'
 EXCLUDED = {'sky', 'person'}
-MASK_VERSION = 2
-
-
-def hardware_guard(width, height, camera):
-    """Manually inspected overhang outlines in 3000x4000 reference coordinates."""
-    mask=np.zeros((height,width),dtype=np.uint8)
-    reference_width, reference_height = GUARD_REFERENCE_SIZE
-    polygon=(np.asarray(GUARD_POLYGONS[camera])*[width/reference_width,height/reference_height]).astype(np.int32)
-    cv2.fillPoly(mask,[polygon],1)
-    mask[int(GUARD_BOTTOM_FRACTION*height):]=1
-    return mask.astype(bool)
 
 
 def virtual_views(cam, size=512, fov=100):
@@ -86,18 +74,18 @@ def predict_sky_person(prepared_views,geometry,model,processor):
 
 
 def mask_cached(record, output):
-    """Stats commit a complete mask; committed corruption is never a cache miss."""
-    source_sha256 = prepared_image_digest(record)
+    """Reuse a completed mask when its source and output metadata match."""
+    source_file = prepared_image_metadata(record)
     output = Path(output)
     stats = output / 'stats' / (record['name'] + '.json')
     if not stats.is_file():
         return False
     info = json.loads(stats.read_text())
-    if info.get('source_sha256') != source_sha256:
+    if info.get('source_file') != source_file:
         raise ValueError(f'Stale mask source: {record["name"]}')
-    for folder, key in (('valid', 'mask_sha256'), ('labels', 'labels_sha256')):
+    for folder, key in (('valid', 'mask_file'), ('labels', 'labels_file')):
         path = output / folder / (record['name'] + '.png')
-        if not path.is_file() or file_digest(path) != info.get(key):
+        if not path.is_file() or file_metadata(path) != info.get(key):
             raise ValueError(f'Committed mask artifact changed: {record["name"]}: {folder}')
     return True
 
@@ -122,14 +110,14 @@ def _write_review(path, original, labels, fov):
     """Render from the already decoded thumbnail, outside the numeric mask path."""
     arr = np.asarray(original).copy()
     arr[~fov] = (arr[~fov] * .18).astype(np.uint8)
-    for reason, color in {1: (60,150,255), 2: (255,65,65), 3: (210,80,245)}.items():
+    for reason, color in {1: (60,150,255), 2: (255,65,65)}.items():
         take = fov & (labels == reason)
         arr[take] = (arr[take] * .45 + np.array(color) * .55).astype(np.uint8)
     canvas = Image.new('RGB', (1200,840), (24,24,24))
     draw = ImageDraw.Draw(canvas)
     canvas.paste(original, (0,40)); canvas.paste(Image.fromarray(arr), (600,40))
     draw.text((8,8), 'Original', fill='white')
-    draw.text((608,8), 'Blue: sky | Red: person | Purple: device | Dark: outside FOV', fill='white')
+    draw.text((608,8), 'Blue: sky | Red: person | Dark: outside FOV', fill='white')
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path, quality=92)
 
@@ -139,14 +127,13 @@ def generate_masks(scene, output, frames, *, model_cache=None):
     output.mkdir(parents=True, exist_ok=True)
     revision = MODEL_REVISION
     metadata = {
-        'model': MODEL, 'revision': revision, 'mask_version': MASK_VERSION,
+        'model': MODEL, 'revision': revision,
         'excluded_labels': sorted(EXCLUDED),
         'inference_domain': 'Five overlapping 100-degree virtual pinhole views, probability fusion in native coordinates',
         'thresholds': {'sky': .90, 'person': .55},
         'boundary_policy': 'Erode excluded sky by 3 grid pixels; dilate person by 3 grid pixels on 900x1200 grid',
-        'hardware_guard': 'Fixed device polygons and bottom y>=0.8H; see hardware_guard source',
         'cameras': scene['cameras'], 'fov_degrees': scene['fov_degrees'],
-        'limitation': 'Approximate semantic and device boundaries; vegetation and moving vehicles require geometric filtering.',
+        'limitation': 'Approximate semantic boundaries; vegetation and moving vehicles require geometric filtering.',
     }
     write_frozen_json(output / 'model.json', metadata)
     images = [dict(im) for im in scene['images'] if im['frame_index'] in frames]
@@ -156,11 +143,11 @@ def generate_masks(scene, output, frames, *, model_cache=None):
     jobs = [(record, Camera.from_dict(scene['cameras'][record['camera']]), mask_cached(record, output))
             for record in images]
     pending_cameras = {cam for _, cam, cached in jobs if not cached}
-    camera_masks = {cam: (hardware_guard(cam.width, cam.height, cam.label), cam.mask(scene['fov_degrees']) > 0)
+    camera_masks = {cam: cam.mask(scene['fov_degrees']) > 0
                     for cam in pending_cameras}
     review_domains = {cam: np.asarray(Image.fromarray(fov.astype(np.uint8)*255)
                          .resize((600,800), Image.Resampling.NEAREST)) > 0
-                      for cam, (_, fov) in camera_masks.items()}
+                      for cam, fov in camera_masks.items()}
     # Share two camera maps within this invocation; none survive into SfM.
     geometry = {cam: fusion_geometry(cam) for cam in pending_cameras}
 
@@ -174,7 +161,7 @@ def generate_masks(scene, output, frames, *, model_cache=None):
         views = [cv2.remap(rgb, source[...,0], source[...,1], cv2.INTER_LINEAR,
                           borderMode=cv2.BORDER_CONSTANT) for source, _, _, _ in geometry[cam][0]]
         thumbnail = original.resize((600,800))
-        prepared_image_digest(record)
+        prepared_image_metadata(record)
         return record, cam, views, thumbnail
 
     def infer():
@@ -200,10 +187,10 @@ def generate_masks(scene, output, frames, *, model_cache=None):
             person=cv2.dilate((probability[...,1]>.55).astype(np.uint8),kernel)
             sky=cv2.resize(sky,(cam.width,cam.height),interpolation=cv2.INTER_NEAREST)>0
             person=cv2.resize(person,(cam.width,cam.height),interpolation=cv2.INTER_NEAREST)>0
-            device,fov=masks
-            # Reason map: 0 retained, 1 sky, 2 person, 3 device. FOV is separate.
+            fov=masks
+            # Reason map: 0 retained, 1 sky, 2 person. FOV is separate.
             full=np.zeros((cam.height,cam.width),dtype=np.uint8)
-            full[sky]=1;full[person]=2;full[device]=3
+            full[sky]=1;full[person]=2
             valid=full==0
             for p in (path,label_path,info_path):
                 p.parent.mkdir(parents=True,exist_ok=True)
@@ -211,10 +198,10 @@ def generate_masks(scene, output, frames, *, model_cache=None):
                 temporary = target.with_suffix('.tmp.png')
                 Image.fromarray(array).save(temporary)
                 temporary.replace(target)
-            write_json(info_path, {'name':record['name'],'source_sha256':record['source_sha256'],
+            write_json(info_path, {'name':record['name'],'source_file':prepared_image_metadata(record),
                 'fov_pixels':int(fov.sum()),'static_valid_pixels_in_fov':int((fov&valid).sum()),
-                'static_fraction_in_fov':float(valid[fov].mean()),'mask_sha256':file_digest(path),
-                'labels_sha256':file_digest(label_path)})
+                'static_fraction_in_fov':float(valid[fov].mean()),'mask_file':file_metadata(path),
+                'labels_file':file_metadata(label_path)})
             labels = np.asarray(Image.fromarray(full).resize((600,800), Image.Resampling.NEAREST))
             _write_review(_review_path(output.parent, record), thumbnail, labels, review_domains[cam])
         record['semantic_mask']=str(path.resolve())
@@ -267,13 +254,13 @@ def mask_review(scene,output, *, segments=None):
                           .resize((600,800),Image.Resampling.NEAREST))>0
           for label,cam in scene['cameras'].items() if label in pending}
     def render_review(record):
-        stats_path=output/'masks_v2/stats'/(record['name']+'.json')
+        stats_path=output/'masks/stats'/(record['name']+'.json')
         stats=json.loads(stats_path.read_text())
         path = _review_path(output, record)
         if not path.is_file():
             with Image.open(record['source']) as im:
                 original = im.convert('RGB').resize((600,800))
-            with Image.open(output/'masks_v2/labels'/(record['name']+'.png')) as im:
+            with Image.open(output/'masks/labels'/(record['name']+'.png')) as im:
                 labels = np.asarray(im.resize((600,800),Image.Resampling.NEAREST))
             _write_review(path, original, labels, fovs[record['camera']])
         label=f'{record["camera"]}{record["frame_index"]:05d}'
@@ -295,18 +282,18 @@ def mask_review(scene,output, *, segments=None):
     values=[r['static_fraction_in_fov'] for r in summaries]
     report={'images':len(values),'retained_fraction_in_fov':{'min':float(min(values)),
              'median':float(np.median(values)),'max':float(max(values))},
-             'policy':'Virtual-view semantic inference; exclude sky, person, and fixed device regions.',
-             'limitation':'Vegetation retained; semantic and device boundaries remain approximate, not ground truth.'}
-    write_json(output/'masks_v2/summary.json',report)
+             'policy':'Virtual-view semantic inference; exclude sky and person.',
+             'limitation':'Vegetation retained; semantic boundaries remain approximate, not ground truth.'}
+    write_json(output/'masks/summary.json',report)
     options=''.join(f'<option value="{label}">{low}–{high}</option>' for label,(low,high) in segments.items())
     body='''<!doctype html><html lang="zh"><meta charset="utf-8"><title>掩码检查</title>
 <style>body{font:16px system-ui;background:#171b23;color:#ddd;margin:24px}img{max-width:100%}article{min-width:0}p{line-height:1.7}a{color:#8bc5ff}summary{padding:12px;cursor:pointer}details{margin:12px 0;border:1px solid #576070}.pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:16px;padding:12px}select{font:inherit;padding:5px}@media(max-width:600px){.pair{grid-template-columns:1fr}}</style>
-<h1>原图与排除区域</h1><p>蓝色：天空；红色：人物；紫色：设备；暗色：硬 FOV 外。其余区域保留。
+<h1>原图与排除区域</h1><p>蓝色：天空；红色：人物；暗色：硬 FOV 外。其余区域保留。
 植被等类别保留，潜在运动区域继续由几何筛选处理。
-语义边界和设备轮廓是近似筛选，不是真值。这里只展示进入 SfM 的原生图像域掩码，虚拟视图没有新增相机或曝光。</p>
+语义边界是近似筛选，不是真值。这里只展示进入 SfM 的原生图像域掩码，虚拟视图没有新增相机或曝光。</p>
 <p>展示本轮全部 '''+str(len(scene['images']))+''' 张图像，按帧号并排排列 L/R；此排列不表示同步曝光。每幅预览左边是原图，右边是掩码，点击可放大。
 圆形暗边来自初始内参下的 160° FOV 候选，并非语义识别边界；160° 尚不是实测真值。</p>
-<p><a href="masks_v2/summary.json">掩码统计</a>。masks_v2/valid 保存语义与设备掩码；最终导出的 masks 还会叠加 FOV。</p>
+<p><a href="masks/summary.json">掩码统计</a>。masks/valid 保存天空和人物的语义掩码；最终导出的 masks 还会叠加 FOV。</p>
 <label>片段 <select id="segment"><option value="all">全部</option>'''+options+'''</select></label>'''+''.join(cards)+'''
 <script>document.getElementById('segment').onchange=function(){document.querySelectorAll('details[data-segment]').forEach(d=>{d.hidden=this.value!=='all'&&d.dataset.segment!==this.value})}</script></html>'''
     (output/'mask_review.html').write_text(body)

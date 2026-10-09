@@ -19,7 +19,7 @@ def preflight(work, stages, delivery, *, model_cache=None):
     base_path = work / 'manifest.json'
     scene = json.loads((scene_path if scene_path.is_file() else base_path).read_text())
     images = scene['images']
-    missing_masks = 'masks' in stages and any(not mask_cached(r, root / 'masks_v2') for r in images)
+    missing_masks = 'masks' in stages and any(not mask_cached(r, root / 'masks') for r in images)
     missing_features = False
     if 'features' in stages:
         if not scene_path.is_file():
@@ -38,7 +38,7 @@ def preflight(work, stages, delivery, *, model_cache=None):
         from geosunpre.pipeline.registration import freeze_inputs
         native = native_costs()
         inputs = freeze_inputs(work)
-        result['registration'] = {'las': inputs['las'], 'inputs_fingerprint': inputs['fingerprint'],
+        result['registration'] = {'las': inputs['las'], 'inputs_file': inputs['inputs_file'],
                                   'native_implementation': native.implementation_version,
                                   'target_frame': 'input_las_xyz'}
     if any(s in stages for s in ('calibration', 'sfm', 'finalize')):

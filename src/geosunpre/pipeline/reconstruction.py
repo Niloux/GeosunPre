@@ -10,10 +10,9 @@ from geosunpre.sfm.reconstruction import bounded_bundle_adjustment
 from geosunpre.sfm.reconstruction import cheirality_health
 from geosunpre.sfm.reconstruction import database_and_seed
 from geosunpre.sfm.reconstruction import map_from_inputs
-from geosunpre.artifacts import digest
-from geosunpre.artifacts import file_digest
+from geosunpre.artifacts import file_metadata
 from geosunpre.artifacts import write_json, staged_directory
-from geosunpre.colmap import MODEL_FILES, model_hashes
+from geosunpre.colmap import MODEL_FILES, model_files
 from geosunpre.sfm.track_filter import CONFIG as TRACK_CONFIG
 from geosunpre.sfm.track_filter import filter_mapped_tracks
 from geosunpre.sfm.track_filter import training_adjacency
@@ -33,12 +32,12 @@ def freeze_geometry(work, *, require_existing=False):
     local = work / 'calibration/stages/principal/sparse/0'
     calibration = verify_calibration(work)
     params = {i: camera.params.tolist() for i, camera in calibration.cameras.items()}
-    protocol = {'version': 2, 'scene_fingerprint': scene['fingerprint'],
-                'frontend_fingerprint': data['fingerprint'],
+    protocol = {'version': 2, 'scene_manifest_file': file_metadata(out / 'manifest.json'),
+                'frontend_file': file_metadata(out / 'frontend.json'),
                 **protocol_identity(work),
-                'calibration_identity_sha256': file_digest(work / 'calibration/calibration_identity.json'),
-                'pair_protocol_sha256': file_digest(out / 'pair_protocol.json'),
-                'calibration_source_model_sha256': {p.name: file_digest(p) for p in local.glob('*.bin')},
+                'calibration_identity_file': file_metadata(work / 'calibration/calibration_identity.json'),
+                'pair_protocol_file': file_metadata(out / 'pair_protocol.json'),
+                'calibration_source_model_files': {p.name: file_metadata(p) for p in local.glob('*.bin')},
                 'calibration': params,
                 'track_filter': TRACK_CONFIG,
                 'bundle_adjustment_stages': ['fixed_calibration', 'triangle_supported', 'shared_calibration'],
@@ -51,7 +50,7 @@ def freeze_geometry(work, *, require_existing=False):
             raise ValueError('Missing global geometry protocol; run the mapping stage first')
         if any((out / name).exists() for name in ('mapping_inputs', 'mapping', 'mapper_output', 'stages')):
             raise ValueError('Uncontracted global geometry exists; use a fresh work directory')
-    write_frozen_json(path, {**protocol, 'fingerprint': digest(protocol)})
+    write_frozen_json(path, protocol)
     return out, scene, data, features, protocol, params
 
 
@@ -65,16 +64,17 @@ def geometric_scene(scene, params):
 @profiled
 def build_mapping(work):
     out, scene, data, features, protocol, params = freeze_geometry(work)
+    protocol_file = file_metadata(out / 'geometry_protocol.json')
     mapping = out / 'mapping'
     if (mapping / 'identity.json').is_file():
         identity = json.loads((mapping / 'identity.json').read_text())
-        if (identity.get('protocol_fingerprint') != digest(protocol)
-                or identity.get('model_sha256') != model_hashes(mapping)):
+        if (identity.get('protocol_file') != protocol_file
+                or identity.get('model_files') != model_files(mapping)):
             raise ValueError('Global mapping identity changed')
         rec = pycolmap.Reconstruction(mapping)
     else:
         db, seed = database_and_seed(out, geometric_scene(scene, params), scene['images'],
-                                     data['pairs'], features, protocol_fingerprint=digest(protocol))
+                                     data['pairs'], features, protocol_file=protocol_file)
         with operation('incremental_mapping'):
             maps = map_from_inputs(out, scene, db, seed)
         if not maps: raise RuntimeError('Full mapping did not reconstruct a component')
@@ -87,8 +87,8 @@ def build_mapping(work):
             rec.write_text(staged)
             if not pycolmap.Reconstruction(staged).is_valid():
                 raise RuntimeError('Incomplete global mapping output')
-            write_json(staged / 'identity.json', {'protocol_fingerprint': digest(protocol),
-                                                 'model_sha256': model_hashes(staged)})
+            write_json(staged / 'identity.json', {'protocol_file': protocol_file,
+                                                 'model_files': model_files(staged)})
     names = {i.name for i in rec.images.values() if i.has_pose}
     summary = {'selected': len(scene['images']), 'registered': rec.num_reg_images(),
                'registered_names': sorted(names), 'unregistered_names': sorted(set(features) - names),
@@ -105,8 +105,8 @@ def build_mapping(work):
 def optimize(work):
     out, scene, data, features, protocol, _ = freeze_geometry(work, require_existing=True)
     identity = json.loads((out / 'mapping/identity.json').read_text())
-    if (identity.get('protocol_fingerprint') != digest(protocol)
-            or identity.get('model_sha256') != model_hashes(out / 'mapping')):
+    if (identity.get('protocol_file') != file_metadata(out / 'geometry_protocol.json')
+            or identity.get('model_files') != model_files(out / 'mapping')):
         raise ValueError('Global mapping identity changed')
     params = {int(i): np.asarray(p, dtype=float) for i, p in protocol['calibration'].items()}
     summary_path = out / 'optimization_summary.json'
@@ -121,13 +121,13 @@ def optimize(work):
             (path / 'sparse/0' / name).is_file() for name in MODEL_FILES)
         if not complete and (path / 'ba.json').is_file():
             saved = json.loads((path / 'ba.json').read_text())
-            if 'model_sha256' in saved:
+            if 'model_files' in saved:
                 raise ValueError(f'Global BA stage identity changed: {stage}: committed model is incomplete')
         if complete:
             ba = json.loads((path / 'ba.json').read_text())
-            for key, model_path in (('model_sha256', path / 'sparse/0'),
-                                    ('input_model_sha256', previous)):
-                if ba.get(key) != model_hashes(model_path):
+            for key, model_path in (('model_files', path / 'sparse/0'),
+                                    ('input_model_files', previous)):
+                if ba.get(key) != model_files(model_path):
                     raise ValueError(f'Global BA stage identity changed: {stage}: {key}')
         if stage in existing['stages'] and complete:
             rec = pycolmap.Reconstruction(path / 'sparse/0')
@@ -162,8 +162,8 @@ def optimize(work):
                 rec.write(model); rec.write_text(model)
                 if not pycolmap.Reconstruction(model).is_valid():
                     raise RuntimeError(f'Incomplete global BA output: {stage}')
-                ba['input_model_sha256'] = model_hashes(previous)
-                ba['model_sha256'] = model_hashes(model)
+                ba['input_model_files'] = model_files(previous)
+                ba['model_files'] = model_files(model)
                 write_json(staged / 'ba.json', ba)
         if stage != 'shared_calibration':
             for cid, p in params.items(): np.testing.assert_array_equal(rec.cameras[cid].params, p)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from geosunpre.artifacts import digest, file_digest, write_frozen_json
+from geosunpre.artifacts import file_metadata, write_frozen_json
 from geosunpre.config import CONFIG_FILE
 
 SCOPE = 'all_eligible_observations'
@@ -16,26 +16,24 @@ def protocol_path(work):
 
 
 def protocol_identity(work):
-    return {'observation_protocol_sha256': file_digest(protocol_path(work))}
+    return {'observation_protocol_file': file_metadata(protocol_path(work))}
 
 
 def _input_identity(root, data):
     return {
-        'scene_manifest_sha256': file_digest(root / 'manifest.json'),
-        'frontend_identity': digest({k: v for k, v in data.items()
-                                     if k not in ('fingerprint', 'cache', 'matching_cache')}),
-        'pair_protocol_sha256': file_digest(root / 'pair_protocol.json'),
-        # Tokens describe extraction inputs. Hash cache bytes as well, so reordered
-        # keypoints or changed matches cannot retain their old observation IDs.
-        'feature_cache_sha256': {name: file_digest(row['path'])
+        'scene_manifest_file': file_metadata(root / 'manifest.json'),
+        'frontend_file': file_metadata(root / 'frontend.json'),
+        'pair_protocol_file': file_metadata(root / 'pair_protocol.json'),
+        # Record the caches supplying the feature and match indices used by SfM.
+        'feature_cache_files': {name: file_metadata(row['path'])
                                  for name, row in sorted(data['features'].items())},
-        'match_cache_sha256': {row['path']: file_digest(row['path']) for row in data['pairs']},
+        'match_cache_files': {row['path']: file_metadata(row['path']) for row in data['pairs']},
     }
 
 
 def _identity(work, data):
     return {'version': 2, 'scope': SCOPE,
-            'pipeline_config_sha256': file_digest(Path(work) / CONFIG_FILE),
+            'pipeline_config_file': file_metadata(Path(work) / CONFIG_FILE),
             'inputs': _input_identity(Path(work) / 'sfm', data)}
 
 
@@ -44,7 +42,6 @@ def load_observations(work, data):
     if not path.is_file():
         raise ValueError('Missing observation protocol; run the observations stage first')
     expected = _identity(work, data)
-    expected['fingerprint'] = digest(expected)
     if json.loads(path.read_text()) != expected:
         raise ValueError('Frozen observations changed; use a fresh work directory')
     return expected
@@ -63,7 +60,7 @@ def freeze_observations(work):
         return load_observations(work, data)
     value = _identity(work, data)
     # First publication validates every feature array, including images without
-    # a retained match. Completed protocols need only their content identities.
+    # a retained match. Completed protocols check their recorded file metadata.
     features = dict(features)
     for entry in data['pairs']:
         with np.load(entry['path'], allow_pickle=False) as raw:
@@ -77,6 +74,5 @@ def freeze_observations(work):
                 raise ValueError(f'Invalid match cache: {entry["a"]}, {entry["b"]}')
     if value != _identity(work, data):
         raise ValueError('Frontend changed while freezing observations')
-    value['fingerprint'] = digest(value)
     write_frozen_json(protocol_path(work), value)
     return value

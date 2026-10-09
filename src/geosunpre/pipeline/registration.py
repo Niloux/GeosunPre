@@ -7,14 +7,13 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 
-from geosunpre.artifacts import archive_interrupted, digest, file_digest, staged_directory, write_frozen_json, write_json
-from geosunpre.colmap import export_colmap, model_hashes
+from geosunpre.artifacts import archive_interrupted, file_metadata, staged_directory, write_frozen_json, write_json
+from geosunpre.colmap import export_colmap, model_files
 from geosunpre.initialization import DEFAULT_VOXEL_SIZE
 from geosunpre.config import CONFIG_FILE, load_config
 from geosunpre.pipeline.finalization import FINAL, _check_model, verify_final
 from geosunpre.pipeline.observations import protocol_identity
 from geosunpre.pipeline.quality import ProductionAcceptanceRejected, production_acceptance, production_quality
-from geosunpre.pipeline.task import TASK_FILE
 from geosunpre.registration.geometry import quantiles
 from geosunpre.registration.global_alignment import MAX_LAS_POINTS, register_global
 from geosunpre.registration.joint import refine_joint
@@ -67,7 +66,7 @@ def freeze_inputs(work):
     if any(not path.is_file() for path in inputs):
         raise ValueError('Joint pipeline requires CameraPos_C2E, pos and pos_ENH navigation files')
     value = {'version': 1, 'input_root': str(input_root), 'las': str(las),
-             'input_sha256': {str(path): file_digest(path) for path in inputs},
+             'input_files': {str(path): file_metadata(path) for path in inputs},
              'las_header': read_header(las),
              'settings': {key: val for key, val in vars(config).items() if key.startswith('registration_') or key == 'workers'},
              'max_las_points': MAX_LAS_POINTS,
@@ -77,9 +76,9 @@ def freeze_inputs(work):
                  'units_assumed': 'metres', 'absolute_crs_verified': False,
                  'timestamps_modified': False, 'raw_quaternions_used': False},
              'image_gates': IMAGE_GATES, 'geometry_policy': POLICY}
-    value['fingerprint'] = digest(value)
-    write_frozen_json(work / ROOT / 'inputs.json', value)
-    return value
+    path = work / ROOT / 'inputs.json'
+    write_frozen_json(path, value)
+    return {**value, 'inputs_file': file_metadata(path)}
 
 
 def _points(path):
@@ -228,14 +227,14 @@ def select_delivery(source, global_stage, joint, scene, config, *, camera_parame
 
 def _stage(work, name, context, compute):
     root = Path(work) / ROOT
-    fingerprint = digest({'name': name, 'protocol_fingerprint': context})
+    context = {'name': name, 'protocol_file': context}
     path = root / name
     if path.exists() and (path / 'completion.json').is_file():
-        verify_publication(path, fingerprint)
+        verify_publication(path, context)
         return path
     archive_interrupted(path)
-    compute(path, fingerprint)
-    verify_publication(path, fingerprint)
+    compute(path, context)
+    verify_publication(path, context)
     return path
 
 
@@ -247,34 +246,34 @@ def register(work):
     visual_scene, visual_result, _ = verify_final(work)
     source = work / FINAL / 'sparse/0'
     root = work / ROOT
-    protocol = {'version': 2, 'inputs_fingerprint': inputs['fingerprint'],
-                'source_model_sha256': model_hashes(source),
-                'visual_result_sha256': file_digest(work / FINAL / 'result.json'),
-                'scene_manifest_sha256': file_digest(work / 'sfm/manifest.json'),
+    protocol = {'version': 2, 'inputs_file': inputs['inputs_file'],
+                'source_model_files': model_files(source),
+                'visual_result_file': file_metadata(work / FINAL / 'result.json'),
+                'scene_manifest_file': file_metadata(work / 'sfm/manifest.json'),
                 'solver_recipe': {**RECIPE, 'workers': config.workers},
                 'image_gates': IMAGE_GATES, 'geometry_policy': POLICY, 'intrinsics_optimized': False}
-    protocol['fingerprint'] = digest(protocol)
     write_frozen_json(root / 'protocol.json', protocol)
+    protocol_file = file_metadata(root / 'protocol.json')
     final = root / 'final'
     if (final / 'completion.json').is_file():
         return verify_registered(work)
-    global_stage = _stage(work, 'global', protocol['fingerprint'], lambda path, fingerprint:
-        register_global(source, inputs, path, workers=config.workers, context_fingerprint=fingerprint))
+    global_stage = _stage(work, 'global', protocol_file, lambda path, context:
+        register_global(source, inputs, path, workers=config.workers, context=context))
     reference = _points(global_stage / 'registration_points.npz')
     base_acceptance = surface_acceptance(reference, config)
     if not base_acceptance['passed']:
         write_json(root / 'rejection.json', {'stage': 'global', 'acceptance': base_acceptance})
         raise ValueError('LAS registration acceptance rejected: ' + '; '.join(base_acceptance['failures']))
 
-    def compute_joint(path, fingerprint):
+    def compute_joint(path, context):
         try:
-            refine_joint(global_stage, inputs, path, workers=config.workers, context_fingerprint=fingerprint)
+            refine_joint(global_stage, inputs, path, workers=config.workers, context=context)
         except JointConstraintsUnavailable as exc:
             with staged_directory(path) as stage:
                 write_json(stage / 'unavailable.json', {'error': str(exc)})
-                complete_publication(stage, fingerprint)
+                complete_publication(stage, context)
 
-    joint = _stage(work, 'joint', protocol['fingerprint'], compute_joint)
+    joint = _stage(work, 'joint', protocol_file, compute_joint)
     unavailable = (joint / 'unavailable.json').is_file()
     rec, decision, quality = select_delivery(source, global_stage, joint, visual_scene, config,
         camera_parameter_bounds=visual_result['ba'].get('cameras', {}))
@@ -283,21 +282,21 @@ def register(work):
         model.mkdir(parents=True)
         rec.write(model)
         _check_model(pycolmap.Reconstruction(model), visual_scene)
-        hashes = model_hashes(model)
-        quality['model_sha256'] = hashes
+        files = model_files(model)
+        quality['model_files'] = files
         result = {'version': 2, 'status': 'registered', 'model': str(final / 'sparse/0'),
                   'selected': decision['selected'], 'joint_accepted': decision['joint_accepted'],
                   'fallback_reasons': decision['fallback_reasons'], 'target_frame': decision['target_frame'],
-                  'model_sha256': hashes, 'protocol_fingerprint': protocol['fingerprint'],
-                  'inputs_fingerprint': inputs['fingerprint'], 'registered_images': rec.num_reg_images(),
+                  'model_files': files, 'protocol_file': protocol_file,
+                  'inputs_file': inputs['inputs_file'], 'registered_images': rec.num_reg_images(),
                   'points': rec.num_points3D(), 'observations': rec.compute_num_observations(),
-                  'global_completion_sha256': file_digest(global_stage / 'completion.json'),
-                  'joint_completion_sha256': file_digest(joint / 'completion.json'),
+                  'global_completion_file': file_metadata(global_stage / 'completion.json'),
+                  'joint_completion_file': file_metadata(joint / 'completion.json'),
                   'absolute_accuracy_validated': False, 'intrinsics_optimized': False}
         write_json(stage / 'quality_summary.json', quality)
         write_json(stage / 'result.json', result)
         _write_report(stage / 'inspection.html', result, quality, unavailable)
-        complete_publication(stage, digest({'name': 'final', 'protocol_fingerprint': protocol['fingerprint']}))
+        complete_publication(stage, {'name': 'final', 'protocol_file': protocol_file})
     return verify_registered(work)
 
 
@@ -309,20 +308,19 @@ def verify_registered(work):
     root = work / ROOT
     protocol = _read(root / 'protocol.json')
     if (protocol.get('version') != 2
-            or protocol.get('fingerprint') != digest({k: v for k, v in protocol.items() if k != 'fingerprint'})
-            or protocol['inputs_fingerprint'] != inputs['fingerprint']
-            or protocol['source_model_sha256'] != model_hashes(work / FINAL / 'sparse/0')
-            or protocol['visual_result_sha256'] != file_digest(work / FINAL / 'result.json')
-            or protocol['scene_manifest_sha256'] != file_digest(work / 'sfm/manifest.json')):
+            or protocol['inputs_file'] != inputs['inputs_file']
+            or protocol['source_model_files'] != model_files(work / FINAL / 'sparse/0')
+            or protocol['visual_result_file'] != file_metadata(work / FINAL / 'result.json')
+            or protocol['scene_manifest_file'] != file_metadata(work / 'sfm/manifest.json')):
         raise ValueError('Registration inputs or visual source identity changed')
     for name in ('global', 'joint', 'final'):
-        verify_publication(root / name, digest({'name': name, 'protocol_fingerprint': protocol['fingerprint']}))
+        verify_publication(root / name, {'name': name, 'protocol_file': file_metadata(root / 'protocol.json')})
     result = _read(root / 'final/result.json')
-    if (result['protocol_fingerprint'] != protocol['fingerprint']
-            or result['inputs_fingerprint'] != inputs['fingerprint']
-            or result['model_sha256'] != model_hashes(root / 'final/sparse/0')
-            or result['global_completion_sha256'] != file_digest(root / 'global/completion.json')
-            or result['joint_completion_sha256'] != file_digest(root / 'joint/completion.json')
+    if (result['protocol_file'] != file_metadata(root / 'protocol.json')
+            or result['inputs_file'] != inputs['inputs_file']
+            or result['model_files'] != model_files(root / 'final/sparse/0')
+            or result['global_completion_file'] != file_metadata(root / 'global/completion.json')
+            or result['joint_completion_file'] != file_metadata(root / 'joint/completion.json')
             or result['target_frame'] != 'input_las_xyz'):
         raise ValueError('Final registration identity changed')
     return result
@@ -344,16 +342,10 @@ def export_registered(work, *, output=None, image_mode='copy', include_masks=Tru
                    ('registration', 'sfm', 'calibration', 'features', 'matches'))
             or output.is_relative_to(Path(inputs['input_root']))):
         raise ValueError('Choose a COLMAP export separate from pipeline models and raw input')
-    provenance = {'kind': 'geosunpre_production', 'source_model_sha256': result['model_sha256'],
-        'pipeline_config_sha256': file_digest(work / CONFIG_FILE),
-        'pipeline_task_sha256': file_digest(work / TASK_FILE),
-        'model_weights_sha256': {name: file_digest(work / name) for name in
-            ('frontend_weights.json', 'segmentation_weights.json') if (work / name).is_file()},
-        'scene_manifest_sha256': file_digest(work / 'sfm/manifest.json'), **protocol_identity(work),
-        'registration_inputs_sha256': file_digest(work / ROOT / 'inputs.json'),
-        'registration_protocol_sha256': file_digest(work / ROOT / 'protocol.json'),
-        'registration_result_sha256': file_digest(final / 'result.json'),
-        'las_sha256': inputs['input_sha256'][inputs['las']],
+    provenance = {'kind': 'geosunpre_production', 'source_model_files': result['model_files'],
+        'work': str(work), 'input_root': inputs['input_root'], 'las': inputs['las'],
+        'settings': json.loads((work / CONFIG_FILE).read_text())['settings'],
+        'las_file': inputs['input_files'][inputs['las']],
         'target_frame': 'input_las_xyz', 'registration_selected': result['selected'],
         'joint_refinement_accepted': result['joint_accepted'],
         'independent_exposure_poses': True, 'manual_annotations_used': False,

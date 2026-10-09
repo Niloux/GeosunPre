@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 
-from geosunpre.artifacts import file_digest, staged_directory, write_json
-from geosunpre.colmap import model_hashes
+from geosunpre.artifacts import file_metadata, staged_directory, write_json
+from geosunpre.colmap import model_files
 from geosunpre.registration.geometry import (error_summary, matrix4, quantiles,
     refine_similarity, residuals, robust_similarity, spatial_split, transform_points)
 from geosunpre.registration.las import sample_las
@@ -95,7 +95,7 @@ def navigation_initialization(input_root, reconstruction):
              'coordinate_conversion_error': quantiles(conversion_errors),
              'coordinate_conversion_scale': float(conversion.scale), 'camera_position_fit': pose_fit,
              'matched_image_names': names, 'unmatched_images': reconstruction.num_reg_images() - len(names),
-             'input_sha256': {str(path): file_digest(path) for path in (pose_path, nav_path, enh_path)}}
+             'input_files': {str(path): file_metadata(path) for path in (pose_path, nav_path, enh_path)}}
     return initial, audit
 
 
@@ -144,12 +144,12 @@ def projection_invariance(before, after):
             'intrinsics_and_all_observation_tracks_unchanged': True}
 
 
-def register_global(model_path, inputs, output, *, workers=4, context_fingerprint=None):
+def register_global(model_path, inputs, output, *, workers=4, context=None):
     """Register a completed visual model without exporting intermediate datasets."""
     model_path, output = Path(model_path).resolve(), Path(output).resolve()
     las = Path(inputs['las'])
     validate_output(output, model_path, inputs['input_root'], las)
-    source_hashes = model_hashes(model_path)
+    source_files = model_files(model_path)
     original = pycolmap.Reconstruction(model_path)
     initial, initialization = navigation_initialization(inputs['input_root'], original)
     target, las_metadata = sample_las(las, max_points=MAX_LAS_POINTS)
@@ -173,9 +173,9 @@ def register_global(model_path, inputs, output, *, workers=4, context_fingerprin
     supported = (distances <= .3) & surface['valid'][nearest]
     transformed = pycolmap.Reconstruction(original)
     transformed.transform(pycolmap.Sim3d(final[:3]))
-    report = {'version': 1, 'inputs_fingerprint': inputs['fingerprint'],
+    report = {'version': 1, 'inputs_file': inputs['inputs_file'],
               'inputs': {'model': str(model_path), 'las': str(las),
-                         'visual_model_sha256': source_hashes, 'input_sha256': inputs['input_sha256']},
+                         'visual_model_files': source_files, 'input_files': inputs['input_files']},
               'initialization': initialization, 'las': las_metadata,
               'split': split, 'optimization': optimization,
               'errors': {label: error_summary(final_points[mask], surface, workers=workers)
@@ -188,14 +188,14 @@ def register_global(model_path, inputs, output, *, workers=4, context_fingerprin
         report['projection_invariance'] = projection_invariance(original, pycolmap.Reconstruction(model))
         write_json(stage / 'report.json', report)
         write_json(stage / 'transform.json', {'matrix': final.tolist(), 'initial_matrix': initial.tolist(),
-                                            'report_sha256': file_digest(stage / 'report.json')})
+                                            'report_file': file_metadata(stage / 'report.json')})
         np.savez_compressed(stage / 'registration_points.npz', point_ids=selected_ids, tiles=tiles,
                             holdout=holdout, partition_xyz=initial_points,
                             initial_xyz=initial_points, final_xyz=final_points,
                             nearest_distance=distances, signed_plane_error=plane,
                             stable_surface_supported=supported, surface_normals=surface['normals'][nearest])
-        if model_hashes(model_path) != source_hashes or any(
-                file_digest(path) != expected for path, expected in inputs['input_sha256'].items()):
+        if model_files(model_path) != source_files or any(
+                file_metadata(path) != expected for path, expected in inputs['input_files'].items()):
             raise ValueError('Registration sources changed during fitting')
-        complete_publication(stage, context_fingerprint)
+        complete_publication(stage, context)
     return report

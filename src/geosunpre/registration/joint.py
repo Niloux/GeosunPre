@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 
-from geosunpre.artifacts import file_digest, staged_directory, write_json
-from geosunpre.colmap import model_hashes
+from geosunpre.artifacts import file_metadata, staged_directory, write_json
+from geosunpre.colmap import model_files
 from geosunpre.registration.geometry import (quantiles, residuals, spatial_split,
     transform_points, validate_similarity)
 from geosunpre.registration.global_alignment import MAX_LAS_POINTS, projection_invariance, validate_output
@@ -21,7 +21,7 @@ from geosunpre.scene import load_poses
 
 
 def _positions(rec, audit):
-    paths = [Path(path) for path in audit['input_sha256'] if path.endswith('_CameraPos_C2E.txt')]
+    paths = [Path(path) for path in audit['input_files'] if path.endswith('_CameraPos_C2E.txt')]
     if len(paths) != 1:
         raise ValueError('Expected exactly one audited camera-position file')
     poses = load_poses(paths[0])
@@ -86,20 +86,20 @@ def _run_stage(label, base, initial_matrix, positions, surface, fit_ids, tiles_f
         'invalid_depth_observations': int((~np.isfinite(depths) | (depths <= 1e-9)).sum())}
 
 
-def refine_joint(alignment, inputs, output, *, workers=4, context_fingerprint=None):
+def refine_joint(alignment, inputs, output, *, workers=4, context=None):
     """Compute one joint candidate and compare it to the unchanged source model."""
     alignment, output = Path(alignment).resolve(), Path(output).resolve()
     validate_output(output, alignment, inputs['input_root'], inputs['las'])
     native_costs()
-    reference_hashes = {name: file_digest(alignment / name)
+    reference_files = {name: file_metadata(alignment / name)
                         for name in ('report.json', 'transform.json', 'registration_points.npz')}
     reference = json.loads((alignment / 'report.json').read_text())
     transform = json.loads((alignment / 'transform.json').read_text())
-    if (reference['inputs_fingerprint'] != inputs['fingerprint']
-            or transform['report_sha256'] != reference_hashes['report.json']):
+    if (reference['inputs_file'] != inputs['inputs_file']
+            or transform['report_file'] != reference_files['report.json']):
         raise ValueError('Global registration identity mismatch')
     model_path = Path(reference['inputs']['model'])
-    if model_hashes(model_path) != reference['inputs']['visual_model_sha256']:
+    if model_files(model_path) != reference['inputs']['visual_model_files']:
         raise ValueError('Visual source model changed before joint refinement')
     base = pycolmap.Reconstruction(model_path)
     initial_matrix = validate_similarity(transform['matrix'])
@@ -152,7 +152,7 @@ def refine_joint(alignment, inputs, output, *, workers=4, context_fingerprint=No
         model.mkdir(parents=True)
         aligned.write(model)
         diagnostic['projection_invariance'] = projection_invariance(rec, pycolmap.Reconstruction(model))
-        diagnostic['model_sha256'] = model_hashes(model)
+        diagnostic['model_files'] = model_files(model)
         candidate_points = transform_points(matrix, np.array([rec.points3D[int(pid)].xyz for pid in ids]))
         distances, plane, nearest = residuals(candidate_points, surface, workers=workers)
         np.savez_compressed(stage / 'las_points.npz', point_ids=ids, holdout=holdout, tiles=tiles,
@@ -163,10 +163,10 @@ def refine_joint(alignment, inputs, output, *, workers=4, context_fingerprint=No
             observed_pixels=observations.pixels, input_error=input_errors, candidate_error=errors)
         write_json(stage / 'diagnostic.json', diagnostic)
         write_json(stage / 'transform.json', {'matrix': matrix.tolist(), 'recipe': recipe,
-                                             'reference_sha256': reference_hashes, 'image_gates': IMAGE_GATES})
-        if (model_hashes(model_path) != reference['inputs']['visual_model_sha256']
-                or any(file_digest(path) != expected for path, expected in inputs['input_sha256'].items())
-                or any(file_digest(alignment / name) != expected for name, expected in reference_hashes.items())):
+                                             'reference_files': reference_files, 'image_gates': IMAGE_GATES})
+        if (model_files(model_path) != reference['inputs']['visual_model_files']
+                or any(file_metadata(path) != expected for path, expected in inputs['input_files'].items())
+                or any(file_metadata(alignment / name) != expected for name, expected in reference_files.items())):
             raise ValueError('Joint refinement sources changed during fitting')
-        complete_publication(stage, context_fingerprint)
+        complete_publication(stage, context)
     return diagnostic

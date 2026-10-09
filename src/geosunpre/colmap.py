@@ -11,7 +11,7 @@ from PIL import Image
 import pycolmap
 
 from geosunpre.camera import Camera
-from geosunpre.artifacts import file_digest, digest
+from geosunpre.artifacts import file_metadata
 from geosunpre.artifacts import write_json
 from geosunpre.parallel import ordered_map
 from geosunpre.initialization import (DEFAULT_VOXEL_SIZE, export_las_ply,
@@ -22,8 +22,8 @@ MODEL_FILES = ('cameras.bin', 'images.bin', 'points3D.bin', 'rigs.bin', 'frames.
 IDENTITY_FILE = 'colmap_export.json'
 
 
-def model_hashes(model):
-    return {name: file_digest(Path(model) / name) for name in MODEL_FILES}
+def model_files(model):
+    return {name: file_metadata(Path(model) / name) for name in MODEL_FILES}
 
 
 def _relative_path(value):
@@ -72,18 +72,15 @@ def verify_colmap_export(output):
     output = Path(output).resolve()
     identity_path = _contained_file(output, IDENTITY_FILE)
     identity = json.loads(identity_path.read_text())
-    if identity.get('fingerprint') != digest(
-            {k: v for k, v in identity.items() if k != 'fingerprint'}):
-        raise ValueError('COLMAP export identity changed')
-    if (identity.get('schema_version') != 3 or identity.get('format') != 'COLMAP'
+    if (identity.get('schema_version') != 4 or identity.get('format') != 'COLMAP'
             or 'initialization' not in identity
-            or not identity.get('request_fingerprint')
+            or not isinstance(identity.get('request'), dict)
             or identity.get('image_mode') not in ('link', 'copy')
-            or set(identity.get('model_sha256', {})) != set(MODEL_FILES)):
+            or set(identity.get('model_files', {})) != set(MODEL_FILES)):
         raise ValueError('Unsupported COLMAP export contract')
-    for name, expected in identity['model_sha256'].items():
+    for name, expected in identity['model_files'].items():
         path = _contained_file(output, f'sparse/0/{name}')
-        if file_digest(path) != expected:
+        if path.stat().st_size != expected:
             raise ValueError(f'Exported COLMAP model changed: {name}')
     model = _read_model(output / 'sparse/0')
     records = identity['images']
@@ -100,38 +97,38 @@ def verify_colmap_export(output):
             raise ValueError(f'Exported camera/image identity changed: {name}')
         original = _contained_file(output, f'images/{name}',
                                    image_link=identity['image_mode'] == 'link')
-        if file_digest(original) != record['sha256']:
-            raise ValueError(f'Exported image content changed: {name}')
+        if original.stat().st_size != record['size_bytes']:
+            raise ValueError(f'Exported image size changed: {name}')
         with Image.open(original) as source:
             if source.size != (camera.width, camera.height) or source.getexif().get(274, 1) != 1:
                 raise ValueError(f'Image dimensions or orientation differ: {name}')
         if identity['include_masks']:
             mask = _contained_file(output, f'masks/{name}.png')
-            if file_digest(mask) != record['mask_sha256']:
-                raise ValueError(f'Exported mask content changed: {name}')
+            if mask.stat().st_size != record['mask_size_bytes']:
+                raise ValueError(f'Exported mask size changed: {name}')
             with Image.open(mask) as source:
                 if source.size != (camera.width, camera.height) or source.mode != 'L':
                     raise ValueError(f'Invalid exported mask: {name}')
-    for relative, expected in identity['supplemental_sha256'].items():
-        if file_digest(_contained_file(output, relative)) != expected:
+    for relative, expected in identity['supplemental_files'].items():
+        if _contained_file(output, relative).stat().st_size != expected:
             raise ValueError(f'Exported supplementary file changed: {relative}')
     initialization = identity['initialization']
     if initialization is not None:
         if (initialization.get('source') != 'las'
                 or initialization.get('coordinate_frame') != 'input_las_xyz'
                 or initialization.get('version') != 1
-                or initialization.get('ply_sha256') != identity['supplemental_sha256'].get('sparse/0/points3D.ply')
-                or 'initialization.json' not in identity['supplemental_sha256']
+                or initialization.get('ply_size_bytes') != identity['supplemental_files'].get('sparse/0/points3D.ply')
+                or 'initialization.json' not in identity['supplemental_files']
                 or json.loads((output / 'initialization.json').read_text()) != initialization):
             raise ValueError('LAS initialization identity differs')
         initialization_recipe(initialization['voxel_size_m'])
         verify_initialization_ply(output / 'sparse/0/points3D.ply', initialization['points'])
-    elif 'sparse/0/points3D.ply' in identity['supplemental_sha256']:
+    elif 'sparse/0/points3D.ply' in identity['supplemental_files']:
         raise ValueError('Initialization PLY lacks LAS provenance')
     return {'output': str(output), 'identity': str(identity_path),
             'model': str(output / 'sparse/0'), 'images': len(records),
             'points': model.num_points3D(), 'image_mode': identity['image_mode'],
-            'include_masks': identity['include_masks'], 'full_content_check': True,
+            'include_masks': identity['include_masks'], 'check_scope': 'model_structure_and_file_sizes',
             'initialization': None if initialization is None else {
                 'source': 'las', 'points': initialization['points'],
                 'voxel_size_m': initialization['voxel_size_m'],
@@ -150,23 +147,24 @@ def _export_mask(record, scene, destination):
     Image.fromarray(valid.astype(np.uint8) * 255).save(destination)
 
 
-def _export_request(source_hashes, scene, *, image_mode, include_masks, include_ply,
+def _export_request(source_files, scene, *, image_mode, include_masks, include_ply,
                     initialization_las, ply_voxel_size, provenance, quality_report):
     if include_ply and initialization_las is None:
         raise ValueError('LAS input is required for the 3DGS initialization PLY')
     records = {row['name']: row for row in scene['images']}
-    return {'source_model_sha256': source_hashes, 'provenance': provenance or {},
+    request = {'source_model_files': source_files, 'provenance': provenance or {},
             'image_mode': image_mode, 'include_masks': include_masks, 'include_ply': include_ply,
-            'initialization': {'source_las_sha256': file_digest(initialization_las),
+            'initialization': {'source_las_file': file_metadata(initialization_las),
                                **initialization_recipe(ply_voxel_size)} if include_ply else None,
-            'quality_sha256': file_digest(quality_report) if quality_report is not None else None,
+            'quality_file': file_metadata(quality_report) if quality_report is not None else None,
             'mask_cameras': scene['cameras'] if include_masks else None,
             'mask_fov': scene['fov_degrees'] if include_masks else None,
-            'images': [{'name': name, 'sha256': file_digest(row['source']),
+            'images': [{'name': name, 'source_file': file_metadata(row['source']),
                         'source': str(Path(row['source']).resolve()) if image_mode == 'link' else None,
-                        'mask_sha256': file_digest(row['semantic_mask'])
+                        'mask_file': file_metadata(row['semantic_mask'])
                             if include_masks and row.get('semantic_mask') else None}
                        for name, row in sorted(records.items())]}
+    return json.loads(json.dumps(request, allow_nan=False))
 
 
 def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks=False,
@@ -190,9 +188,9 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
             raise ValueError('Destination is not a COLMAP export; choose a new output directory')
         verified = verify_colmap_export(output)
         existing = json.loads((output / IDENTITY_FILE).read_text())
-    source_hashes = model_hashes(model_path)
-    expected_hashes = (provenance or {}).get('source_model_sha256')
-    if expected_hashes is not None and source_hashes != expected_hashes:
+    source_files = model_files(model_path)
+    expected_files = (provenance or {}).get('source_model_files')
+    if expected_files is not None and source_files != expected_files:
         raise ValueError('Source COLMAP model changed after provenance validation')
     model = _read_model(model_path)
     records = {row['name']: row for row in scene['images']}
@@ -203,18 +201,17 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
         source = Path(record['source']).resolve()
         if source.is_relative_to(output):
             raise ValueError('Export directory contains a source image')
-    request = _export_request(source_hashes, scene, image_mode=image_mode, include_masks=include_masks,
+    request = _export_request(source_files, scene, image_mode=image_mode, include_masks=include_masks,
                               include_ply=include_ply, initialization_las=initialization_las,
                               ply_voxel_size=ply_voxel_size, provenance=provenance, quality_report=quality_report)
     if include_ply:
         if Path(initialization_las).resolve().is_relative_to(output):
             raise ValueError('Export directory contains the source LAS')
-        expected_las = (provenance or {}).get('las_sha256')
-        if expected_las is not None and request['initialization']['source_las_sha256'] != expected_las:
+        expected_las = (provenance or {}).get('las_file')
+        if expected_las is not None and request['initialization']['source_las_file'] != expected_las:
             raise ValueError('Initialization LAS differs from the registered LAS')
-    request_fingerprint = digest(request)
     if existing:
-        if existing['request_fingerprint'] != request_fingerprint:
+        if existing['request'] != request:
             raise ValueError('Existing COLMAP export differs; choose a new output directory')
         return verified
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -224,8 +221,8 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
         sparse.mkdir(parents=True)
         for name in MODEL_FILES:
             shutil.copyfile(model_path / name, sparse / name)
-            if file_digest(sparse / name) != source_hashes[name]:
-                raise ValueError(f'Source COLMAP model changed during export: {name}')
+            if (sparse / name).stat().st_size != source_files[name]['size_bytes']:
+                raise ValueError(f'Incomplete COLMAP model copy: {name}')
         camera_details = {name: (image.camera_id, model.cameras[image.camera_id].width,
                                 model.cameras[image.camera_id].height)
                           for name, image in by_name.items()}
@@ -234,7 +231,6 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
             source = Path(record['source']).resolve()
             destination = stage / 'images' / _relative_path(name)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            source_hash = file_digest(source)
             if image_mode == 'copy':
                 shutil.copyfile(source, destination)
             else:
@@ -242,11 +238,11 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
                 destination.symlink_to(os.path.relpath(source, destination.parent))
             camera_id, width, height = camera_details[name]
             row = {'name': name, 'camera_id': camera_id,
-                   'size': [width, height], 'sha256': source_hash}
+                   'size': [width, height], 'size_bytes': destination.stat().st_size}
             if include_masks:
                 mask_path = stage / 'masks' / (name + '.png')
                 _export_mask(record, scene, mask_path)
-                row['mask_sha256'] = file_digest(mask_path)
+                row['mask_size_bytes'] = mask_path.stat().st_size
             return row
         images = list(ordered_map(copy_image, sorted(records.items())))
         supplements = {}
@@ -254,24 +250,27 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
         if include_ply:
             initialization = export_las_ply(initialization_las, sparse / 'points3D.ply',
                                             voxel_size=ply_voxel_size)
-            if initialization['source_las_sha256'] != request['initialization']['source_las_sha256']:
+            if initialization['source_las_file'] != request['initialization']['source_las_file']:
                 raise ValueError('LAS changed during initialization export')
-            supplements['sparse/0/points3D.ply'] = file_digest(sparse / 'points3D.ply')
+            supplements['sparse/0/points3D.ply'] = initialization['ply_size_bytes']
             write_json(stage / 'initialization.json', initialization)
-            supplements['initialization.json'] = file_digest(stage / 'initialization.json')
+            supplements['initialization.json'] = (stage / 'initialization.json').stat().st_size
         if quality_report is not None:
             shutil.copyfile(quality_report, stage / 'quality.json')
-            supplements['quality.json'] = file_digest(stage / 'quality.json')
+            supplements['quality.json'] = (stage / 'quality.json').stat().st_size
+        if request != _export_request(source_files, scene, image_mode=image_mode, include_masks=include_masks,
+                include_ply=include_ply, initialization_las=initialization_las, ply_voxel_size=ply_voxel_size,
+                provenance=provenance, quality_report=quality_report) or model_files(model_path) != source_files:
+            raise ValueError('Export sources changed during copying')
         identity = {
-            'schema_version': 3, 'format': 'COLMAP',
-            'request_fingerprint': request_fingerprint,
+            'schema_version': 4, 'format': 'COLMAP',
+            'request': request,
             'image_mode': image_mode, 'include_masks': include_masks,
-            'model_sha256': model_hashes(sparse),
+            'model_files': {name: (sparse / name).stat().st_size for name in MODEL_FILES},
             'images': images, 'points': model.num_points3D(),
-            'supplemental_sha256': supplements, 'provenance': provenance or {},
+            'supplemental_files': supplements, 'provenance': provenance or {},
             'initialization': initialization,
         }
-        identity['fingerprint'] = digest(identity)
         write_json(stage / IDENTITY_FILE, identity)
         verify_colmap_export(stage)
         # A completed dataset appears atomically; interrupted staging is never reused.

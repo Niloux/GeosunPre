@@ -4,7 +4,7 @@
 
 ```mermaid
 flowchart LR
-    A[输入检查] --> B[SegFormer 与设备/FOV 掩码]
+    A[输入检查] --> B[SegFormer 天空/人物掩码与 FOV]
     B --> C[LoMa 特征与 FlashAttention 匹配]
     C --> D[冻结全量有效观测]
     D --> E[局部视觉标定]
@@ -87,18 +87,14 @@ quality_max_p90_px = 4.0
 .venv/bin/geosunpre check --output /path/to/colmap
 ```
 
-阶段顺序为 `prepare → masks → features → matches → observations → calibration → sfm → finalize → register → export`。每个工作目录有进程锁，完整阶段原子发布；续跑检查源码、依赖、配置、输入和已使用权重身份。输入或数值实现改变时新建工作目录。此次重构只接受新的版本 6 配置和版本 2 交付协议，旧任务及实验配置需要重新开始。
+阶段顺序为 `prepare → masks → features → matches → observations → calibration → sfm → finalize → register → export`。每个工作目录有进程锁，完整阶段原子发布。续跑直接比较配置、提取参数及输入/缓存的大小和修改时间；运行环境只记录版本信息。掩码统一保存在 `WORK/sfm/masks/`，只排除天空和人物，导出时叠加初始鱼眼 FOV。旧任务含固定设备掩码，使用新工作目录重新处理。
 
 `pipeline_status.json` 保存阶段状态、失败原因、耗时和资源读数，`run_result.json` 保存最近成功调用。最终几何选择可查看 `WORK/registration/final/inspection.html`，交付质量和来源记录在 `COLMAP/quality.json` 与 `colmap_export.json`。
 
-## 架构与验证
+## 架构与运行记录
 
 [架构审查与重构决策](docs/architecture.md)记录保留路线、删除范围和效率边界；[COLMAP 契约](docs/colmap_contract.md)说明接收方的坐标、掩码及验包方式。
 
-```bash
-.venv/bin/python -m pytest -q tests
-```
+[篮球场历史运行](docs/benchmarks/basketball_architecture_20261008.md)记录 2026-10-08 的 536 张图像任务：整进程 21 分 59.25 秒，RSS 高水位 4.64 GiB。该运行早于此次掩码和续跑规则调整，不能代表当前实现的耗时或重建结果。
 
-131 项测试包含实际 Ceres 求解、解析导数、合成导航/LAS 配准与阶段交接、按需特征读取、恢复与拒绝退化、内容篡改和可移动交付。[篮球场真实验收](docs/benchmarks/basketball_architecture_20261008.md)已完成 536 张图像的全新任务、独立验包和导出复用；整进程 21 分 59.25 秒，超过 20 分钟目标，RSS 高水位 4.64 GiB。未训练 3DGS，独立绝对精度与渲染质量仍需另外验证。
-
-数据、权重和运行产物分别放在忽略跟踪的 `input/`、`.cache/`、`work/`。仓库只保留生产源码、场景配置、数值及工程契约测试和当前文档。
+数据、权重和运行产物分别放在忽略跟踪的 `input/`、`.cache/`、`work/`。仓库保留生产源码、场景配置和当前文档。维护时使用静态检查、必要的定向编译或实际阶段运行；不维护单元测试、回归测试及其脚本。

@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 
-from geosunpre.artifacts import digest, file_digest, staged_directory, write_json
-from geosunpre.colmap import model_hashes
+from geosunpre.artifacts import file_metadata, staged_directory, write_json
+from geosunpre.colmap import model_files
 from geosunpre.config import load_config
 from geosunpre.pipeline.observations import protocol_identity
 from geosunpre.pipeline.quality import production_acceptance
@@ -62,10 +62,9 @@ def finalize(work):
     output.mkdir(parents=True, exist_ok=True)
     protocol = {
         'schema_version': 1,
-        'source_model_sha256': model_hashes(source_path),
-        'scene_manifest_sha256': file_digest(root / 'manifest.json'),
-        'scene_fingerprint': scene['fingerprint'],
-        'geometry_protocol_sha256': file_digest(geometry_path),
+        'source_model_files': model_files(source_path),
+        'scene_manifest_file': file_metadata(root / 'manifest.json'),
+        'geometry_protocol_file': file_metadata(geometry_path),
         **protocol_identity(work),
         'solver': {'stage': 'principal', 'protect_depth': True,
                    'max_iterations': BA_ITERATIONS},
@@ -73,17 +72,16 @@ def finalize(work):
         'navigation_pose_or_las_used': False,
         'all_exposures_independent': True,
     }
-    protocol['fingerprint'] = digest(protocol)
     protocol_path = output / 'protocol.json'
     if protocol_path.exists():
-        if json.loads(protocol_path.read_text())['fingerprint'] != protocol['fingerprint']:
+        if json.loads(protocol_path.read_text()) != protocol:
             raise ValueError('Final BA inputs changed; use a fresh work directory')
     model_path = output / 'sparse/0'
     result_path = output / 'result.json'
     if result_path.exists():
         result = json.loads(result_path.read_text())
-        if (result['protocol_fingerprint'] != protocol['fingerprint']
-                or result['model_sha256'] != model_hashes(model_path)):
+        if (result['protocol_file'] != file_metadata(protocol_path)
+                or result['model_files'] != model_files(model_path)):
             raise ValueError('Saved final BA model changed')
         candidate = pycolmap.Reconstruction(model_path)
     else:
@@ -103,22 +101,22 @@ def finalize(work):
             staged_model.mkdir(parents=True)
             candidate.write(staged_model)
             _check_model(pycolmap.Reconstruction(staged_model), scene)
-            result = {'protocol_fingerprint': protocol['fingerprint'],
-                      'model_sha256': model_hashes(staged_model), 'ba': ba,
+            write_json(staged / 'protocol.json', protocol)
+            result = {'protocol_file': file_metadata(staged / 'protocol.json'),
+                      'model_files': model_files(staged_model), 'ba': ba,
                       'registered': after[0], 'points': after[1],
                       'observations': after[2],
                       'manual_annotations_used': False}
-            write_json(staged / 'protocol.json', protocol)
             write_json(staged / 'result.json', result)
     _check_model(candidate, scene)
     validation_path = output / 'quality_summary.json'
     if validation_path.exists():
         validation = json.loads(validation_path.read_text())
-        if validation['model_sha256'] != result['model_sha256']:
+        if validation['model_files'] != result['model_files']:
             raise ValueError('Final BA quality report belongs to another model')
     else:
         from geosunpre.pipeline.quality import production_quality
-        validation = {'model_sha256': result['model_sha256'],
+        validation = {'model_files': result['model_files'],
                       **production_quality(candidate), 'manual_annotations_used': False}
         validation['camera_parameter_bounds'] = result['ba'].get('cameras', {})
         validation['acceptance'] = production_acceptance(validation, load_config(work))
@@ -126,7 +124,7 @@ def finalize(work):
     acceptance = production_acceptance(validation, load_config(work))
     return {'model': str(model_path), 'registered': candidate.num_reg_images(),
             'points': candidate.num_points3D(),
-            'protocol_fingerprint': protocol['fingerprint'],
+            'protocol_file': file_metadata(protocol_path),
             'training_reprojection': validation['training_reprojection'], 'acceptance': acceptance}
 
 
@@ -140,13 +138,12 @@ def verify_final(work):
     protocol = json.loads((final / 'protocol.json').read_text())
     result = json.loads((final / 'result.json').read_text())
     quality = json.loads((final / 'quality_summary.json').read_text())
-    if (protocol.get('fingerprint') != digest({k: v for k, v in protocol.items() if k != 'fingerprint'})
-            or result['protocol_fingerprint'] != protocol['fingerprint']
-            or result['model_sha256'] != model_hashes(final / 'sparse/0')
-            or quality['model_sha256'] != result['model_sha256']
-            or protocol['scene_manifest_sha256'] != file_digest(root / 'manifest.json')
-            or protocol['source_model_sha256'] != model_hashes(work / SOURCE)
-            or protocol['geometry_protocol_sha256'] != file_digest(root / 'geometry_protocol.json')
+    if (result['protocol_file'] != file_metadata(final / 'protocol.json')
+            or result['model_files'] != model_files(final / 'sparse/0')
+            or quality['model_files'] != result['model_files']
+            or protocol['scene_manifest_file'] != file_metadata(root / 'manifest.json')
+            or protocol['source_model_files'] != model_files(work / SOURCE)
+            or protocol['geometry_protocol_file'] != file_metadata(root / 'geometry_protocol.json')
             or any(protocol.get(k) != v for k, v in protocol_identity(work).items())):
         raise ValueError('Final visual model identity changed')
     _check_model(pycolmap.Reconstruction(final / 'sparse/0'), scene)

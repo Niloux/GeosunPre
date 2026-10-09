@@ -1,80 +1,10 @@
 {
-  "version": 1,
   "date": "2026-10-08",
   "dataset": "basketball",
-  "validation_scope": "One fresh production run and cached export. No before/after performance comparison, independent absolute accuracy or 3DGS training validation.",
-  "source": {
-    "git_head": "76344cdb1028fd1a33262b71fee18a68cf6c4cef",
-    "working_tree_changes_included": true,
-    "execution_identity_sha256": "7486dab229fd7606e3cad4da3e63b94eb38db933e5a760a5ac531b848e1d9e9c",
-    "source_sha256": {
-      "__init__.py": "725fbf90285b1753a43c2accb7d81ea91cb29074143467d3b465b8e977482c3d",
-      "__main__.py": "c975f4c575121b1b7eac2e58ced37b0a5a54733db95e2c2ef59711b0d57ac695",
-      "artifacts.py": "4d92a782e7d20236222e614a0e931f49d93fa55ecf44eabac6452df546a63735",
-      "camera.py": "b54f56cff746a7f49769fde3832b1774e86a6b27288c00850eb65f5e7744d30f",
-      "cli.py": "1c53048910b5661eba20f57e182f40730a0c2a9e6a6fb2afcb6de10b66b55c57",
-      "colmap.py": "f7b3e7c879f96c35cc4bef3d27b5d7410ec263279db6e7317d223f920f7ab683",
-      "config.py": "cefb4bf92e221d0372d9396c202a45894162261a849a48f3def32716351dc053",
-      "device.py": "46c51681f2162801f985532287ff55710223076cee404e0b50c4a3a4edf5307e",
-      "features.py": "844ceaf7777c13d1170aa1ea417b7e88851188ec393926305b2f361c09637aed",
-      "initialization.py": "5026981ee4210fa65f8fabcfea206e3c24b3721d07842f978db5d953ec9f9fff",
-      "masks.py": "21ca993ad7f7fe444e563f41ef44d9e3b8d6c29eecd53b38e22b5e99d04b7578",
-      "matching.py": "bed923141dbabb0ccbcd0a5fcd9a57cb2e0ee0f95c4a43dc7dbd7dccd90534d0",
-      "parallel.py": "80e3d4b2a108351e16655ac918e244d2b18623e2d747c6c1b8dd749d9ccfa2c2",
-      "pipeline/__init__.py": "368b15f6325ab6a20953d4b99410378dc7c23e2fc0b56bcf9b3ef07a51a1767a",
-      "pipeline/calibration.py": "09eb10ca63360df0c7b6eaa6d608b82e1490ffcefdad26688a0221165f6e93f4",
-      "pipeline/data.py": "efe35bfcba928073bbebd49a75d6e6994f0f519394f987e9409bded2c29976f9",
-      "pipeline/finalization.py": "a22f4939d93760eab70586afdbaa5d96b35c1a1f8e5f1d0a595da8957d1f4cfc",
-      "pipeline/observations.py": "b9318a48e8859f408459be964df5d3b0b5c3949a4b38566b692de6c91431f435",
-      "pipeline/preflight.py": "1a686632a78268d6cefb42a40facd2b244d149dcf6b6d05d3d5782fed2aa7d48",
-      "pipeline/quality.py": "fb6f001debbd48ddd7e85b2626753fc3b779420200368d600b80165b96a72d24",
-      "pipeline/reconstruction.py": "bb82907b3decaf1d5b50d362b9fdb6529f17cb057116a1e897e9f56941eccc8e",
-      "pipeline/registration.py": "4b5b3df9c5f12fe0dff9b9410ca8a8d98a32c7e37d867cc3d0ca5239b1389bc2",
-      "pipeline/runner.py": "49020397434ef7b873cec8e47d2ae0c56dd81df06351462298b5d77cdc985f0f",
-      "pipeline/runtime.py": "6706ff9f0a1b3bf0bc98ad5d8f9206e4a2664181b13a68d4b312745db471e4ba",
-      "pipeline/task.py": "276dcc031f31e8335f0cdc9b69703a5af6bfff515838bf36841120fc06bdbdf7",
-      "profiling.py": "b8db78145a55dd3bc30863c05ff37c84654a5b69d155d458863b9138c7aab911",
-      "registration/__init__.py": "005b92a47aaa46f6ae8959eb8347c5c22d68be6dc41329b50c03df9d27824b47",
-      "registration/geometry.py": "d7c53f046f39fb6e6a2212836e54b4f31b64d1ea60b0b3fa0dd93b2999681493",
-      "registration/global_alignment.py": "6fa96bcd697910d9a4a81798c37819908230f4283e1e18f37b1f79976e320f2f",
-      "registration/joint.py": "d5336a1553488fc4c131078b0da74fd9d13c5f62f806f1e0f6f089f57b9041ab",
-      "registration/joint_solver.py": "186d6d00de141793d9808f845da0f8a058a29b1743c51183fa667297f047003b",
-      "registration/las.py": "0b5a5036f668ee92a4f5e17a8e0c90f2a58c7e9e2fd5407df0d57ae91488f6eb",
-      "registration/publication.py": "6e45cd7343a690f85de0f16c3826754d82970583bcac344041d878a9294a03fd",
-      "registration/structural.py": "04a2e99eb4672039d483db25bdb5d86afe7e2119ec39c8d395d75c0579a9bf0a",
-      "scene.py": "4243c4991dfc2ce5756991d8e970cc9b55e082e5e1196fdb3d03a66f2ba7085d",
-      "sfm/__init__.py": "1fedd50e2e8b723549a0288fea27b4f1b0a79541b64feca77c3ae5352e42aa82",
-      "sfm/depth_guard.py": "ebb7e83d4c992bb4371d4893b7d41bc047483129667b804fdc7777ed14a7adc0",
-      "sfm/geometry.py": "78c8fb55bf2c379ba1e5816509721179836901a77ef9c9fd798f4f4660d9648a",
-      "sfm/reconstruction.py": "38d4b69a8cdc72483b1145cf47107ea87f83537645098a48921816b7c3afdc8e",
-      "sfm/statistics.py": "f4d250a8f41419eff69b61fb953f10cd2e9fe4a2ad75ff65d2d123c374ad6388",
-      "sfm/track_filter.py": "02c0162a16da1282cfe8cb9133985ea460ae794bbe1c9ea2ca6ed324a527119f",
-      "native/depth_guard.cpp": "1ca787a52a86b7277552b4ac273587d75478dde7142df3bb073aba07198d788d",
-      "native/joint_costs.h": "03af472e35707b65f3ac667c5105bc335c66ba463bcbe7c8f75597f7b5baae92",
-      "native_extension": "6ab094ef89c3ae01b7608fccd73a9ac21c4df80d6f8981c0d8667eaf3be5c26e",
-      "uv.lock": "75b3554478544712ab463442453a22eba637f97a5c704676fb7a56ea0d5cef7f"
-    },
-    "packages": {
-      "geosunpre-native": "0.1.0",
-      "pycolmap": "4.2.0",
-      "pyceres": "2.6",
-      "torch": "2.8.0+cu128",
-      "torchvision": "0.23.0+cu128",
-      "lomatch": "1.0.0",
-      "transformers": "4.57.6",
-      "numpy": "2.5.3",
-      "scipy": "1.18.1",
-      "Pillow": "12.3.0",
-      "opencv-python": "4.14.0.94"
-    },
-    "python": "3.13.15",
-    "task_fingerprint": "3895aa9431e3cf63ede84b839cc9db9b6d5460e69baf8a2b545387ee21260153"
-  },
+  "scope": "Historical run before the 2026-10-09 mask and resume changes. No before/after comparison, independent absolute accuracy or 3DGS validation.",
+  "config": "configs/basketball.toml",
   "fresh_run": {
-    "version": 1,
-    "kind": "fresh_production_run",
     "work": "work/basketball_architecture_20261008_130059",
-    "stdout_log": "work/basketball_architecture_20261008_130059.log",
     "command": [
       "/home/wuyou/GeosunPre/.venv/bin/geosunpre",
       "run",
@@ -85,23 +15,12 @@
       "--config",
       "/home/wuyou/GeosunPre/configs/basketball.toml"
     ],
-    "status": "completed",
     "started_at_utc": "2026-10-08T05:00:59.997004+00:00",
-    "pid": 67115,
-    "exit_code": 0,
     "finished_at_utc": "2026-10-08T05:22:59.245379+00:00",
     "elapsed_seconds": 1319.248293274999,
-    "process_rss_high_water_bytes": 4982075392,
-    "pipeline_status": "work/basketball_architecture_20261008_130059/acceptance/fresh_pipeline_status.json",
-    "run_result": "work/basketball_architecture_20261008_130059/acceptance/fresh_run_result.json",
     "stage_recorded_elapsed_seconds": 1316.9130627890008,
     "target_elapsed_seconds": 1200,
     "target_met": false,
-    "target_overrun_seconds": 119.24829327499901,
-    "input": {
-      "images": 536,
-      "calibration_images": 50
-    },
     "feature_images": 536,
     "match_pairs": 8025
   },
@@ -120,40 +39,18 @@
     "fallback_reasons": [
       "Joint update increases supported plane errors: tile/-1,0,0"
     ],
-    "joint_quality_acceptance": {
-      "status": "not_evaluated"
-    },
     "registered_images": 536,
     "points": 75645,
     "observations": 481925,
-    "model_sha256": {
-      "cameras.bin": "0569239f0ce2a4a5c306d84711fe68966b9e3d0f63fc3bdcdd90427a76c9eb49",
-      "images.bin": "93435cd35525076ff7609ee913b7fb9e9a2f413974b34da6b567deacb879e2f0",
-      "points3D.bin": "6121fd99c3b4a7f5fa7ef8dd9d75d0c3bf1c8fb81a83eac2d5be3694c28ece69",
-      "rigs.bin": "3e0480c890e6ccd659a062df110c3f3ca8839a1ae8d17d5a96eb87676f83035e",
-      "frames.bin": "117b7cd6e87d069e39e12f242ef32db071645bdda18d07fc8ee9a491dc7a258b"
-    },
-    "initialization": {
-      "source": "las",
-      "points": 7587128,
-      "voxel_size_m": 0.05,
-      "ply": "/home/wuyou/GeosunPre/work/basketball_architecture_20261008_130059/colmap/sparse/0/points3D.ply"
-    },
     "image_mode": "copy",
-    "include_masks": true,
-    "export_full_content_check": true,
-    "absolute_accuracy_validated": false
+    "include_masks": true
+  },
+  "initialization": {
+    "source": "las",
+    "points": 7587128,
+    "voxel_size_m": 0.05
   },
   "quality": {
-    "acceptance": {
-      "status": "passed",
-      "limits": {
-        "median_px": 2.0,
-        "p90_px": 4.0,
-        "bounds_policy": "reject"
-      },
-      "scope": "Fitted-data delivery checks; not independent geometry or 3DGS accuracy."
-    },
     "training_reprojection": {
       "count": 481925,
       "finite_count": 481925,
@@ -191,88 +88,9 @@
       "positive_depth": 481925,
       "invalid_depth": 0
     },
-    "camera_health": {
-      "R": {
-        "params": [
-          966.7141787252186,
-          965.9380650986487,
-          1489.7175501084557,
-          2008.3148267186195,
-          -0.028570552636710562,
-          -0.006564480978746454,
-          0.002880340470694783,
-          -0.0008371163854731788
-        ],
-        "monotonic_in_160deg": true
-      },
-      "L": {
-        "params": [
-          965.1043170490103,
-          964.4387619892098,
-          1515.3234650288514,
-          1999.5673764833914,
-          -0.028352897013065363,
-          -0.005944022461335595,
-          0.002471917135119523,
-          -0.0007372769870180775
-        ],
-        "monotonic_in_160deg": true
-      }
-    },
-    "camera_parameter_bounds": {
-      "2": {
-        "params": [
-          966.7141787252186,
-          965.9380650986487,
-          1489.7175501084557,
-          2008.3148267186195,
-          -0.028570552636710562,
-          -0.006564480978746454,
-          0.002880340470694783,
-          -0.0008371163854731788
-        ],
-        "delta": [
-          0.07424648133167011,
-          -0.7981094289510793,
-          2.345283042935989,
-          4.742124156959562,
-          -0.0009117166453278709,
-          0.001388912626674634,
-          -0.0005869248091391853,
-          6.063395552462062e-05
-        ],
-        "monotonic_in_160deg": true,
-        "parameters_at_bounds": []
-      },
-      "1": {
-        "params": [
-          965.1043170490103,
-          964.4387619892098,
-          1515.3234650288514,
-          1999.5673764833914,
-          -0.028352897013065363,
-          -0.005944022461335595,
-          0.002471917135119523,
-          -0.0007372769870180775
-        ],
-        "delta": [
-          -0.3051580698129328,
-          -0.20881544900453264,
-          0.39004695139033174,
-          -1.228171421690604,
-          0.0001518959679453341,
-          0.0007323303297094704,
-          -0.0008885770285834236,
-          0.0002586318727448827
-        ],
-        "monotonic_in_160deg": true,
-        "parameters_at_bounds": []
-      }
-    },
     "accuracy_scope": "fitted_observations"
   },
   "las_fit": {
-    "passed": true,
     "fit_points": 31476,
     "supported_fit_points": 15210,
     "supported_fit_fraction": 0.48322531452535267,
@@ -283,563 +101,49 @@
       "p90": 0.06765573818073377,
       "max": 0.4165043397817101
     },
-    "limits": {
-      "support_fraction": 0.25,
-      "median_m": 0.1,
-      "p90_m": 0.3,
-      "minimum_supported_fit_points": 100,
-      "minimum_supported_fit_tiles": 5,
-      "minimum_regional_points": 30,
-      "maximum_regional_p90_m": 0.5,
-      "maximum_support_fraction_drop": 0.02,
-      "maximum_paired_median_increase_m": 0.005,
-      "maximum_paired_p90_increase_m": 0.02,
-      "minimum_common_support_fraction": 0.9,
-      "scope": "Operational fit-region checks; LAS holdout is descriptive only, not used to select output."
-    },
     "scope": "Operational fit-region checks; LAS holdout is descriptive only, not used to select output."
   },
-  "joint_rejected_regions": [
-    {
-      "group": "tile/-1,0,0",
-      "points": 74,
-      "before_m": {
-        "count": 74,
-        "median": 0.072287821472192,
-        "p90": 0.09604397744195177,
-        "max": 0.285891345312687
-      },
-      "after_m": {
-        "count": 74,
-        "median": 0.08979237349855207,
-        "p90": 0.11212327570707878,
-        "max": 0.29280765590580127
-      },
-      "changes_m": {
-        "median": 0.017504552026360073,
-        "p90": 0.01607929826512701
-      }
-    }
-  ],
-  "independent_check": {
-    "command": [
-      ".venv/bin/geosunpre",
-      "check",
-      "--work",
-      "work/basketball_architecture_20261008_130059"
-    ],
-    "exit_code": 0,
-    "images": 536,
-    "points": 75645,
-    "initialization_points": 7587128,
-    "full_content_check": true
-  },
-  "cached_export": {
-    "command": [
-      "/home/wuyou/GeosunPre/.venv/bin/geosunpre",
-      "export",
-      "--work",
-      "/home/wuyou/GeosunPre/work/basketball_architecture_20261008_130059"
-    ],
-    "exit_code": 0,
-    "elapsed_seconds": 15.762347365000096,
-    "finished_at_utc": "2026-10-08T05:26:49.399608+00:00",
-    "identity_check": {
-      "unchanged": true,
-      "export_identity_sha256": "2c4e3115143570639b7247a0e04b609a03e53572a57b4520e801f174c7e7a91f",
-      "model_sha256": {
-        "cameras.bin": "0569239f0ce2a4a5c306d84711fe68966b9e3d0f63fc3bdcdd90427a76c9eb49",
-        "images.bin": "93435cd35525076ff7609ee913b7fb9e9a2f413974b34da6b567deacb879e2f0",
-        "points3D.bin": "6121fd99c3b4a7f5fa7ef8dd9d75d0c3bf1c8fb81a83eac2d5be3694c28ece69",
-        "rigs.bin": "3e0480c890e6ccd659a062df110c3f3ca8839a1ae8d17d5a96eb87676f83035e",
-        "frames.bin": "117b7cd6e87d069e39e12f242ef32db071645bdda18d07fc8ee9a491dc7a258b"
-      },
-      "initialization_ply_sha256": "3f930cd8e1a02faae60baa8a627ee76dd3f0ff0aef9fc5e54893a617b75fd916",
-      "cuda_allocator_initialized": false,
-      "requested_stages": [
-        "export"
-      ]
-    },
-    "delivery_complete": true
-  },
-  "tests": {
-    "command": "PYTHONPATH=src .venv/bin/python -m pytest -q tests",
-    "passed": 131
-  },
+  "cached_export_seconds": 15.762347365000096,
   "stages": [
     {
       "name": "prepare",
-      "elapsed_seconds": 4.352526605000094,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 42,
-        "rss_sampled_peak_bytes": 787386368,
-        "cuda_allocated_peak_bytes": 17920,
-        "cuda_reserved_peak_bytes": 2097152,
-        "rss_start_bytes": 71073792,
-        "rss_end_bytes": 787382272,
-        "process_rss_high_water_bytes": 786841600,
-        "cpu_seconds": 5.492253,
-        "cuda_allocated_end_bytes": 0,
-        "cuda_reserved_end_bytes": 2097152,
-        "average_cpu_cores": 1.2619197021993507
-      },
-      "operations": []
+      "elapsed_seconds": 4.352526605000094
     },
     {
       "name": "masks",
-      "elapsed_seconds": 135.32218433900016,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 1345,
-        "rss_sampled_peak_bytes": 2281635840,
-        "cuda_allocated_peak_bytes": 584467968,
-        "cuda_reserved_peak_bytes": 671088640,
-        "rss_start_bytes": 787382272,
-        "rss_end_bytes": 2094317568,
-        "process_rss_high_water_bytes": 2281021440,
-        "cpu_seconds": 307.285132,
-        "cuda_allocated_end_bytes": 8519680,
-        "cuda_reserved_end_bytes": 671088640,
-        "average_cpu_cores": 2.2707708615972892
-      },
-      "operations": []
+      "elapsed_seconds": 135.32218433900016
     },
     {
       "name": "features",
-      "elapsed_seconds": 87.42094548399837,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 871,
-        "rss_sampled_peak_bytes": 4414238720,
-        "cuda_allocated_peak_bytes": 2631766016,
-        "cuda_reserved_peak_bytes": 4599054336,
-        "rss_start_bytes": 2094317568,
-        "rss_end_bytes": 2192961536,
-        "process_rss_high_water_bytes": 4420104192,
-        "cpu_seconds": 175.561613,
-        "cuda_allocated_end_bytes": 8519680,
-        "cuda_reserved_end_bytes": 4599054336,
-        "average_cpu_cores": 2.008239579748014
-      },
-      "operations": []
+      "elapsed_seconds": 87.42094548399837
     },
     {
       "name": "matches",
-      "elapsed_seconds": 87.23685164000017,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 869,
-        "rss_sampled_peak_bytes": 4757458944,
-        "cuda_allocated_peak_bytes": 2493206528,
-        "cuda_reserved_peak_bytes": 5125439488,
-        "rss_start_bytes": 2192961536,
-        "rss_end_bytes": 2310426624,
-        "process_rss_high_water_bytes": 4756512768,
-        "cpu_seconds": 90.93346000000005,
-        "cuda_allocated_end_bytes": 25559040,
-        "cuda_reserved_end_bytes": 62914560,
-        "average_cpu_cores": 1.042378528917787
-      },
-      "operations": []
+      "elapsed_seconds": 87.23685164000017
     },
     {
       "name": "observations",
-      "elapsed_seconds": 3.056897915999798,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 32,
-        "rss_sampled_peak_bytes": 2345500672,
-        "cuda_allocated_peak_bytes": 25559040,
-        "cuda_reserved_peak_bytes": 62914560,
-        "rss_start_bytes": 2310430720,
-        "rss_end_bytes": 2319523840,
-        "process_rss_high_water_bytes": 4756512768,
-        "cpu_seconds": 2.951072999999944,
-        "cuda_allocated_end_bytes": 25559040,
-        "cuda_reserved_end_bytes": 62914560,
-        "average_cpu_cores": 0.9655877691198397
-      },
-      "operations": [
-        {
-          "path": [
-            "geosunpre.pipeline.data.load_frontend"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2310434816,
-          "elapsed_seconds": 0.1386739010013116,
-          "rss_end_bytes": 2321502208
-        }
-      ]
+      "elapsed_seconds": 3.056897915999798
     },
     {
       "name": "calibration",
-      "elapsed_seconds": 29.712623634999545,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 191,
-        "rss_sampled_peak_bytes": 2573815808,
-        "cuda_allocated_peak_bytes": 25559040,
-        "cuda_reserved_peak_bytes": 62914560,
-        "rss_start_bytes": 2319527936,
-        "rss_end_bytes": 2553278464,
-        "process_rss_high_water_bytes": 4756512768,
-        "cpu_seconds": 57.360095000000044,
-        "cuda_allocated_end_bytes": 25559040,
-        "cuda_reserved_end_bytes": 62914560,
-        "average_cpu_cores": 1.9305153458242255
-      },
-      "operations": [
-        {
-          "path": [
-            "geosunpre.pipeline.data.load_frontend"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2319556608,
-          "elapsed_seconds": 0.1698605019992101,
-          "rss_end_bytes": 2331795456
-        },
-        {
-          "path": [
-            "geosunpre.sfm.reconstruction.database_and_seed"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2332655616,
-          "elapsed_seconds": 1.5300885099986772,
-          "rss_end_bytes": 2501636096
-        },
-        {
-          "path": [
-            "geosunpre.sfm.reconstruction.bounded_bundle_adjustment"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2510151680,
-          "elapsed_seconds": 0.9873978030009312,
-          "rss_end_bytes": 2510217216
-        },
-        {
-          "path": [
-            "geosunpre.sfm.reconstruction.bounded_bundle_adjustment"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2510217216,
-          "elapsed_seconds": 0.9069843029992626,
-          "rss_end_bytes": 2510413824
-        },
-        {
-          "path": [
-            "geosunpre.sfm.reconstruction.bounded_bundle_adjustment"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2510413824,
-          "elapsed_seconds": 0.8957833029999165,
-          "rss_end_bytes": 2510413824
-        },
-        {
-          "path": [
-            "geosunpre.sfm.reconstruction.bounded_bundle_adjustment"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2510413824,
-          "elapsed_seconds": 9.145829279999816,
-          "rss_end_bytes": 2554339328
-        }
-      ]
+      "elapsed_seconds": 29.712623634999545
     },
     {
       "name": "sfm",
-      "elapsed_seconds": 827.407063609,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 5942,
-        "rss_sampled_peak_bytes": 4982763520,
-        "cuda_allocated_peak_bytes": 25559040,
-        "cuda_reserved_peak_bytes": 62914560,
-        "rss_start_bytes": 2553278464,
-        "rss_end_bytes": 4264108032,
-        "process_rss_high_water_bytes": 4982075392,
-        "cpu_seconds": 1499.2175989999998,
-        "cuda_allocated_end_bytes": 25559040,
-        "cuda_reserved_end_bytes": 62914560,
-        "average_cpu_cores": 1.8119475807505256
-      },
-      "operations": [
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.build_mapping"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2553286656,
-          "elapsed_seconds": 558.2970594750004,
-          "rss_end_bytes": 3696291840
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.build_mapping",
-            "geosunpre.pipeline.reconstruction.freeze_geometry"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2553286656,
-          "elapsed_seconds": 0.18497449999995297,
-          "rss_end_bytes": 2552242176
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.build_mapping",
-            "geosunpre.pipeline.reconstruction.freeze_geometry",
-            "geosunpre.pipeline.data.load_frontend"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2553286656,
-          "elapsed_seconds": 0.17071540000142704,
-          "rss_end_bytes": 2552242176
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.build_mapping",
-            "geosunpre.sfm.reconstruction.database_and_seed"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2552242176,
-          "elapsed_seconds": 41.859253714999795,
-          "rss_end_bytes": 2703540224
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.build_mapping",
-            "incremental_mapping"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 2703540224,
-          "elapsed_seconds": 510.40525336000064,
-          "rss_end_bytes": 3696291840
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.optimize"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 3696291840,
-          "elapsed_seconds": 269.08712303299944,
-          "rss_end_bytes": 4269379584
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.optimize",
-            "geosunpre.pipeline.reconstruction.freeze_geometry"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 3696291840,
-          "elapsed_seconds": 0.19433489999937592,
-          "rss_end_bytes": 3696291840
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.optimize",
-            "geosunpre.pipeline.reconstruction.freeze_geometry",
-            "geosunpre.pipeline.data.load_frontend"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 3696291840,
-          "elapsed_seconds": 0.1799616000007518,
-          "rss_end_bytes": 3696291840
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.optimize",
-            "geosunpre.sfm.reconstruction.bounded_bundle_adjustment"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 3696291840,
-          "elapsed_seconds": 51.45250644499902,
-          "rss_end_bytes": 4271464448
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.optimize",
-            "geosunpre.sfm.track_filter.training_adjacency"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4337655808,
-          "elapsed_seconds": 6.460705401999803,
-          "rss_end_bytes": 4842512384
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.optimize",
-            "geosunpre.sfm.track_filter.filter_mapped_tracks"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4842512384,
-          "elapsed_seconds": 10.34523798400005,
-          "rss_end_bytes": 4832804864
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.optimize",
-            "geosunpre.sfm.reconstruction.bounded_bundle_adjustment"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4262608896,
-          "elapsed_seconds": 86.18811098000151,
-          "rss_end_bytes": 4272476160
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.optimize",
-            "geosunpre.sfm.reconstruction.bounded_bundle_adjustment"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4270379008,
-          "elapsed_seconds": 108.41602822099958,
-          "rss_end_bytes": 4279865344
-        }
-      ]
+      "elapsed_seconds": 827.407063609
     },
     {
       "name": "finalize",
-      "elapsed_seconds": 15.285799819999738,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 105,
-        "rss_sampled_peak_bytes": 4362915840,
-        "cuda_allocated_peak_bytes": 25559040,
-        "cuda_reserved_peak_bytes": 62914560,
-        "rss_start_bytes": 4263112704,
-        "rss_end_bytes": 4255399936,
-        "process_rss_high_water_bytes": 4982075392,
-        "cpu_seconds": 16.442713999999782,
-        "cuda_allocated_end_bytes": 25559040,
-        "cuda_reserved_end_bytes": 62914560,
-        "average_cpu_cores": 1.0757129964866883
-      },
-      "operations": [
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.freeze_geometry"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4262068224,
-          "elapsed_seconds": 0.18386869999994815,
-          "rss_end_bytes": 4253696000
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.freeze_geometry",
-            "geosunpre.pipeline.data.load_frontend"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4262068224,
-          "elapsed_seconds": 0.16883810000035737,
-          "rss_end_bytes": 4253696000
-        },
-        {
-          "path": [
-            "geosunpre.sfm.reconstruction.bounded_bundle_adjustment"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4251680768,
-          "elapsed_seconds": 10.569263516001229,
-          "rss_end_bytes": 4270919680
-        }
-      ]
+      "elapsed_seconds": 15.285799819999738
     },
     {
       "name": "register",
-      "elapsed_seconds": 85.7408520809986,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 607,
-        "rss_sampled_peak_bytes": 4295512064,
-        "cuda_allocated_peak_bytes": 25559040,
-        "cuda_reserved_peak_bytes": 62914560,
-        "rss_start_bytes": 4255399936,
-        "rss_end_bytes": 4178497536,
-        "process_rss_high_water_bytes": 4982075392,
-        "cpu_seconds": 102.74648399999961,
-        "cuda_allocated_end_bytes": 25559040,
-        "cuda_reserved_end_bytes": 62914560,
-        "average_cpu_cores": 1.1983438764428853
-      },
-      "operations": [
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.freeze_geometry"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4255404032,
-          "elapsed_seconds": 0.1794017989996064,
-          "rss_end_bytes": 4254355456
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.freeze_geometry",
-            "geosunpre.pipeline.data.load_frontend"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4255404032,
-          "elapsed_seconds": 0.1650143989991193,
-          "rss_end_bytes": 4254355456
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.freeze_geometry"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4185833472,
-          "elapsed_seconds": 0.18593500000133645,
-          "rss_end_bytes": 4185833472
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.freeze_geometry",
-            "geosunpre.pipeline.data.load_frontend"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4185833472,
-          "elapsed_seconds": 0.17072120000011637,
-          "rss_end_bytes": 4185833472
-        }
-      ]
+      "elapsed_seconds": 85.7408520809986
     },
     {
       "name": "export",
-      "elapsed_seconds": 41.37158506000014,
-      "resources": {
-        "sample_interval_seconds": 0.1,
-        "samples": 401,
-        "rss_sampled_peak_bytes": 4631355392,
-        "cuda_allocated_peak_bytes": 25559040,
-        "cuda_reserved_peak_bytes": 62914560,
-        "rss_start_bytes": 4178497536,
-        "rss_end_bytes": 4235857920,
-        "process_rss_high_water_bytes": 4982075392,
-        "cpu_seconds": 87.09504000000025,
-        "cuda_allocated_end_bytes": 25559040,
-        "cuda_reserved_end_bytes": 62914560,
-        "average_cpu_cores": 2.105209570651006
-      },
-      "operations": [
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.freeze_geometry"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4177453056,
-          "elapsed_seconds": 0.18645010000000184,
-          "rss_end_bytes": 4177453056
-        },
-        {
-          "path": [
-            "geosunpre.pipeline.reconstruction.freeze_geometry",
-            "geosunpre.pipeline.data.load_frontend"
-          ],
-          "status": "completed",
-          "rss_start_bytes": 4177453056,
-          "elapsed_seconds": 0.1710453999985475,
-          "rss_end_bytes": 4177453056
-        }
-      ]
+      "elapsed_seconds": 41.37158506000014
     }
   ]
 }

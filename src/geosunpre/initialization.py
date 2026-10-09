@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
-from geosunpre.artifacts import _file_signature, file_digest
+from geosunpre.artifacts import file_metadata
 from geosunpre.registration.las import read_header
 
 DEFAULT_VOXEL_SIZE = .05
@@ -80,8 +80,7 @@ def export_las_ply(las, output, *, voxel_size=DEFAULT_VOXEL_SIZE, chunk_points=5
     las, output = Path(las).resolve(), Path(output)
     if las == output.resolve():
         raise ValueError('Choose a PLY output separate from the source LAS')
-    before = _file_signature(las.stat())
-    source_sha256 = file_digest(las)
+    source_file = file_metadata(las)
     header = read_header(las)
     scales, offsets = np.asarray(header['scales']), np.asarray(header['offsets'])
     lower = np.floor(np.asarray(header['bounds_min']) / voxel_size) - 1
@@ -149,7 +148,7 @@ def export_las_ply(las, output, *, voxel_size=DEFAULT_VOXEL_SIZE, chunk_points=5
                 vertices.tofile(stream)
                 points += len(vertices)
                 del voxels, counts, xyz, rgb, vertices
-        if _file_signature(las.stat()) != before:
+        if file_metadata(las) != source_file:
             raise ValueError('LAS changed during initialization')
         staged = directory / 'points3D.ply'
         with staged.open('wb') as destination, payload.open('rb') as source:
@@ -157,9 +156,9 @@ def export_las_ply(las, output, *, voxel_size=DEFAULT_VOXEL_SIZE, chunk_points=5
             shutil.copyfileobj(source, destination)
         verify_initialization_ply(staged, points)
         staged.replace(output)
-    return {'version': 1, 'source': 'las', 'source_las_sha256': source_sha256,
+    return {'version': 1, 'source': 'las', 'source_las_file': source_file,
             'source_point_count': header['point_count'], 'accepted_records': accepted,
             'excluded_withheld_or_noise': rejected, 'points': points, **recipe,
             'rgb_encoding': ('uint16_0_65535' if rgb_max > 255 else 'uint16_0_255') if has_rgb else 'absent_gray_127',
             'bounds_min': bounds_min.tolist(), 'bounds_max': bounds_max.tolist(),
-            'ply_sha256': file_digest(output)}
+            'ply_size_bytes': output.stat().st_size}

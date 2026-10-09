@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from geosunpre.artifacts import file_digest, write_json
+from geosunpre.artifacts import file_metadata, write_json
 
 
 def _inventory(directory):
@@ -13,23 +13,23 @@ def _inventory(directory):
         if relative.as_posix() == 'completion.json':
             continue
         if path.is_file():
-            result[relative.as_posix()] = file_digest(path)
+            result[relative.as_posix()] = file_metadata(path)
     return result
 
 
-def complete_publication(directory, context_fingerprint):
+def complete_publication(directory, context):
     write_json(Path(directory) / 'completion.json', {
-        'version': 1, 'context_fingerprint': context_fingerprint,
-        'file_sha256': _inventory(directory)})
+        'version': 1, 'context': context,
+        'files': _inventory(directory)})
 
 
-def verify_publication(directory, context_fingerprint):
+def verify_publication(directory, context):
     directory = Path(directory)
     path = directory / 'completion.json'
     if not path.is_file():
         raise ValueError(f'Registration stage has no committed identity: {directory}')
     saved = json.loads(path.read_text())
-    if (saved.get('version') != 1 or saved.get('context_fingerprint') != context_fingerprint
-            or saved.get('file_sha256') != _inventory(directory)):
+    if (saved.get('version') != 1 or saved.get('context') != context
+            or saved.get('files') != _inventory(directory)):
         raise ValueError(f'Completed registration stage changed: {directory}')
     return saved

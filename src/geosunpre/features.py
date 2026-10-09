@@ -10,8 +10,7 @@ import numpy as np
 from PIL import Image
 
 from geosunpre.camera import Camera
-from geosunpre.artifacts import digest
-from geosunpre.artifacts import file_digest
+from geosunpre.artifacts import file_metadata
 
 LOMA_COMMIT = '8fb59c458f2a2ef44314f462467b229c27786bf0'
 FRONTEND_VERSION = 1
@@ -31,36 +30,40 @@ class FrontendConfig:
 FRONTEND_CONFIG = FrontendConfig()
 
 
-def _feature_cache_root(work, config):
-    return Path(work) / 'features' / digest(asdict(config))[:20]
+def _feature_cache_root(work):
+    return Path(work) / 'features'
 
 
 def feature_input(work, scene, config, record):
     """Check prepared inputs and derive the shared extraction identity and path."""
-    from geosunpre.scene import prepared_image_digest
+    from geosunpre.scene import prepared_image_metadata
 
     cam = Camera.from_dict(scene['cameras'][record['camera']])
-    identity = {'image_sha256': prepared_image_digest(record),
-                'mask_sha256': file_digest(record['semantic_mask']) if record['semantic_mask'] else None,
+    identity = {'image_file': prepared_image_metadata(record),
+                'mask_file': file_metadata(record['semantic_mask']) if record['semantic_mask'] else None,
                 'camera': cam.to_dict(), 'fov': scene['fov_degrees'], 'config': asdict(config)}
-    token = digest(identity)
-    return cam, identity, token, _feature_cache_root(work, config) / f'{token}.npz'
+    identity = json.loads(json.dumps(identity, allow_nan=False))
+    token = record['name']
+    return cam, identity, token, _feature_cache_root(work) / f'{token}.npz'
 
 
-def read_feature_cache(path, token, *, name=None, fields=None, expected_sha256=None):
-    """Read requested arrays, checking input identity and any frozen byte identity."""
-    def check_content():
-        if expected_sha256 is not None and file_digest(path) != expected_sha256:
-            raise ValueError(f'Feature cache content changed: {name or path}')
+def read_feature_cache(path, token, *, name=None, fields=None, identity=None, expected_file=None):
+    """Read selected arrays after checking recorded inputs and file metadata."""
+    def check_file():
+        if expected_file is not None and file_metadata(path) != expected_file:
+            raise ValueError(f'Feature cache changed: {name or path}')
 
-    check_content()
+    check_file()
     with np.load(path, allow_pickle=False) as cached:
         if str(cached['token']) != token:
             raise ValueError(f'Cached feature identity changed: {name or path}')
-        if name is not None and json.loads(str(cached['metadata']))['name'] != name:
+        metadata = json.loads(str(cached['metadata']))
+        if name is not None and metadata['name'] != name:
             raise ValueError(f'Global feature identity changed: {name}')
+        if identity is not None and metadata['inputs'] != identity:
+            raise ValueError(f'Feature extraction inputs changed: {name or path}')
         result = {key: cached[key] for key in (cached.files if fields is None else fields)}
-    check_content()
+    check_file()
     return result
 
 
@@ -99,7 +102,7 @@ class LoMaFrontend:
         self.cache_stats = {'feature_hits': 0, 'feature_misses': 0, 'match_hits': 0, 'match_misses': 0}
         self.cache_stats.update(gpu_feature_hits=0, gpu_feature_misses=0,
                                 gpu_upload_bytes=0, gpu_feature_peak_bytes=0)
-        self.cache = _feature_cache_root(self.work, config)
+        self.cache = _feature_cache_root(self.work)
         self.cache.mkdir(parents=True, exist_ok=True)
 
     def load_model(self):
@@ -158,7 +161,7 @@ class LoMaFrontend:
         cam, identity, token, path = feature_input(self.work, self.scene, self.config, record)
         if path.exists():
             self.cache_stats['feature_hits'] += 1
-            return read_feature_cache(path, token)
+            return read_feature_cache(path, token, name=record['name'], identity=identity)
         self.cache_stats['feature_misses'] += 1
         import torch
         model = self.load_model()
@@ -186,13 +189,14 @@ class LoMaFrontend:
             keypoints = result['keypoints'][:, torch.as_tensor(indices, device=self.device)]
             descriptors = model._descriptor.describe_keypoints(
                 descriptor_image, keypoints)['descriptions'][0].float().cpu().numpy()
-        meta = {**identity, 'token': token, 'name': record['name'], 'detected': len(pixels),
+        meta = {'inputs': identity, 'token': token, 'name': record['name'], 'detected': len(pixels),
                 'valid_before_quota': len(candidates), 'selected': len(indices),
                 'descriptor_resolution': [784, 784], 'pixel_coordinates': self.scene['pixel_coordinates']}
         output = {'keypoints': pixels[indices].astype(np.float32),
                   'normalized_keypoints': normalized[indices].astype(np.float32),
                   'descriptors': descriptors.astype(np.float32), 'scores': probabilities[indices],
                   'metadata': np.array(json.dumps(meta, ensure_ascii=False)), 'token': np.array(token)}
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix('.tmp.npz')
         np.savez(tmp, **output)
         tmp.replace(path)
@@ -223,13 +227,18 @@ class LoMaFrontend:
         return value
 
     def match(self, features_a, features_b, *, feature_loader=None):
-        identity = {'a': str(features_a['token']), 'b': str(features_b['token']), 'config': asdict(self.config)}
-        identity['attention_backend'] = 'flash_v1'
-        token = digest(identity)
+        a_name, b_name = str(features_a['token']), str(features_b['token'])
+        identity = {'a': a_name, 'b': b_name, 'config': asdict(self.config),
+                    'a_file': file_metadata(self.cache / f'{a_name}.npz'),
+                    'b_file': file_metadata(self.cache / f'{b_name}.npz'),
+                    'attention_backend': 'flash'}
+        token = f'{Path(a_name).name}__{Path(b_name).name}'
         path = self.work/'matches'/f'{token}.npz'
         if path.exists():
             self.cache_stats['match_hits'] += 1
             with np.load(path, allow_pickle=False) as f:
+                if str(f['token']) != token or json.loads(str(f['identity'])) != identity:
+                    raise ValueError(f'Match inputs changed: {a_name}, {b_name}')
                 return {k: f[k] for k in f.files}
         self.cache_stats['match_misses'] += 1
         import torch
@@ -244,7 +253,8 @@ class LoMaFrontend:
             ia = torch.where(m0[0] >= 0)[0]
             indices = torch.stack((ia, m0[0, ia]), dim=-1).cpu().numpy().astype(np.uint32)
             confidence = scores[0, ia].float().cpu().numpy()
-        output = {'matches': indices, 'scores': confidence, 'token': np.array(token)}
+        output = {'matches': indices, 'scores': confidence, 'token': np.array(token),
+                  'identity': np.array(json.dumps(identity, ensure_ascii=False))}
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix('.tmp.npz')
         np.savez_compressed(tmp, **output)
