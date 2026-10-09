@@ -25,8 +25,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     run = sub.add_parser('run', help='Run or resume the production pipeline')
     run.add_argument('--input', help='Raw input directory; required for a new run')
-    run.add_argument('--work', required=True, help='Fresh or resumable work directory')
-    run.add_argument('--config', help='Scene TOML; frozen on first run')
+    run.add_argument('--work', help='Fresh or resumable work directory; default work/INPUT_NAME')
+    run.add_argument('--config', help='Resource and delivery limits TOML; frozen on first run')
     run.add_argument('--stage', choices=(*STAGES, 'all'), default='all')
     _delivery_options(run)
     export = sub.add_parser('export', help='Export an accepted pipeline model')
@@ -37,6 +37,10 @@ def main(argv=None):
     location.add_argument('--output', help='COLMAP export directory')
     location.add_argument('--work', help='Check the frozen task delivery destination')
     args = parser.parse_args(argv)
+    if args.command == 'run' and args.work is None:
+        if args.input is None:
+            parser.error('A new run needs --input; resume an existing task with --work')
+        args.work = str(Path('work') / Path(args.input).expanduser().resolve().name)
     try:
         if args.command in ('run', 'export'):
             from geosunpre.pipeline.runner import run_pipeline

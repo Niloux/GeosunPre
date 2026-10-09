@@ -1,108 +1,66 @@
-# 生产运行与验收
+# 生产运行
 
-## 配置
+## 配置与阶段
 
-`--config` 接受严格 TOML，未知字段直接报错。全部字段如下。
+`--config` 接受严格 TOML，未知字段报错。没有标定帧号或场景模式；[通用示例](../configs/default.toml)可省略，默认值相同。
 
-| 字段 | 默认 | 语义 |
+| 字段 | 默认 | 含义 |
 | --- | --- | --- |
-| `expected_images` | 省略 | 选中 L/R 图像总数必须相等 |
-| `calibration_frames` | 省略 | 包含首尾的标定帧号范围 |
-| `calibration_frame_count` | 25 | 未指定范围时的自动窗口大小 |
-| `workers` | 4 | CPU 前端处理与配准查询/联合求解线程数，1–16 |
-| `registration_las` | 省略 | 绝对路径或相对输入目录的 LAS 路径；默认唯一 `ResultOut/*.las` |
+| `workers` | 4 | LAS 查询与联合求解线程数，1–16 |
+| `registration_las` | 省略 | 绝对路径或相对输入目录的 LAS；默认唯一 `ResultOut/*.las` |
 | `quality_max_median_px` | 2.0 | 整体及各镜头拟合重投影 median 上限 |
 | `quality_max_p90_px` | 4.0 | 整体及各镜头拟合重投影 P90 上限 |
-| `registration_min_support_fraction` | 0.25 | 拟合区域的可靠表面支持比例下限 |
+| `registration_min_support_fraction` | 0.25 | 可靠 LAS 表面支持比例下限 |
 | `registration_max_median_m` | 0.1 | 支持区域点到面 median 上限 |
 | `registration_max_p90_m` | 0.3 | 支持区域点到面 P90 上限 |
 
-标定片段必须含两个镜头、至少两个不同帧号；没有显式范围时自动跳过只含单镜头的前缀。局部和全局求解使用同一套特征编号。验收条件冻结后不可在原工作目录放宽；改变配置使用新目录。
-
-## 固定阶段
-
-| 阶段 | 主要结果 |
+| 阶段 | 结果 |
 | --- | --- |
-| `prepare` | 输入清单、曝光文件大小和修改时间、初始内参有效性、图像数量与标定窗口检查 |
-| `masks` | 天空/人物语义掩码和带掩码的场景清单，统一位于 `sfm/masks/` |
-| `features` | LoMa 特征缓存 |
-| `matches` | 固定候选对与匹配缓存 |
-| `observations` | 所有有效观测来源、特征/匹配索引和缓存文件元数据 |
-| `calibration` | 四步局部受限标定与最终身份 |
-| `sfm` | 全图像增量建图、三步全局 BA 与轨迹筛选 |
-| `finalize` | 曝光完整且通过质量检查的视觉模型 |
-| `register` | 导航/LAS 输入协议、全局配准、联合候选、验收后正式模型 |
-| `export` | 可移动 COLMAP 数据集及回读验包结果，默认附带掩码、5 cm LAS 初始化点云 `sparse/0/points3D.ply` 和 `initialization.json` |
+| `prepare` | 输入、曝光和初始内参检查 |
+| `masks` | 天空/人物语义掩码与预览 |
+| `features` | 共享 LoMa 特征与检索描述子 |
+| `matches` | 时间/检索候选、薄弱图补边与匹配缓存 |
+| `observations` | 冻结有效观测、匹配索引及来源 |
+| `calibration` | 自动支撑选择与四步受限标定 |
+| `sfm` | 复用标定模型，全局建图、轨迹筛选和受限 BA |
+| `finalize` | 发布并验收视觉模型，不重复 BA |
+| `register` | LAS 配准、条件联合候选与交付选择 |
+| `export` | COLMAP、掩码和 LAS 初始化 PLY，回读检查后发布 |
 
-`--stage` 只执行所指定阶段，上游必须已完成。新任务从 `prepare` 或默认 `all` 开始。通常直接重复完整运行命令，完整缓存会被验证和复用。
+`--stage` 只执行指定阶段，上游必须已完成；新任务从 `prepare` 或默认 `all` 开始。算法和验收细节见[架构说明](architecture.md)。
 
-## 验收与结果查看
-
-视觉交付要求全部入选曝光恰好注册一次，原生 L/R 鱼眼模型有效，观测具有正深度、镜头在 160° 内单调，拟合误差和覆盖满足配方及场景阈值，内参没有触及优化边界。
-
-全局配准要求足够的拟合点和诊断点、可靠表面支持、空间覆盖和点到面误差。联合更新同时检查整体、镜头、图像、FOV 区域和空间瓦片的拟合投影变化，以及固定点身份上的几何变化；内参、图像成员和观测拓扑必须保持不变。联合失败采用已验收全局模型，全局失败停止导出。程序异常或输入身份变化会报错，不被当作数值退化吞掉。
-
-联合候选通过相对投影与 LAS 检查后，仍须通过整体及每个镜头的绝对拟合 median/P90 限值。只有完整验收通过后才形成最终交付选择；绝对限值拒绝联合候选时，检查并采用合格的全局配准结果，记录具体拒绝原因。全局结果也不合格时停止发布。`quality_summary.json` 的 `registration.joint_quality_acceptance` 记录候选的 `passed / rejected / not_evaluated` 状态；`not_evaluated` 表示它已因上游联合或 LAS 检查被排除。
-
-```text
-WORK/
-  pipeline_config.json
-  pipeline_task.json
-  frontend_weights.json      # 首次使用 LoMa 后生成
-  segmentation_weights.json  # 首次使用 SegFormer 后生成
-  pipeline_status.json
-  run_result.json
-  manifest.json
-  calibration/
-  sfm/
-    masks/
-      valid/                 # 白色保留，黑色排除天空/人物
-      labels/                # 0 保留，1 天空，2 人物
-      stats/
-    final/
-  registration/
-    inputs.json
-    protocol.json
-    global/
-    joint/
-    final/
-      sparse/0/
-      inspection.html
-      result.json
-      quality_summary.json
-      completion.json
-  colmap/
-```
-
-`registration/final/inspection.html` 展示选择结果、质量概要和拒绝联合更新的理由，链接详细 JSON。`quality.json` 中的重投影统计使用拟合数据；LAS 空间诊断区域不用于选择最终结果。内容验包验证交付一致性，不能替代独立几何精度或 3DGS 渲染检查。
-
-## 恢复与交付
-
-工作目录保存输入、配置、模型缓存和默认导出参数。权重在实际使用模型时记录路径、大小和修改时间；只做准备时可以随后补齐缓存。后续调用不带输入、配置和交付参数时继承原任务；重新指定参数必须一致。依赖与 Python 版本仅作为运行信息保存，源码修改不再锁死续跑。
-
-完成的数值阶段在临时目录写完后原子发布。中断的未提交模型归档为 `*.interrupted-*`，续跑从上一个完整阶段开始；输入参数或已提交文件的元数据变化会报错。强制终止可能留下临时目录，不会把它当成已完成模型。
-
-每幅曝光记录 `size_bytes` 和 `mtime_ns`，掩码和特征使用前核对这两个字段。prepare 检查图像尺寸、方向及内参有效域，FOV 数组在掩码阶段按需生成。掩码 stats 最后提交，保存源图、有效图及原因标签的元数据；预览缺失可由 CPU 重画。特征按图像名缓存，匹配按图像对缓存，提取及匹配参数直接保存和比较。
-
-局部与全局建图的 `mapping_inputs/` 包含一起发布的 `database.db`、`seed/` 和 `completion.json`。COLMAP 使用临时数据库副本，后端写入不会改变冻结输入。已完成输入可直接验证复用，不必重新加载特征数组或重新做两视图估计。
-
-配置、输入、权重或算法配方改变时使用新工作目录，避免混用已完成阶段。当前只接受配置协议 7、场景协议 3 和任务协议 3，旧任务需要重新处理。协议编号只描述文件结构，所有任务使用同一条流程。
+## 续跑与导出
 
 ```bash
-# 一键继续默认任务
-./run.sh
+./run.sh --input input/场景 --work work/场景
+./run.sh --work work/场景
 
-# 恢复到同一任务，保留交付选项
-.venv/bin/geosunpre run --work work/场景
+# 单独执行阶段
+.venv/bin/geosunpre run --work work/场景 --stage calibration
 
-# 重新导出；缓存阶段不需要 GPU
-.venv/bin/geosunpre export --work work/场景
-
-# 换输出路径和交付方式，不修改任务默认交付
-.venv/bin/geosunpre export --work work/场景 --output /path/to/other --image-mode link
-
-# 检查冻结任务的默认交付路径，包含自定义输出路径
-.venv/bin/geosunpre check --work work/场景
+# 重新交付已验收结果；默认复制原图
+.venv/bin/geosunpre export --work work/场景 --output /path/to/colmap --image-mode copy
+.venv/bin/geosunpre check --output /path/to/colmap
 ```
 
-同一输出目录不能改变复制/链接、掩码、PLY 或体素大小选项；换一个 `--output` 即可。`check --output` 独立读取交付包，复制模式无需原始输入和工作目录。失败阶段及具体原因查看 `pipeline_status.json`，最近成功调用查看 `run_result.json`。
+工作目录冻结输入、配置、权重来源与默认交付选项；省略参数时继承。改变复制/链接、掩码、PLY 或体素参数时选择新 `--output`。`check --work` 检查任务默认输出。
+
+默认附带掩码和 5 cm LAS 初始化 PLY。`--ply-voxel-size 0.1` 使用 10 cm，`--no-include-ply`、`--no-include-masks` 可省略对应产物；格式及迁移要求见[交付契约](colmap_contract.md)。
+
+每个工作目录有进程锁，数值阶段原子发布；未提交模型在恢复时归档为 `*.interrupted-*`，完整阶段验证后复用。输入、缓存和权重按文件大小/修改时间及参数比较；运行环境版本只作记录。算法、输入或配置改变时使用新工作目录。当前配置/场景/任务协议为 **8 / 3 / 3**。
+
+## 查看结果
+
+| 路径，相对于 WORK | 内容 |
+| --- | --- |
+| `pipeline_status.json` | 阶段状态、失败原因、计时和资源 |
+| `run_result.json` | 最近成功调用 |
+| `calibration/selection.json` | 自动标定支撑与选择诊断 |
+| `sfm/pair_protocol.json` | 匹配支持图及补边记录 |
+| `sfm/masks/` | 语义有效图、原因标签和预览；导出时叠加初始 FOV |
+| `registration/global/report.json` | 自动尺度、区域、秩与拟合诊断 |
+| `registration/joint/unavailable.json` | 联合不可用或被跳过的原因，按需生成 |
+| `registration/final/inspection.html` | 正式交付选择与质量概要 |
+| `colmap/` | 最终训练数据、质量与来源清单 |
+
+失败原因保存在阶段状态中。重投影和 LAS 残差来自拟合数据；验包证明交付结构一致性，独立精度和 3DGS 渲染质量需另行验证。

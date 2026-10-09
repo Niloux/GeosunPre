@@ -10,9 +10,8 @@ import numpy as np
 
 from geosunpre.features import LoMaFrontend, feature_input, read_feature_cache
 from geosunpre.features import FRONTEND_CONFIG as CONFIG
-from geosunpre.artifacts import file_metadata
+from geosunpre.artifacts import file_metadata, write_frozen_json, write_json
 from geosunpre.scene import load_scene
-from geosunpre.artifacts import write_json, write_frozen_json
 
 OUTPUT = 'sfm'
 
@@ -130,52 +129,13 @@ def extract_features(work):
     return result
 
 
-def local_pairs(images):
-    pairs = []
-    for i,a in enumerate(images):
-        for b in images[i+1:]:
-            gap = abs(a['frame_index']-b['frame_index'])
-            same = a['camera']==b['camera']
-            if (same and (1<=gap<=5 or (gap in (8,12) and a['frame_index']%3==0))) or (not same and gap<=2):
-                pairs.append((a,b))
-    return pairs
-
-
-def candidate_pairs(images, names, descriptors):
-    by_name = {r['name']: r for r in images}
-    rank = {r['name']: i for i, r in enumerate(images)}
-    pairs = {}
-    def add(a, b, reason):
-        a, b = sorted((a, b), key=lambda n: rank[n])
-        if a != b: pairs.setdefault((a, b), set()).add(reason)
-    for a, b in local_pairs(images): add(a['name'], b['name'], 'temporal')
-    similarity = descriptors @ descriptors.T
-    for i, name in enumerate(names):
-        record = by_name[str(name)]
-        for camera in ['L', 'R']:
-            eligible = [j for j, n in enumerate(names) if by_name[str(n)]['camera'] == camera
-                        and abs(by_name[str(n)]['frame_index'] - record['frame_index']) >= 25]
-            top = sorted(eligible, key=lambda j: (-float(similarity[i, j]), str(names[j])))[:4]
-            for j in top: add(str(name), str(names[j]), 'appearance_retrieval')
-    first = min(r['frame_index'] for r in images); last = max(r['frame_index'] for r in images)
-    for a in images:
-        if a['frame_index'] > first + 3: continue
-        for b in images:
-            if b['frame_index'] >= last - 3: add(a['name'], b['name'], 'endpoint_candidate')
-    return [{'a': a, 'b': b, 'reasons': sorted(reasons)} for (a, b), reasons in sorted(pairs.items(), key=lambda e: (rank[e[0][0]], rank[e[0][1]]))]
-
-
 def match_features(work):
+    from geosunpre.sfm.pair_selection import PairSelection
     work = Path(work).resolve(); out = work / OUTPUT; scene = load_scene(out)
     catalog = json.loads((out / 'feature_catalog.json').read_text())
     if catalog['scene_manifest_file'] != file_metadata(out / 'manifest.json'): raise ValueError('Global scene changed')
     with np.load(out / 'retrieval_descriptors.npz') as retrieval:
-        pairs = candidate_pairs(scene['images'], retrieval['names'], retrieval['descriptors'])
-    pair_protocol = {'pairs': pairs, 'feature_catalog_file': file_metadata(out / 'feature_catalog.json'),
-                     'retrieval_descriptors_file': file_metadata(out / 'retrieval_descriptors.npz'),
-                     'minimum_retrieval_frame_gap': 25, 'retrieval_neighbors_per_camera': 4,
-                     'selection_uses_input_pose_or_las': False}
-    write_frozen_json(out / 'pair_protocol.json', pair_protocol)
+        selection = PairSelection(scene['images'], retrieval['names'], retrieval['descriptors'])
     frontend = LoMaFrontend(work, scene, CONFIG)
     by_token = {row['token']: row['path'] for row in catalog['features'].values()}
     identities = {}
@@ -185,17 +145,31 @@ def match_features(work):
             raise ValueError(f'Global feature catalog changed: {record["name"]}')
         read_feature_cache(expected_path, token, name=token, fields=(), identity=identity)
         identities[token] = identity
+
     @lru_cache(maxsize=32)
     def get_features(token):
         return read_feature_cache(by_token[token], token, name=token, identity=identities[token],
             fields=('normalized_keypoints', 'descriptors', 'token'))
-    entries = []
-    for i, pair in enumerate(pairs, 1):
+
+    matched = 0
+
+    def match(pair):
+        nonlocal matched
         raw = frontend.match({'token': catalog['features'][pair['a']]['token']},
                              {'token': catalog['features'][pair['b']]['token']},
                              feature_loader=get_features)
-        entries.append({**pair, 'token': str(raw['token']), 'path': str(work / 'matches' / f'{str(raw["token"])}.npz')})
-        if i % 40 == 0 or i == len(pairs): print(f'global matches {i}/{len(pairs)}', flush=True)
+        entry = {**pair, 'token': str(raw['token']), 'path': str(work / 'matches' / f'{str(raw["token"])}.npz')}
+        matched += 1
+        if matched % 40 == 0:
+            print(f'global matches {matched}', flush=True)
+        return entry, int((raw['scores'] >= .5).sum())
+
+    entries, report = selection.match(match)
+    print(f'global matches complete: {len(entries)} pairs', flush=True)
+    pair_protocol = {**report, 'pairs': [{k: row[k] for k in ('a', 'b', 'reasons')} for row in entries],
+                     'feature_catalog_file': file_metadata(out / 'feature_catalog.json'),
+                     'retrieval_descriptors_file': file_metadata(out / 'retrieval_descriptors.npz')}
+    write_frozen_json(out / 'pair_protocol.json', pair_protocol)
     result = {**catalog, 'pairs': entries, 'pair_protocol_file': file_metadata(out / 'pair_protocol.json'),
               'matching_cache': frontend.cache_stats}
     result['matcher_attention'] = 'flash'

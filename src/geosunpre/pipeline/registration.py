@@ -34,7 +34,7 @@ POLICY = {
     'maximum_paired_median_increase_m': .005,
     'maximum_paired_p90_increase_m': .02,
     'minimum_common_support_fraction': .9,
-    'scope': 'Operational fit-region checks; LAS holdout is descriptive only, not used to select output.',
+    'scope': 'Operational checks on all eligible fit points and frozen adaptive regions.',
 }
 
 
@@ -88,17 +88,17 @@ def _points(path):
 
 def surface_acceptance(points, config):
     """Check supported surfaces and fixed spatial regions without trimming residuals."""
-    fit = ~points['holdout']
-    supported = points['stable_surface_supported'] & fit
+    supported = points['stable_surface_supported']
     plane = np.abs(points['signed_plane_error'])
     errors = []
-    count, support = int(fit.sum()), int(supported.sum())
+    count, support = len(supported), int(supported.sum())
     fraction = support / count if count else 0.
     values = quantiles(plane[supported])
     tile_count = len(np.unique(points['tiles'][supported], axis=0))
     if not np.isfinite(plane).all() or not np.isfinite(points['nearest_distance']).all():
         errors.append('Nonfinite registration residuals')
-    if support < POLICY['minimum_supported_fit_points'] or tile_count < POLICY['minimum_supported_fit_tiles']:
+    minimum_tiles = min(POLICY['minimum_supported_fit_tiles'], len(np.unique(points['tiles'], axis=0)))
+    if support < POLICY['minimum_supported_fit_points'] or tile_count < minimum_tiles:
         errors.append('Insufficient stable surface support or spatial coverage')
     if fraction < config.registration_min_support_fraction:
         errors.append('Stable surface support fraction below configured minimum')
@@ -106,7 +106,7 @@ def surface_acceptance(points, config):
         if values[metric] is None or not np.isfinite(values[metric]) or values[metric] > limit:
             errors.append(f'Supported plane {metric} exceeds configured limit')
     regions = []
-    for tile in np.unique(points['tiles'][fit], axis=0):
+    for tile in np.unique(points['tiles'], axis=0):
         selected = supported & np.all(points['tiles'] == tile, axis=1)
         if selected.sum() < POLICY['minimum_regional_points']:
             continue
@@ -124,26 +124,25 @@ def surface_acceptance(points, config):
 
 def geometric_regression(reference, candidate):
     """Compare fixed fit-point identities on common supported surfaces and regions."""
-    for key in ('point_ids', 'holdout', 'tiles'):
+    for key in ('point_ids', 'tiles'):
         if not np.array_equal(reference[key], candidate[key]):
             raise ValueError('Joint candidate changed frozen LAS point identities or partition')
-    fit = ~reference['holdout']
-    before = reference['stable_surface_supported'] & fit
-    after = candidate['stable_surface_supported'] & fit
+    before = reference['stable_surface_supported']
+    after = candidate['stable_surface_supported']
     common = before & after
     old, new = np.abs(reference['signed_plane_error']), np.abs(candidate['signed_plane_error'])
     failures, comparisons = [], []
-    denominator = int(fit.sum())
+    denominator = len(before)
     if int(after.sum()) / denominator < int(before.sum()) / denominator - POLICY['maximum_support_fraction_drop']:
         failures.append('Joint update reduces stable surface coverage')
     if common.sum() < before.sum() * POLICY['minimum_common_support_fraction']:
         failures.append('Joint update loses too much reference surface support')
-    groups = [('all', fit)]
+    groups = [('all', np.ones(len(before), dtype=bool))]
     normals = reference['surface_normals']
     groups += [('horizontal', np.abs(normals[:, 2]) >= np.cos(np.deg2rad(25))),
                ('vertical', np.abs(normals[:, 2]) <= np.sin(np.deg2rad(25)))]
     groups += [('tile/' + ','.join(map(str, tile)), np.all(reference['tiles'] == tile, axis=1))
-               for tile in np.unique(reference['tiles'][fit], axis=0)]
+               for tile in np.unique(reference['tiles'], axis=0)]
     for name, mask in groups:
         selected = common & mask
         if selected.sum() < POLICY['minimum_regional_points']:
@@ -270,7 +269,7 @@ def register(work):
             refine_joint(global_stage, inputs, path, workers=config.workers, context=context)
         except JointConstraintsUnavailable as exc:
             with staged_directory(path) as stage:
-                write_json(stage / 'unavailable.json', {'error': str(exc)})
+                write_json(stage / 'unavailable.json', {'error': str(exc), 'eligibility': exc.diagnostic})
                 complete_publication(stage, context)
 
     joint = _stage(work, 'joint', protocol_file, compute_joint)

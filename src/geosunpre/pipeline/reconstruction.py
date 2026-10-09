@@ -74,7 +74,8 @@ def build_mapping(work):
         rec = pycolmap.Reconstruction(mapping)
     else:
         db, seed = database_and_seed(out, geometric_scene(scene, params), scene['images'],
-                                     data['pairs'], features, protocol_file=protocol_file)
+                                     data['pairs'], features, protocol_file=protocol_file,
+                                     initial_model=Path(work) / 'calibration/stages/principal/sparse/0')
         with operation('incremental_mapping'):
             maps = map_from_inputs(out, scene, db, seed)
         if not maps: raise RuntimeError('Full mapping did not reconstruct a component')
@@ -158,6 +159,13 @@ def optimize(work):
                 print('Global BA', stage, rec.num_reg_images(), rec.num_points3D(), rec.compute_num_observations(), flush=True)
                 ba = bounded_bundle_adjustment(rec, 'principal' if stage == 'shared_calibration' else 'fixed',
                                                params, protect_depth=True, show_progress=False)
+                if stage == 'shared_calibration' and ba['termination_type'].endswith('NO_CONVERGENCE'):
+                    previous_ba = ba
+                    ba = bounded_bundle_adjustment(rec, 'principal', params, protect_depth=True,
+                                                   show_progress=False, max_iterations=40)
+                    ba['continuation'] = {'reason': 'Continue an unfinished shared calibration solve.',
+                        'previous_solver': previous_ba['solver'],
+                        'previous_elapsed_seconds': previous_ba['elapsed_seconds']}
                 model = staged / 'sparse/0'; model.mkdir(parents=True)
                 rec.write(model); rec.write_text(model)
                 if not pycolmap.Reconstruction(model).is_valid():

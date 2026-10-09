@@ -48,6 +48,9 @@ IMAGE_GATES = {
 
 class JointConstraintsUnavailable(ValueError):
     """Reliable LAS matches are insufficient; the registered visual model is usable."""
+    def __init__(self, message, *, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 def native_costs():
@@ -118,7 +121,7 @@ def _groups(values):
 
 class ImageObservations:
     """Freeze every feature identity and grouping before any candidate solve."""
-    def __init__(self, rec, initial_matrix):
+    def __init__(self, rec, initial_matrix, *, regions):
         self.images = []
         ids, image_ids, camera_ids, feature_ids, pixels, zones = [], [], [], [], [], []
         self.initial_intrinsics = {cid: camera.params.copy() for cid, camera in rec.cameras.items()}
@@ -148,7 +151,8 @@ class ImageObservations:
         self.image_ids, self.camera_ids = np.concatenate(image_ids), np.concatenate(camera_ids)
         self.feature_ids, self.pixels, self.zones = np.concatenate(feature_ids), np.concatenate(pixels), np.concatenate(zones)
         xyz = np.array([rec.points3D[int(pid)].xyz for pid in self.point_ids])
-        self.tiles = np.floor(transform_points(initial_matrix, xyz) / 4.).astype(np.int64)
+        self.tiles = np.floor((transform_points(initial_matrix, xyz)
+            - np.asarray(regions['origin'])) / regions['tile_size']).astype(np.int64)
         self.groups = [('all', 'all', np.arange(len(self.point_ids)))]
         for label, values in [('camera', self.camera_ids), ('image', self.image_ids),
                               ('camera_zone', np.column_stack((self.camera_ids, self.zones))), ('tile', self.tiles)]:
@@ -217,11 +221,21 @@ def las_correspondences(rec, matrix, fit_ids, tiles_fit, surface, *, maximum=.25
     confidence = (np.minimum(1., (.02 / np.maximum(normal_std, 1e-12))**2)
                   * np.minimum(1., (.01 / np.maximum(surface['noise'][nearest[keep]], 1e-12))**2))
     weight, orientation = balanced_weights(tiles_fit[keep], n, confidence)
+    sigma = np.sqrt(normal_std**2 + np.maximum(surface['noise'][nearest[keep]], .01)**2)
+    pivot = points[keep].mean(0)
+    jacobian = np.column_stack((np.cross(points[keep] - pivot, n), n,
+        np.einsum('ni,ni->n', points[keep] - pivot, n))) * np.sqrt(weight[:, None])
+    singular = np.linalg.svd(jacobian / np.maximum(np.linalg.norm(jacobian, axis=0), 1e-12),
+                             compute_uv=False)
+    rank = int(np.count_nonzero(singular > singular[0] * 1e-3))
     return {'point_ids': np.asarray(fit_ids)[keep], 'centres': surface['centres'][nearest[keep]],
             'normals': n, 'weights': weight, 'nearest': nearest[keep],
             'summary': {'fit_points': len(fit_ids), 'matches': int(keep.sum()),
                 'precise_point_only_matches': int((keep & point_only).sum()),
-                'ambiguous_parallel_faces': int(ambiguous.sum()), 'holdout_used': False,
+                'ambiguous_parallel_faces': int(ambiguous.sum()),
+                'similarity_information_rank': rank, 'similarity_singular_values': singular.tolist(),
+                'relative_plane_error_sigma': quantiles(np.abs(plane[keep]) / sigma),
+                'noise_scope': 'Conditional visual precision and conservative LAS noise proxies.',
                 'initial_plane_error': quantiles(np.abs(plane[keep])),
                 'orientation_groups': {name: {'points': int((orientation == i).sum()),
                     'weight': float(weight[orientation == i].sum())}

@@ -19,7 +19,7 @@ RECIPE = {
     'maximum_point_only_precision_proxy_std': .1,
     'candidate_neighbours': 8,
     'parallel_face_ambiguity_distance_margin': .1, 'parallel_face_separation': .05,
-    'orientation_total_weights': {'horizontal': .45, 'vertical': .45, 'inclined': .1},
+    'normal_direction_grid': 4, 'minimum_direction_support': 30,
 }
 
 
@@ -92,9 +92,9 @@ def visual_planes(points, *, workers=4):
     return normals[1], valid
 
 
-def coherent_las(target, *, workers=4):
-    fine = surfaces(target, voxel_size=.1, workers=workers)
-    coarse = surfaces(target, voxel_size=.2, workers=workers)
+def coherent_las(target, *, voxel_size, workers=4):
+    fine = surfaces(target, voxel_size=voxel_size, workers=workers)
+    coarse = surfaces(target, voxel_size=2 * voxel_size, workers=workers)
     _, nearest = coarse['tree'].query(fine['points'], workers=workers)
     normal_dot = np.abs(np.einsum('ni,ni->n', fine['normals'], coarse['normals'][nearest]))
     separation = np.abs(np.einsum('ni,ni->n', fine['centres'] - coarse['centres'][nearest], fine['normals']))
@@ -135,15 +135,23 @@ def structural_matches(points, normals, visual_valid, surface, maximum, *, worke
 
 
 def balanced_weights(tiles, normals, confidence):
-    """Equal density weights per tile within each orientation, scaled by confidence."""
+    """Balance actual normal directions and regions, with support and confidence.
+
+    Sparse directions receive proportionally less mass. Horizontal/vertical
+    labels are descriptive only and no longer define optimization weights.
+    """
     z = np.abs(normals[:, 2])
     orientation = np.where(z >= np.cos(np.deg2rad(25)), 0,
                            np.where(z <= np.sin(np.deg2rad(25)), 1, 2))
     weights = np.zeros(len(tiles))
-    for group, mass in enumerate(RECIPE['orientation_total_weights'].values()):
-        mask = orientation == group
-        if not mask.any():
-            continue
+    axis = np.argmax(np.abs(normals), axis=1)
+    sign = np.where(normals[np.arange(len(normals)), axis] < 0, -1., 1.)
+    directions = np.rint(normals * sign[:, None] * RECIPE['normal_direction_grid']).astype(int)
+    _, groups, support = np.unique(directions, axis=0, return_inverse=True, return_counts=True)
+    masses = np.minimum(1., support / RECIPE['minimum_direction_support'])
+    masses /= masses.sum()
+    for group, mass in enumerate(masses):
+        mask = groups == group
         unique, inverse, counts = np.unique(tiles[mask], axis=0, return_inverse=True, return_counts=True)
         weights[mask] = mass * confidence[mask] / (len(unique) * counts[inverse])
     return weights, orientation

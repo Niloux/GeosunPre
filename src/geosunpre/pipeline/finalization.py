@@ -3,7 +3,6 @@
 import json
 from pathlib import Path
 
-import numpy as np
 import pycolmap
 
 from geosunpre.artifacts import file_metadata, staged_directory, write_json
@@ -11,9 +10,7 @@ from geosunpre.colmap import model_files
 from geosunpre.config import load_config
 from geosunpre.pipeline.observations import protocol_identity
 from geosunpre.pipeline.quality import production_acceptance
-from geosunpre.sfm.reconstruction import bounded_bundle_adjustment
 
-BA_ITERATIONS = 40
 SOURCE = Path('sfm/stages/shared_calibration/sparse/0')
 FINAL = Path('sfm/final')
 
@@ -44,7 +41,7 @@ def _check_model(rec, scene):
 
 
 def finalize(work):
-    """Finalize the native fisheye model with guarded bundle adjustment."""
+    """Accept and publish the completed visual solve without repeating BA."""
     from geosunpre.pipeline.reconstruction import freeze_geometry
 
     work = Path(work).resolve()
@@ -53,21 +50,20 @@ def finalize(work):
     source = pycolmap.Reconstruction(source_path)
     _check_model(source, scene)
     geometry_path = root / 'geometry_protocol.json'
-    geometry = json.loads(geometry_path.read_text())
-    initial_cameras = {int(cid): np.asarray(values, dtype=float)
-                       for cid, values in geometry['calibration'].items()}
-    if set(initial_cameras) != set(source.cameras):
-        raise ValueError('Frozen initial calibration differs from the model cameras')
+    ba_path = source_path.parent.parent / 'ba.json'
+    ba = json.loads(ba_path.read_text())
+    if ba['model_files'] != model_files(source_path):
+        raise ValueError('Final optimization report differs from the source model')
     output = work / FINAL
     output.mkdir(parents=True, exist_ok=True)
     protocol = {
-        'schema_version': 1,
+        'schema_version': 2,
         'source_model_files': model_files(source_path),
         'scene_manifest_file': file_metadata(root / 'manifest.json'),
         'geometry_protocol_file': file_metadata(geometry_path),
         **protocol_identity(work),
-        'solver': {'stage': 'principal', 'protect_depth': True,
-                   'max_iterations': BA_ITERATIONS},
+        'source_optimization_file': file_metadata(ba_path),
+        'numerical_fit_performed': False,
         'manual_annotations_used': False,
         'navigation_pose_or_las_used': False,
         'all_exposures_independent': True,
@@ -82,19 +78,12 @@ def finalize(work):
         result = json.loads(result_path.read_text())
         if (result['protocol_file'] != file_metadata(protocol_path)
                 or result['model_files'] != model_files(model_path)):
-            raise ValueError('Saved final BA model changed')
+            raise ValueError('Saved final visual model changed')
         candidate = pycolmap.Reconstruction(model_path)
     else:
         candidate = pycolmap.Reconstruction(source_path)
-        before = (candidate.num_reg_images(), candidate.num_points3D(),
-                  candidate.compute_num_observations())
-        ba = bounded_bundle_adjustment(candidate, 'principal', initial_cameras,
-                                       protect_depth=True, show_progress=False,
-                                       max_iterations=BA_ITERATIONS)
         after = (candidate.num_reg_images(), candidate.num_points3D(),
                  candidate.compute_num_observations())
-        if before != after:
-            raise RuntimeError('Final BA changed reconstruction topology')
         _check_model(candidate, scene)
         with staged_directory(output) as staged:
             staged_model = staged / 'sparse/0'
@@ -104,6 +93,7 @@ def finalize(work):
             write_json(staged / 'protocol.json', protocol)
             result = {'protocol_file': file_metadata(staged / 'protocol.json'),
                       'model_files': model_files(staged_model), 'ba': ba,
+                      'numerical_fit_performed': False,
                       'registered': after[0], 'points': after[1],
                       'observations': after[2],
                       'manual_annotations_used': False}
@@ -143,6 +133,7 @@ def verify_final(work):
             or quality['model_files'] != result['model_files']
             or protocol['scene_manifest_file'] != file_metadata(root / 'manifest.json')
             or protocol['source_model_files'] != model_files(work / SOURCE)
+            or protocol['source_optimization_file'] != file_metadata(work / SOURCE.parent.parent / 'ba.json')
             or protocol['geometry_protocol_file'] != file_metadata(root / 'geometry_protocol.json')
             or any(protocol.get(k) != v for k, v in protocol_identity(work).items())):
         raise ValueError('Final visual model identity changed')

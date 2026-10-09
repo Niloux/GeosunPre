@@ -70,9 +70,9 @@ def run_pipeline(work, *, input_root=None, config=None, stage='all', output=None
                 with recorder.stage(current):
                     if current == 'prepare':
                         scene = prepare(input_root, work)
-                        calibration = config.calibration_images(scene)
+                        config.check_scene(scene)
                         summary['input'] = {'images': len(scene['images']),
-                                            'calibration_images': len(calibration)}
+                                            'calibration_selection': 'automatic after matching'}
                         if len(selected) > 1:
                             summary['preflight'] = preflight(work, selected, delivery, model_cache=model_cache)
                     elif current == 'sfm':

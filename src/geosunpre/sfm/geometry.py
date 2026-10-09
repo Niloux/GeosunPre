@@ -66,57 +66,50 @@ def triangulation_diagnostics(cam_a, cam_b, a, b, pose):
 
 
 def fit_pair(cam_a, cam_b, a, b, max_error=3.0, seed=42, fov=160):
-    """Fit on 80% of raw matches, leaving the remaining correspondences out."""
+    """Estimate and verify relative geometry using all eligible correspondences."""
     n = len(a)
     blank = {'success': False, 'reason': 'fewer than 24 matches', 'raw_matches': n,
-             'verified': 0, 'train_count': 0, 'holdout_count': 0}
+             'verified': 0, 'fitted_matches': 0}
     if n < 24:
-        return blank, {'verified_mask': np.zeros(n, dtype=bool), 'heldout_mask': np.zeros(n, dtype=bool),
+        return blank, {'verified_mask': np.zeros(n, dtype=bool),
                        'epipolar_error_px': np.full(n, np.inf)}
-    shuffled = np.random.default_rng(seed).permutation(n)
-    heldout = np.zeros(n, dtype=bool)
-    heldout[shuffled[:max(5, n//5)]] = True
-    train = np.flatnonzero(~heldout).astype(np.uint32)
     # The generic "calibrated two-view geometry" API can still select raw-pixel
     # F over E. That F is invalid on distorted fisheye pixels. Use the 4.2
     # camera-aware E-only API, whose ray Jacobians retain native pixel units.
     options = pycolmap.RANSACOptions(max_error=max_error, min_num_trials=100,
                                     max_num_trials=10000, confidence=.9999, random_seed=seed)
     result = pycolmap.estimate_relative_pose(
-        cam_a.pycolmap(), np.asarray(a, dtype=np.float64)[train],
-        cam_b.pycolmap(), np.asarray(b, dtype=np.float64)[train], options)
+        cam_a.pycolmap(), np.asarray(a, dtype=np.float64),
+        cam_b.pycolmap(), np.asarray(b, dtype=np.float64), options)
     if result is None:
-        return {**blank, 'reason': 'relative pose estimation failed', 'train_count': len(train),
-                'holdout_count': int(heldout.sum())}, {
-                    'verified_mask': np.zeros(n, dtype=bool), 'heldout_mask': heldout,
+        return {**blank, 'reason': 'relative pose estimation failed', 'fitted_matches': n}, {
+                    'verified_mask': np.zeros(n, dtype=bool),
                     'epipolar_error_px': np.full(n, np.inf)}
     pose = result['cam2_from_cam1'].matrix()
     E = skew(pose[:, 3]) @ pose[:, :3]
     errors = epipolar_pixel_error(cam_a, cam_b, a, b, E)
     positive, reproj, angles = triangulation_diagnostics(cam_a, cam_b, a, b, pose)
-    # Threshold the same native-pixel metric on fitting and held-out observations.
+    # Verify every correspondence in native pixels and physical ray geometry.
     epipolar = errors <= max_error
     verified = epipolar & positive & (reproj <= max_error*2)
     rho_a = np.linalg.norm((a-np.array(cam_a.params[2:4]))/np.array(cam_a.params[:2]), axis=1)
     rho_b = np.linalg.norm((b-np.array(cam_b.params[2:4]))/np.array(cam_b.params[:2]), axis=1)
     peripheral = (rho_a > .8*cam_a.distorted_radius(fov)) | (rho_b > .8*cam_b.distorted_radius(fov))
     median_angle = float(np.median(angles[verified])) if verified.any() else 0.
-    summary = {'success': int(verified.sum()) >= 15, 'reason': 'image-only diagnostic fit',
-               'raw_matches': n, 'train_count': len(train), 'holdout_count': int(heldout.sum()),
-               'ransac_train_inliers': result['num_inliers'], 'epipolar_inliers': int(epipolar.sum()),
+    summary = {'success': int(verified.sum()) >= 15, 'reason': 'image-only geometric verification',
+               'raw_matches': n, 'fitted_matches': n,
+               'ransac_inliers': result['num_inliers'], 'epipolar_inliers': int(epipolar.sum()),
                'verified': int(verified.sum()), 'estimator': 'camera-aware E-only tangent Sampson LO-RANSAC',
                'low_parallax': median_angle < .5,
                'seed_candidate': bool(verified.sum() >= 30 and median_angle >= 1.),
-               'holdout_epipolar_error_px_all_raw': stats(errors[heldout]),
-               'holdout_fraction_within_threshold': float(epipolar[heldout].mean()),
-               'holdout_verified_fraction': float(verified[heldout].mean()),
-               'peripheral_holdout_error_px_all_raw': stats(errors[heldout & peripheral]),
+               'fitted_epipolar_error_px': stats(errors[verified]),
+               'peripheral_verified_error_px': stats(errors[verified & peripheral]),
                'verified_two_view_reprojection_max_px': stats(reproj[verified]),
                'verified_triangulation_angle_degrees': stats(angles[verified]),
                'native_pixel_threshold': max_error,
-               'note': 'Pairwise holdout only; not independent multi-view/3DGS validation.'}
+               'note': 'Fitted pair geometry; not independent multi-view or 3DGS accuracy.'}
     arrays = {'pose_cam_b_from_a': pose, 'essential': E, 'verified_mask': verified,
-              'heldout_mask': heldout, 'epipolar_error_px': errors,
+              'epipolar_error_px': errors,
               'two_view_reprojection_max_px': reproj, 'triangulation_angle_degrees': angles}
     return summary, arrays
 

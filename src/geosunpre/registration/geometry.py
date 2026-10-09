@@ -1,4 +1,4 @@
-"""Similarity registration against LAS surface patches, with spatial holdout."""
+"""Similarity registration against reliable LAS surface patches."""
 
 import numpy as np
 import pycolmap
@@ -56,21 +56,6 @@ def voxel_downsample(points, size):
     _, inverse, counts = np.unique(np.floor(points / size).astype(np.int64), axis=0,
                                    return_inverse=True, return_counts=True)
     return np.column_stack([np.bincount(inverse, weights=points[:, i]) / counts for i in range(3)])
-
-
-def spatial_split(points, *, tile_size=4., fraction=.2, seed=0):
-    if tile_size <= 0 or not 0 < fraction < 1:
-        raise ValueError('Expected positive tiles and a holdout fraction between zero and one')
-    tiles, inverse = np.unique(np.floor(np.asarray(points) / tile_size).astype(np.int64),
-                               axis=0, return_inverse=True)
-    if len(tiles) < 5:
-        raise ValueError('Too few spatial tiles for registration holdout')
-    chosen = np.random.default_rng(seed).permutation(len(tiles))[:max(1, int(round(len(tiles) * fraction)))]
-    holdout = np.isin(inverse, chosen)
-    return holdout, tiles[inverse], {'tile_size': tile_size, 'fraction_requested': fraction,
-                                     'seed': seed, 'tiles': len(tiles), 'heldout_tiles': len(chosen),
-                                     'fit_points': int((~holdout).sum()), 'holdout_points': int(holdout.sum()),
-                                     'frozen_in_initial_frame': True}
 
 
 def surfaces(points, *, voxel_size, workers=4, diagnostics=False):
@@ -146,9 +131,9 @@ def _huber(residual, cutoff):
     return np.where(absolute <= cutoff, .5 * residual**2, cutoff * (absolute - .5 * cutoff))
 
 
-def refine_similarity(source_fit, target, initial, *, tiles_fit=None, workers=4,
-                      voxel_sizes=(.4, .2, .1), correspondence_distances=(.8, .4, .2), iterations=12):
-    """Only fit points enter this optimizer; holdout points cannot be consulted.
+def refine_similarity(source_fit, target, initial, *, tiles_fit, workers=4,
+                      voxel_sizes, correspondence_distances, iterations=12):
+    """Fit all eligible points with frozen regional density weights.
 
     Each accepted update has a proper rotation and positive uniform scale.
     Surface correspondences use robust residuals and equal total tile weights.
@@ -159,8 +144,6 @@ def refine_similarity(source_fit, target, initial, *, tiles_fit=None, workers=4,
         raise ValueError('Too few points for surface refinement')
     if len(voxel_sizes) != len(correspondence_distances) or not voxel_sizes:
         raise ValueError('Expected one correspondence distance per voxel scale')
-    if tiles_fit is None:
-        tiles_fit = np.floor(transform_points(matrix, source_fit) / 4.).astype(np.int64)
     log, ranks = [], []
     last_surface = None
     for voxel, maximum in zip(voxel_sizes, correspondence_distances):

@@ -8,7 +8,7 @@ import pycolmap
 
 from geosunpre.artifacts import file_metadata, staged_directory, write_json
 from geosunpre.colmap import model_files
-from geosunpre.registration.geometry import (quantiles, residuals, spatial_split,
+from geosunpre.registration.geometry import (quantiles, residuals,
     transform_points, validate_similarity)
 from geosunpre.registration.global_alignment import MAX_LAS_POINTS, projection_invariance, validate_output
 from geosunpre.registration.joint_solver import (RECIPE, IMAGE_GATES, ImageObservations,
@@ -34,13 +34,14 @@ def _positions(rec, audit):
 
 
 def _run_stage(label, base, initial_matrix, positions, surface, fit_ids, tiles_fit,
-               observations, input_errors, recipe, directory):
+               observations, input_errors, recipe, directory, initial_matches):
     current, matrix = pycolmap.Reconstruction(base), initial_matrix.copy()
     steps = []
     directory.mkdir()
     for iteration in range(recipe['outer_iterations']):
-        matches = las_correspondences(current, matrix, fit_ids, tiles_fit, surface,
-            maximum=.4 if iteration == 0 else .25, workers=recipe['workers'])
+        matches = initial_matches if iteration == 0 else las_correspondences(
+            current, matrix, fit_ids, tiles_fit, surface,
+            maximum=surface['correspondence_distance'], workers=recipe['workers'])
         errors_before, depth_before = observations.errors(current)
         objective_before = mixed_objective(current, matrix, errors_before, positions, matches, recipe)
         proposal = pycolmap.Reconstruction(current)
@@ -110,13 +111,13 @@ def refine_joint(alignment, inputs, output, *, workers=4, context=None):
         raise JointConstraintsUnavailable('Noncollinear position priors are required for joint refinement')
     with np.load(alignment / 'registration_points.npz', allow_pickle=False) as archive:
         points = {name: archive[name] for name in archive.files}
-    ids, holdout, tiles = points['point_ids'], points['holdout'], points['tiles']
-    split = reference['split']
-    repeated_holdout, repeated_tiles, _ = spatial_split(points['partition_xyz'], tile_size=split['tile_size'],
-                                                      fraction=split['fraction_requested'], seed=split['seed'])
+    ids, tiles = points['point_ids'], points['tiles']
+    regions, scales = reference['regions'], reference['sampling_scales']
+    repeated_tiles = np.floor((points['partition_xyz'] - np.asarray(regions['origin']))
+                              / regions['tile_size']).astype(np.int64)
     source = np.array([base.points3D[int(pid)].xyz for pid in ids])
     initial_points = transform_points(initial_matrix, source)
-    if (not np.array_equal(holdout, repeated_holdout) or not np.array_equal(tiles, repeated_tiles)
+    if (not np.array_equal(tiles, repeated_tiles)
             or len(np.unique(ids)) != len(ids)
             or not np.allclose(transform_points(transform['initial_matrix'], source), points['partition_xyz'], atol=1e-10, rtol=0)
             or not np.allclose(initial_points, points['final_xyz'], atol=1e-10, rtol=0)):
@@ -125,20 +126,29 @@ def refine_joint(alignment, inputs, output, *, workers=4, context=None):
                                   seed=reference['las']['sample_seed'])
     if metadata != reference['las']:
         raise ValueError('LAS sample changed since global registration')
-    surface = coherent_las(target, workers=workers)
+    surface = coherent_las(target, voxel_size=scales['voxel_sizes'][-1], workers=workers)
+    surface['correspondence_distance'] = max(scales['correspondence_distances'][-1], scales['support_distance'])
     distances, plane, nearest = residuals(initial_points, surface, workers=workers)
     if (not np.allclose(distances, points['nearest_distance'], atol=1e-10, rtol=0)
             or not np.allclose(plane, points['signed_plane_error'], atol=1e-10, rtol=0)
-            or not np.array_equal((distances <= .3) & surface['valid'][nearest], points['stable_surface_supported'])):
+            or not np.array_equal((distances <= scales['support_distance']) & surface['valid'][nearest], points['stable_surface_supported'])):
         raise ValueError('Global registration surface support does not replay')
-    observations = ImageObservations(base, initial_matrix)
+    matches = las_correspondences(base, initial_matrix, ids, tiles, surface,
+        maximum=surface['correspondence_distance'], workers=workers)
+    summary = matches['summary']
+    if summary['similarity_information_rank'] < 7:
+        raise JointConstraintsUnavailable('Joint support cannot constrain all similarity directions', diagnostic=summary)
+    if (summary['relative_plane_error_sigma']['median'] <= 1.
+            and summary['relative_plane_error_sigma']['p90'] <= 3.):
+        raise JointConstraintsUnavailable('Reliable surfaces already fit within relative noise proxies', diagnostic=summary)
+    observations = ImageObservations(base, transform['initial_matrix'], regions=regions)
     input_errors, depths = observations.errors(base)
     if not np.isfinite(input_errors).all() or np.any(depths <= 1e-9):
         raise ValueError('Visual source has invalid projections')
     recipe = {**RECIPE, 'workers': workers}
     with staged_directory(output) as stage:
         rec, matrix, errors, diagnostic = _run_stage('pose_las', base, initial_matrix, positions, surface,
-            ids[~holdout], tiles[~holdout], observations, input_errors, recipe, stage / 'solver')
+            ids, tiles, observations, input_errors, recipe, stage / 'solver', matches)
         diagnostic['accepted_for_delivery'] = bool(diagnostic['input_image_gate']['passed']
             and diagnostic['geometry_gate']['passed'] and diagnostic['accepted_updates'] > 0
             and diagnostic['invalid_depth_observations'] == 0)
@@ -155,9 +165,9 @@ def refine_joint(alignment, inputs, output, *, workers=4, context=None):
         diagnostic['model_files'] = model_files(model)
         candidate_points = transform_points(matrix, np.array([rec.points3D[int(pid)].xyz for pid in ids]))
         distances, plane, nearest = residuals(candidate_points, surface, workers=workers)
-        np.savez_compressed(stage / 'las_points.npz', point_ids=ids, holdout=holdout, tiles=tiles,
+        np.savez_compressed(stage / 'las_points.npz', point_ids=ids, tiles=tiles,
             initial_xyz=initial_points, final_xyz=candidate_points, nearest_distance=distances,
-            signed_plane_error=plane, stable_surface_supported=surface['valid'][nearest] & (distances <= .3))
+            signed_plane_error=plane, stable_surface_supported=surface['valid'][nearest] & (distances <= scales['support_distance']))
         np.savez_compressed(stage / 'image_observations.npz', point_ids=observations.point_ids,
             image_ids=observations.image_ids, point2D_indices=observations.feature_ids,
             observed_pixels=observations.pixels, input_error=input_errors, candidate_error=errors)

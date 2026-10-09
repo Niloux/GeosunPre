@@ -98,16 +98,15 @@ def _build_mapping_inputs(directory, scene, images, entries, features, initial_m
         a,b=records[entry['a']],records[entry['b']]
         with np.load(entry['path']) as raw:
             matches=raw['matches']
-            train=matches
-        pa=features[a['name']]['keypoints'][train[:,0]].astype(float)
-        pb=features[b['name']]['keypoints'][train[:,1]].astype(float)
+        pa=features[a['name']]['keypoints'][matches[:,0]].astype(float)
+        pb=features[b['name']]['keypoints'][matches[:,1]].astype(float)
         metrics,arrays=fit_pair(cameras[a['camera']],cameras[b['camera']],pa,pb,max_error=3,seed=271828)
         name=f'{a["camera"]}{a["frame_index"]:05d}__{b["camera"]}{b["frame_index"]:05d}'
         row={'label':name,'a':a['name'],'b':b['name'],'raw_count':len(matches),
-             'eligible_matches':len(train),**metrics}
+             'eligible_matches':len(matches),**metrics}
         candidate=None
         if metrics['success']:
-            inliers=train[arrays['verified_mask']]
+            inliers=matches[arrays['verified_mask']]
             candidate={**row,'inliers':inliers,'pose':arrays['pose_cam_b_from_a'],
                        'essential':arrays['essential'],
                        'angles':arrays['triangulation_angle_degrees'][arrays['verified_mask']]}
@@ -118,7 +117,7 @@ def _build_mapping_inputs(directory, scene, images, entries, features, initial_m
         if candidate is not None:candidates.append(candidate)
         write_json(directory/'geometry'/f'{row["label"]}.json',row)
         if i%40==0 or i==len(entries):
-            print(f'{directory.name}: train E verification {i}/{len(entries)}',flush=True)
+            print(f'{directory.name}: E verification {i}/{len(entries)}',flush=True)
     graph=rotation_graph_diagnostics([(r['a'],r['b'],r['pose'][:,:3],r['label']) for r in candidates],records)
     write_json(directory/'rotation_cycles.json',graph)
     closure={r['label']:r for r in graph['pairs']}
@@ -133,14 +132,16 @@ def _build_mapping_inputs(directory, scene, images, entries, features, initial_m
         'pairs':len(entries),'successful_E_pairs':len(candidates),'database_pairs':len(accepted),
         'rotation_consensus_excluded':[r['label'] for r in candidates if r['excluded_by_rotation_consensus']],
         'note':'Rotation-median screening is a robust heuristic, not a ground-truth edge label.'})
-    # Prefer a same-camera baseline with large support. No navigation pose enters.
-    seeds=[r for r in accepted if records[r['a']]['camera']==records[r['b']]['camera']
-           and len(r['inliers'])>=100 and np.median(r['angles'])>=2
-           and (closure[r['label']]['rotation_closure_degrees']['median'] or 0)<2]
-    if not seeds:
-        raise RuntimeError('No well-supported image-only fisheye seed')
-    seeds.sort(key=lambda r:len(r['inliers'])*min(float(np.median(r['angles'])),10),reverse=True)
-    seed=seeds[0]
+    seed = None
+    if initial is None:
+        # A reused calibration model already supplies the image-only seed.
+        seeds=[r for r in accepted if records[r['a']]['camera']==records[r['b']]['camera']
+               and len(r['inliers'])>=100 and np.median(r['angles'])>=2
+               and (closure[r['label']]['rotation_closure_degrees']['median'] or 0)<2]
+        if not seeds:
+            raise RuntimeError('No well-supported image-only fisheye seed')
+        seeds.sort(key=lambda r:len(r['inliers'])*min(float(np.median(r['angles'])),10),reverse=True)
+        seed=seeds[0]
     path=directory/'database.db'
     if path.exists():
         raise FileExistsError(f'Database already exists without completed mapping: {path}')

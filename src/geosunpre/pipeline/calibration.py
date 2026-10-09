@@ -4,32 +4,40 @@ from pathlib import Path
 
 import pycolmap
 
-from geosunpre.config import CONFIG_FILE, load_config
+from geosunpre.config import CONFIG_FILE
+from geosunpre.sfm.calibration_selection import select_calibration
 from geosunpre.sfm.reconstruction import STAGES
 from geosunpre.sfm.reconstruction import bounded_bundle_adjustment
 from geosunpre.sfm.reconstruction import cheirality_health
 from geosunpre.sfm.reconstruction import database_and_seed
 from geosunpre.sfm.reconstruction import mapper_options, map_from_inputs
-from geosunpre.artifacts import file_metadata
-from geosunpre.artifacts import write_json, staged_directory
+from geosunpre.artifacts import file_metadata, staged_directory, write_frozen_json, write_json
 from geosunpre.colmap import MODEL_FILES, model_files
 from geosunpre.pipeline.observations import SCOPE, protocol_identity
-from geosunpre.artifacts import write_frozen_json
 
 
 def prepare_calibration(work):
-    """Reuse global feature IDs and source identities for the calibration segment."""
+    """Reuse global feature IDs and source identities for the calibration subset."""
     from geosunpre.pipeline.data import load_frontend
 
     _, global_scene, global_data, features = load_frontend(work)
     out = Path(work).resolve() / 'calibration'
-    images = load_config(work).calibration_images(global_scene)
+    selection_path = out / 'selection.json'
+    if selection_path.is_file():
+        selection = json.loads(selection_path.read_text())
+        selected = set(selection['image_names'])
+        images = [row for row in global_scene['images'] if row['name'] in selected]
+        if len(images) != len(selected):
+            raise ValueError('Calibration selection differs from the frozen scene')
+    else:
+        images, selection = select_calibration(global_scene, global_data['pairs'], features)
+        write_frozen_json(selection_path, selection)
     names = {row['name'] for row in images}
     if not (out / 'run_contract.json').exists() and any(
             (out / name).exists() for name in ('mapping_inputs', 'mapping', 'mapper_output', 'stages')):
         raise ValueError('Uncontracted local geometry exists; use a fresh work directory')
     scene = {**global_scene, 'images': images,
-             'scope': 'Local calibration from all eligible frozen global observations.'}
+             'scope': 'Automatically selected calibration support from frozen global observations.'}
     write_frozen_json(out / 'manifest.json', scene)
     data = {'version': 2, 'scene_manifest_file': file_metadata(out / 'manifest.json'),
             'config': global_data['config'],
@@ -45,7 +53,7 @@ def prepare_calibration(work):
 
 
 def _calibration_artifacts():
-    files = ['manifest.json', 'frontend.json', 'run_contract.json']
+    files = ['manifest.json', 'frontend.json', 'run_contract.json', 'selection.json']
     files += [f'mapping/{name}' for name in MODEL_FILES]
     files.append('mapping/identity.json')
     for stage in STAGES:
@@ -78,7 +86,7 @@ def verify_calibration(work):
 
 
 def calibrate(work):
-    """Fit the configured calibration subset from frozen global observations."""
+    """Fit automatically selected support from frozen global observations."""
     out, scene, data, features = prepare_calibration(work)
     if (out / 'calibration_identity.json').exists():
         verify_calibration(work)
@@ -87,6 +95,7 @@ def calibrate(work):
     images = [records[name] for name in data['image_names']]
     contract = {
         'geometry_pipeline_version': 2, 'scene_manifest_file': file_metadata(out / 'manifest.json'),
+        'selection_file': file_metadata(out / 'selection.json'),
         **protocol_identity(work),
         'pipeline_config_file': data['pipeline_config_file'],
         'frontend_config': data['config'],

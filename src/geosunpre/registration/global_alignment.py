@@ -8,7 +8,8 @@ import pycolmap
 from geosunpre.artifacts import file_metadata, staged_directory, write_json
 from geosunpre.colmap import model_files
 from geosunpre.registration.geometry import (error_summary, matrix4, quantiles,
-    refine_similarity, residuals, robust_similarity, spatial_split, transform_points)
+    refine_similarity, residuals, robust_similarity, transform_points)
+from geosunpre.registration.sampling import sampling_scales, spatial_regions
 from geosunpre.registration.las import sample_las
 from geosunpre.registration.publication import complete_publication
 from geosunpre.scene import load_poses, parse_name
@@ -153,33 +154,36 @@ def register_global(model_path, inputs, output, *, workers=4, context=None):
     original = pycolmap.Reconstruction(model_path)
     initial, initialization = navigation_initialization(inputs['input_root'], original)
     target, las_metadata = sample_las(las, max_points=MAX_LAS_POINTS)
+    scales = sampling_scales(target, las_metadata, inputs['settings'], initialization, workers=workers)
     point_ids = np.array(sorted(original.points3D), dtype=np.uint64)
     xyz = np.array([original.points3D[int(pid)].xyz for pid in point_ids])
     quality = np.array([original.points3D[int(pid)].error <= 2.
                         and original.points3D[int(pid)].track.length() >= 4 for pid in point_ids])
     partition_all = transform_points(initial, xyz)
-    lower, upper = np.array(las_metadata['bounds_min']) - .8, np.array(las_metadata['bounds_max']) + .8
+    margin = scales['correspondence_distances'][0]
+    lower, upper = np.array(las_metadata['bounds_min']) - margin, np.array(las_metadata['bounds_max']) + margin
     eligible = quality & np.all((partition_all >= lower) & (partition_all <= upper), axis=1)
     source, selected_ids = xyz[eligible], point_ids[eligible]
     initial_points = partition_all[eligible]
-    holdout, tiles, split = spatial_split(initial_points)
-    if holdout.sum() < 100 or (~holdout).sum() < 100:
-        raise ValueError('Insufficient fit/diagnostic points in the LAS overlap')
+    if len(source) < 100:
+        raise ValueError('Insufficient eligible visual points in the LAS overlap')
+    tiles, regions = spatial_regions(initial_points)
     print(f'Registration: {len(source)} visual points, {len(target)} LAS samples', flush=True)
-    final, optimization, surface = refine_similarity(source[~holdout], target, initial,
-                                                     tiles_fit=tiles[~holdout], workers=workers)
+    final, optimization, surface = refine_similarity(source, target, initial,
+        tiles_fit=tiles, workers=workers, voxel_sizes=scales['voxel_sizes'],
+        correspondence_distances=scales['correspondence_distances'])
     final_points = transform_points(final, source)
     distances, plane, nearest = residuals(final_points, surface, workers=workers)
-    supported = (distances <= .3) & surface['valid'][nearest]
+    supported = (distances <= scales['support_distance']) & surface['valid'][nearest]
     transformed = pycolmap.Reconstruction(original)
     transformed.transform(pycolmap.Sim3d(final[:3]))
     report = {'version': 1, 'inputs_file': inputs['inputs_file'],
               'inputs': {'model': str(model_path), 'las': str(las),
                          'visual_model_files': source_files, 'input_files': inputs['input_files']},
               'initialization': initialization, 'las': las_metadata,
-              'split': split, 'optimization': optimization,
-              'errors': {label: error_summary(final_points[mask], surface, workers=workers)
-                         for label, mask in (('fit', ~holdout), ('diagnostic', holdout))},
+              'regions': regions, 'sampling_scales': scales, 'optimization': optimization,
+              'errors': {'fit': error_summary(final_points, surface,
+                  support_distance=scales['support_distance'], workers=workers)},
               'scope': 'Fit-region delivery checks; no independent absolute accuracy validation.'}
     with staged_directory(output) as stage:
         model = stage / 'sparse/0'
@@ -190,7 +194,7 @@ def register_global(model_path, inputs, output, *, workers=4, context=None):
         write_json(stage / 'transform.json', {'matrix': final.tolist(), 'initial_matrix': initial.tolist(),
                                             'report_file': file_metadata(stage / 'report.json')})
         np.savez_compressed(stage / 'registration_points.npz', point_ids=selected_ids, tiles=tiles,
-                            holdout=holdout, partition_xyz=initial_points,
+                            partition_xyz=initial_points,
                             initial_xyz=initial_points, final_xyz=final_points,
                             nearest_distance=distances, signed_plane_error=plane,
                             stable_surface_supported=supported, surface_normals=surface['normals'][nearest])
