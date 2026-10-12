@@ -108,7 +108,7 @@ void Run(const Arguments& args) {
   Json state = fs::exists(state_path) ? ReadJson(state_path) : Json::object();
   if (!state.empty() && state.at("version") != 1)
     throw std::runtime_error("Unsupported work format; choose a new work directory");
-  if (!state.empty() && state.value("pipeline_version", 0) != 2)
+  if (!state.empty() && state.value("pipeline_version", 0) != 3)
     throw std::runtime_error("Reconstruction implementation changed; choose a new work directory");
   const auto input = args.Get("--input").empty() ? fs::u8path(state.at("input").get<std::string>())
                                                  : args.Path("--input");
@@ -126,7 +126,7 @@ void Run(const Arguments& args) {
   ReadLasHeader(scene.las);
   const auto prepared = scene.ToJson();
   if (state.empty()) {
-    state = {{"version", 1},         {"pipeline_version", 2}, {"input", scene.input.u8string()},
+    state = {{"version", 1},         {"pipeline_version", 3}, {"input", scene.input.u8string()},
              {"settings", settings}, {"scene", prepared},     {"stages", Json::object()}};
     WriteJson(work / "scene.json", prepared);
   } else if (state.at("scene") != prepared || state.at("settings") != settings)

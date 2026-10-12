@@ -75,6 +75,7 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
   Json rows = Json::array(), failures = Json::array();
   std::vector<double> errors;
   std::array<std::vector<double>, 2> by_camera;
+  std::array<std::array<std::vector<double>, 4>, 2> by_angle;
   uint64_t invalid = 0;
   size_t active = 0;
   for (const auto& p : points)
@@ -101,6 +102,10 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
         errors.push_back(r);
         by_camera[image.camera].push_back(r);
         const auto& xy = image.pixels[k];
+        const double angle =
+            std::acos(std::clamp(scene.cameras[image.camera].Ray(xy).z(), -1., 1.));
+        const int bin = std::clamp(int(angle * 180 / 3.14159265358979323846 / 20), 0, 3);
+        by_angle[image.camera][bin].push_back(r);
         cells.insert(std::clamp(int(xy.x() / c.width * 8), 0, 7) +
                      8 * std::clamp(int(xy.y() / c.height * 8), 0, 7));
       }
@@ -117,9 +122,20 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
     failures.push_back("Nonpositive depth or nonfinite projection");
   if (errors.empty() || Quantile(errors, .5) > median_limit || Quantile(errors, .9) > p90_limit)
     failures.push_back("Global reprojection error exceeds limit");
+  Json calibration = Json::object();
   for (int cid = 0; cid < 2; ++cid) {
     cameras[cid].Radius();
     const auto& base = scene.cameras[cid].params;
+    Json bins = Json::array();
+    for (int bin = 0; bin < 4; ++bin)
+      bins.push_back({{"angle_degrees", {bin * 20, (bin + 1) * 20}},
+                      {"reprojection_px", Statistics(by_angle[cid][bin])}});
+    calibration[cameras[cid].label] = {
+        {"initial_params", base},
+        {"params", cameras[cid].params},
+        {"principal_shift_px",
+         {cameras[cid].params[2] - base[2], cameras[cid].params[3] - base[3]}},
+        {"reprojection_by_angle", bins}};
     const std::array<double, 8> bounds = {base[0] * .1, base[1] * .1, 50, 50, .05, .02, .01, .005};
     for (int j = 0; j < 8; ++j)
       if (std::abs(cameras[cid].params[j] - base[j]) >= bounds[j] * (1 - 1e-4))
@@ -130,6 +146,7 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
       failures.push_back("Camera reprojection error exceeds limit: " + cameras[cid].label);
   }
   return {{"passed", failures.empty()},
+          {"calibration", calibration},
           {"failures", failures},
           {"registered_images", Registered()},
           {"expected_images", scene.images.size()},

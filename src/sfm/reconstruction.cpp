@@ -834,28 +834,26 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       throw RegistrationIncomplete(missing.get<std::vector<uint32_t>>());
     }
   }
-  optimization.push_back(Optimize(m, scene.cameras, "focal", workers, 150));
-  m.Filter();
-  completion.push_back(CompleteTracks(m, graph, points));
-  optimization.push_back(Optimize(m, scene.cameras, "radial", workers, 150));
-  m.Filter();
-  completion.push_back(CompleteTracks(m, graph, points));
+  // Growth has already refined focal length and distortion. Calibrate the
+  // complete image set once, hold intrinsics while incorporating new tracks,
+  // then finish with a strict joint refinement of all parameters.
+  optimization.push_back(Optimize(m, scene.cameras, "principal", workers, 150));
   for (int round = 0; round < 3; ++round) {
-    optimization.push_back(Optimize(m, scene.cameras, "principal", workers, 200));
     const size_t before = m.Observations();
     m.Filter();
     const size_t removed = before - m.Observations();
-    if (round == 2)
-      break;
     auto completed = CompleteTracks(m, graph, points);
     const size_t total_removed = removed + completed.at("removed_observations").get<size_t>();
     const size_t changed = total_removed + completed.at("added_observations").get<size_t>();
     completed["removed_observations"] = total_removed;
     completion.push_back(std::move(completed));
-    if (changed <= std::max<size_t>(1, size_t(before * .0005)) &&
-        optimization.back().at("converged").get<bool>())
+    if (round == 2 || (changed <= std::max<size_t>(1, size_t(before * .0005)) &&
+                       optimization.back().at("converged").get<bool>()))
       break;
+    optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 100));
   }
+  optimization.push_back(Optimize(m, scene.cameras, "principal", workers, 200));
+  m.Filter();
   for (uint32_t id = 0; id < m.images.size(); ++id) {
     const auto rgb = ReadImage(scene.images[id].source, cv::IMREAD_COLOR);
     for (uint32_t k = 0; k < m.images[id].points.size(); ++k)

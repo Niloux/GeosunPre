@@ -23,6 +23,8 @@ points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重
 
 manifest 协议版本 1，保存请求、图像身份、文件大小、初始化参数。quality 保存所选模型拟合验收和限值。省略 PLY 时不生成 initialization.json，清单中的 initialization 为 null。
 
+quality.calibration 保存两镜头的初始与最终内参、主点偏移，以及每 20° 入射角区间的重投影误差。角度按初始标定计算，便于比较镜头中心与边缘；这些统计是拟合诊断，不代表独立精度。
+
 同级 `.pending` 中完成写入及回读后重命名发布。同一请求的完整包可复用，不同请求拒绝覆盖。`check --output` 只依赖交付包，检查结构、引用、尺寸、PLY 和几何拟合，不代表独立精度或渲染效果。
 
 格式依据：[COLMAP output format](https://colmap.github.io/format.html)。

@@ -4,7 +4,7 @@
 
 scene.json 保存曝光、初始相机和输入元数据。state.json 版本 1，保存冻结场景、配置、模型元数据和阶段产物元数据。文件变化时拒绝复用；输入、配置或模型改变时使用新 work。
 
-state.json 的 pipeline_version=2 标识当前重建实现；旧实现的 work 不直接复用，需使用新目录。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，最终 result.json 同时包含此报告。导航误差按最终所选模型计算。
+state.json 的 pipeline_version=3 标识当前重建实现；旧实现的 work 不直接复用，需使用新目录。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，最终 result.json 同时包含此报告。导航误差按最终所选模型计算。
 
 `cache/features/索引.bin`：字符串标记 `GEOSUN_FEATURES_1`；uint32 image、dimension；uint64 N（32–3072）；N 条 float32 `(x,y,nx,ny,score)`；N×256 个 float32 描述子；256 个 float32 检索向量（描述子均值的 L2 归一化）。
 

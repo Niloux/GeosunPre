@@ -2,42 +2,110 @@
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
 #include <ceres/product_manifold.h>
+#include <algorithm>
+#include <cmath>
 
 namespace geosun {
 namespace {
-template <class T>
-void Transform(const T* pose, const T* point, T* output) {
-  const T q[] = {pose[3], pose[0], pose[1], pose[2]};
-  ceres::QuaternionRotatePoint(q, point, output);
-  for (int i = 0; i < 3; ++i)
-    output[i] += pose[4 + i];
-}
 template <class T>
 void Center(const T* pose, T* out) {
   const T q[] = {pose[3], -pose[0], -pose[1], -pose[2]}, t[] = {-pose[4], -pose[5], -pose[6]};
   ceres::QuaternionRotatePoint(q, t, out);
 }
-struct Reprojection {
+Eigen::Matrix<double, 3, 4> RotationJacobian(const Eigen::Quaterniond& unit,
+                                             const Eigen::Vector3d& point,
+                                             const Eigen::Vector3d& rotated, double norm) {
+  const Eigen::Vector3d u = unit.vec();
+  Eigen::Matrix3d cross;
+  cross << 0, -point.z(), point.y(), point.z(), 0, -point.x(), -point.y(), point.x(), 0;
+  Eigen::Matrix<double, 3, 4> j;
+  j.leftCols<3>() = 2 * (u.dot(point) * Eigen::Matrix3d::Identity() + u * point.transpose() -
+                         point * u.transpose() - unit.w() * cross);
+  j.col(3) = 2 * (unit.w() * point + u.cross(point));
+  // QuaternionRotatePoint normalizes the ambient quaternion. Account for that
+  // normalization before Ceres applies the unit-quaternion manifold.
+  j -= 2 * rotated * unit.coeffs().transpose();
+  return j / norm;
+}
+struct Reprojection : ceres::SizedCostFunction<2, 7, 3, 8> {
   Eigen::Vector2d pixel;
-  template <class T>
-  bool operator()(const T* pose, const T* point, const T* cam, T* residual) const {
-    T v[3];
-    Transform(pose, point, v);
-    const T r = ceres::sqrt(v[0] * v[0] + v[1] * v[1] + T(1e-24));
-    const T theta = ceres::atan2(r, v[2]), t2 = theta * theta;
-    const T d = theta * (T(1) + t2 * (cam[4] + t2 * (cam[5] + t2 * (cam[6] + t2 * cam[7])))) / r;
-    residual[0] = cam[0] * v[0] * d + cam[2] - T(pixel.x());
-    residual[1] = cam[1] * v[1] * d + cam[3] - T(pixel.y());
+  explicit Reprojection(const Eigen::Vector2d& measurement) : pixel(measurement) {}
+  bool Evaluate(double const* const* parameters, double* residual,
+                double** jacobians) const override {
+    const auto* pose = parameters[0];
+    const Eigen::Map<const Eigen::Vector3d> point(parameters[1]);
+    Eigen::Quaterniond rotation(pose[3], pose[0], pose[1], pose[2]);
+    const double norm = rotation.norm();
+    rotation.coeffs() /= norm;
+    const Eigen::Vector3d rotated = rotation * point;
+    const Eigen::Vector3d v = rotated + Eigen::Map<const Eigen::Vector3d>(pose + 4);
+    Camera camera;
+    std::copy_n(parameters[2], 8, camera.params.begin());
+    Eigen::Map<Eigen::Vector2d> output(residual);
+    output = camera.Project(v) - pixel;
+    if (!jacobians)
+      return true;
+    const auto j = camera.ProjectionJacobian(v);
+    if (jacobians[0]) {
+      Eigen::Map<Eigen::Matrix<double, 2, 7, Eigen::RowMajor>> pose_j(jacobians[0]);
+      pose_j.leftCols<4>() = j * RotationJacobian(rotation, point, rotated, norm);
+      pose_j.rightCols<3>() = j;
+    }
+    if (jacobians[1]) {
+      Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[1]);
+      point_j = j * rotation.toRotationMatrix();
+    }
+    if (jacobians[2]) {
+      Eigen::Map<Eigen::Matrix<double, 2, 8, Eigen::RowMajor>> camera_j(jacobians[2]);
+      camera_j.setZero();
+      const auto& cam = camera.params;
+      const double r = std::hypot(v.x(), v.y()), theta = std::atan2(r, v.z()), t2 = theta * theta;
+      const double d =
+          r < 1e-15 ? 1 / v.z()
+                    : theta * (1 + t2 * (cam[4] + t2 * (cam[5] + t2 * (cam[6] + t2 * cam[7])))) / r;
+      camera_j(0, 0) = v.x() * d;
+      camera_j(1, 1) = v.y() * d;
+      camera_j(0, 2) = camera_j(1, 3) = 1;
+      double power = theta * t2;
+      for (int k = 4; k < 8; ++k) {
+        const double radial = r < 1e-15 ? 0 : power / r;
+        camera_j(0, k) = cam[0] * v.x() * radial;
+        camera_j(1, k) = cam[1] * v.y() * radial;
+        power *= t2;
+      }
+    }
     return true;
   }
 };
-struct Depth {
+struct Depth : ceres::SizedCostFunction<1, 7, 3> {
   double minimum, gain;
-  template <class T>
-  bool operator()(const T* pose, const T* point, T* residual) const {
-    T v[3];
-    Transform(pose, point, v);
-    residual[0] = v[2] < T(minimum) ? T(gain) * (T(minimum) - v[2]) : T(0);
+  Depth(double minimum_depth, double weight) : minimum(minimum_depth), gain(weight) {}
+  bool Evaluate(double const* const* parameters, double* residual,
+                double** jacobians) const override {
+    const auto* pose = parameters[0];
+    const Eigen::Map<const Eigen::Vector3d> point(parameters[1]);
+    Eigen::Quaterniond rotation(pose[3], pose[0], pose[1], pose[2]);
+    const double norm = rotation.norm();
+    rotation.coeffs() /= norm;
+    const Eigen::Vector3d rotated = rotation * point;
+    const bool active = rotated.z() + pose[6] < minimum;
+    residual[0] = active ? gain * (minimum - rotated.z() - pose[6]) : 0;
+    if (jacobians) {
+      if (jacobians[0]) {
+        Eigen::Map<Eigen::Matrix<double, 1, 7, Eigen::RowMajor>> pose_j(jacobians[0]);
+        pose_j.setZero();
+        if (active) {
+          pose_j.leftCols<4>() = -gain * RotationJacobian(rotation, point, rotated, norm).row(2);
+          pose_j[6] = -gain;
+        }
+      }
+      if (jacobians[1]) {
+        Eigen::Map<Eigen::RowVector3d> point_j(jacobians[1]);
+        point_j.setZero();
+        if (active)
+          point_j = -gain * rotation.toRotationMatrix().row(2);
+      }
+    }
     return true;
   }
 };
@@ -97,9 +165,8 @@ void RefinePose(const Camera& camera, Pose& pose, const std::vector<Eigen::Vecto
   ceres::Problem problem;
   auto* loss = new ceres::HuberLoss(2.);
   for (size_t i = 0; i < points.size(); ++i) {
-    problem.AddResidualBlock(
-        new ceres::AutoDiffCostFunction<Reprojection, 2, 7, 3, 8>(new Reprojection{pixels[i]}),
-        loss, pose.params.data(), fixed_points[i].data(), calibration.data());
+    problem.AddResidualBlock(new Reprojection(pixels[i]), loss, pose.params.data(),
+                             fixed_points[i].data(), calibration.data());
     problem.SetParameterBlockConstant(fixed_points[i].data());
   }
   problem.SetParameterBlockConstant(calibration.data());
@@ -140,13 +207,11 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         const double depth = image.pose.Apply(p.xyz).z();
         if (depth <= 0)
           throw std::runtime_error("BA requires positive initial depth");
-        problem.AddResidualBlock(new ceres::AutoDiffCostFunction<Reprojection, 2, 7, 3, 8>(
-                                     new Reprojection{image.pixels[o.feature]}),
-                                 loss, image.pose.params.data(), p.xyz.data(),
+        problem.AddResidualBlock(new Reprojection(image.pixels[o.feature]), loss,
+                                 image.pose.params.data(), p.xyz.data(),
                                  m.cameras[image.camera].params.data());
-        problem.AddResidualBlock(
-            new ceres::AutoDiffCostFunction<Depth, 1, 7, 3>(new Depth{.05 * depth, 1000 / depth}),
-            nullptr, image.pose.params.data(), p.xyz.data());
+        problem.AddResidualBlock(new Depth(.05 * depth, 1000 / depth), nullptr,
+                                 image.pose.params.data(), p.xyz.data());
         used_images.insert(o.image);
         used_cameras.insert(image.camera);
       }
