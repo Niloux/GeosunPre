@@ -129,6 +129,7 @@ def generate_masks(scene, output, frames, *, model_cache=None):
     metadata = {
         'model': MODEL, 'revision': revision,
         'excluded_labels': sorted(EXCLUDED),
+        'mask_values': {'static': 255, 'sky': 128, 'person': 0},
         'inference_domain': 'Five overlapping 100-degree virtual pinhole views, probability fusion in native coordinates',
         'thresholds': {'sky': .90, 'person': .55},
         'boundary_policy': 'Erode excluded sky by 3 grid pixels; dilate person by 3 grid pixels on 900x1200 grid',
@@ -192,9 +193,10 @@ def generate_masks(scene, output, frames, *, model_cache=None):
             full=np.zeros((cam.height,cam.width),dtype=np.uint8)
             full[sky]=1;full[person]=2
             valid=full==0
+            semantic=np.array([255,128,0],dtype=np.uint8)[full]
             for p in (path,label_path,info_path):
                 p.parent.mkdir(parents=True,exist_ok=True)
-            for target, array in ((path, valid.astype(np.uint8)*255), (label_path, full)):
+            for target, array in ((path, semantic), (label_path, full)):
                 temporary = target.with_suffix('.tmp.png')
                 Image.fromarray(array).save(temporary)
                 temporary.replace(target)
@@ -227,12 +229,13 @@ def mask_contact_sheet(scene, images, path, selected_frames):
         if record['frame_index'] not in selected_frames:
             continue
         im = Image.open(record['source']).convert('RGB').resize((320,426))
-        sem = Image.open(record['semantic_mask']).resize(im.size,Image.Resampling.NEAREST)
+        sem = np.asarray(Image.open(record['semantic_mask']).resize(im.size,Image.Resampling.NEAREST))
         arr = np.asarray(im).copy()
         invalid = fovs[record['camera']]
-        ignored = (np.asarray(sem)==0)&~invalid
         arr[invalid] = (arr[invalid]*.2).astype(np.uint8)
-        arr[ignored] = (arr[ignored]*.45+np.array([150,20,20])*.55).astype(np.uint8)
+        for value,color in {128:(60,150,255),0:(150,20,20)}.items():
+            ignored = (sem==value)&~invalid
+            arr[ignored] = (arr[ignored]*.45+np.array(color)*.55).astype(np.uint8)
         x=selected_frames.index(record['frame_index'])*320
         y=(0 if record['camera']=='L' else 1)*440
         canvas.paste(Image.fromarray(arr),(x,y+14))
@@ -293,7 +296,7 @@ def mask_review(scene,output, *, segments=None):
 语义边界是近似筛选，不是真值。这里只展示进入 SfM 的原生图像域掩码，虚拟视图没有新增相机或曝光。</p>
 <p>展示本轮全部 '''+str(len(scene['images']))+''' 张图像，按帧号并排排列 L/R；此排列不表示同步曝光。每幅预览左边是原图，右边是掩码，点击可放大。
 圆形暗边来自初始内参下的 160° FOV 候选，并非语义识别边界；160° 尚不是实测真值。</p>
-<p><a href="masks/summary.json">掩码统计</a>。masks/valid 保存天空和人物的语义掩码；最终导出的 masks 还会叠加 FOV。</p>
+<p><a href="masks/summary.json">掩码统计</a>。masks/valid 中静态区域为 255、天空为 128、人物为 0；最终导出的 masks 还会将 FOV 外设为 0。</p>
 <label>片段 <select id="segment"><option value="all">全部</option>'''+options+'''</select></label>'''+''.join(cards)+'''
 <script>document.getElementById('segment').onchange=function(){document.querySelectorAll('details[data-segment]').forEach(d=>{d.hidden=this.value!=='all'&&d.dataset.segment!==this.value})}</script></html>'''
     (output/'mask_review.html').write_text(body)

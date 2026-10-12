@@ -137,14 +137,16 @@ def verify_colmap_export(output):
 
 def _export_mask(record, scene, destination):
     camera = Camera.from_dict(scene['cameras'][record['camera']])
-    valid = camera.mask(scene['fov_degrees']) > 0
+    exported = camera.mask(scene['fov_degrees'])
+    valid = exported > 0
     if record.get('semantic_mask'):
         with Image.open(record['semantic_mask']) as mask:
             if mask.size != (camera.width, camera.height):
                 raise ValueError(f'Mask/image dimensions differ: {record["name"]}')
-            valid &= np.asarray(mask.convert('L')) >= 128
+            exported = np.asarray(mask.convert('L')).copy()
+        exported[~valid] = 0
     destination.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(valid.astype(np.uint8) * 255).save(destination)
+    Image.fromarray(exported).save(destination)
 
 
 def _export_request(source_files, scene, *, image_mode, include_masks, include_ply,

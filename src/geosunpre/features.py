@@ -13,7 +13,6 @@ from geosunpre.camera import Camera
 from geosunpre.artifacts import file_metadata
 
 LOMA_COMMIT = '8fb59c458f2a2ef44314f462467b229c27786bf0'
-FRONTEND_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -24,7 +23,6 @@ class FrontendConfig:
     grid_size: int = 8
     match_threshold: float = .1
     loma_commit: str = LOMA_COMMIT
-    implementation_version: int = FRONTEND_VERSION
 
 
 FRONTEND_CONFIG = FrontendConfig()
@@ -175,7 +173,7 @@ class LoMaFrontend:
             valid = cam.valid(pixels, self.scene['fov_degrees'])
             if record['semantic_mask']:
                 with Image.open(record['semantic_mask']) as im:
-                    mask = np.asarray(im.convert('L')) >= 128
+                    mask = np.asarray(im.convert('L')) == 255
                 ij = np.floor(pixels).astype(int)
                 ij[:, 0] = ij[:, 0].clip(0, cam.width-1)
                 ij[:, 1] = ij[:, 1].clip(0, cam.height-1)
