@@ -16,6 +16,7 @@ struct Camera {
   bool Valid(double x, double y, double fov = 160) const;
   cv::Mat Mask(double fov = 160) const;
   Eigen::Vector2d Project(const Eigen::Vector3d& xyz) const;
+  Eigen::Matrix<double, 2, 3> ProjectionJacobian(const Eigen::Vector3d& xyz) const;
   Eigen::Vector3d Ray(const Eigen::Vector2d& pixel) const;
 };
 struct Pose {

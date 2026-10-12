@@ -113,25 +113,33 @@ class FeatureCache {
   std::list<uint32_t> order;
   struct Entry {
     FeatureSet value;
+    Tensor keypoints, descriptors, mask;
     std::list<uint32_t>::iterator position;
   };
   std::map<uint32_t, Entry> entries;
 
  public:
   explicit FeatureCache(fs::path path) : work(std::move(path)) {}
-  const FeatureSet& Get(uint32_t id) {
+  const Entry& Get(uint32_t id) {
     auto it = entries.find(id);
     if (it != entries.end()) {
       order.splice(order.begin(), order, it->second.position);
-      return it->second.value;
+      return it->second;
     }
     if (entries.size() >= 48) {
       entries.erase(order.back());
       order.pop_back();
     }
     order.push_front(id);
-    auto entry = entries.emplace(id, Entry{ReadFeatures(FeaturePath(work, id)), order.begin()});
-    return entry.first->second.value;
+    Entry entry;
+    entry.value = ReadFeatures(FeaturePath(work, id));
+    const auto n = entry.value.pixels.size();
+    entry.keypoints = Tensor::Upload({1, 3072, 2}, entry.value.normalized[0].data(), n * 2);
+    entry.descriptors = Tensor::Upload({1, 3072, 256}, entry.value.descriptors.data(), n * 256);
+    const std::vector<float> mask(n, 1.f);
+    entry.mask = Tensor::Upload({1, 3072}, mask.data(), mask.size());
+    entry.position = order.begin();
+    return entries.emplace(id, std::move(entry)).first->second;
   }
 };
 }  // namespace
@@ -215,13 +223,17 @@ void MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
     auto image = ReadImage(record.source, cv::IMREAD_COLOR);
     cv::cvtColor(image, image, cv::COLOR_BGR2RGB);
     const auto detected =
-        models.Predict("detector", {ImageTensor(BicubicResize(image, width, height))})[0];
-    const auto raw = DetectKeypoints(detected, width, height, 12288);
+        models.Predict("detector", {ImageTensor(BicubicResize(image, width, height))}, true)[0];
+    const auto raw = DetectKeypoints(detected, width, height, 12288, models.Stream());
     const auto mask = ReadImage(MaskPath(work, record.id), cv::IMREAD_GRAYSCALE);
     std::vector<std::array<float, 3>> candidates;
+    const double radius = camera.Radius();
     for (const auto& point : raw) {
       const float x = (point[0] + 1) * camera.width / 2, y = (point[1] + 1) * camera.height / 2;
-      if (camera.Valid(x, y) && mask.at<uint8_t>(int(y), int(x)) == 255)
+      const double dx = (x - camera.params[2]) / camera.params[0],
+                   dy = (y - camera.params[3]) / camera.params[1];
+      if (x >= 0 && y >= 0 && x < camera.width && y < camera.height &&
+          dx * dx + dy * dy <= radius * radius && mask.at<uint8_t>(int(y), int(x)) == 255)
         candidates.push_back({x, y, point[2]});
     }
     const auto selected = Select(candidates, camera);
@@ -305,23 +317,10 @@ void MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
     if (!fs::exists(path)) {
       const auto& fa = cache.Get(a);
       const auto& fb = cache.Get(b);
-      const auto na = int64_t(fa.pixels.size()), nb = int64_t(fb.pixels.size());
+      const auto na = int64_t(fa.value.pixels.size()), nb = int64_t(fb.value.pixels.size());
       constexpr int64_t capacity = 3072;
-      std::vector<float> ka(capacity * 2), kb(capacity * 2), da(capacity * 256), db(capacity * 256),
-          ma(capacity), mb(capacity);
-      std::memcpy(ka.data(), fa.normalized[0].data(), na * 2 * sizeof(float));
-      std::memcpy(kb.data(), fb.normalized[0].data(), nb * 2 * sizeof(float));
-      std::copy(fa.descriptors.begin(), fa.descriptors.end(), da.begin());
-      std::copy(fb.descriptors.begin(), fb.descriptors.end(), db.begin());
-      std::fill(ma.begin(), ma.begin() + na, 1.f);
-      std::fill(mb.begin(), mb.begin() + nb, 1.f);
-      const auto output =
-          models.Predict("matcher", {Tensor::Float({1, capacity, 2}, ka.data(), ka.size()),
-                                     Tensor::Float({1, capacity, 2}, kb.data(), kb.size()),
-                                     Tensor::Float({1, capacity, 256}, da.data(), da.size()),
-                                     Tensor::Float({1, capacity, 256}, db.data(), db.size()),
-                                     Tensor::Float({1, capacity}, ma.data(), ma.size()),
-                                     Tensor::Float({1, capacity}, mb.data(), mb.size())});
+      const auto output = models.Predict("matcher", {fa.keypoints, fb.keypoints, fa.descriptors,
+                                                     fb.descriptors, fa.mask, fb.mask});
       if (output.size() != 2 || output[0].Count() != size_t(capacity) ||
           output[1].Count() != size_t(capacity))
         throw std::runtime_error("Unexpected matcher outputs");

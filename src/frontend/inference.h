@@ -23,11 +23,12 @@ struct Tensor {
   const float* Floats() const;
   int64_t Index(size_t i) const;
   static Tensor Float(std::vector<int64_t> shape, const float* data, size_t count);
+  static Tensor Upload(std::vector<int64_t> shape, const float* data, size_t count);
 };
 Tensor ImageTensor(const cv::Mat& rgb, const std::array<float, 3>& mean = {0, 0, 0},
                    const std::array<float, 3>& std = {1, 1, 1});
 std::vector<std::array<float, 3>> DetectKeypoints(const Tensor& logits, int width, int height,
-                                                  size_t maximum);
+                                                  size_t maximum, cudaStream_t stream = nullptr);
 class Models {
   struct Implementation;
   std::unique_ptr<Implementation> impl_;
@@ -36,7 +37,9 @@ class Models {
   explicit Models(const fs::path& root);
   ~Models();
   const Json& Manifest() const;
-  std::vector<Tensor> Predict(const std::string& model, const std::vector<Tensor>& inputs);
+  std::vector<Tensor> Predict(const std::string& model, const std::vector<Tensor>& inputs,
+                              bool device_output = false);
+  cudaStream_t Stream() const;
 };
 Json GpuInfo();
 }  // namespace geosun

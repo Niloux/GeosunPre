@@ -4,12 +4,14 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <Eigen/SVD>
+#include <Eigen/Eigenvalues>
 #include <atomic>
 #include <mutex>
 #include <thread>
 #include <numeric>
 #include <unordered_map>
 #include <set>
+#include <random>
 
 namespace geosun {
 namespace {
@@ -47,6 +49,70 @@ struct Pair {
   std::vector<Match> inliers;
   double angle = 0;
 };
+struct Measurement {
+  Eigen::Vector3d ray;
+  Eigen::Matrix<double, 3, 2> derivative;
+};
+Measurement Measure(const Camera& camera, const Eigen::Vector2d& pixel) {
+  Measurement m;
+  m.ray = camera.Ray(pixel);
+  const auto& p = camera.params;
+  const Eigen::Vector2d xy((pixel.x() - p[2]) / p[0], (pixel.y() - p[3]) / p[1]);
+  const double r = xy.norm();
+  if (r < 1e-7) {
+    m.derivative.setZero();
+    m.derivative(0, 0) = 1 / p[0];
+    m.derivative(1, 1) = 1 / p[1];
+    return m;
+  }
+  const double theta = std::atan2(m.ray.head<2>().norm(), m.ray.z()), t2 = theta * theta;
+  const double slope = 1 + t2 * (3 * p[4] + t2 * (5 * p[5] + t2 * (7 * p[6] + t2 * 9 * p[7])));
+  const double sine = std::sin(theta), cosine = std::cos(theta);
+  m.derivative.topRows<2>() = Eigen::Matrix2d::Identity() * (sine / r) +
+                              (cosine / (slope * r * r) - sine / (r * r * r)) * xy * xy.transpose();
+  m.derivative.row(2) = -sine / (slope * r) * xy.transpose();
+  m.derivative.col(0) /= p[0];
+  m.derivative.col(1) /= p[1];
+  return m;
+}
+double EpipolarSquared(const Eigen::Matrix3d& e, const Measurement& a, const Measurement& b) {
+  const Eigen::Vector3d ea = e * a.ray, eb = e.transpose() * b.ray;
+  const double value = b.ray.dot(ea);
+  const double gradient =
+      (a.derivative.transpose() * eb).squaredNorm() + (b.derivative.transpose() * ea).squaredNorm();
+  return value * value / std::max(gradient, 1e-24);
+}
+bool RefitEssential(const std::vector<Measurement>& a, const std::vector<Measurement>& b,
+                    const Eigen::Matrix3d& current, Eigen::Matrix3d& candidate) {
+  Eigen::Matrix<double, 9, 9> normal = Eigen::Matrix<double, 9, 9>::Zero();
+  size_t count = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (EpipolarSquared(current, a[i], b[i]) > 9)
+      continue;
+    const double gradient =
+        (a[i].derivative.transpose() * current.transpose() * b[i].ray).squaredNorm() +
+        (b[i].derivative.transpose() * current * a[i].ray).squaredNorm();
+    Eigen::Matrix<double, 9, 1> row;
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c)
+        row[3 * r + c] = b[i].ray[r] * a[i].ray[c];
+    normal.noalias() += row * row.transpose() / std::max(gradient, 1e-24);
+    ++count;
+  }
+  if (count < 8)
+    return false;
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 9, 9>> solve(normal);
+  if (solve.info() != Eigen::Success || solve.eigenvalues()[1] <= solve.eigenvalues()[8] * 1e-10)
+    return false;
+  const Eigen::Matrix<double, 9, 1> v = solve.eigenvectors().col(0);
+  Eigen::Matrix3d e;
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c)
+      e(r, c) = v[3 * r + c];
+  const auto svd = e.jacobiSvd(Eigen::ComputeFullU | Eigen::ComputeFullV);
+  candidate = svd.matrixU() * Eigen::Vector3d(1, 1, 0).asDiagonal() * svd.matrixV().transpose();
+  return candidate.allFinite();
+}
 Pair Verify(const Scene& scene, const Reconstruction& model, const MatchSet& matches) {
   Pair result{matches.a, matches.b};
   if (matches.matches.size() < 24)
@@ -54,21 +120,79 @@ Pair Verify(const Scene& scene, const Reconstruction& model, const MatchSet& mat
   const auto& ca = model.cameras[scene.images[matches.a].camera];
   const auto& cb = model.cameras[scene.images[matches.b].camera];
   std::vector<cv::Point2d> na, nb;
-  std::vector<Eigen::Vector3d> ra, rb;
+  std::vector<Measurement> ra, rb;
   for (const auto& m : matches.matches) {
-    const auto x = ca.Ray(model.images[matches.a].pixels.at(m.a)),
-               y = cb.Ray(model.images[matches.b].pixels.at(m.b));
+    const auto x = Measure(ca, model.images[matches.a].pixels.at(m.a)),
+               y = Measure(cb, model.images[matches.b].pixels.at(m.b));
     ra.push_back(x);
     rb.push_back(y);
-    na.emplace_back(x.x() / x.z(), x.y() / x.z());
-    nb.emplace_back(y.x() / y.z(), y.y() / y.z());
+    na.emplace_back(x.ray.x() / x.ray.z(), x.ray.y() / x.ray.z());
+    nb.emplace_back(y.ray.x() / y.ray.z(), y.ray.y() / y.ray.z());
   }
   const double focal = (ca.params[0] + ca.params[1] + cb.params[0] + cb.params[1]) / 4;
-  cv::Mat mask;
-  cv::Mat E =
-      cv::findEssentialMat(na, nb, 1., cv::Point2d(), cv::USAC_MAGSAC, .999, 3 / focal, mask);
-  if (E.empty() || E.rows != 3 || E.cols != 3)
+  Eigen::Matrix3d essential;
+  size_t best = 0;
+  double best_cost = INFINITY;
+  auto score = [&](const Eigen::Matrix3d& e) {
+    size_t support = 0;
+    double cost = 0;
+    for (size_t i = 0; i < ra.size(); ++i) {
+      const double error = EpipolarSquared(e, ra[i], rb[i]);
+      support += error <= 9;
+      cost += std::min(error, 9.);
+    }
+    if (support > best || (support == best && cost < best_cost)) {
+      best = support;
+      best_cost = cost;
+      essential = e;
+      return true;
+    }
+    return false;
+  };
+  const cv::Mat initial =
+      cv::findEssentialMat(na, nb, 1., cv::Point2d(), cv::USAC_MAGSAC, .999, 3 / focal);
+  for (int row = 0; row + 3 <= initial.rows; row += 3)
+    score(Matrix(initial.rowRange(row, row + 3)));
+  // Five-point hypotheses use perspective coordinates only for the minimal
+  // solve. Consensus and local refinement use the native fisheye pixel metric.
+  std::mt19937 rng(matches.a * 73856093u ^ matches.b * 19349663u);
+  std::uniform_int_distribution<size_t> choose(0, ra.size() - 1);
+  size_t trials = 1024;
+  for (size_t trial = 0; trial < trials; ++trial) {
+    std::array<size_t, 5> ids;
+    std::vector<cv::Point2d> sa, sb;
+    for (size_t k = 0; k < ids.size(); ++k) {
+      size_t id;
+      do {
+        id = choose(rng);
+      } while (std::find(ids.begin(), ids.begin() + k, id) != ids.begin() + k);
+      ids[k] = id;
+      sa.push_back(na[id]);
+      sb.push_back(nb[id]);
+    }
+    const cv::Mat hypotheses =
+        cv::findEssentialMat(sa, sb, 1., cv::Point2d(), cv::RANSAC, .999, 1e-6, 1);
+    for (int row = 0; row + 3 <= hypotheses.rows; row += 3)
+      score(Matrix(hypotheses.rowRange(row, row + 3)));
+    if (best >= 24) {
+      const double success = std::pow(double(best) / ra.size(), 5);
+      const double needed = success >= 1 ? 32 : std::ceil(std::log(.001) / std::log1p(-success));
+      trials = std::min(trials, size_t(std::clamp(needed, 32., 1024.)));
+    }
+  }
+  if (best < 24)
     return result;
+  for (int round = 0; round < 3; ++round) {
+    Eigen::Matrix3d candidate;
+    if (!RefitEssential(ra, rb, essential, candidate) || !score(candidate))
+      break;
+  }
+  cv::Mat E(3, 3, CV_64F), mask(int(ra.size()), 1, CV_8UC1);
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c)
+      E.at<double>(r, c) = essential(r, c);
+  for (size_t i = 0; i < ra.size(); ++i)
+    mask.at<uint8_t>(int(i)) = EpipolarSquared(essential, ra[i], rb[i]) <= 9 ? 255 : 0;
   cv::Mat rotation, translation;
   cv::recoverPose(E, na, nb, cv::Mat::eye(3, 3, CV_64F), rotation, translation, 10000, mask);
   if (rotation.empty())
@@ -76,7 +200,6 @@ Pair Verify(const Scene& scene, const Reconstruction& model, const MatchSet& mat
   result.relative.Set(
       Eigen::Quaterniond(Matrix(rotation)),
       {translation.at<double>(0), translation.at<double>(1), translation.at<double>(2)});
-  const auto essential = Matrix(E);
   const auto R = result.relative.Rotation();
   std::vector<double> angles;
   Pose origin;
@@ -86,25 +209,13 @@ Pair Verify(const Scene& scene, const Reconstruction& model, const MatchSet& mat
     const auto& m = matches.matches[i];
     const auto& xa = model.images[matches.a].pixels[m.a];
     const auto& xb = model.images[matches.b].pixels[m.b];
-    double gradient = 0;
-    for (int axis = 0; axis < 2; ++axis) {
-      Eigen::Vector2d ap = xa, am = xa, bp = xb, bm = xb;
-      ap[axis] += .25;
-      am[axis] -= .25;
-      bp[axis] += .25;
-      bm[axis] -= .25;
-      const double ga = rb[i].dot(essential * (ca.Ray(ap) - ca.Ray(am)) / .5),
-                   gb = ((cb.Ray(bp) - cb.Ray(bm)) / .5).dot(essential * ra[i]);
-      gradient += ga * ga + gb * gb;
-    }
-    const double error =
-        std::abs(rb[i].dot(essential * ra[i])) / std::sqrt(std::max(gradient, 1e-24));
     Eigen::Vector3d point;
-    if (error <= 3 && Triangulate(origin, result.relative, ra[i], rb[i], point) &&
+    if (Triangulate(origin, result.relative, ra[i].ray, rb[i].ray, point) &&
         (ca.Project(point) - xa).norm() <= 6 &&
         (cb.Project(result.relative.Apply(point)) - xb).norm() <= 6) {
       result.inliers.push_back(m);
-      angles.push_back(std::acos(std::clamp(ra[i].dot(R.conjugate() * rb[i]), -1., 1.)) * 180 / Pi);
+      angles.push_back(std::acos(std::clamp(ra[i].ray.dot(R.conjugate() * rb[i].ray), -1., 1.)) *
+                       180 / Pi);
     }
   }
   result.angle = angles.empty() ? 0 : Quantile(angles, .5);
@@ -181,13 +292,65 @@ struct Tracks {
     }
   }
 };
+double PointCost(const Reconstruction& model, const std::vector<Observation>& track,
+                 const Eigen::Vector3d& point) {
+  double cost = 0;
+  for (const auto& o : track) {
+    const auto& image = model.images[o.image];
+    const Eigen::Vector3d v = image.pose.Apply(point);
+    if (v.z() <= 0)
+      return INFINITY;
+    const double error = (model.cameras[image.camera].Project(v) - image.pixels[o.feature]).norm();
+    cost += error <= 2 ? .5 * error * error : 2 * (error - 1);
+  }
+  return cost;
+}
+void RefinePoint(const Reconstruction& model, const std::vector<Observation>& track,
+                 Eigen::Vector3d& point) {
+  double cost = PointCost(model, track, point);
+  for (int iteration = 0; iteration < 6; ++iteration) {
+    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+    for (const auto& o : track) {
+      const auto& image = model.images[o.image];
+      const auto& camera = model.cameras[image.camera];
+      const Eigen::Vector3d v = image.pose.Apply(point);
+      const Eigen::Vector2d residual = camera.Project(v) - image.pixels[o.feature];
+      const Eigen::Matrix<double, 2, 3> j =
+          camera.ProjectionJacobian(v) * image.pose.Rotation().toRotationMatrix();
+      const double weight = std::min(1., 2 / std::max(residual.norm(), 1e-12));
+      normal.noalias() += weight * j.transpose() * j;
+      rhs.noalias() -= weight * j.transpose() * residual;
+    }
+    const Eigen::Vector3d step = normal.ldlt().solve(rhs);
+    if (!step.allFinite())
+      throw std::runtime_error("Nonfinite triangulation refinement");
+    bool accepted = false;
+    for (int backtrack = 0; backtrack < 6; ++backtrack) {
+      const Eigen::Vector3d candidate = point + step * std::pow(.5, backtrack);
+      const double next = PointCost(model, track, candidate);
+      if (std::isfinite(next) && next < cost) {
+        point = candidate;
+        const double improvement = cost - next;
+        cost = next;
+        accepted = true;
+        if (improvement < 1e-7 * std::max(1., cost))
+          return;
+        break;
+      }
+    }
+    if (!accepted)
+      break;
+  }
+}
 bool AddPoint(Reconstruction& model, const std::vector<Observation>& observations,
-              uint64_t& identity) {
+              uint64_t& identity, bool refine = false) {
   if (identity != NoPoint && !model.points[identity].track.empty()) {
     auto& point = model.points[identity];
     std::set<uint32_t> seen;
     for (const auto& o : point.track)
       seen.insert(o.image);
+    const size_t before = point.track.size();
     for (const auto& o : observations) {
       const auto& image = model.images[o.image];
       if (!image.registered || seen.count(o.image) ||
@@ -195,11 +358,14 @@ bool AddPoint(Reconstruction& model, const std::vector<Observation>& observation
         continue;
       const auto v = image.pose.Apply(point.xyz);
       if (v.z() > 0 &&
-          (model.cameras[image.camera].Project(v) - image.pixels[o.feature]).norm() <= 6) {
+          (model.cameras[image.camera].Project(v) - image.pixels[o.feature]).norm() <= 4.5) {
         point.track.push_back(o);
+        model.images[o.image].points[o.feature] = identity;
         seen.insert(o.image);
       }
     }
+    if (refine || point.track.size() > before)
+      RefinePoint(model, point.track, point.xyz);
     return true;
   }
   std::vector<Observation> track;
@@ -209,7 +375,7 @@ bool AddPoint(Reconstruction& model, const std::vector<Observation>& observation
       track.push_back(o);
   if (track.size() < 2)
     return false;
-  double best = 0;
+  double best = 1;
   size_t first = 0, second = 0;
   std::vector<Eigen::Vector3d> rays, world;
   for (const auto& o : track) {
@@ -220,14 +386,14 @@ bool AddPoint(Reconstruction& model, const std::vector<Observation>& observation
   }
   for (size_t i = 0; i < track.size(); ++i)
     for (size_t j = i + 1; j < track.size(); ++j) {
-      const double angle = std::acos(std::clamp(world[i].dot(world[j]), -1., 1.));
-      if (angle > best) {
-        best = angle;
+      const double cosine = world[i].dot(world[j]);
+      if (cosine < best) {
+        best = cosine;
         first = i;
         second = j;
       }
     }
-  if (best < .5 * Pi / 180)
+  if (best > std::cos(.5 * Pi / 180))
     return false;
   Eigen::Vector3d point;
   if (!Triangulate(model.images[track[first].image].pose, model.images[track[second].image].pose,
@@ -242,6 +408,7 @@ bool AddPoint(Reconstruction& model, const std::vector<Observation>& observation
   }
   if (good.size() < 2)
     return false;
+  RefinePoint(model, good, point);
   if (identity == NoPoint) {
     identity = model.points.size();
     model.points.push_back({point, {127, 127, 127}, 0, good});
@@ -249,7 +416,69 @@ bool AddPoint(Reconstruction& model, const std::vector<Observation>& observation
     model.points[identity].xyz = point;
     model.points[identity].track = std::move(good);
   }
+  for (const auto& o : model.points[identity].track)
+    model.images[o.image].points[o.feature] = identity;
   return true;
+}
+Json CompleteTracks(Reconstruction& model, const Tracks& graph, std::vector<uint64_t>& identities) {
+  const auto started = Clock::now();
+  const size_t before = model.Observations();
+  size_t merged = 0;
+  for (size_t i = 0; i < graph.tracks.size(); ++i) {
+    std::set<uint64_t> existing;
+    for (const auto& o : graph.tracks[i])
+      if (model.images[o.image].points[o.feature] != NoPoint)
+        existing.insert(model.images[o.image].points[o.feature]);
+    if (existing.size() == 1)
+      identities[i] = *existing.begin();
+    else if (existing.size() > 1) {
+      std::map<uint32_t, uint32_t> features;
+      std::vector<Observation> track;
+      bool conflict = false;
+      uint64_t winner = *existing.begin();
+      for (uint64_t id : existing) {
+        if (model.points[id].track.size() > model.points[winner].track.size())
+          winner = id;
+        for (const auto& o : model.points[id].track) {
+          const auto inserted = features.emplace(o.image, o.feature);
+          if (!inserted.second && inserted.first->second != o.feature)
+            conflict = true;
+          if (inserted.second)
+            track.push_back(o);
+        }
+      }
+      if (conflict)
+        continue;
+      Eigen::Vector3d point = model.points[winner].xyz;
+      RefinePoint(model, track, point);
+      bool valid = true;
+      for (const auto& o : track) {
+        const auto& image = model.images[o.image];
+        const auto v = image.pose.Apply(point);
+        valid = valid && v.z() > 0 &&
+                (model.cameras[image.camera].Project(v) - image.pixels[o.feature]).norm() <= 4.5;
+      }
+      if (!valid)
+        continue;
+      for (uint64_t id : existing)
+        if (id != winner) {
+          model.points[id].track.clear();
+          ++merged;
+        }
+      model.points[winner].xyz = point;
+      model.points[winner].track = std::move(track);
+      for (const auto& o : model.points[winner].track)
+        model.images[o.image].points[o.feature] = winner;
+      identities[i] = winner;
+    }
+    AddPoint(model, graph.tracks[i], identities[i], true);
+  }
+  const size_t completed = model.Observations();
+  model.Filter();
+  return {{"added_observations", completed - before},
+          {"removed_observations", completed - model.Observations()},
+          {"merged_points", merged},
+          {"seconds", Seconds(started)}};
 }
 size_t Correspondences(const Reconstruction& model, const std::vector<Pair>& pairs,
                        const std::vector<size_t>& neighbors, uint32_t id,
@@ -380,14 +609,16 @@ bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
   image.registered = true;
   for (size_t i = 0; i < xyz.size(); ++i) {
     const auto v = selected.Apply(model.points[identities[i]].xyz);
-    if (v.z() > 0 && (cam.Project(v) - image.pixels[features[i]]).norm() <= 6)
+    if (v.z() > 0 && (cam.Project(v) - image.pixels[features[i]]).norm() <= 6) {
       model.points[identities[i]].track.push_back({id, features[i]});
+      image.points[features[i]] = identities[i];
+    }
   }
-  model.RebuildReferences();
   return true;
 }
 }  // namespace
 Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report) {
+  const auto started = Clock::now();
   Reconstruction m;
   const auto checkpoint = work / "cache/incremental.bin";
   const bool resumed = fs::exists(checkpoint);
@@ -423,6 +654,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   for (const auto& pair : catalog.at("pairs"))
     candidates.push_back(pair.get<std::array<uint32_t, 2>>());
   std::vector<Pair> pairs(candidates.size());
+  const auto geometry_started = Clock::now();
   std::atomic<size_t> next{0}, done{0};
   std::exception_ptr error;
   std::mutex mutex;
@@ -453,6 +685,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     t.join();
   if (error)
     std::rethrow_exception(error);
+  const double geometry_seconds = Seconds(geometry_started);
   Tracks graph(m, pairs);
   std::vector<uint64_t> points(graph.tracks.size(), NoPoint);
   std::vector<std::vector<size_t>> adjacency(m.images.size());
@@ -462,6 +695,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       adjacency[pairs[i].b].push_back(i);
     }
   Json optimization = Json::array();
+  Json completion = Json::array();
   if (resumed) {
     for (size_t i = 0; i < graph.tracks.size(); ++i) {
       std::set<uint64_t> existing;
@@ -529,7 +763,6 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           touched.insert(track);
       for (uint32_t track : touched)
         AddPoint(m, graph.tracks[track], points[track]);
-      m.RebuildReferences();
       const auto registered = m.Registered();
       if (registered % 8 == 0) {
         std::set<uint32_t> local = recent;
@@ -558,8 +791,10 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         if (counts[0] >= 8 && counts[1] >= 8) {
           optimization.push_back(Optimize(m, scene.cameras, "focal", workers, 100));
           m.Filter();
+          completion.push_back(CompleteTracks(m, graph, points));
           optimization.push_back(Optimize(m, scene.cameras, "radial", workers, 100));
           m.Filter();
+          completion.push_back(CompleteTracks(m, graph, points));
           calibrated = true;
           last_global = registered;
         }
@@ -567,6 +802,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         optimization.push_back(
             Optimize(m, scene.cameras, calibrated ? "radial" : "fixed", workers, 100));
         m.Filter();
+        completion.push_back(CompleteTracks(m, graph, points));
         last_global = registered;
       }
       if (registered % 16 == 0)
@@ -579,6 +815,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       if (m.Registered() > last_global) {
         optimization.push_back(Optimize(m, scene.cameras, "radial", workers, 150));
         m.Filter();
+        completion.push_back(CompleteTracks(m, graph, points));
         last_global = m.Registered();
         continue;
       }
@@ -599,16 +836,26 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   }
   optimization.push_back(Optimize(m, scene.cameras, "focal", workers, 150));
   m.Filter();
+  completion.push_back(CompleteTracks(m, graph, points));
   optimization.push_back(Optimize(m, scene.cameras, "radial", workers, 150));
   m.Filter();
-  optimization.push_back(Optimize(m, scene.cameras, "principal", workers, 200));
-  m.Filter();
-  for (uint32_t i = 0; i < graph.tracks.size(); ++i)
-    if (points[i] == NoPoint || m.points[points[i]].track.empty())
-      AddPoint(m, graph.tracks[i], points[i]);
-  m.RebuildReferences();
-  optimization.push_back(Optimize(m, scene.cameras, "principal", workers, 200));
-  m.Filter();
+  completion.push_back(CompleteTracks(m, graph, points));
+  for (int round = 0; round < 3; ++round) {
+    optimization.push_back(Optimize(m, scene.cameras, "principal", workers, 200));
+    const size_t before = m.Observations();
+    m.Filter();
+    const size_t removed = before - m.Observations();
+    if (round == 2)
+      break;
+    auto completed = CompleteTracks(m, graph, points);
+    const size_t total_removed = removed + completed.at("removed_observations").get<size_t>();
+    const size_t changed = total_removed + completed.at("added_observations").get<size_t>();
+    completed["removed_observations"] = total_removed;
+    completion.push_back(std::move(completed));
+    if (changed <= std::max<size_t>(1, size_t(before * .0005)) &&
+        optimization.back().at("converged").get<bool>())
+      break;
+  }
   for (uint32_t id = 0; id < m.images.size(); ++id) {
     const auto rgb = ReadImage(scene.images[id].source, cv::IMREAD_COLOR);
     for (uint32_t k = 0; k < m.images[id].points.size(); ++k)
@@ -625,6 +872,9 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   report = {{"verified_pairs", std::count_if(pairs.begin(), pairs.end(),
                                              [](const auto& p) { return !p.inliers.empty(); })},
             {"tracks", graph.tracks.size()},
+            {"seconds", Seconds(started)},
+            {"geometry_seconds", geometry_seconds},
+            {"completion", completion},
             {"optimization", optimization}};
   fs::remove(work / "cache/unregistered.json");
   return m;

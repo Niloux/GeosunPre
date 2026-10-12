@@ -62,6 +62,27 @@ Eigen::Vector2d Camera::Project(const Eigen::Vector3d& v) const {
       t * (1 + t2 * (params[4] + t2 * (params[5] + t2 * (params[6] + t2 * params[7])))) / r;
   return {params[0] * v.x() * d + params[2], params[1] * v.y() * d + params[3]};
 }
+Eigen::Matrix<double, 2, 3> Camera::ProjectionJacobian(const Eigen::Vector3d& v) const {
+  Eigen::Matrix<double, 2, 3> j = Eigen::Matrix<double, 2, 3>::Zero();
+  const double r = std::hypot(v.x(), v.y());
+  if (r < 1e-10) {
+    j(0, 0) = params[0] / v.z();
+    j(1, 1) = params[1] / v.z();
+    return j;
+  }
+  const double theta = std::atan2(r, v.z()), t2 = theta * theta;
+  const double radial =
+      theta * (1 + t2 * (params[4] + t2 * (params[5] + t2 * (params[6] + t2 * params[7]))));
+  const double slope =
+      1 + t2 * (3 * params[4] + t2 * (5 * params[5] + t2 * (7 * params[6] + t2 * 9 * params[7])));
+  const Eigen::Vector3d dr(v.x() / r, v.y() / r, 0);
+  const Eigen::Vector3d dt = (v.z() * dr - Eigen::Vector3d(0, 0, r)) / v.squaredNorm();
+  const double scale = radial / r;
+  const Eigen::Vector3d ds = (slope * dt - scale * dr) / r;
+  j.row(0) = params[0] * (v.x() * ds + Eigen::Vector3d(scale, 0, 0)).transpose();
+  j.row(1) = params[1] * (v.y() * ds + Eigen::Vector3d(0, scale, 0)).transpose();
+  return j;
+}
 Eigen::Vector3d Camera::Ray(const Eigen::Vector2d& pixel) const {
   const double x = (pixel.x() - params[2]) / params[0], y = (pixel.y() - params[3]) / params[1],
                r = std::hypot(x, y);

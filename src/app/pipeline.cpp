@@ -108,6 +108,8 @@ void Run(const Arguments& args) {
   Json state = fs::exists(state_path) ? ReadJson(state_path) : Json::object();
   if (!state.empty() && state.at("version") != 1)
     throw std::runtime_error("Unsupported work format; choose a new work directory");
+  if (!state.empty() && state.value("pipeline_version", 0) != 2)
+    throw std::runtime_error("Reconstruction implementation changed; choose a new work directory");
   const auto input = args.Get("--input").empty() ? fs::u8path(state.at("input").get<std::string>())
                                                  : args.Path("--input");
   if (Contains(input, work) || Contains(work, input))
@@ -124,11 +126,8 @@ void Run(const Arguments& args) {
   ReadLasHeader(scene.las);
   const auto prepared = scene.ToJson();
   if (state.empty()) {
-    state = {{"version", 1},
-             {"input", scene.input.u8string()},
-             {"settings", settings},
-             {"scene", prepared},
-             {"stages", Json::object()}};
+    state = {{"version", 1},         {"pipeline_version", 2}, {"input", scene.input.u8string()},
+             {"settings", settings}, {"scene", prepared},     {"stages", Json::object()}};
     WriteJson(work / "scene.json", prepared);
   } else if (state.at("scene") != prepared || state.at("settings") != settings)
     throw std::runtime_error("Inputs/settings changed; choose a new work directory");
@@ -222,7 +221,9 @@ void Run(const Arguments& args) {
         if (!quality.at("passed").get<bool>())
           throw std::runtime_error("Visual acceptance rejected: " + quality.at("failures").dump());
         WriteModel(work / "cache/visual.bin", model);
-        products = {work / "cache/visual.bin"};
+        report["quality"] = quality;
+        WriteJson(work / "cache/sfm.json", report);
+        products = {work / "cache/visual.bin", work / "cache/sfm.json"};
       } else if (stage == "align") {
         auto model = ReadModel(work / "cache/visual.bin");
         const AlignmentLimits limits{settings.at("las_support_fraction"),
@@ -230,6 +231,7 @@ void Run(const Arguments& args) {
                                      settings.at("quality_median_px"),
                                      settings.at("quality_p90_px")};
         auto result = Align(scene, model, workers, limits);
+        result["sfm"] = ReadJson(work / "cache/sfm.json");
         result["runtime"] = "C++/CUDA/TensorRT";
         result["input"] = scene.input.u8string();
         WriteModel(work / "cache/aligned.bin", model);

@@ -574,6 +574,10 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
       }
       point.error /= point.track.size();
     }
+  nav_errors.clear();
+  for (uint32_t i = 0; i < model.images.size(); ++i)
+    if (model.images[i].registered)
+      nav_errors.push_back((model.images[i].pose.Center() - navigation[i]).norm());
   return {
       {"coordinate_frame", "input_las_xyz"},
       {"navigation_frame_assumption", "ENH minus first ENH position; vendor convention unverified"},

@@ -125,6 +125,9 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   auto ordering = std::make_shared<ceres::ParameterBlockOrdering>();
   auto* loss = new ceres::HuberLoss(2.);
   std::set<uint32_t> used_images, used_cameras;
+  size_t observations = 0;
+  const bool metric = !nav.empty() && !planes.empty();
+  size_t variable_count = 0;
   for (auto& p : m.points)
     if (p.track.size() >= 2) {
       if (!variable_images.empty() &&
@@ -132,6 +135,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
                        [&](const auto& o) { return variable_images.count(o.image) != 0; }))
         continue;
       for (const auto& o : p.track) {
+        ++observations;
         auto& image = m.images[o.image];
         const double depth = image.pose.Apply(p.xyz).z();
         if (depth <= 0)
@@ -156,10 +160,13 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         pose,
         new ceres::ProductManifold<ceres::EigenQuaternionManifold, ceres::EuclideanManifold<3>>());
     ordering->AddElementToGroup(pose, 1);
-    if (id == m.gauge_image || (!variable_images.empty() && !variable_images.count(id)))
+    if ((!metric && id == m.gauge_image) ||
+        (!variable_images.empty() && !variable_images.count(id)))
       problem.SetParameterBlockConstant(pose);
+    else
+      ++variable_count;
   }
-  if (used_images.count(m.gauge_image) && used_images.count(m.scale_image))
+  if (!metric && used_images.count(m.gauge_image) && used_images.count(m.scale_image))
     problem.AddResidualBlock(
         new ceres::AutoDiffCostFunction<Baseline, 1, 7, 7>(new Baseline{m.gauge_baseline}), nullptr,
         m.images[m.gauge_image].pose.params.data(), m.images[m.scale_image].pose.params.data());
@@ -200,18 +207,26 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   options.num_threads = workers;
   options.max_num_iterations = iterations;
   options.logging_type = ceres::SILENT;
-  options.linear_solver_type = ceres::SPARSE_SCHUR;
+  const bool iterative = variable_images.empty() && used_images.size() >= 64;
+  options.linear_solver_type = iterative ? ceres::ITERATIVE_SCHUR : ceres::SPARSE_SCHUR;
+  if (iterative)
+    options.preconditioner_type = ceres::SCHUR_JACOBI;
+  options.use_explicit_schur_complement = iterative && used_images.size() <= 1024;
   options.sparse_linear_algebra_library_type = ceres::EIGEN_SPARSE;
   options.linear_solver_ordering = ordering;
-  options.function_tolerance = 1e-7;
+  options.function_tolerance = iterations <= 100 && planes.empty() && nav.empty() ? 1e-5 : 1e-7;
   Progress progress;
   options.callbacks.push_back(&progress);
   ceres::Solver::Summary summary;
   Log("BA " + stage + ": " + std::to_string(used_images.size()) + " images, " +
-      std::to_string(m.Observations()) + " observations");
+      std::to_string(observations) + " observations");
+  const double build_seconds = Seconds(started);
   ceres::Solve(options, &problem, &summary);
   if (!summary.IsSolutionUsable())
     throw std::runtime_error("BA failed: " + summary.BriefReport());
+  if (metric)
+    m.gauge_baseline =
+        (m.images[m.gauge_image].pose.Center() - m.images[m.scale_image].pose.Center()).norm();
   for (const auto& c : m.cameras)
     c.Radius();
   Log(summary.BriefReport());
@@ -220,6 +235,15 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"iterations", summary.iterations.size()},
           {"initial_cost", summary.initial_cost},
           {"final_cost", summary.final_cost},
+          {"images", used_images.size()},
+          {"variable_images", variable_count},
+          {"metric_constraints", metric},
+          {"observations", observations},
+          {"solver", ceres::LinearSolverTypeToString(summary.linear_solver_type_used)},
+          {"explicit_schur", options.use_explicit_schur_complement},
+          {"build_seconds", build_seconds},
+          {"linear_solver_seconds", summary.linear_solver_time_in_seconds},
+          {"jacobian_seconds", summary.jacobian_evaluation_time_in_seconds},
           {"converged", summary.termination_type == ceres::CONVERGENCE}};
 }
 }  // namespace geosun

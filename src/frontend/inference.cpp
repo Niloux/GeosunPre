@@ -33,13 +33,15 @@ size_t Tensor::Count() const {
   return n;
 }
 const float* Tensor::Floats() const {
-  if (type != 0)
-    throw std::runtime_error("Expected float32 tensor");
+  if (type != 0 || bytes.size() != Count() * sizeof(float))
+    throw std::runtime_error("Expected host float32 tensor");
   return reinterpret_cast<const float*>(bytes.data());
 }
 int64_t Tensor::Index(size_t i) const {
   if (i >= Count())
     throw std::runtime_error("Tensor index out of range");
+  if (bytes.size() != Count() * (type == 1 ? 8 : 4))
+    throw std::runtime_error("Expected host integer tensor");
   if (type == 1)
     return reinterpret_cast<const int64_t*>(bytes.data())[i];
   if (type == 2)
@@ -56,6 +58,18 @@ Tensor Tensor::Float(std::vector<int64_t> dims, const float* data, size_t count)
     std::memcpy(t.bytes.data(), data, t.bytes.size());
   return t;
 }
+Tensor Tensor::Upload(std::vector<int64_t> dims, const float* data, size_t count) {
+  Tensor t;
+  t.shape = std::move(dims);
+  if (count > t.Count())
+    throw std::runtime_error("Tensor data exceeds shape");
+  t.device = std::make_shared<DeviceBuffer>(t.Count() * sizeof(float));
+  if (count < t.Count())
+    CudaCheck(cudaMemset(t.device->data, 0, t.device->bytes));
+  if (count)
+    CudaCheck(cudaMemcpy(t.device->data, data, count * sizeof(float), cudaMemcpyHostToDevice));
+  return t;
+}
 namespace {
 class Logger : public nvinfer1::ILogger {
  public:
@@ -67,11 +81,11 @@ class Logger : public nvinfer1::ILogger {
 struct Engine {
   std::unique_ptr<nvinfer1::ICudaEngine> engine;
   std::unique_ptr<nvinfer1::IExecutionContext> context;
-  std::map<std::string, std::unique_ptr<DeviceBuffer>> buffers;
+  std::map<std::string, std::shared_ptr<DeviceBuffer>> buffers;
   void* Buffer(const std::string& name, size_t size) {
     auto& p = buffers[name];
-    if (!p || p->bytes < size)
-      p = std::make_unique<DeviceBuffer>(size);
+    if (!p || p->bytes < size || p.use_count() > 1)
+      p = std::make_shared<DeviceBuffer>(size);
     return p->data;
   }
 };
@@ -133,7 +147,9 @@ Models::Models(const fs::path& root) : impl_(std::make_unique<Implementation>())
 }
 Models::~Models() = default;
 const Json& Models::Manifest() const { return impl_->manifest; }
-std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<Tensor>& inputs) {
+cudaStream_t Models::Stream() const { return impl_->stream; }
+std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<Tensor>& inputs,
+                                    bool device_output) {
   auto found = impl_->engines.find(name);
   if (found == impl_->engines.end()) {
     const auto path = impl_->root / "engines" / (name + ".engine");
@@ -190,20 +206,25 @@ std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<T
       t.type = 2;
     else
       throw std::runtime_error("Expected float32/integer model output: " + label);
-    t.bytes.resize(t.Count() * (t.type == 1 ? 8 : 4));
-    if (!e.context->setTensorAddress(label.c_str(), e.Buffer(label, t.bytes.size())))
+    const size_t bytes = t.Count() * (t.type == 1 ? 8 : 4);
+    if (!e.context->setTensorAddress(label.c_str(), e.Buffer(label, bytes)))
       throw std::runtime_error("Cannot bind model output");
+    if (device_output)
+      t.device = e.buffers.at(label);
+    else
+      t.bytes.resize(bytes);
     outputs.push_back(std::move(t));
   }
   if (!e.context->enqueueV3(impl_->stream))
     throw std::runtime_error("TensorRT inference failed: " + name);
-  for (size_t i = 0; i < outputs.size(); ++i) {
+  for (size_t i = 0; !device_output && i < outputs.size(); ++i) {
     const auto label = spec.at("outputs")[i].get<std::string>();
     auto& t = outputs[i];
     CudaCheck(cudaMemcpyAsync(t.bytes.data(), e.buffers.at(label)->data, t.bytes.size(),
                               cudaMemcpyDeviceToHost, impl_->stream));
   }
-  CudaCheck(cudaStreamSynchronize(impl_->stream));
+  if (!device_output)
+    CudaCheck(cudaStreamSynchronize(impl_->stream));
   return outputs;
 }
 Json GpuInfo() {

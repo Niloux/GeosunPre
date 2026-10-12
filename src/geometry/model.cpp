@@ -39,7 +39,7 @@ void Reconstruction::RebuildReferences() {
   }
 }
 void Reconstruction::Filter(double threshold, double min_angle) {
-  constexpr double to_degrees = 180 / 3.14159265358979323846;
+  const double cosine = std::cos(min_angle * 3.14159265358979323846 / 180);
   for (auto& p : points) {
     std::vector<Observation> track;
     std::vector<Eigen::Vector3d> directions;
@@ -55,12 +55,14 @@ void Reconstruction::Filter(double threshold, double min_angle) {
         directions.push_back((p.xyz - image.pose.Center()).normalized());
       }
     }
-    double maximum = 0;
-    for (size_t i = 0; i < directions.size(); ++i)
+    bool parallax = false;
+    for (size_t i = 0; i < directions.size() && !parallax; ++i)
       for (size_t j = i + 1; j < directions.size(); ++j)
-        maximum = std::max(
-            maximum, std::acos(std::clamp(directions[i].dot(directions[j]), -1., 1.)) * to_degrees);
-    if (track.size() < 2 || maximum < min_angle)
+        if (directions[i].dot(directions[j]) <= cosine) {
+          parallax = true;
+          break;
+        }
+    if (track.size() < 2 || !parallax)
       p.track.clear();
     else {
       p.track = std::move(track);
