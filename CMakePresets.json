@@ -1,0 +1,9 @@
+{
+  "version": 5,
+  "configurePresets": [{
+    "name": "windows", "generator": "Visual Studio 17 2022", "architecture": "x64",
+    "binaryDir": "${sourceDir}/build",
+    "cacheVariables": {"CMAKE_POLICY_VERSION_MINIMUM": "3.5", "CMAKE_CUDA_ARCHITECTURES": "native"}
+  }],
+  "buildPresets": [{"name": "release", "configurePreset": "windows", "configuration": "Release", "jobs": 8}]
+}

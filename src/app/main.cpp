@@ -1,0 +1,59 @@
+#include "app/pipeline.h"
+#include "io/colmap.h"
+#include "io/las.h"
+#include "frontend/inference.h"
+#include <opencv2/core.hpp>
+#include <iostream>
+
+namespace geosun {
+int Main(const std::vector<std::string>& argv) {
+  try {
+    cv::setNumThreads(1);
+    Arguments args(argv);
+    if (args.command == "run" || args.command == "prepare")
+      Run(args);
+    else if (args.command == "export")
+      Export(args);
+    else if (args.command == "check") {
+      args.Validate({"--output", "--work"});
+      std::cout << CheckBundle(args.Get("--output").empty() ? args.Path("--work") / "colmap"
+                                                            : args.Path("--output"))
+                       .dump(2)
+                << '\n';
+    } else if (args.command == "info") {
+      args.Validate({});
+      std::cout << Json({{"version", "1.0.0"},
+                         {"runtime", "C++17/CUDA/TensorRT 10.13"},
+                         {"gpu", GpuInfo()}})
+                       .dump(2)
+                << '\n';
+    } else if (args.command == "las-ply") {
+      args.Validate({"--las", "--output", "--voxel"});
+      std::cout << ExportLasPly(args.Path("--las"), args.Path("--output"),
+                                args.Number("--voxel", .05))
+                       .dump(2)
+                << '\n';
+    } else if (args.command == "help" || args.command == "--help") {
+      std::cout << "GeosunPre 1.0 - native dual-fisheye/LAS reconstruction\n"
+                   "  geosunpre run --input INPUT --work WORK --models MODELS [--config JSON]\n"
+                   "  geosunpre run --work WORK [--stage "
+                   "prepare|masks|features|matches|sfm|align|export]\n"
+                   "  geosunpre prepare --input INPUT --work WORK\n"
+                   "  geosunpre export --work WORK [--output DIR] [--no-ply] [--ply-voxel METRES]\n"
+                   "  geosunpre check --output DIR\n"
+                   "  geosunpre info\n"
+                   "  geosunpre las-ply --las FILE --output FILE [--voxel METRES]\n";
+    } else
+      throw std::runtime_error("Unknown command: " + args.command);
+    return 0;
+  } catch (const std::exception& error) {
+    std::cerr << "geosunpre: " << error.what() << '\n';
+    return 1;
+  }
+}
+}  // namespace geosun
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) { return geosun::Main(geosun::Utf8Arguments(argc, argv)); }
+#else
+int main(int argc, char** argv) { return geosun::Main(geosun::Utf8Arguments(argc, argv)); }
+#endif

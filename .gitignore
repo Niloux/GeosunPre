@@ -1,20 +1,9 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-input/
-work/
-.cache/
-.pytest_cache/
-
-# Local code index and compiled native modules
-.codegraph/
-*.so
-*.pyd
+/build/
+/dist/
+/.cache/
+/models/
+/input/
+/work/
+/.codegraph/
+/.vs/
+*.user

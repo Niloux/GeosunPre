@@ -1,0 +1,10 @@
+#pragma once
+#include "geometry/model.h"
+
+namespace geosun {
+struct AlignmentLimits {
+  double support_fraction = .25, median_m = .1, p90_m = .3;
+  double median_px = 2, p90_px = 4;
+};
+Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits);
+}  // namespace geosun

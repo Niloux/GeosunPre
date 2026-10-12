@@ -1,0 +1,223 @@
+#include "frontend/inference.h"
+#include <NvInferRuntime.h>
+#include <NvInferVersion.h>
+#include <fstream>
+#include <cstring>
+#include <iostream>
+#ifdef _WIN32
+#include <Windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+namespace geosun {
+void CudaCheck(cudaError_t e) {
+  if (e != cudaSuccess)
+    throw std::runtime_error(std::string("CUDA: ") + cudaGetErrorString(e));
+}
+DeviceBuffer::DeviceBuffer(size_t n) : bytes(n) {
+  if (n)
+    CudaCheck(cudaMalloc(&data, n));
+}
+DeviceBuffer::~DeviceBuffer() {
+  if (data)
+    cudaFree(data);
+}
+size_t Tensor::Count() const {
+  size_t n = 1;
+  for (auto d : shape) {
+    if (d < 0)
+      throw std::runtime_error("Unresolved tensor shape");
+    n *= size_t(d);
+  }
+  return n;
+}
+const float* Tensor::Floats() const {
+  if (type != 0)
+    throw std::runtime_error("Expected float32 tensor");
+  return reinterpret_cast<const float*>(bytes.data());
+}
+int64_t Tensor::Index(size_t i) const {
+  if (i >= Count())
+    throw std::runtime_error("Tensor index out of range");
+  if (type == 1)
+    return reinterpret_cast<const int64_t*>(bytes.data())[i];
+  if (type == 2)
+    return reinterpret_cast<const int32_t*>(bytes.data())[i];
+  throw std::runtime_error("Expected integer tensor");
+}
+Tensor Tensor::Float(std::vector<int64_t> dims, const float* data, size_t count) {
+  Tensor t;
+  t.shape = std::move(dims);
+  if (t.Count() != count)
+    throw std::runtime_error("Tensor data/shape differ");
+  t.bytes.resize(count * sizeof(float));
+  if (count)
+    std::memcpy(t.bytes.data(), data, t.bytes.size());
+  return t;
+}
+namespace {
+class Logger : public nvinfer1::ILogger {
+ public:
+  void log(Severity level, const char* message) noexcept override {
+    if (level <= Severity::kWARNING)
+      std::cerr << "TensorRT: " << message << std::endl;
+  }
+};
+struct Engine {
+  std::unique_ptr<nvinfer1::ICudaEngine> engine;
+  std::unique_ptr<nvinfer1::IExecutionContext> context;
+  std::map<std::string, std::unique_ptr<DeviceBuffer>> buffers;
+  void* Buffer(const std::string& name, size_t size) {
+    auto& p = buffers[name];
+    if (!p || p->bytes < size)
+      p = std::make_unique<DeviceBuffer>(size);
+    return p->data;
+  }
+};
+}  // namespace
+struct Models::Implementation {
+  fs::path root;
+  Json manifest;
+  Logger logger;
+#ifdef _WIN32
+  HMODULE library = nullptr;
+#else
+  void* library = nullptr;
+#endif
+  std::unique_ptr<nvinfer1::IRuntime> runtime;
+  std::map<std::string, Engine> engines;
+  cudaStream_t stream = nullptr;
+  ~Implementation() {
+    engines.clear();
+    runtime.reset();
+    if (stream)
+      cudaStreamDestroy(stream);
+#ifdef _WIN32
+    if (library)
+      FreeLibrary(library);
+#else
+    if (library)
+      dlclose(library);
+#endif
+  }
+};
+Models::Models(const fs::path& root) : impl_(std::make_unique<Implementation>()) {
+  impl_->root = root;
+  impl_->manifest = ReadJson(root / "manifest.json");
+  if (impl_->manifest.at("version") != 1 || impl_->manifest.at("tensorrt") != "10.13.3.9")
+    throw std::runtime_error("Models require the pinned TensorRT 10.13.3.9 runtime");
+  CudaCheck(cudaSetDevice(0));
+  CudaCheck(cudaStreamCreate(&impl_->stream));
+  using Create = void* (*)(void*, int32_t);
+  Create create = nullptr;
+#ifdef _WIN32
+  const auto library = root / "runtime/nvinfer_10.dll";
+  impl_->library =
+      LoadLibraryExW(library.c_str(), nullptr,
+                     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+  if (impl_->library)
+    create =
+        reinterpret_cast<Create>(GetProcAddress(impl_->library, "createInferRuntime_INTERNAL"));
+#else
+  impl_->library = dlopen((root / "runtime/libnvinfer.so.10").c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (impl_->library)
+    create = reinterpret_cast<Create>(dlsym(impl_->library, "createInferRuntime_INTERNAL"));
+#endif
+  if (!create)
+    throw std::runtime_error("Cannot load TensorRT runtime from " + (root / "runtime").u8string());
+  impl_->runtime.reset(
+      static_cast<nvinfer1::IRuntime*>(create(&impl_->logger, NV_TENSORRT_VERSION)));
+  if (!impl_->runtime)
+    throw std::runtime_error("Cannot create TensorRT runtime");
+}
+Models::~Models() = default;
+const Json& Models::Manifest() const { return impl_->manifest; }
+std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<Tensor>& inputs) {
+  auto found = impl_->engines.find(name);
+  if (found == impl_->engines.end()) {
+    const auto path = impl_->root / "engines" / (name + ".engine");
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+      throw std::runtime_error("Missing model engine: " + path.u8string());
+    std::vector<uint8_t> data(fs::file_size(path));
+    if (!file.read(reinterpret_cast<char*>(data.data()), data.size()))
+      throw std::runtime_error("Truncated model engine");
+    Engine e;
+    e.engine.reset(impl_->runtime->deserializeCudaEngine(data.data(), data.size()));
+    if (!e.engine)
+      throw std::runtime_error("TensorRT engine incompatible with runtime/GPU: " + name);
+    e.context.reset(e.engine->createExecutionContext());
+    if (!e.context)
+      throw std::runtime_error("Cannot allocate inference context");
+    found = impl_->engines.emplace(name, std::move(e)).first;
+    Log("Loaded " + name);
+  }
+  auto& e = found->second;
+  const auto& spec = impl_->manifest.at("models").at(name);
+  if (inputs.size() != spec.at("inputs").size())
+    throw std::runtime_error("Wrong inference input count");
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    const auto key = spec.at("inputs")[i].get<std::string>();
+    const auto& t = inputs[i];
+    nvinfer1::Dims dims;
+    dims.nbDims = int32_t(t.shape.size());
+    for (int d = 0; d < dims.nbDims; ++d)
+      dims.d[d] = t.shape[d];
+    if (!e.context->setInputShape(key.c_str(), dims) ||
+        e.engine->getTensorDataType(key.c_str()) != nvinfer1::DataType::kFLOAT)
+      throw std::runtime_error("Unsupported model input: " + key);
+    void* pointer = t.device ? t.device->data : e.Buffer(key, t.bytes.size());
+    if (!t.device)
+      CudaCheck(cudaMemcpyAsync(pointer, t.bytes.data(), t.bytes.size(), cudaMemcpyHostToDevice,
+                                impl_->stream));
+    if (!e.context->setTensorAddress(key.c_str(), pointer))
+      throw std::runtime_error("Cannot bind model input");
+  }
+  std::vector<Tensor> outputs;
+  for (const auto& key : spec.at("outputs")) {
+    const auto label = key.get<std::string>();
+    const auto dims = e.context->getTensorShape(label.c_str());
+    Tensor t;
+    for (int i = 0; i < dims.nbDims; ++i)
+      t.shape.push_back(dims.d[i]);
+    const auto type = e.engine->getTensorDataType(label.c_str());
+    if (type == nvinfer1::DataType::kFLOAT)
+      t.type = 0;
+    else if (type == nvinfer1::DataType::kINT64)
+      t.type = 1;
+    else if (type == nvinfer1::DataType::kINT32)
+      t.type = 2;
+    else
+      throw std::runtime_error("Expected float32/integer model output: " + label);
+    t.bytes.resize(t.Count() * (t.type == 1 ? 8 : 4));
+    if (!e.context->setTensorAddress(label.c_str(), e.Buffer(label, t.bytes.size())))
+      throw std::runtime_error("Cannot bind model output");
+    outputs.push_back(std::move(t));
+  }
+  if (!e.context->enqueueV3(impl_->stream))
+    throw std::runtime_error("TensorRT inference failed: " + name);
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    const auto label = spec.at("outputs")[i].get<std::string>();
+    auto& t = outputs[i];
+    CudaCheck(cudaMemcpyAsync(t.bytes.data(), e.buffers.at(label)->data, t.bytes.size(),
+                              cudaMemcpyDeviceToHost, impl_->stream));
+  }
+  CudaCheck(cudaStreamSynchronize(impl_->stream));
+  return outputs;
+}
+Json GpuInfo() {
+  int count = 0;
+  CudaCheck(cudaGetDeviceCount(&count));
+  if (count < 1)
+    throw std::runtime_error("No CUDA device");
+  cudaDeviceProp p;
+  CudaCheck(cudaGetDeviceProperties(&p, 0));
+  size_t free, total;
+  CudaCheck(cudaMemGetInfo(&free, &total));
+  return {{"name", p.name},
+          {"compute_capability", {p.major, p.minor}},
+          {"memory_total", total},
+          {"memory_free", free}};
+}
+}  // namespace geosun
