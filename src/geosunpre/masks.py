@@ -80,7 +80,7 @@ def mask_cached(record, output):
     stats = output / 'stats' / (record['name'] + '.json')
     if not stats.is_file():
         return False
-    info = json.loads(stats.read_text())
+    info = json.loads(stats.read_text(encoding='utf-8'))
     if info.get('source_file') != source_file:
         raise ValueError(f'Stale mask source: {record["name"]}')
     for folder, key in (('valid', 'mask_file'), ('labels', 'labels_file')):
@@ -258,7 +258,7 @@ def mask_review(scene,output, *, segments=None):
           for label,cam in scene['cameras'].items() if label in pending}
     def render_review(record):
         stats_path=output/'masks/stats'/(record['name']+'.json')
-        stats=json.loads(stats_path.read_text())
+        stats=json.loads(stats_path.read_text(encoding='utf-8'))
         path = _review_path(output, record)
         if not path.is_file():
             with Image.open(record['source']) as im:
@@ -299,5 +299,5 @@ def mask_review(scene,output, *, segments=None):
 <p><a href="masks/summary.json">掩码统计</a>。masks/valid 中静态区域为 255、天空为 128、人物为 0；最终导出的 masks 还会将 FOV 外设为 0。</p>
 <label>片段 <select id="segment"><option value="all">全部</option>'''+options+'''</select></label>'''+''.join(cards)+'''
 <script>document.getElementById('segment').onchange=function(){document.querySelectorAll('details[data-segment]').forEach(d=>{d.hidden=this.value!=='all'&&d.dataset.segment!==this.value})}</script></html>'''
-    (output/'mask_review.html').write_text(body)
+    (output/'mask_review.html').write_text(body, encoding='utf-8')
     return report

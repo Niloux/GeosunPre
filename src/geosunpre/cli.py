@@ -55,7 +55,7 @@ def main(argv=None):
             if args.output:
                 output = args.output
             else:
-                task = json.loads((Path(args.work).expanduser() / 'pipeline_task.json').read_text())
+                task = json.loads((Path(args.work).expanduser() / 'pipeline_task.json').read_text(encoding='utf-8'))
                 output = task['delivery']['output']
             result = verify_colmap_export(output)
     except (ValueError, OSError, RuntimeError, ImportError) as exc:

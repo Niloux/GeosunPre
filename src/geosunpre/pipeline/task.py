@@ -10,6 +10,7 @@ from geosunpre.artifacts import file_metadata, write_frozen_json
 from geosunpre.config import CONFIG_FILE
 from geosunpre.device import DEVICE_PROFILE
 from geosunpre.masks import MODEL, MODEL_REVISION
+from geosunpre.matching import ATTENTION_BACKEND
 from geosunpre.initialization import DEFAULT_VOXEL_SIZE, initialization_recipe
 
 TASK_FILE = 'pipeline_task.json'
@@ -32,7 +33,8 @@ def runtime_environment():
         except PackageNotFoundError:
             packages[name] = None
     return {'packages': packages, 'python': platform.python_version(),
-            'device_profile': DEVICE_PROFILE, 'matcher': 'flash_cuda_graph', 'depth_backend': 'native'}
+            'device_profile': DEVICE_PROFILE, 'matcher': f'{ATTENTION_BACKEND}_cuda_graph',
+            'depth_backend': 'native'}
 
 
 def _weights_identity(model_cache, families):
@@ -55,7 +57,7 @@ def bind_weights(work, model_cache, *, frontend=False, segmentation=False):
     for name, identity in _weights_identity(model_cache, families).items():
         path = Path(work) / name
         if path.is_file():
-            if json.loads(path.read_text()) != identity:
+            if json.loads(path.read_text(encoding='utf-8')) != identity:
                 raise ValueError('Frozen model weights changed: ' + name +
                                  '; use a fresh work directory')
         else:
@@ -78,13 +80,13 @@ def bind_task(work, *, output=None, image_mode=None, include_masks=None,
             raise ValueError(f'{key} must be a boolean')
     environment = runtime_environment()
     if path.is_file():
-        task = json.loads(path.read_text())
+        task = json.loads(path.read_text(encoding='utf-8'))
         if task.get('version') != 3:
             raise ValueError('Unsupported pipeline task; use a fresh work directory')
         cache = task['model_cache']
         if model_cache is not None and str(Path(model_cache).expanduser().resolve()) != cache:
             raise ValueError('Frozen model cache changed; use a fresh work directory')
-        if task['config'] != json.loads((work / CONFIG_FILE).read_text()):
+        if task['config'] != json.loads((work / CONFIG_FILE).read_text(encoding='utf-8')):
             raise ValueError('Pipeline configuration changed; use a fresh work directory')
         bind_weights(work, cache)
         delivery = dict(task['delivery'])
@@ -97,7 +99,7 @@ def bind_task(work, *, output=None, image_mode=None, include_masks=None,
                     'include_masks': True if include_masks is None else include_masks,
                     'include_ply': True if include_ply is None else include_ply,
                     'ply_voxel_size': DEFAULT_VOXEL_SIZE if ply_voxel_size is None else float(ply_voxel_size)}
-        task = {'version': 3, 'config': json.loads((work / CONFIG_FILE).read_text()),
+        task = {'version': 3, 'config': json.loads((work / CONFIG_FILE).read_text(encoding='utf-8')),
                 'environment': environment, 'delivery': delivery, 'model_cache': cache}
         write_frozen_json(path, task)
     destination = str(Path(output).expanduser().resolve()) if output else delivery['output']

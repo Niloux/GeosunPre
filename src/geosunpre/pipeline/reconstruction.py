@@ -1,24 +1,20 @@
 """Image-only, asynchronous full-sequence SfM with frozen observation sources."""
 import json
 from pathlib import Path
-from geosunpre.profiling import profiled, operation
 
 import numpy as np
 import pycolmap
 
-from geosunpre.sfm.reconstruction import bounded_bundle_adjustment
-from geosunpre.sfm.reconstruction import cheirality_health
-from geosunpre.sfm.reconstruction import database_and_seed
-from geosunpre.sfm.reconstruction import map_from_inputs
-from geosunpre.artifacts import file_metadata
-from geosunpre.artifacts import write_json, staged_directory
+from geosunpre.artifacts import file_metadata, staged_directory, write_frozen_json, write_json
 from geosunpre.colmap import MODEL_FILES, model_files
-from geosunpre.sfm.track_filter import CONFIG as TRACK_CONFIG
-from geosunpre.sfm.track_filter import filter_mapped_tracks
-from geosunpre.sfm.track_filter import training_adjacency
-from geosunpre.pipeline.observations import protocol_identity
-from geosunpre.artifacts import write_frozen_json
 from geosunpre.pipeline.data import load_frontend
+from geosunpre.pipeline.observations import protocol_identity
+from geosunpre.profiling import operation, profiled
+from geosunpre.sfm.reconstruction import (
+    bounded_bundle_adjustment, cheirality_health, database_and_seed, map_from_inputs,
+)
+from geosunpre.sfm.track_filter import CONFIG as TRACK_CONFIG
+from geosunpre.sfm.track_filter import filter_mapped_tracks, training_adjacency
 
 OUTPUT = 'sfm'
 
@@ -61,13 +57,19 @@ def geometric_scene(scene, params):
     return result
 
 
+def _check_fixed_intrinsics(rec, params):
+    for camera_id, expected in params.items():
+        if not np.array_equal(rec.cameras[camera_id].params, expected):
+            raise ValueError(f'Camera {camera_id}: fixed intrinsics changed')
+
+
 @profiled
 def build_mapping(work):
-    out, scene, data, features, protocol, params = freeze_geometry(work)
+    out, scene, data, features, _, params = freeze_geometry(work)
     protocol_file = file_metadata(out / 'geometry_protocol.json')
     mapping = out / 'mapping'
     if (mapping / 'identity.json').is_file():
-        identity = json.loads((mapping / 'identity.json').read_text())
+        identity = json.loads((mapping / 'identity.json').read_text(encoding='utf-8'))
         if (identity.get('protocol_file') != protocol_file
                 or identity.get('model_files') != model_files(mapping)):
             raise ValueError('Global mapping identity changed')
@@ -78,11 +80,12 @@ def build_mapping(work):
                                      initial_model=Path(work) / 'calibration/stages/principal/sparse/0')
         with operation('incremental_mapping'):
             maps = map_from_inputs(out, scene, db, seed)
-        if not maps: raise RuntimeError('Full mapping did not reconstruct a component')
+        if not maps:
+            raise RuntimeError('Full mapping did not reconstruct a component')
         rec = max(maps.values(), key=lambda r: r.num_reg_images())
-        if cheirality_health(rec)['invalid_depth']: raise RuntimeError('Global mapper model has invalid depths')
-        for cid, values in params.items():
-            np.testing.assert_array_equal(rec.cameras[cid].params, np.asarray(values))
+        if cheirality_health(rec)['invalid_depth']:
+            raise RuntimeError('Global mapper model has invalid depths')
+        _check_fixed_intrinsics(rec, params)
         with staged_directory(mapping) as staged:
             rec.write(staged)
             rec.write_text(staged)
@@ -104,14 +107,14 @@ def build_mapping(work):
 
 @profiled
 def optimize(work):
-    out, scene, data, features, protocol, _ = freeze_geometry(work, require_existing=True)
-    identity = json.loads((out / 'mapping/identity.json').read_text())
+    out, scene, data, _, protocol, _ = freeze_geometry(work, require_existing=True)
+    identity = json.loads((out / 'mapping/identity.json').read_text(encoding='utf-8'))
     if (identity.get('protocol_file') != file_metadata(out / 'geometry_protocol.json')
             or identity.get('model_files') != model_files(out / 'mapping')):
         raise ValueError('Global mapping identity changed')
     params = {int(i): np.asarray(p, dtype=float) for i, p in protocol['calibration'].items()}
     summary_path = out / 'optimization_summary.json'
-    existing = json.loads(summary_path.read_text()) if summary_path.exists() else {'stages': {}}
+    existing = json.loads(summary_path.read_text(encoding='utf-8')) if summary_path.exists() else {'stages': {}}
     stages = {}
     for stage in ['fixed_calibration', 'triangle_supported', 'shared_calibration']:
         path = out / 'stages' / stage
@@ -121,11 +124,11 @@ def optimize(work):
         complete = (path / 'ba.json').is_file() and all(
             (path / 'sparse/0' / name).is_file() for name in MODEL_FILES)
         if not complete and (path / 'ba.json').is_file():
-            saved = json.loads((path / 'ba.json').read_text())
+            saved = json.loads((path / 'ba.json').read_text(encoding='utf-8'))
             if 'model_files' in saved:
                 raise ValueError(f'Global BA stage identity changed: {stage}: committed model is incomplete')
         if complete:
-            ba = json.loads((path / 'ba.json').read_text())
+            ba = json.loads((path / 'ba.json').read_text(encoding='utf-8'))
             for key, model_path in (('model_files', path / 'sparse/0'),
                                     ('input_model_files', previous)):
                 if ba.get(key) != model_files(model_path):
@@ -133,13 +136,13 @@ def optimize(work):
         if stage in existing['stages'] and complete:
             rec = pycolmap.Reconstruction(path / 'sparse/0')
             if stage != 'shared_calibration':
-                for cid, p in params.items(): np.testing.assert_array_equal(rec.cameras[cid].params, p)
+                _check_fixed_intrinsics(rec, params)
             stages[stage] = existing['stages'][stage]
             print('Global saved stage', stage, rec.num_reg_images(), rec.num_points3D(), flush=True)
             continue
         if complete:
             rec = pycolmap.Reconstruction(path / 'sparse/0')
-            ba = json.loads((path / 'ba.json').read_text())
+            ba = json.loads((path / 'ba.json').read_text(encoding='utf-8'))
         else:
             rec = pycolmap.Reconstruction(previous)
             with staged_directory(path) as staged:
@@ -174,7 +177,7 @@ def optimize(work):
                 ba['model_files'] = model_files(model)
                 write_json(staged / 'ba.json', ba)
         if stage != 'shared_calibration':
-            for cid, p in params.items(): np.testing.assert_array_equal(rec.cameras[cid].params, p)
+            _check_fixed_intrinsics(rec, params)
         stages[stage] = {'ba': ba, 'registered': rec.num_reg_images(), 'points': rec.num_points3D(),
                          'observations': rec.compute_num_observations(),
                          'camera_params': {cid: c.params.tolist() for cid, c in rec.cameras.items()}}

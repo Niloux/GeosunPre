@@ -225,11 +225,12 @@ class LoMaFrontend:
         return value
 
     def match(self, features_a, features_b, *, feature_loader=None):
+        from geosunpre.matching import ATTENTION_BACKEND
         a_name, b_name = str(features_a['token']), str(features_b['token'])
         identity = {'a': a_name, 'b': b_name, 'config': asdict(self.config),
                     'a_file': file_metadata(self.cache / f'{a_name}.npz'),
                     'b_file': file_metadata(self.cache / f'{b_name}.npz'),
-                    'attention_backend': 'flash'}
+                    'attention_backend': ATTENTION_BACKEND}
         token = f'{Path(a_name).name}__{Path(b_name).name}'
         path = self.work/'matches'/f'{token}.npz'
         if path.exists():

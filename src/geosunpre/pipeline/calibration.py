@@ -24,7 +24,7 @@ def prepare_calibration(work):
     out = Path(work).resolve() / 'calibration'
     selection_path = out / 'selection.json'
     if selection_path.is_file():
-        selection = json.loads(selection_path.read_text())
+        selection = json.loads(selection_path.read_text(encoding='utf-8'))
         selected = set(selection['image_names'])
         images = [row for row in global_scene['images'] if row['name'] in selected]
         if len(images) != len(selected):
@@ -69,7 +69,7 @@ def verify_calibration(work):
     path = out / 'calibration_identity.json'
     if not path.is_file():
         raise ValueError('Missing calibration identity; run the calibration stage first')
-    identity = json.loads(path.read_text())
+    identity = json.loads(path.read_text(encoding='utf-8'))
     observation_id = protocol_identity(work)
     if (identity.get('version') != 1 or any(identity.get(k) != v for k, v in observation_id.items())
             or identity.get('pipeline_config_file') != file_metadata(work / CONFIG_FILE)
@@ -78,7 +78,7 @@ def verify_calibration(work):
     for relative, expected in identity['files'].items():
         if file_metadata(out / relative) != expected:
             raise ValueError(f'Calibration artifact changed: {relative}')
-    contract = json.loads((out / 'run_contract.json').read_text())
+    contract = json.loads((out / 'run_contract.json').read_text(encoding='utf-8'))
     if contract.get('geometry_pipeline_version') != 2 or any(contract.get(k) != v for k, v in observation_id.items()):
         raise ValueError('Calibration has no pre-geometry observation contract')
     model = pycolmap.Reconstruction(out / 'stages/principal/sparse/0')
@@ -110,7 +110,7 @@ def calibrate(work):
 
     mapping = directory / 'mapping'
     if (mapping / 'identity.json').is_file():
-        identity = json.loads((mapping / 'identity.json').read_text())
+        identity = json.loads((mapping / 'identity.json').read_text(encoding='utf-8'))
         if (identity.get('protocol_file') != contract_file
                 or identity.get('model_files') != model_files(mapping)):
             raise ValueError('Calibration mapping identity changed')
@@ -148,11 +148,11 @@ def calibrate(work):
         previous_model = mapping if index == 0 else directory / 'stages' / STAGES[index - 1] / 'sparse/0'
         input_files = model_files(previous_model)
         if report_path.is_file() and not all((model / name).is_file() for name in MODEL_FILES):
-            if 'model_files' in json.loads(report_path.read_text()):
+            if 'model_files' in json.loads(report_path.read_text(encoding='utf-8')):
                 raise ValueError(f'Committed calibration model is incomplete: {stage}')
         if report_path.is_file() and all((model / name).is_file() for name in MODEL_FILES):
             rec = pycolmap.Reconstruction(model)
-            ba = json.loads(report_path.read_text())
+            ba = json.loads(report_path.read_text(encoding='utf-8'))
             if (ba.get('input_model_files') != input_files
                     or ba.get('model_files') != model_files(model)):
                 raise ValueError(f'Calibration stage identity changed: {stage}')

@@ -4,7 +4,24 @@
 
 ## 启动
 
-需要 Linux、Python ≥ 3.13、NVIDIA CUDA GPU、C++17 编译器和本地模型权重。依赖版本由 `uv.lock` 固定，权重准备见[资源说明](docs/resources.md)。
+支持 Linux 和 Windows 本机，需要 Python 3.13、NVIDIA CUDA GPU、C++17 编译器和本地模型权重。依赖版本由 `uv.lock` 固定，权重准备见[资源说明](docs/resources.md)。
+
+Windows 在 PowerShell 中运行；首次配置会复用已安装的 `uv`、自动找到 Visual Studio C++ 工具链，并在项目内创建独立环境：
+
+```powershell
+.\setup-windows.ps1
+.\run.ps1 --input "input/场景"
+.\run.ps1 --work "work/场景"
+
+# 仅检查依赖导入、CUDA 和原生扩展
+.\setup-windows.ps1 -CheckOnly
+
+# 导出与验包
+.\.venv\Scripts\python.exe -X utf8 -m geosunpre export --work "work/场景" --output "D:/output/colmap"
+.\.venv\Scripts\python.exe -X utf8 -m geosunpre check --output "D:/output/colmap"
+```
+
+Linux：
 
 ```bash
 uv sync --locked
@@ -54,3 +71,5 @@ input/场景/
 | [2026-10-09 验证](docs/benchmarks/generalization_20261009.md) | 本轮实际运行、证据范围与历史记录 |
 
 原始数据、权重和运行产物位于忽略跟踪的 `input/`、`.cache/`、`work/`。
+
+开发协作约定见 [AGENTS.md](AGENTS.md)。

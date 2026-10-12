@@ -94,8 +94,8 @@ def refine_joint(alignment, inputs, output, *, workers=4, context=None):
     native_costs()
     reference_files = {name: file_metadata(alignment / name)
                         for name in ('report.json', 'transform.json', 'registration_points.npz')}
-    reference = json.loads((alignment / 'report.json').read_text())
-    transform = json.loads((alignment / 'transform.json').read_text())
+    reference = json.loads((alignment / 'report.json').read_text(encoding='utf-8'))
+    transform = json.loads((alignment / 'transform.json').read_text(encoding='utf-8'))
     if (reference['inputs_file'] != inputs['inputs_file']
             or transform['report_file'] != reference_files['report.json']):
         raise ValueError('Global registration identity mismatch')

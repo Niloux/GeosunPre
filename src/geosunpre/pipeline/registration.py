@@ -39,7 +39,7 @@ POLICY = {
 
 
 def _read(path):
-    return json.loads(Path(path).read_text())
+    return json.loads(Path(path).read_text(encoding='utf-8'))
 
 
 def freeze_inputs(work):
@@ -343,7 +343,7 @@ def export_registered(work, *, output=None, image_mode='copy', include_masks=Tru
         raise ValueError('Choose a COLMAP export separate from pipeline models and raw input')
     provenance = {'kind': 'geosunpre_production', 'source_model_files': result['model_files'],
         'work': str(work), 'input_root': inputs['input_root'], 'las': inputs['las'],
-        'settings': json.loads((work / CONFIG_FILE).read_text())['settings'],
+        'settings': json.loads((work / CONFIG_FILE).read_text(encoding='utf-8'))['settings'],
         'las_file': inputs['input_files'][inputs['las']],
         'target_frame': 'input_las_xyz', 'registration_selected': result['selected'],
         'joint_refinement_accepted': result['joint_accepted'],

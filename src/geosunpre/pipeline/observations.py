@@ -42,7 +42,7 @@ def load_observations(work, data):
     if not path.is_file():
         raise ValueError('Missing observation protocol; run the observations stage first')
     expected = _identity(work, data)
-    if json.loads(path.read_text()) != expected:
+    if json.loads(path.read_text(encoding='utf-8')) != expected:
         raise ValueError('Frozen observations changed; use a fresh work directory')
     return expected
 

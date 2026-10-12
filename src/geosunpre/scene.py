@@ -136,12 +136,12 @@ def prepare(input_root, work):
         'cameras': {k: c.to_dict() for k,c in cameras.items()}, 'images': images,
     }
     write_frozen_json(work/'manifest.json', manifest)
-    (work/'images.txt').write_text('\n'.join(im['name'] for im in images)+'\n')
+    (work/'images.txt').write_text('\n'.join(im['name'] for im in images)+'\n', encoding='utf-8')
     return manifest
 
 
 def load_scene(work):
-    scene = json.loads((Path(work)/'manifest.json').read_text())
+    scene = json.loads((Path(work)/'manifest.json').read_text(encoding='utf-8'))
     if scene['contract_version'] != CONTRACT_VERSION or scene['pose_model'] != 'independent_exposure':
         raise ValueError('Incompatible prepared scene contract')
     return scene

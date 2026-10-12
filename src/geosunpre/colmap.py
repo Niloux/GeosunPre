@@ -71,7 +71,7 @@ def verify_colmap_export(output):
     """Validate a dataset using only its exported files and image links."""
     output = Path(output).resolve()
     identity_path = _contained_file(output, IDENTITY_FILE)
-    identity = json.loads(identity_path.read_text())
+    identity = json.loads(identity_path.read_text(encoding='utf-8'))
     if (identity.get('schema_version') != 4 or identity.get('format') != 'COLMAP'
             or 'initialization' not in identity
             or not isinstance(identity.get('request'), dict)
@@ -119,7 +119,7 @@ def verify_colmap_export(output):
                 or initialization.get('version') != 1
                 or initialization.get('ply_size_bytes') != identity['supplemental_files'].get('sparse/0/points3D.ply')
                 or 'initialization.json' not in identity['supplemental_files']
-                or json.loads((output / 'initialization.json').read_text()) != initialization):
+                or json.loads((output / 'initialization.json').read_text(encoding='utf-8')) != initialization):
             raise ValueError('LAS initialization identity differs')
         initialization_recipe(initialization['voxel_size_m'])
         verify_initialization_ply(output / 'sparse/0/points3D.ply', initialization['points'])
@@ -189,7 +189,7 @@ def export_colmap(model_path, scene, output, *, image_mode='copy', include_masks
         if not (output / IDENTITY_FILE).is_file():
             raise ValueError('Destination is not a COLMAP export; choose a new output directory')
         verified = verify_colmap_export(output)
-        existing = json.loads((output / IDENTITY_FILE).read_text())
+        existing = json.loads((output / IDENTITY_FILE).read_text(encoding='utf-8'))
     source_files = model_files(model_path)
     expected_files = (provenance or {}).get('source_model_files')
     if expected_files is not None and source_files != expected_files:

@@ -68,7 +68,7 @@ def load_config(work):
     path = Path(work) / CONFIG_FILE
     if not path.is_file():
         raise ValueError('Missing pipeline_config.json; start a run in a fresh work directory')
-    value = json.loads(path.read_text())
+    value = json.loads(path.read_text(encoding='utf-8'))
     if value.get('version') != CONFIG_VERSION:
         raise ValueError('Unsupported pipeline configuration; use a fresh work directory')
     if set(value.get('settings', {})) != {field.name for field in fields(PipelineConfig)}:

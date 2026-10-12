@@ -19,6 +19,7 @@ dependencies = [
     "lomatch @ git+https://github.com/davnords/LoMa.git@8fb59c458f2a2ef44314f462467b229c27786bf0",
     "torch==2.8.0",
     "torchvision==0.23.0",
+    "psutil>=7,<8; sys_platform == 'win32'",
 ]
 
 [project.scripts]
@@ -29,8 +30,12 @@ requires = ["uv_build>=0.12.14,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-source-include = ["run.sh", "configs/**", "docs/**", "native/pyproject.toml",
-                  "native/setup.py", "native/MANIFEST.in", "native/*.cpp", "native/*.h", "native/*.md", "native/vendor/**"]
+source-include = [
+    "run.sh", "run.ps1", "setup-windows.ps1",
+    "scripts/**", "configs/**", "docs/**",
+    "native/pyproject.toml", "native/setup.py", "native/MANIFEST.in",
+    "native/*.cpp", "native/*.h", "native/*.md", "native/vendor/**",
+]
 
 [tool.uv.sources]
 geosunpre-native = { path = "native" }

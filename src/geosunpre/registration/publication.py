@@ -28,7 +28,7 @@ def verify_publication(directory, context):
     path = directory / 'completion.json'
     if not path.is_file():
         raise ValueError(f'Registration stage has no committed identity: {directory}')
-    saved = json.loads(path.read_text())
+    saved = json.loads(path.read_text(encoding='utf-8'))
     if (saved.get('version') != 1 or saved.get('context') != context
             or saved.get('files') != _inventory(directory)):
         raise ValueError(f'Completed registration stage changed: {directory}')

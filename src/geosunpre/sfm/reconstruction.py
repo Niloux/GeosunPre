@@ -45,7 +45,7 @@ def database_and_seed(directory, scene, images, entries, features, *, protocol_f
     files = ['database.db', 'seed.json', 'geometry_summary.json', 'rotation_cycles.json']
     files += [f'seed/{name}' for name in MODEL_FILES]
     if receipt.is_file():
-        saved = json.loads(receipt.read_text())
+        saved = json.loads(receipt.read_text(encoding='utf-8'))
         if saved.get('request') != request or set(saved.get('files', {})) != set(files):
             raise ValueError('Mapping inputs belong to another geometry protocol')
         for name in files:

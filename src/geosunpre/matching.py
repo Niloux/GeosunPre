@@ -1,17 +1,25 @@
-"""Pinned LoMa inference without unused math-SDPA outputs or reverse matches."""
+"""Pinned LoMa inference with the platform CUDA kernel and forward matches."""
+import sys
 from types import MethodType
 
+ATTENTION_BACKEND = 'efficient' if sys.platform == 'win32' else 'flash'
 
-def flash_self_attention(self, x, encoding):
+
+def attention_backend():
+    from torch.nn.attention import SDPBackend
+    return getattr(SDPBackend, f'{ATTENTION_BACKEND.upper()}_ATTENTION')
+
+
+def cuda_self_attention(self, x, encoding):
     import torch
     from loma.loma import apply_cached_rotary_emb
-    from torch.nn.attention import SDPBackend, sdpa_kernel
+    from torch.nn.attention import sdpa_kernel
     qkv = self.Wqkv(x).unflatten(-1, (self.num_heads, -1, 3)).transpose(1, 2)
     q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]
     q = apply_cached_rotary_emb(encoding, q)
     k = apply_cached_rotary_emb(encoding, k)
     # Require the fixed production kernel; fail if the GPU cannot run it.
-    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    with sdpa_kernel(attention_backend()):
         context = torch.nn.functional.scaled_dot_product_attention(q, k, v.contiguous())
     message = self.out_proj(context.transpose(1, 2).flatten(start_dim=-2))
     return x + self.ffn(torch.cat([x, message], -1))
@@ -22,7 +30,7 @@ def configure_matcher(model):
     for layer in model.transformers:
         if not isinstance(layer.self_attn, SelfBlock):
             raise TypeError('Unsupported LoMa self-attention implementation')
-        layer.self_attn.forward = MethodType(flash_self_attention, layer.self_attn)
+        layer.self_attn.forward = MethodType(cuda_self_attention, layer.self_attn)
 
 
 def forward_matches(scores, threshold):

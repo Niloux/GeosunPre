@@ -17,7 +17,7 @@ def preflight(work, stages, delivery, *, model_cache=None):
     root = work / 'sfm'
     scene_path = root / 'manifest.json'
     base_path = work / 'manifest.json'
-    scene = json.loads((scene_path if scene_path.is_file() else base_path).read_text())
+    scene = json.loads((scene_path if scene_path.is_file() else base_path).read_text(encoding='utf-8'))
     images = scene['images']
     missing_masks = 'masks' in stages and any(not mask_cached(r, root / 'masks') for r in images)
     missing_features = False
@@ -29,7 +29,7 @@ def preflight(work, stages, delivery, *, model_cache=None):
     missing_matches = False
     if 'matches' in stages:
         path = root / 'frontend.json'
-        data = json.loads(path.read_text()) if path.is_file() else {}
+        data = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
         missing_matches = not data.get('pairs') or any(not Path(p['path']).is_file() for p in data.get('pairs', []))
     gpu_needed = missing_masks or missing_features or missing_matches
     result = {'gpu_needed': gpu_needed, 'device_profile': DEVICE_PROFILE, 'warnings': []}
@@ -58,12 +58,14 @@ def preflight(work, stages, delivery, *, model_cache=None):
         if not torch.cuda.is_available():
             raise RuntimeError('Pending masks/features/matches require an available CUDA GPU')
         if missing_matches:
-            from torch.nn.attention import SDPBackend, sdpa_kernel
+            from torch.nn.attention import sdpa_kernel
+            from geosunpre.matching import ATTENTION_BACKEND, attention_backend
             # Test the requested kernel with the pinned matcher dtype/head width.
-            with torch.inference_mode(), sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            with torch.inference_mode(), sdpa_kernel(attention_backend()):
                 sample = torch.zeros((1, 4, 16, 64), dtype=torch.bfloat16, device='cuda')
                 torch.nn.functional.scaled_dot_product_attention(sample, sample, sample)
             del sample
+            result['attention_backend'] = ATTENTION_BACKEND
         result['gpu'] = torch.cuda.get_device_name()
     if missing_features or missing_matches:
         checkpoints = Path(os.environ.get('TORCH_HOME', '.cache/torch')).expanduser().resolve() / 'hub/checkpoints'

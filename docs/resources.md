@@ -2,7 +2,16 @@
 
 ## 环境与权重
 
-需要 Linux、Python ≥ 3.13、C++17 编译器和 Python 开发头文件。依赖由 `uv.lock` 固定，GPU 阶段使用 CUDA 12.8 的 PyTorch 2.8、FlashAttention 和 CUDA Graph。
+支持 Linux 和 Windows 本机，使用 Python 3.13、C++17 编译器和 Python 开发头文件。依赖由 `uv.lock` 固定，GPU 阶段使用 CUDA 12.8 的 PyTorch 2.8 和 CUDA Graph。Linux 匹配使用 FlashAttention；Windows 版 PyTorch 2.8 未编译该内核，使用 `EFFICIENT_ATTENTION` CUDA 内核，实际后端写入运行记录和匹配缓存。
+
+Windows 需要 Visual Studio 的“使用 C++ 的桌面开发”工作负载和 Windows SDK；不需要另行编译 PyTorch 或安装第三方 `flash-attn`。运行：
+
+```powershell
+.\setup-windows.ps1
+.\setup-windows.ps1 -CheckOnly
+```
+
+脚本复用已安装的 `uv`，即使当前进程的 PATH 尚未刷新也会检查用户 PATH。Python 下载至项目 `.cache/python/`，依赖环境位于 `.venv/`；不修改系统 Python。环境检查仅导入依赖、确认 CUDA 可用并加载原生扩展，结果保存在 `.cache/environment_check.json`。权重和匹配内核由实际阶段的资源预检检查。
 
 ```bash
 uv sync --locked
@@ -27,9 +36,13 @@ LoMa、SegFormer 和原生 Ceres 扩展均必需，扩展缺失直接报错。�
       model.safetensors       # 或 pytorch_model.bin
 ```
 
-snapshot 可用指向 `blobs/` 的有效链接。LoMa 使用 `TORCH_HOME`，默认 `.cache/torch`；SegFormer 使用 `--model-cache`、`HF_HUB_CACHE` 或 `.cache/huggingface`，参数指向缓存根目录。`run.sh` 在仓库根运行；直接 CLI 的相对路径以启动目录为基准。续跑继承缓存位置并核对已使用权重。
+snapshot 可用指向 `blobs/` 的有效链接。从 WSL 迁移到 Windows 时，将上述权重复制为实际文件；Linux 缓存的符号链接不能直接作为 Windows 文件读取。无需迁移 `.venv` 或 `uv` 缓存。
 
-`prepare` 无需 GPU/权重；昂贵阶段前预检待处理缓存、CUDA、FlashAttention、扩展、导航/LAS 和交付空间。缓存数值阶段不初始化 GPU。
+LoMa 使用 `TORCH_HOME`，默认 `.cache/torch`；SegFormer 使用 `--model-cache`、`HF_HUB_CACHE` 或 `.cache/huggingface`，参数指向缓存根目录。`run.sh` 和 `run.ps1` 在仓库根运行；直接 CLI 的相对路径以启动目录为基准。续跑继承缓存位置并核对已使用权重。
+
+在 Windows 上使用新工作目录；WSL 的旧工作目录冻结了 Linux 绝对路径，不能直接跨系统续跑。默认 `copy` 导出可直接使用；`--image-mode link` 创建符号链接，需要 Windows 开发者模式或相应权限。
+
+`prepare` 无需 GPU/权重；昂贵阶段前预检待处理缓存、CUDA、平台注意力内核、扩展、导航/LAS 和交付空间。缓存数值阶段不初始化 GPU。
 
 ## 资源与计时
 

@@ -16,7 +16,7 @@ def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + '.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + '\n')
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + '\n', encoding='utf-8')
     temporary.replace(path)
 
 
@@ -25,7 +25,7 @@ def write_frozen_json(path, value):
     path = Path(path)
     if path.exists():
         # Normalize tuples and integer keys to their on-disk JSON representation.
-        if json.loads(path.read_text()) != json.loads(json.dumps(value, allow_nan=False)):
+        if json.loads(path.read_text(encoding='utf-8')) != json.loads(json.dumps(value, allow_nan=False)):
             raise ValueError(f'Frozen inputs changed; use a fresh work directory: {path}')
     else:
         write_json(path, value)

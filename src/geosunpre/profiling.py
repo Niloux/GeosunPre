@@ -3,11 +3,16 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
-import resource
 import gc
 import sys
 from threading import Event, Thread
 import time
+
+if sys.platform == 'win32':
+    import psutil
+    _process = psutil.Process()
+else:
+    import resource
 
 _operations = ContextVar('profile_operations', default=None)
 _parents = ContextVar('profile_parents', default=())
@@ -54,10 +59,26 @@ def _cuda():
 
 
 def _rss_bytes():
-    for line in Path('/proc/self/status').read_text().splitlines():
+    if sys.platform == 'win32':
+        return _process.memory_info().rss
+    for line in Path('/proc/self/status').read_text(encoding='utf-8').splitlines():
         if line.startswith('VmRSS:'):
             return int(line.split()[1]) * 1024
     return 0
+
+
+def _cpu_seconds():
+    if sys.platform == 'win32':
+        cpu = _process.cpu_times()
+        return cpu.user + cpu.system
+    cpu = resource.getrusage(resource.RUSAGE_SELF)
+    return cpu.ru_utime + cpu.ru_stime
+
+
+def _rss_high_water_bytes():
+    if sys.platform == 'win32':
+        return _process.memory_info().peak_wset
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
 
 
 def release_gpu_cache():
@@ -73,6 +94,8 @@ def reclaim_host_memory():
     import ctypes
     gc.collect()
     before = _rss_bytes()
+    if sys.platform != 'linux':
+        return {'supported': False, 'rss_before_bytes': before, 'rss_after_bytes': _rss_bytes()}
     try:
         trim = ctypes.CDLL(None).malloc_trim
     except AttributeError:
@@ -89,7 +112,7 @@ class StageResources:
     def start(self):
         self.stop_event = Event()
         self.started = time.perf_counter()
-        self.cpu_started = resource.getrusage(resource.RUSAGE_SELF)
+        self.cpu_started = _cpu_seconds()
         self.values = {'sample_interval_seconds': .1, 'samples': 0,
                        'rss_sampled_peak_bytes': 0,
                        'cuda_allocated_peak_bytes': 0, 'cuda_reserved_peak_bytes': 0}
@@ -126,12 +149,10 @@ class StageResources:
         self.stop_event.set()
         self.thread.join()
         self._safe_sample()
-        cpu = resource.getrusage(resource.RUSAGE_SELF)
         elapsed = time.perf_counter() - self.started
         self.values.update(rss_end_bytes=_rss_bytes(),
-                           process_rss_high_water_bytes=cpu.ru_maxrss * 1024,
-                           cpu_seconds=(cpu.ru_utime + cpu.ru_stime -
-                                        self.cpu_started.ru_utime - self.cpu_started.ru_stime))
+                           process_rss_high_water_bytes=_rss_high_water_bytes(),
+                           cpu_seconds=_cpu_seconds() - self.cpu_started)
         cuda = _cuda()
         if cuda is not None:
             self.values.update(cuda_allocated_end_bytes=cuda.memory_allocated(),

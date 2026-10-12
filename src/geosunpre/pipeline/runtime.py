@@ -2,12 +2,17 @@
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
-import fcntl
+import errno
 import json
 import os
 from pathlib import Path
 import time
 from uuid import uuid4
+
+if os.name == 'nt':
+    import msvcrt
+else:
+    import fcntl
 
 from geosunpre.artifacts import write_json
 from geosunpre.profiling import StageResources, release_gpu_cache, reclaim_host_memory
@@ -21,19 +26,29 @@ def utc_now():
 def work_lock(work):
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
-    with (work / '.pipeline.lock').open('a+') as stream:
+    with (work / '.pipeline.lock').open('a+b') as stream:
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            if os.name == 'nt':
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                raise
             raise RuntimeError(f'Another pipeline process is using {work}') from exc
-        stream.seek(0)
-        stream.truncate()
-        stream.write(json.dumps({'pid': os.getpid(), 'started_at_utc': utc_now()}))
-        stream.flush()
         try:
+            stream.seek(0)
+            stream.truncate()
+            stream.write(json.dumps({'pid': os.getpid(), 'started_at_utc': utc_now()}).encode('utf-8'))
+            stream.flush()
             yield
         finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            if os.name == 'nt':
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 class StageRecorder:

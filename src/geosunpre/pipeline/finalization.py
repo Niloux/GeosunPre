@@ -51,7 +51,7 @@ def finalize(work):
     _check_model(source, scene)
     geometry_path = root / 'geometry_protocol.json'
     ba_path = source_path.parent.parent / 'ba.json'
-    ba = json.loads(ba_path.read_text())
+    ba = json.loads(ba_path.read_text(encoding='utf-8'))
     if ba['model_files'] != model_files(source_path):
         raise ValueError('Final optimization report differs from the source model')
     output = work / FINAL
@@ -70,12 +70,12 @@ def finalize(work):
     }
     protocol_path = output / 'protocol.json'
     if protocol_path.exists():
-        if json.loads(protocol_path.read_text()) != protocol:
+        if json.loads(protocol_path.read_text(encoding='utf-8')) != protocol:
             raise ValueError('Final BA inputs changed; use a fresh work directory')
     model_path = output / 'sparse/0'
     result_path = output / 'result.json'
     if result_path.exists():
-        result = json.loads(result_path.read_text())
+        result = json.loads(result_path.read_text(encoding='utf-8'))
         if (result['protocol_file'] != file_metadata(protocol_path)
                 or result['model_files'] != model_files(model_path)):
             raise ValueError('Saved final visual model changed')
@@ -101,7 +101,7 @@ def finalize(work):
     _check_model(candidate, scene)
     validation_path = output / 'quality_summary.json'
     if validation_path.exists():
-        validation = json.loads(validation_path.read_text())
+        validation = json.loads(validation_path.read_text(encoding='utf-8'))
         if validation['model_files'] != result['model_files']:
             raise ValueError('Final BA quality report belongs to another model')
     else:
@@ -125,9 +125,9 @@ def verify_final(work):
     work = Path(work).resolve()
     root, scene, *_ = freeze_geometry(work, require_existing=True)
     final = work / FINAL
-    protocol = json.loads((final / 'protocol.json').read_text())
-    result = json.loads((final / 'result.json').read_text())
-    quality = json.loads((final / 'quality_summary.json').read_text())
+    protocol = json.loads((final / 'protocol.json').read_text(encoding='utf-8'))
+    result = json.loads((final / 'result.json').read_text(encoding='utf-8'))
+    quality = json.loads((final / 'quality_summary.json').read_text(encoding='utf-8'))
     if (result['protocol_file'] != file_metadata(final / 'protocol.json')
             or result['model_files'] != model_files(final / 'sparse/0')
             or quality['model_files'] != result['model_files']

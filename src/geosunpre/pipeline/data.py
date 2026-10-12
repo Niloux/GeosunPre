@@ -50,7 +50,7 @@ def load_frontend(work, *, require_observations=True):
     work = Path(work).resolve()
     out = work / OUTPUT
     scene = load_scene(out)
-    data = json.loads((out / 'frontend.json').read_text())
+    data = json.loads((out / 'frontend.json').read_text(encoding='utf-8'))
     if data['scene_manifest_file'] != file_metadata(out / 'manifest.json') or data['config'] != asdict(CONFIG):
         raise ValueError('Global frontend does not match current scene/configuration')
     sources = {}
@@ -132,7 +132,7 @@ def extract_features(work):
 def match_features(work):
     from geosunpre.sfm.pair_selection import PairSelection
     work = Path(work).resolve(); out = work / OUTPUT; scene = load_scene(out)
-    catalog = json.loads((out / 'feature_catalog.json').read_text())
+    catalog = json.loads((out / 'feature_catalog.json').read_text(encoding='utf-8'))
     if catalog['scene_manifest_file'] != file_metadata(out / 'manifest.json'): raise ValueError('Global scene changed')
     with np.load(out / 'retrieval_descriptors.npz') as retrieval:
         selection = PairSelection(scene['images'], retrieval['names'], retrieval['descriptors'])
@@ -181,7 +181,7 @@ def match_features(work):
 def _save_catalog(path, result):
     """Keep completed catalog metadata stable when only cache counters change."""
     if path.is_file():
-        saved = json.loads(path.read_text())
+        saved = json.loads(path.read_text(encoding='utf-8'))
         inputs = lambda value: {k: v for k, v in value.items() if k not in ('cache', 'matching_cache')}
         if inputs(saved) != inputs(result):
             raise ValueError(f'Frontend catalog changed; use a fresh work directory: {path}')

@@ -84,9 +84,9 @@ def production_acceptance(report, config):
 
 def write_production_report(out, scene):
     out = Path(out)
-    mapping = json.loads((out / 'mapping_summary.json').read_text())
+    mapping = json.loads((out / 'mapping_summary.json').read_text(encoding='utf-8'))
     path = out / 'optimization_summary.json'
-    stages = json.loads(path.read_text())['stages'] if path.exists() else {}
+    stages = json.loads(path.read_text(encoding='utf-8'))['stages'] if path.exists() else {}
     rows = ''.join(f'<tr><td>{html.escape(stage)}</td><td>{value["registered"]}</td>'
                    f'<td>{value["points"]}</td><td>{value["observations"]}</td></tr>'
                    for stage, value in stages.items())
@@ -98,4 +98,4 @@ def write_production_report(out, scene):
 <p><a href="mapping_summary.json">建图记录</a> · <a href="optimization_summary.json">优化记录</a> ·
 <a href="final/quality_summary.json">最终质量诊断</a></p>
 <p>重投影残差属于拟合数据诊断，不代表测试集精度或下游渲染质量。</p></html>'''
-    (out / 'index.html').write_text(document)
+    (out / 'index.html').write_text(document, encoding='utf-8')
