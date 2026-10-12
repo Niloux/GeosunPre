@@ -1,0 +1,1 @@
+{"name":"blas","version-date":"2026-10-12","dependencies":["openblas"],"supports":"windows & x64 & !static"}

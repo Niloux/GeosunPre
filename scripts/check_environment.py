@@ -25,6 +25,10 @@ def main():
         'cuda': {'runtime': torch.version.cuda, 'gpu': torch.cuda.get_device_name()},
         'native': {'implementation': native.implementation_version},
     }
+    from geosunpre import native_runtime
+    result['numeric_backend'] = native_runtime.backend()
+    if native_runtime.backend() == 'cpp':
+        result['cpp'] = native_runtime.info()
     root = Path(__file__).resolve().parents[1]
     write_json(root / '.cache/environment_check.json', result)
     print(json.dumps(result, ensure_ascii=False, indent=2))

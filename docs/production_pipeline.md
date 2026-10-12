@@ -1,5 +1,7 @@
 # 生产运行
 
+Windows 默认入口 `run.ps1` 使用 C++/CUDA；原有 Python 工作目录使用 `run-reference.ps1`。原生任务使用新目录，进度见[迁移记录](../native/MIGRATION.md)。
+
 ## 配置与阶段
 
 `--config` 接受严格 TOML，未知字段报错。没有标定帧号或场景模式；[通用示例](../configs/default.toml)可省略，默认值相同。
@@ -44,6 +46,17 @@
 ```
 
 工作目录冻结输入、配置、权重来源与默认交付选项；省略参数时继承。改变复制/链接、掩码、PLY 或体素参数时选择新 `--output`。`check --work` 检查任务默认输出。
+
+Windows 原生入口：
+
+```powershell
+.\run.ps1 --input "input/场景" --work "work/场景-native"
+.\run.ps1 --work "work/场景-native" --stage sfm
+.\.cache\native\build\bin\geosunpre-native.exe export --work "work/场景-native" --output "D:/output/colmap"
+.\.cache\native\build\bin\geosunpre-native.exe check --output "D:/output/colmap"
+```
+
+原生工作目录使用 `native_contract.json` 和 `native_receipts/` 保存来源及完成记录；完整阶段核对文件元数据后复用，未提交目录恢复时归档。`visual/` 保存视觉模型，`registration/native/` 保存 LAS 配准、联合去留和最终模型。原生诊断以 JSON 为主，当前没有参考流程的掩码预览拼图与 HTML 检查页。
 
 默认附带掩码和 5 cm LAS 初始化 PLY。`--ply-voxel-size 0.1` 使用 10 cm，`--no-include-ply`、`--no-include-masks` 可省略对应产物；格式及迁移要求见[交付契约](colmap_contract.md)。
 

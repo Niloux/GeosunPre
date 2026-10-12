@@ -32,9 +32,13 @@ def runtime_environment():
             packages[name] = version(name)
         except PackageNotFoundError:
             packages[name] = None
-    return {'packages': packages, 'python': platform.python_version(),
+    from geosunpre import native_runtime
+    result = {'packages': packages, 'python': platform.python_version(),
             'device_profile': DEVICE_PROFILE, 'matcher': f'{ATTENTION_BACKEND}_cuda_graph',
-            'depth_backend': 'native'}
+            'depth_backend': 'native', 'numeric_backend': native_runtime.backend()}
+    if native_runtime.backend() == 'cpp':
+        result['cpp'] = native_runtime.info()
+    return result
 
 
 def _weights_identity(model_cache, families):

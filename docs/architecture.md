@@ -2,6 +2,8 @@
 
 目标是同一套双鱼眼 + LAS 设备覆盖不同场景。项目使用一条生产流程，配置只表达资源、LAS 文件选择和验收限值。
 
+Windows 默认编排和算法入口位于 `native/cpp/`，GPU 前端采用 LibTorch C++/CUDA，视觉及联合求解采用 COLMAP/Ceres，LAS 邻域采用 nanoflann。Python 模块保留为显式参考实现。移植仍沿用下述策略和验收；LAS 固定种子分层抽样采用 C++ 随机数，样本无需与 NumPy 逐条相同。[迁移记录](../native/MIGRATION.md)说明实际验证范围。
+
 ```mermaid
 flowchart LR
     A[输入与语义掩码] --> B[特征、检索与补边]
@@ -58,6 +60,8 @@ LAS 检查表面支持、空间覆盖、区域点到面残差。联合候选还�
 | `artifacts.py`、`colmap.py`、`initialization.py` | 原子发布、COLMAP 与完整 LAS 初始化点云 |
 
 局部和全局共用冻结特征编号；几何数组按需读取，自动选图会访问全场关键点。数据库、种子和完成记录一起发布，COLMAP 使用临时数据库副本。缓存与恢复规则见[生产运行](production_pipeline.md)，维护采用静态检查、定向编译和必要的实际阶段运行。
+
+Windows 的完整原生入口由 `native/cpp/pipeline.cpp` 编排，推理子进程只负责 C++/CUDA 前端；`sfm_pipeline.cpp`、`registration.cpp`、`joint.cpp`、`delivery.cpp` 分别负责视觉、LAS、条件联合更新及交付。正深度与联合代价在 C++ 中构建和检查，数值依赖统一构建；Ceres CUDA 稠密求解可显式使用。显式 Python 参考流程仍通过 `native_runtime.py` 调用数值程序。[第一阶段数值验证](benchmarks/windows_native_20261012.md)和[完整迁移验证](benchmarks/windows_cpp_pipeline_20261012.md)分别记录对应证据。
 
 本轮设计参考以下一手资料；它们提供算法依据，项目收益仍以实际验证为准：
 

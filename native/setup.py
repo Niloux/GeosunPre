@@ -6,7 +6,7 @@ setup(
     license_files=['vendor/LICENSE.ceres'],
     ext_modules=[Pybind11Extension(
         'geosunpre_native', ['depth_guard.cpp', 'vendor/cost_function.cc'],
-        depends=['joint_costs.h', 'vendor/ceres/cost_function.h'],
+        depends=['depth_cost.h', 'joint_costs.h', 'vendor/ceres/cost_function.h'],
         include_dirs=['vendor'], cxx_std=17,
     )],
     cmdclass={'build_ext': build_ext},

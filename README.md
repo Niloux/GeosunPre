@@ -4,21 +4,26 @@
 
 ## 启动
 
-支持 Linux 和 Windows 本机，需要 Python 3.13、NVIDIA CUDA GPU、C++17 编译器和本地模型权重。依赖版本由 `uv.lock` 固定，权重准备见[资源说明](docs/resources.md)。
+Windows 默认使用独立 C++/CUDA 流程，生产运行不启动 Python 或 WSL。Linux 和显式参考流程保留 Python 3.13。需要 NVIDIA CUDA GPU 和本地模型权重，准备方式见[资源说明](docs/resources.md)。
 
-Windows 在 PowerShell 中运行；首次配置会复用已安装的 `uv`、自动找到 Visual Studio C++ 工具链，并在项目内创建独立环境：
+Windows 开发构建使用 Visual Studio C++ 工具链、CUDA Toolkit 12.8 和 vcpkg。`setup-windows.ps1` 准备开发/参考环境，`setup-native.ps1` 构建原生程序；固定权重只需转换一次，生产运行加载转换后的 `.pt`。
+
+通过 `VCPKG_ROOT` 指定 vcpkg，或在项目同级放置 vcpkg。程序和依赖位于 `.cache/native/`，`package-native.ps1` 整理可独立使用的 EXE、DLL 和权重目录。实现和验收进度见 [native](native/README.md)与[迁移记录](native/MIGRATION.md)。旧工作目录和结果保留，原生任务使用新的工作目录。
 
 ```powershell
 .\setup-windows.ps1
-.\run.ps1 --input "input/场景"
-.\run.ps1 --work "work/场景"
+.\run.ps1 --input "input/场景" --work "work/场景-native"
+.\run.ps1 --work "work/场景-native"
 
-# 仅检查依赖导入、CUDA 和原生扩展
+# 仅检查依赖导入、CUDA、原生扩展和 C++ 求解程序
 .\setup-windows.ps1 -CheckOnly
 
 # 导出与验包
-.\.venv\Scripts\python.exe -X utf8 -m geosunpre export --work "work/场景" --output "D:/output/colmap"
-.\.venv\Scripts\python.exe -X utf8 -m geosunpre check --output "D:/output/colmap"
+.\.cache\native\build\bin\geosunpre-native.exe export --work "work/场景-native" --output "D:/output/colmap"
+.\.cache\native\build\bin\geosunpre-native.exe check --output "D:/output/colmap"
+
+# 继续原来的 Python 任务
+.\run-reference.ps1 --work "work/场景"
 ```
 
 Linux：
@@ -58,7 +63,7 @@ input/场景/
 
 最终训练数据位于 **`WORK/colmap/`**，默认复制原图，附带有效域掩码和 5 cm LAS 初始化点云 `sparse/0/points3D.ply`。`points3D.bin` 保存 SfM 稀疏点及轨迹。图像不缩放、不去畸变，下游须支持原生鱼眼模型。
 
-`--image-mode link` 适合本机使用；迁移数据使用默认 `copy`。最终选择与质量见 `WORK/registration/final/inspection.html`，运行状态见 `WORK/pipeline_status.json`。
+`--image-mode link` 适合本机使用；迁移数据使用默认 `copy`。原生最终选择见 `WORK/registration/native/report.json`，质量见 `WORK/colmap/quality.json`，运行状态见 `WORK/pipeline_status.json`。参考流程保留原来的 HTML 检查页。
 
 ## 文档
 
@@ -69,6 +74,8 @@ input/场景/
 | [COLMAP 契约](docs/colmap_contract.md) | 模型、坐标、掩码、初始化 PLY 与验包 |
 | [资源与离线运行](docs/resources.md) | 依赖、权重缓存与资源读数 |
 | [2026-10-09 验证](docs/benchmarks/generalization_20261009.md) | 本轮实际运行、证据范围与历史记录 |
+| [Windows 原生数值验证](docs/benchmarks/windows_native_20261012.md) | 性能归因、同模型 BA 对照、实际交付与迁移进度 |
+| [Windows 完整 C++/CUDA 验证](docs/benchmarks/windows_cpp_pipeline_20261012.md) | 从原始输入执行的原生整场任务、部署和交付验收 |
 
 原始数据、权重和运行产物位于忽略跟踪的 `input/`、`.cache/`、`work/`。
 

@@ -31,10 +31,11 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 source-include = [
-    "run.sh", "run.ps1", "setup-windows.ps1",
+    "run.sh", "run.ps1", "run-reference.ps1", "setup-windows.ps1", "setup-native.ps1", "package-native.ps1",
     "scripts/**", "configs/**", "docs/**",
     "native/pyproject.toml", "native/setup.py", "native/MANIFEST.in",
     "native/*.cpp", "native/*.h", "native/*.md", "native/vendor/**",
+    "native/cpp/**",
 ]
 
 [tool.uv.sources]

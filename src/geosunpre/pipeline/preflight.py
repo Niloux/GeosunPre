@@ -42,9 +42,14 @@ def preflight(work, stages, delivery, *, model_cache=None):
                                   'native_implementation': native.implementation_version,
                                   'target_frame': 'input_las_xyz'}
     if any(s in stages for s in ('calibration', 'sfm', 'finalize')):
-        from geosunpre.sfm.depth_guard import depth_cost_class
-        cost = depth_cost_class()
-        result['depth_backend'] = cost.__module__
+        from geosunpre import native_runtime
+        if native_runtime.backend() == 'cpp':
+            result['numeric_backend'] = native_runtime.info()
+            result['depth_backend'] = 'geosunpre_cpp'
+        else:
+            from geosunpre.sfm.depth_guard import depth_cost_class
+            cost = depth_cost_class()
+            result['depth_backend'] = cost.__module__
     if gpu_needed:
         modules = {'torch'}
         if missing_features or missing_matches:

@@ -231,6 +231,9 @@ def mapper_options():
 
 def map_from_inputs(directory, scene, database, seed):
     """COLMAP owns a scratch database; the committed input remains immutable."""
+    from geosunpre import native_runtime
+    if native_runtime.backend() == 'cpp':
+        return native_runtime.map_from_inputs(scene, database, seed)
     directory = Path(directory)
     with TemporaryDirectory(prefix='.mapper-', dir=directory) as temporary:
         working_database = Path(temporary) / 'database.db'
@@ -242,6 +245,10 @@ def map_from_inputs(directory, scene, database, seed):
 @profiled
 def bounded_bundle_adjustment(rec,stage,initial_cameras, *, protect_depth=False,
                               show_progress=False, max_iterations=None):
+    from geosunpre import native_runtime
+    if native_runtime.backend() == 'cpp':
+        return native_runtime.bundle_adjustment(rec, stage, initial_cameras,
+            protect_depth=protect_depth, show_progress=show_progress, max_iterations=max_iterations)
     options=pycolmap.BundleAdjustmentOptions()
     free=stage!='fixed'
     options.refine_focal_length=free;options.refine_extra_params=free

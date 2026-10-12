@@ -1,13 +1,18 @@
-# Run or resume the production pipeline with the local Windows environment.
+# Run or resume the standalone C++/CUDA production pipeline.
 $ErrorActionPreference = 'Stop'
 $pipelineArgs = $args
-$python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $python)) {
-    throw 'Prepare the environment first: .\setup-windows.ps1'
+$program = Join-Path $PSScriptRoot '.cache\native\runtime\geosunpre-native.exe'
+if (-not (Test-Path -LiteralPath $program)) {
+    $program = Join-Path $PSScriptRoot '.cache\native\build\bin\geosunpre-native.exe'
+}
+if (-not (Test-Path -LiteralPath $program)) {
+    throw 'Build the native runtime first: .\setup-native.ps1'
 }
 Push-Location $PSScriptRoot
 try {
-    & $python -X utf8 -m geosunpre run @pipelineArgs
+    # Native stderr also carries progress. Its exit code determines failure.
+    $ErrorActionPreference = 'Continue'
+    & $program run @pipelineArgs
     $exitCode = $LASTEXITCODE
 } finally {
     Pop-Location

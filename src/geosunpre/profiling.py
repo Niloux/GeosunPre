@@ -16,6 +16,16 @@ else:
 
 _operations = ContextVar('profile_operations', default=None)
 _parents = ContextVar('profile_parents', default=())
+_native_usage = ContextVar('native_process_usage', default=None)
+
+
+def record_native_resources(report):
+    usage = _native_usage.get()
+    if usage is not None:
+        resource = report['resources']
+        usage['native_processes'] += 1
+        usage['native_cpu_seconds'] += resource['cpu_seconds']
+        usage['native_rss_peak_bytes'] = max(usage['native_rss_peak_bytes'], resource['rss_peak_bytes'])
 
 
 @contextmanager
@@ -117,6 +127,8 @@ class StageResources:
                        'rss_sampled_peak_bytes': 0,
                        'cuda_allocated_peak_bytes': 0, 'cuda_reserved_peak_bytes': 0}
         self.operations = []
+        self.native_usage = {'native_processes': 0, 'native_cpu_seconds': 0., 'native_rss_peak_bytes': 0}
+        self.native_token = _native_usage.set(self.native_usage)
         self.token = _operations.set(self.operations)
         cuda = _cuda()
         if cuda is not None:
@@ -158,5 +170,9 @@ class StageResources:
             self.values.update(cuda_allocated_end_bytes=cuda.memory_allocated(),
                                cuda_reserved_end_bytes=cuda.memory_reserved())
         self.values['average_cpu_cores'] = self.values['cpu_seconds'] / max(elapsed, 1e-9)
+        self.values.update(self.native_usage)
+        self.values['combined_cpu_seconds'] = self.values['cpu_seconds'] + self.native_usage['native_cpu_seconds']
+        self.values['combined_average_cpu_cores'] = self.values['combined_cpu_seconds'] / max(elapsed, 1e-9)
+        _native_usage.reset(self.native_token)
         _operations.reset(self.token)
         return self.values

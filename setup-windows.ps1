@@ -32,6 +32,7 @@ try {
         }
         & $uvPath sync --locked --python 3.13
         if ($LASTEXITCODE -ne 0) { throw 'uv sync failed; see the dependency or compiler error above.' }
+        & (Join-Path $PSScriptRoot 'setup-native.ps1')
     }
     $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $python)) { throw 'The Windows virtual environment is missing. Run .\setup-windows.ps1 first.' }
