@@ -4,6 +4,7 @@
 #include <fstream>
 #include <cstring>
 #include <iostream>
+#include <deque>
 #ifdef _WIN32
 #include <Windows.h>
 #else
@@ -89,6 +90,22 @@ struct Engine {
     return p->data;
   }
 };
+struct Measurement {
+  std::string model;
+  cudaEvent_t begin = nullptr, end = nullptr;
+  explicit Measurement(std::string name) : model(std::move(name)) {
+    CudaCheck(cudaEventCreate(&begin));
+    CudaCheck(cudaEventCreate(&end));
+  }
+  ~Measurement() {
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+  }
+};
+struct InferenceTiming {
+  size_t calls = 0;
+  double load_seconds = 0, host_seconds = 0, gpu_seconds = 0;
+};
 }  // namespace
 struct Models::Implementation {
   fs::path root;
@@ -102,7 +119,29 @@ struct Models::Implementation {
   std::unique_ptr<nvinfer1::IRuntime> runtime;
   std::map<std::string, Engine> engines;
   cudaStream_t stream = nullptr;
+  std::deque<std::unique_ptr<Measurement>> pending;
+  std::map<std::string, InferenceTiming> timings;
+  void Collect(bool wait) {
+    while (!pending.empty()) {
+      const auto& p = *pending.front();
+      if (wait)
+        CudaCheck(cudaEventSynchronize(p.end));
+      else {
+        const auto status = cudaEventQuery(p.end);
+        if (status == cudaErrorNotReady)
+          break;
+        CudaCheck(status);
+      }
+      float milliseconds;
+      CudaCheck(cudaEventElapsedTime(&milliseconds, p.begin, p.end));
+      timings[p.model].gpu_seconds += milliseconds / 1000.;
+      pending.pop_front();
+    }
+  }
   ~Implementation() {
+    if (stream)
+      cudaStreamSynchronize(stream);
+    pending.clear();
     engines.clear();
     runtime.reset();
     if (stream)
@@ -148,8 +187,20 @@ Models::Models(const fs::path& root) : impl_(std::make_unique<Implementation>())
 Models::~Models() = default;
 const Json& Models::Manifest() const { return impl_->manifest; }
 cudaStream_t Models::Stream() const { return impl_->stream; }
+Json Models::Profile() {
+  impl_->Collect(true);
+  Json result = Json::object();
+  for (const auto& [name, t] : impl_->timings)
+    result[name] = {{"calls", t.calls},
+                    {"load_seconds", t.load_seconds},
+                    {"host_seconds", t.host_seconds},
+                    {"gpu_seconds", t.gpu_seconds}};
+  return result;
+}
 std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<Tensor>& inputs,
                                     bool device_output) {
+  const auto started = Clock::now();
+  impl_->Collect(impl_->pending.size() >= 32);
   auto found = impl_->engines.find(name);
   if (found == impl_->engines.end()) {
     const auto path = impl_->root / "engines" / (name + ".engine");
@@ -168,6 +219,7 @@ std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<T
       throw std::runtime_error("Cannot allocate inference context");
     found = impl_->engines.emplace(name, std::move(e)).first;
     Log("Loaded " + name);
+    impl_->timings[name].load_seconds += Seconds(started);
   }
   auto& e = found->second;
   const auto& spec = impl_->manifest.at("models").at(name);
@@ -215,8 +267,12 @@ std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<T
       t.bytes.resize(bytes);
     outputs.push_back(std::move(t));
   }
+  auto measurement = std::make_unique<Measurement>(name);
+  CudaCheck(cudaEventRecord(measurement->begin, impl_->stream));
   if (!e.context->enqueueV3(impl_->stream))
     throw std::runtime_error("TensorRT inference failed: " + name);
+  CudaCheck(cudaEventRecord(measurement->end, impl_->stream));
+  impl_->pending.push_back(std::move(measurement));
   for (size_t i = 0; !device_output && i < outputs.size(); ++i) {
     const auto label = spec.at("outputs")[i].get<std::string>();
     auto& t = outputs[i];
@@ -225,6 +281,9 @@ std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<T
   }
   if (!device_output)
     CudaCheck(cudaStreamSynchronize(impl_->stream));
+  auto& timing = impl_->timings[name];
+  ++timing.calls;
+  timing.host_seconds += Seconds(started);
   return outputs;
 }
 Json GpuInfo() {

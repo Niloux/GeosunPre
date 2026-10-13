@@ -1,5 +1,6 @@
 #include "frontend/frontend.h"
 #include "frontend/inference.h"
+#include "frontend/preprocessing.h"
 #include "io/cache.h"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -8,17 +9,17 @@
 #include <set>
 #include <cmath>
 #include <cstring>
+#include <deque>
+#include <future>
+#include <functional>
 
 namespace geosun {
 fs::path MaskPath(const fs::path& work, uint32_t id) {
   return work / "cache/masks" / (std::to_string(id) + ".png");
 }
 namespace {
-struct View {
-  cv::Mat source, x, y, weight;
-};
 struct Fusion {
-  std::vector<View> views;
+  std::vector<MaskView> views;
   cv::Mat weight;
 };
 Fusion VirtualViews(const Camera& camera) {
@@ -46,8 +47,8 @@ Fusion VirtualViews(const Camera& camera) {
     const Eigen::Matrix3d R =
         length == 0 ? Eigen::Matrix3d::Identity().eval()
                     : Eigen::AngleAxisd(length, angle.normalized()).toRotationMatrix();
-    View v{cv::Mat(512, 512, CV_32FC2), cv::Mat(h, w, CV_32FC1), cv::Mat(h, w, CV_32FC1),
-           cv::Mat(h, w, CV_32FC1)};
+    MaskView v{cv::Mat(512, 512, CV_32FC2), cv::Mat(h, w, CV_32FC1), cv::Mat(h, w, CV_32FC1),
+               cv::Mat(h, w, CV_32FC1)};
     for (int y = 0; y < 512; ++y)
       for (int x = 0; x < 512; ++x) {
         const Eigen::Vector3d ray =
@@ -77,6 +78,100 @@ Fusion VirtualViews(const Camera& camera) {
   }
   return out;
 }
+struct FrontendTiming {
+  size_t computed = 0, reused = 0;
+  double decode = 0, preprocess = 0, wait = 0, gpu_pipeline = 0, postprocess = 0, write = 0;
+  Json Report(Clock::time_point started, Models* models = nullptr) const {
+    Json report = {{"computed", computed},
+                   {"reused", reused},
+                   {"seconds", Seconds(started)},
+                   {"decode_seconds", decode},
+                   {"cpu_preprocess_seconds", preprocess},
+                   {"input_wait_seconds", wait},
+                   {"gpu_pipeline_host_seconds", gpu_pipeline},
+                   {"cpu_postprocess_seconds", postprocess},
+                   {"write_seconds", write}};
+    if (models)
+      report["inference"] = models->Profile();
+    return report;
+  }
+};
+struct PreparedImage {
+  uint32_t id;
+  cv::Mat rgb, mask;
+  std::vector<cv::Mat> views;
+  double decode = 0, preprocess = 0;
+};
+class ImageReader {
+  const std::vector<Exposure>& images;
+  const fs::path work;
+  const std::array<Fusion, 2>* fusion;
+  size_t next = 0;
+  std::deque<std::future<PreparedImage>> ready;
+  void Fill() {
+    while (ready.size() < 2 && next < images.size()) {
+      const auto record = images[next++];
+      ready.push_back(std::async(std::launch::async, [this, record] {
+        PreparedImage image;
+        image.id = record.id;
+        auto started = Clock::now();
+        image.rgb = ReadImage(record.source, cv::IMREAD_COLOR);
+        image.decode = Seconds(started);
+        started = Clock::now();
+        cv::cvtColor(image.rgb, image.rgb, cv::COLOR_BGR2RGB);
+        if (fusion) {
+          for (const auto& view : (*fusion)[record.camera].views) {
+            cv::Mat sampled;
+            cv::remap(image.rgb, sampled, view.source, cv::Mat(), cv::INTER_LINEAR,
+                      cv::BORDER_CONSTANT);
+            image.views.push_back(std::move(sampled));
+          }
+          image.rgb.release();
+        } else
+          image.mask = ReadImage(MaskPath(work, record.id), cv::IMREAD_GRAYSCALE);
+        image.preprocess = Seconds(started);
+        return image;
+      }));
+    }
+  }
+
+ public:
+  ImageReader(const std::vector<Exposure>& records, fs::path path,
+              const std::array<Fusion, 2>* maps = nullptr)
+      : images(records), work(std::move(path)), fusion(maps) {
+    Fill();
+  }
+  PreparedImage Next() {
+    auto image = ready.front().get();
+    ready.pop_front();
+    Fill();
+    return image;
+  }
+};
+class AsyncWriter {
+  std::deque<std::future<double>> jobs;
+
+ public:
+  double seconds = 0;
+  void Pop() {
+    seconds += jobs.front().get();
+    jobs.pop_front();
+  }
+  template <class Function>
+  void Submit(Function write) {
+    if (jobs.size() == 2)
+      Pop();
+    jobs.push_back(std::async(std::launch::async, [write = std::move(write)] {
+      const auto started = Clock::now();
+      write();
+      return Seconds(started);
+    }));
+  }
+  void Finish() {
+    while (!jobs.empty())
+      Pop();
+  }
+};
 std::vector<size_t> Select(const std::vector<std::array<float, 3>>& points, const Camera& camera) {
   std::vector<size_t> order(points.size());
   std::iota(order.begin(), order.end(), 0);
@@ -117,9 +212,25 @@ class FeatureCache {
     std::list<uint32_t>::iterator position;
   };
   std::map<uint32_t, Entry> entries;
+  struct Loaded {
+    FeatureSet value;
+    double seconds;
+  };
+  std::map<uint32_t, std::future<Loaded>> pending;
 
  public:
   explicit FeatureCache(fs::path path) : work(std::move(path)) {}
+  double read_seconds = 0, wait_seconds = 0, upload_seconds = 0;
+  void Prefetch(uint32_t id) {
+    if (entries.count(id) || pending.count(id) || pending.size() >= 4)
+      return;
+    const auto path = FeaturePath(work, id);
+    pending.emplace(id, std::async(std::launch::async, [path] {
+                      const auto started = Clock::now();
+                      auto value = ReadFeatures(path);
+                      return Loaded{std::move(value), Seconds(started)};
+                    }));
+  }
   const Entry& Get(uint32_t id) {
     auto it = entries.find(id);
     if (it != entries.end()) {
@@ -132,22 +243,34 @@ class FeatureCache {
     }
     order.push_front(id);
     Entry entry;
-    entry.value = ReadFeatures(FeaturePath(work, id));
+    const auto waiting = Clock::now();
+    auto prefetched = pending.find(id);
+    if (prefetched != pending.end()) {
+      auto loaded = prefetched->second.get();
+      read_seconds += loaded.seconds;
+      entry.value = std::move(loaded.value);
+      pending.erase(prefetched);
+    } else {
+      entry.value = ReadFeatures(FeaturePath(work, id));
+      read_seconds += Seconds(waiting);
+    }
+    wait_seconds += Seconds(waiting);
+    const auto uploading = Clock::now();
     const auto n = entry.value.pixels.size();
     entry.keypoints = Tensor::Upload({1, 3072, 2}, entry.value.normalized[0].data(), n * 2);
     entry.descriptors = Tensor::Upload({1, 3072, 256}, entry.value.descriptors.data(), n * 256);
     const std::vector<float> mask(n, 1.f);
     entry.mask = Tensor::Upload({1, 3072}, mask.data(), mask.size());
+    upload_seconds += Seconds(uploading);
     entry.position = order.begin();
     return entries.emplace(id, std::move(entry)).first->second;
   }
 };
 }  // namespace
-void MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
-  Models models(root);
-  std::array<Fusion, 2> fusion{VirtualViews(scene.cameras[0]), VirtualViews(scene.cameras[1])};
-  const auto mean = models.Manifest().at("segmentation_mean").get<std::array<float, 3>>(),
-             deviation = models.Manifest().at("segmentation_std").get<std::array<float, 3>>();
+Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
+  const auto started = Clock::now();
+  FrontendTiming timing;
+  std::vector<Exposure> pending;
   for (const auto& record : scene.images) {
     const auto path = MaskPath(work, record.id);
     const auto& camera = scene.cameras[record.camera];
@@ -155,77 +278,94 @@ void MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
       const auto h = ImageHeader(path);
       if (h.at("width") != camera.width || h.at("height") != camera.height || h.at("mode") != "L")
         throw std::runtime_error("Invalid mask cache");
-      continue;
-    }
-    auto image = ReadImage(record.source, cv::IMREAD_COLOR);
-    cv::cvtColor(image, image, cv::COLOR_BGR2RGB);
-    const auto& geometry = fusion[record.camera];
-    cv::Mat sum = cv::Mat::zeros(1200, 900, CV_32FC2);
-    for (const auto& v : geometry.views) {
-      cv::Mat sampled;
-      cv::remap(image, sampled, v.source, cv::Mat(), cv::INTER_LINEAR, cv::BORDER_CONSTANT);
+      ++timing.reused;
+    } else
+      pending.push_back(record);
+  }
+  if (pending.empty())
+    return timing.Report(started);
+  Models models(root);
+  ImagePreprocessor pixels(models.Stream());
+  const std::array<Fusion, 2> fusion{VirtualViews(scene.cameras[0]),
+                                     VirtualViews(scene.cameras[1])};
+  std::array<std::unique_ptr<MaskFusion>, 2> masks;
+  for (int c = 0; c < 2; ++c)
+    masks[c] = std::make_unique<MaskFusion>(fusion[c].views, fusion[c].weight,
+                                            scene.cameras[c].Mask(), models.Stream());
+  const auto mean = models.Manifest().at("segmentation_mean").get<std::array<float, 3>>(),
+             deviation = models.Manifest().at("segmentation_std").get<std::array<float, 3>>();
+  ImageReader reader(pending, work, &fusion);
+  AsyncWriter writer;
+  for (const auto& record : pending) {
+    auto phase = Clock::now();
+    auto image = reader.Next();
+    timing.wait += Seconds(phase);
+    timing.decode += image.decode;
+    timing.preprocess += image.preprocess;
+    auto& fusion_gpu = *masks[record.camera];
+    phase = Clock::now();
+    fusion_gpu.Begin();
+    for (size_t view = 0; view < image.views.size(); ++view) {
+      pixels.Upload(image.views[view]);
       const auto output =
-          models.Predict("segmentation", {ImageTensor(sampled, mean, deviation)})[0];
-      if (output.shape != std::vector<int64_t>{1, 2, 512, 512})
-        throw std::runtime_error("Unexpected segmentation output");
-      const auto* p = output.Floats();
-      cv::Mat probability(512, 512, CV_32FC2);
-      for (int y = 0; y < 512; ++y)
-        for (int x = 0; x < 512; ++x)
-          probability.at<cv::Vec2f>(y, x) = {p[y * 512 + x], p[512 * 512 + y * 512 + x]};
-      cv::Mat projected;
-      cv::remap(probability, projected, v.x, v.y, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
-      for (int y = 0; y < 1200; ++y)
-        for (int x = 0; x < 900; ++x)
-          sum.at<cv::Vec2f>(y, x) += projected.at<cv::Vec2f>(y, x) * v.weight.at<float>(y, x);
+          models.Predict("segmentation", {pixels.Normalize(512, 512, mean, deviation)}, true)[0];
+      fusion_gpu.Add(output, view);
     }
-    cv::Mat sky(1200, 900, CV_8UC1), person(1200, 900, CV_8UC1);
-    for (int y = 0; y < 1200; ++y)
-      for (int x = 0; x < 900; ++x) {
-        const auto p = sum.at<cv::Vec2f>(y, x) / std::max(geometry.weight.at<float>(y, x), 1e-8f);
-        sky.at<uint8_t>(y, x) = p[0] > .90 ? 255 : 0;
-        person.at<uint8_t>(y, x) = p[1] > .55 ? 255 : 0;
-      }
-    const auto kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, {7, 7});
-    cv::erode(sky, sky, kernel);
-    cv::dilate(person, person, kernel);
-    cv::resize(sky, sky, {camera.width, camera.height}, 0, 0, cv::INTER_NEAREST);
-    cv::resize(person, person, {camera.width, camera.height}, 0, 0, cv::INTER_NEAREST);
-    auto mask = camera.Mask();
-    for (int y = 0; y < camera.height; ++y)
-      for (int x = 0; x < camera.width; ++x)
-        if (mask.at<uint8_t>(y, x))
-          mask.at<uint8_t>(y, x) = person.at<uint8_t>(y, x) ? 0 : sky.at<uint8_t>(y, x) ? 128 : 255;
-    auto temporary = path.parent_path() / (path.stem().u8string() + ".writing.png");
-    WriteImage(temporary, mask);
-    PublishFile(temporary, path);
+    auto mask = fusion_gpu.Finish();
+    timing.gpu_pipeline += Seconds(phase);
+    const auto path = MaskPath(work, record.id);
+    writer.Submit([path, mask = std::move(mask)] {
+      const auto temporary = path.parent_path() / (path.stem().u8string() + ".writing.png");
+      WriteImage(temporary, mask);
+      PublishFile(temporary, path);
+    });
+    ++timing.computed;
     if (record.id % 16 == 0)
       Log("Masks " + std::to_string(record.id + 1) + "/" + std::to_string(scene.images.size()));
   }
+  writer.Finish();
+  timing.write = writer.seconds;
+  return timing.Report(started, &models);
 }
-void MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root) {
-  Models models(root);
-  const auto expected = models.Manifest().at("detector_size").get<std::array<int, 2>>();
+Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root) {
+  const auto started = Clock::now();
+  FrontendTiming timing;
+  std::vector<Exposure> pending;
   for (const auto& record : scene.images) {
     const auto path = FeaturePath(work, record.id);
     if (fs::exists(path)) {
       const auto f = ReadFeatures(path);
       if (f.image != record.id)
         throw std::runtime_error("Feature identity differs");
-      continue;
-    }
+      ++timing.reused;
+    } else
+      pending.push_back(record);
+  }
+  if (pending.empty())
+    return timing.Report(started);
+  Models models(root);
+  ImagePreprocessor pixels(models.Stream());
+  const auto expected = models.Manifest().at("detector_size").get<std::array<int, 2>>();
+  ImageReader reader(pending, work);
+  AsyncWriter writer;
+  for (const auto& record : pending) {
     const auto& camera = scene.cameras[record.camera];
     const double scale = 1536. / std::max(camera.width, camera.height);
     const int width = int(scale * camera.width) / 8 * 8,
               height = int(scale * camera.height) / 8 * 8;
     if (expected != std::array<int, 2>{width, height})
       throw std::runtime_error("Detector engine resolution differs from camera input");
-    auto image = ReadImage(record.source, cv::IMREAD_COLOR);
-    cv::cvtColor(image, image, cv::COLOR_BGR2RGB);
-    const auto detected =
-        models.Predict("detector", {ImageTensor(BicubicResize(image, width, height))}, true)[0];
+    auto phase = Clock::now();
+    auto image = reader.Next();
+    timing.wait += Seconds(phase);
+    timing.decode += image.decode;
+    timing.preprocess += image.preprocess;
+    phase = Clock::now();
+    pixels.Upload(image.rgb);
+    const auto detected = models.Predict("detector", {pixels.Normalize(width, height)}, true)[0];
     const auto raw = DetectKeypoints(detected, width, height, 12288, models.Stream());
-    const auto mask = ReadImage(MaskPath(work, record.id), cv::IMREAD_GRAYSCALE);
+    timing.gpu_pipeline += Seconds(phase);
+    phase = Clock::now();
     std::vector<std::array<float, 3>> candidates;
     const double radius = camera.Radius();
     for (const auto& point : raw) {
@@ -233,7 +373,7 @@ void MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
       const double dx = (x - camera.params[2]) / camera.params[0],
                    dy = (y - camera.params[3]) / camera.params[1];
       if (x >= 0 && y >= 0 && x < camera.width && y < camera.height &&
-          dx * dx + dy * dy <= radius * radius && mask.at<uint8_t>(int(y), int(x)) == 255)
+          dx * dx + dy * dy <= radius * radius && image.mask.at<uint8_t>(int(y), int(x)) == 255)
         candidates.push_back({x, y, point[2]});
     }
     const auto selected = Select(candidates, camera);
@@ -247,12 +387,16 @@ void MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
       f.normalized.push_back({2 * p[0] / camera.width - 1, 2 * p[1] / camera.height - 1});
       f.scores.push_back(p[2]);
     }
+    timing.postprocess += Seconds(phase);
+    phase = Clock::now();
     const auto description = models.Predict(
-        "descriptor", {ImageTensor(BicubicResize(image, 784, 784)),
+        "descriptor", {pixels.Normalize(784, 784),
                        Tensor::Float({1, int64_t(selected.size()), 2}, f.normalized[0].data(),
                                      selected.size() * 2)})[0];
     if (description.shape != std::vector<int64_t>{1, int64_t(selected.size()), 256})
       throw std::runtime_error("Unexpected descriptor output dimensions");
+    timing.gpu_pipeline += Seconds(phase);
+    phase = Clock::now();
     f.descriptors.assign(description.Floats(), description.Floats() + description.Count());
     std::array<double, 256> mean{};
     for (size_t k = 0; k < selected.size(); ++k)
@@ -264,13 +408,21 @@ void MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
     norm = std::max(1e-12, std::sqrt(norm));
     for (int d = 0; d < 256; ++d)
       f.retrieval[d] = float(mean[d] / norm);
-    WriteFeatures(path, f);
+    timing.postprocess += Seconds(phase);
+    const auto path = FeaturePath(work, record.id);
+    writer.Submit([path, f = std::move(f)] { WriteFeatures(path, f); });
+    ++timing.computed;
     if (record.id % 16 == 0)
       Log("Features " + std::to_string(record.id + 1) + "/" + std::to_string(scene.images.size()));
   }
+  writer.Finish();
+  timing.write = writer.seconds;
+  return timing.Report(started, &models);
 }
-void MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
+Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
                  const std::set<uint32_t>& repair) {
+  const auto started = Clock::now();
+  FrontendTiming timing;
   const uint32_t n = uint32_t(scene.images.size());
   std::vector<std::array<float, 256>> retrieval;
   for (uint32_t id = 0; id < n; ++id)
@@ -309,18 +461,32 @@ void MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
         add(id, options[k].second);
     }
   }
-  Models models(root);
-  FeatureCache cache(work);
-  size_t completed = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> pending;
   for (const auto& [a, b] : pairs) {
-    const auto path = MatchPath(work, a, b);
-    if (!fs::exists(path)) {
+    if (fs::exists(MatchPath(work, a, b)))
+      ++timing.reused;
+    else
+      pending.emplace_back(a, b);
+  }
+  if (!pending.empty()) {
+    Models models(root);
+    FeatureCache cache(work);
+    AsyncWriter writer;
+    for (size_t index = 0; index < pending.size(); ++index) {
+      const auto [a, b] = pending[index];
       const auto& fa = cache.Get(a);
       const auto& fb = cache.Get(b);
+      for (size_t next = index + 1; next < std::min(pending.size(), index + 3); ++next) {
+        cache.Prefetch(pending[next].first);
+        cache.Prefetch(pending[next].second);
+      }
       const auto na = int64_t(fa.value.pixels.size()), nb = int64_t(fb.value.pixels.size());
       constexpr int64_t capacity = 3072;
+      auto phase = Clock::now();
       const auto output = models.Predict("matcher", {fa.keypoints, fb.keypoints, fa.descriptors,
                                                      fb.descriptors, fa.mask, fb.mask});
+      timing.gpu_pipeline += Seconds(phase);
+      phase = Clock::now();
       if (output.size() != 2 || output[0].Count() != size_t(capacity) ||
           output[1].Count() != size_t(capacity))
         throw std::runtime_error("Unexpected matcher outputs");
@@ -333,14 +499,29 @@ void MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
           m.matches.push_back({k, uint32_t(j), output[1].Floats()[k]});
         }
       }
-      WriteMatches(path, m);
+      timing.postprocess += Seconds(phase);
+      const auto path = MatchPath(work, a, b);
+      writer.Submit([path, m = std::move(m)] { WriteMatches(path, m); });
+      ++timing.computed;
+      if ((index + 1) % 500 == 0)
+        Log("Matches " + std::to_string(index + 1) + "/" + std::to_string(pending.size()));
     }
-    if (++completed % 500 == 0)
-      Log("Matches " + std::to_string(completed) + "/" + std::to_string(pairs.size()));
+    writer.Finish();
+    timing.write = writer.seconds;
+    timing.decode = cache.read_seconds;
+    timing.wait = cache.wait_seconds;
+    timing.preprocess = cache.upload_seconds;
+    auto report = timing.Report(started, &models);
+    Json list = Json::array();
+    for (const auto& [a, b] : pairs)
+      list.push_back({a, b});
+    WriteJson(work / "cache/pairs.json", {{"version", 1}, {"pairs", list}});
+    return report;
   }
   Json list = Json::array();
   for (const auto& [a, b] : pairs)
     list.push_back({a, b});
   WriteJson(work / "cache/pairs.json", {{"version", 1}, {"pairs", list}});
+  return timing.Report(started);
 }
 }  // namespace geosun

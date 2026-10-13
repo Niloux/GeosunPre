@@ -41,6 +41,6 @@ models/
 
 `.\package.ps1` 生成 `dist/` 独立运行包：EXE、CUDA/模型推理运行库、引擎和硬文档。已存在时先移走旧包。
 
-当前重建实现标记为 `pipeline_version=3`，旧版 work 需换用新目录，原成果仍可独立回读检查。SfM 使用鱼眼像素误差验证两视图、解析 BA 导数和迭代 Schur 加速全局优化。末尾先标定、锁定内参补全与合并轨迹，再统一精调。`cache/sfm.json` 和最终 `result.json` 保存优化收敛、观测及耗时；导航误差按最终模型计算，质量报告附带主点变化与分角度误差。
+当前实现标记为 `pipeline_version=4`，旧版 work 需换用新目录，原成果仍可独立回读检查。前端使用整数双三次 GPU 缩放、GPU 掩码融合和有界读写队列，保持模型、配对及几何策略。SfM 使用鱼眼像素误差验证两视图、解析 BA 导数和迭代 Schur 加速全局优化。末尾先标定、锁定内参补全与合并轨迹，再统一精调。`cache/*_profile.json`、`cache/sfm.json` 和最终 `result.json` 保存处理数量、细项耗时及优化收敛；导航误差按最终模型计算，质量报告附带主点变化与分角度误差。
 
 约定：[输入与坐标](docs/input.md)、[输出](docs/output.md)、[模型](docs/models.md)、[缓存](docs/cache.md)。

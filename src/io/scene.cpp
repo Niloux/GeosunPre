@@ -18,10 +18,6 @@ double Cubic(double x) {
     return (((-.5 * x + 2.5) * x - 4) * x) + 2;
   return 0;
 }
-struct Coefficients {
-  int start;
-  std::vector<int32_t> values;
-};
 struct ImageMetadata {
   int width = 0, height = 0, orientation = 1;
   Json exposure = nullptr;
@@ -97,29 +93,6 @@ ImageMetadata ReadJpegMetadata(const fs::path& path) {
     throw std::runtime_error("Missing JPEG dimensions");
   return result;
 }
-std::vector<Coefficients> ResizeWeights(int input, int output) {
-  const double scale = double(input) / output, filter_scale = std::max(1., scale),
-               support = 2 * filter_scale;
-  std::vector<Coefficients> coefficients;
-  for (int i = 0; i < output; ++i) {
-    const double center = (i + .5) * scale;
-    const int lo = std::max(0, int(center - support + .5));
-    const int hi = std::min(input, int(center + support + .5));
-    std::vector<double> raw;
-    double sum = 0;
-    for (int j = lo; j < hi; ++j) {
-      raw.push_back(Cubic((j - center + .5) / filter_scale));
-      sum += raw.back();
-    }
-    Coefficients row{lo, {}};
-    for (double weight : raw) {
-      weight = weight / sum * (1 << 22);
-      row.values.push_back(int32_t(weight < 0 ? weight - .5 : weight + .5));
-    }
-    coefficients.push_back(std::move(row));
-  }
-  return coefficients;
-}
 std::pair<int, double> TimeName(const std::string& name, int& frame, std::string& camera) {
   std::smatch parts;
   if (!std::regex_match(name, parts,
@@ -180,6 +153,29 @@ void WriteImage(const fs::path& path, const cv::Mat& image) {
   stream.close();
   if (!stream)
     throw std::runtime_error("Cannot write image: " + path.u8string());
+}
+std::vector<ResizeCoefficients> ResizeWeights(int input, int output) {
+  const double scale = double(input) / output, filter_scale = std::max(1., scale),
+               support = 2 * filter_scale;
+  std::vector<ResizeCoefficients> coefficients;
+  for (int i = 0; i < output; ++i) {
+    const double center = (i + .5) * scale;
+    const int lo = std::max(0, int(center - support + .5));
+    const int hi = std::min(input, int(center + support + .5));
+    std::vector<double> raw;
+    double sum = 0;
+    for (int j = lo; j < hi; ++j) {
+      raw.push_back(Cubic((j - center + .5) / filter_scale));
+      sum += raw.back();
+    }
+    ResizeCoefficients row{lo, {}};
+    for (double weight : raw) {
+      weight = weight / sum * (1 << 22);
+      row.values.push_back(int32_t(weight < 0 ? weight - .5 : weight + .5));
+    }
+    coefficients.push_back(std::move(row));
+  }
+  return coefficients;
 }
 cv::Mat BicubicResize(const cv::Mat& image, int width, int height) {
   if (image.type() != CV_8UC3)

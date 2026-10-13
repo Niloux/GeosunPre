@@ -40,6 +40,7 @@ class Models {
   std::vector<Tensor> Predict(const std::string& model, const std::vector<Tensor>& inputs,
                               bool device_output = false);
   cudaStream_t Stream() const;
+  Json Profile();
 };
 Json GpuInfo();
 }  // namespace geosun

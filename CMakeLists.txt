@@ -14,7 +14,7 @@ add_executable(geosunpre
   src/app/main.cpp src/app/pipeline.cpp src/app/runtime.cpp
   src/io/scene.cpp src/io/cache.cpp src/io/las.cpp src/io/colmap.cpp
   src/geometry/camera.cpp src/geometry/model.cpp
-  src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/frontend.cpp
+  src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/preprocessing.cu src/frontend/frontend.cpp
   src/sfm/reconstruction.cpp src/sfm/optimization.cpp src/alignment/alignment.cpp)
 target_include_directories(geosunpre PRIVATE src ${tensorrt_SOURCE_DIR}/include ${OpenCV_INCLUDE_DIRS})
 target_include_directories(geosunpre SYSTEM PRIVATE ${opencv_BINARY_DIR} ${CMAKE_BINARY_DIR}
