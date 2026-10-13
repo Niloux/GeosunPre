@@ -2,7 +2,21 @@
 
 固定 TensorRT 10.13.3.9、GPU 0；按阶段加载释放模型，主程序直接调用 C++ API。运行库为 `models/runtime/nvinfer_10.dll`，运行包不包含 ONNX parser、builder resource、Python 或原始权重。
 
-manifest.json：version=1、tensorrt=`10.13.3.9`、gpu、detector_size、descriptor_size、max_features=3072、descriptor_dimension=256、segmentation_mean、segmentation_std、models。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256。
+## 默认准备流程
+
+在项目根目录执行：
+
+```powershell
+.\prepare-models.ps1
+```
+
+默认向 `models/` 准备四个引擎，原图尺寸为宽 3000、高 4000，匹配器精度为 FP16。Softmax、Reduce 和 Normalization 层保留 FP32，所有浮点输入输出保持 float32。`run.ps1` 和 `package.ps1` 默认使用这个目录。
+
+首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。GPU、尺寸或精度不匹配时需指定新的输出目录。
+
+## 模型接口
+
+manifest.json：version=1、tensorrt=`10.13.3.9`、gpu、matcher_precision、detector_size、descriptor_size、max_features=3072、descriptor_dimension=256、segmentation_mean、segmentation_std、models。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256。
 
 | 引擎 | 输入 | 输出 |
 | --- | --- | --- |
@@ -26,22 +40,26 @@ manifest.json：version=1、tensorrt=`10.13.3.9`、gpu、detector_size、descrip
 
 导出和 ONNX→TensorRT 编译是独立资源准备，由根目录 `prepare-models.ps1` 完成。引擎针对构建 GPU，更换 GPU 时重新构建，不默认承诺跨型号兼容。
 
-## 一键准备
+## 自定义参数
+
+按实际图像尺寸或目标设备调整准备参数：
 
 ```powershell
-.\prepare-models.ps1
 .\prepare-models.ps1 -Models models/other-gpu -OnnxFrom models
 .\prepare-models.ps1 -Models models/landscape -ImageWidth 4000 -ImageHeight 3000
 .\prepare-models.ps1 -Images "D:/照片/A.JPG","D:/照片/B.JPG"
-.\prepare-models.ps1 -Models models/fast -OnnxFrom models -MatcherPrecision fp16
 ```
 
-- `-Models`：输出目录，默认 `models`。完整且兼容的包检查清单、引擎 SHA256、推理 DLL 与真实推理后复用，不重建；版本、GPU、尺寸或校验值不符时报错，应指定新目录。
+- `-Models`：输出目录，默认 `models`。完整且兼容的包检查清单、引擎 SHA256、推理 DLL 与真实推理后复用，不重建；版本、GPU、尺寸、匹配精度或校验值不符时报错，应指定新目录。
 - `-ImageWidth` / `-ImageHeight`：原图宽高，默认 3000 / 4000。按最长边 1536、各边向下取 8 的倍数确定检测输入尺寸。
 - `-OnnxFrom`：可传已有模型目录或 `onnx/` 目录。四个单文件 ONNX 的名称、float32 输入与形状必须满足当前契约；尺寸改变时重新导出。
-- `-MatcherPrecision`：`fp32`（默认）、`tf32` 或 `fp16`。FP16 模式将 Softmax、Reduce 和 Normalization 层固定为 FP32，其余允许 FP16；TF32 允许 Tensor Core 矩阵乘法。模型清单保存该选择，修改时使用新目录。不同精度需用真实场景检查最终几何质量。
+- `-MatcherPrecision`：`fp16`（默认）、`fp32` 或 `tf32`，用于显式调整匹配引擎的计算精度。TF32 允许 Tensor Core 矩阵乘法。模型清单保存该选择；未声明 `matcher_precision` 的清单按 FP32 解析。修改精度时使用新目录，并用真实场景检查最终几何质量。
 - 当 `-OnnxFrom` 指向同 GPU、版本和尺寸的完整模型包时，复用未改变精度且清单及校验通过的引擎；切换匹配精度只需重建 matcher。
 - `-Images`：两张真实验证照片；默认使用固定 LoMa 源码包中的 `0015_A.jpg` / `0015_B.jpg`。验证包括四模型有限输出及形状、描述子数量 32 / 127 / 3072、匹配有效数量不等、补零值变化不影响有效结果、同图匹配和语义概率范围。新导出的图还比较 PyTorch 与 TensorRT 输出。
+
+使用自定义目录时，运行指定 `--models`，打包指定 `-Models`。复用 ONNX 可以省去权重导出；更换 GPU 时仍需在目标 GPU 上重新构建并校验引擎。
+
+## 缓存与校验
 
 脚本自动准备项目内 uv、Python 3.11.13、PyTorch 2.8.0（CUDA 12.8）、ONNX 与 TensorRT，均缓存于 `.cache/model-prepare/`，不修改系统 Python。首次需要联网；缓存完整后可离线准备与校验。已有 `models/source/` 的固定源码与权重按 SHA256 校验后直接复用。
 

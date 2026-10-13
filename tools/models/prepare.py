@@ -195,7 +195,7 @@ def export_models(directory, shapes, source, images, references):
         torch.cuda.empty_cache()
 
 
-def build_engine(path, name, shapes, matcher_precision='fp32'):
+def build_engine(path, name, shapes, matcher_precision='fp16'):
     if path.is_file():
         print(f'Reuse engine: {name}', flush=True)
         return
@@ -389,7 +389,8 @@ def main():
     parser.add_argument('--models', type=Path, required=True)
     parser.add_argument('--image-width', type=int, default=3000)
     parser.add_argument('--image-height', type=int, default=4000)
-    parser.add_argument('--matcher-precision', choices=('fp32', 'tf32', 'fp16'), default='fp32')
+    parser.add_argument('--matcher-precision', choices=('fp32', 'tf32', 'fp16'), default='fp16',
+                        help='matcher engine precision (default: %(default)s)')
     parser.add_argument('--onnx-from', type=Path)
     parser.add_argument('--images', type=Path, nargs=2)
     args = parser.parse_args()

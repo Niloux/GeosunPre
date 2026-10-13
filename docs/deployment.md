@@ -2,7 +2,7 @@
 
 Windows x64，需与模型包匹配的 NVIDIA GPU 和驱动。无需安装 Python、CUDA Toolkit、Visual Studio 或联网。
 
-在本目录打开 PowerShell：
+运行包由项目的 `build.ps1` 编译程序，再由 `package.ps1` 收集程序、模型、运行库和文档。默认准备流程生成 FP16 匹配引擎，并保留关键层的 FP32 计算。将整个运行包复制到目标机器，在包目录打开 PowerShell：
 
 ```powershell
 .\geosunpre.exe info
@@ -12,7 +12,7 @@ Windows x64，需与模型包匹配的 NVIDIA GPU 和驱动。无需安装 Pytho
 .\geosunpre.exe check --output "D:/工作/场景/colmap"
 ```
 
-模型默认读取 EXE 同级的 `models/`；`--models` 可显式指定其他模型包，续跑优先使用工作目录记录的模型位置。开发脚本通过进程环境变量 `GEOSUNPRE_MODELS` 指定项目模型目录。
+模型默认读取 EXE 同级的 `models/`；`--models` 可显式指定其他模型包，续跑使用工作目录记录的模型位置。更新程序时从当前源码重新编译并打包，将完整运行包放到新目录。
 
 `info` 显示程序路径、构建版本、GPU 和默认模型目录。`check-models` 使用指定的真实照片执行四个模型，照片仅用于本次检查，不会写入模型或运行包。
 

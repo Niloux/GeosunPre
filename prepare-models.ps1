@@ -3,7 +3,7 @@ param(
     [string]$Models = (Join-Path $PSScriptRoot 'models'),
     [ValidateRange(1, 2147483647)][int]$ImageWidth = 3000,
     [ValidateRange(1, 2147483647)][int]$ImageHeight = 4000,
-    [ValidateSet('fp32', 'tf32', 'fp16')][string]$MatcherPrecision = 'fp32',
+    [ValidateSet('fp32', 'tf32', 'fp16')][string]$MatcherPrecision = 'fp16',
     [string]$OnnxFrom,
     [string[]]$Images
 )

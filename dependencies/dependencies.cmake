@@ -22,6 +22,7 @@ set(PROVIDE_UNINSTALL_TARGET OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(ceres URL https://codeload.github.com/ceres-solver/ceres-solver/tar.gz/refs/tags/2.2.0
   URL_HASH SHA512=D4CEFE5851E25BD3C7B76352092D8D549EB371AF2E35A325736554C54FE58A3523658697C3E2D65AF660FE6895AE3D96FE31BD1875870474FC4B6FED3BBDFAE9)
 FetchContent_MakeAvailable(ceres)
+include("${CMAKE_CURRENT_LIST_DIR}/ceres-schur.cmake")
 if(MSVC)
   target_compile_options(ceres PRIVATE /utf-8 /MP8)
 endif()
