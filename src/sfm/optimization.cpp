@@ -184,7 +184,8 @@ void RefinePose(const Camera& camera, Pose& pose, const std::vector<Eigen::Vecto
 }
 Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std::string& stage,
               int workers, int iterations, const std::set<uint32_t>& variable_images,
-              const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav) {
+              const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav,
+              const std::set<uint64_t>& selected_points) {
   const auto started = Clock::now();
   ceres::Problem problem;
   // Own losses through residual blocks; all generated observations share the
@@ -197,6 +198,8 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   size_t variable_count = 0;
   for (auto& p : m.points)
     if (p.track.size() >= 2) {
+      if (!selected_points.empty() && !selected_points.count(uint64_t(&p - m.points.data())))
+        continue;
       if (!variable_images.empty() &&
           std::none_of(p.track.begin(), p.track.end(),
                        [&](const auto& o) { return variable_images.count(o.image) != 0; }))

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
+#include <cstdlib>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -17,6 +18,43 @@
 #endif
 
 namespace geosun {
+fs::path ExecutablePath() {
+#ifdef _WIN32
+  std::wstring path(32768, L'\0');
+  const auto size = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
+  if (!size || size >= path.size())
+    throw std::runtime_error("Cannot locate executable");
+  path.resize(size);
+  return fs::path(path);
+#else
+  return fs::read_symlink("/proc/self/exe");
+#endif
+}
+fs::path DefaultModels() {
+#ifdef _WIN32
+  std::wstring configured(32768, L'\0');
+  const auto length =
+      GetEnvironmentVariableW(L"GEOSUNPRE_MODELS", configured.data(), DWORD(configured.size()));
+  if (length >= configured.size())
+    throw std::runtime_error("GEOSUNPRE_MODELS path is too long");
+  if (length) {
+    configured.resize(length);
+    return fs::absolute(fs::path(configured));
+  }
+#else
+  const auto* configured = std::getenv("GEOSUNPRE_MODELS");
+  if (configured && *configured)
+    return fs::absolute(fs::u8path(configured));
+#endif
+  return ExecutablePath().parent_path() / "models";
+}
+Json BuildInfo() {
+  return {{"version", GEOSUN_VERSION},
+          {"revision", GEOSUN_REVISION},
+          {"built_utc", GEOSUN_BUILD_TIME},
+          {"pipeline_version", PipelineVersion},
+          {"executable", ExecutablePath().u8string()}};
+}
 double Seconds(Clock::time_point started) {
   return std::chrono::duration<double>(Clock::now() - started).count();
 }

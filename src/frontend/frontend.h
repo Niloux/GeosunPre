@@ -8,4 +8,5 @@ Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& mode
 Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& models,
                  const std::set<uint32_t>& repair = {});
 fs::path MaskPath(const fs::path& work, uint32_t image);
+Json CheckModels(const fs::path& models, const fs::path& image);
 }  // namespace geosun

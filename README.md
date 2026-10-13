@@ -29,6 +29,7 @@ Windows x64：Visual Studio 2022 C++ 桌面工具链、Windows SDK、CUDA Toolki
 ```powershell
 .\prepare-models.ps1 -Models models/new-gpu -OnnxFrom models
 .\prepare-models.ps1 -Models models/new-size -ImageWidth 4000 -ImageHeight 3000
+.\prepare-models.ps1 -Models models/fast -OnnxFrom models -MatcherPrecision fp16
 ```
 
 资源不进入 Git。TensorRT 固定为 10.13.3.9，完整参数与固定来源见[模型契约](docs/models.md)。Python 仅用于独立资源准备，原生程序和 `dist/` 运行包不使用它。
@@ -58,8 +59,10 @@ models/
 
 `prepare` 不加载模型，检查真实输入、相机和导航转换。进度在 `state.json`，最终结果汇总为 `result.json`。不同请求的现有交付包拒绝覆盖。
 
-`.\package.ps1` 生成 `dist/` 独立运行包：EXE、CUDA/模型推理运行库、引擎和硬文档。已存在时先移走旧包。
+根目录 `run.ps1` 固定运行 `build/bin/Release/geosunpre.exe`，不会被旧 `dist/` 覆盖；启动时显示程序路径、构建版本和时间。独立 EXE 默认使用同级 `models/`，开发脚本为本进程设置项目模型目录，续跑使用工作目录记录的模型位置。
 
-当前实现标记为 `pipeline_version=5`，旧版 work 需换用新目录，原成果仍可独立回读检查。前端使用整数双三次 GPU 缩放、GPU 掩码融合和有界读写队列。配对保留密集近邻和间隔连接，并按曝光序列分段检索、抑制同镜头的相近曝光；仅针对未注册或观测覆盖不足的图像加密补边。模型、特征配额和几何验收保持不变。SfM 使用鱼眼像素误差验证两视图、解析 BA 导数和迭代 Schur 加速全局优化。末尾先标定、锁定内参补全与合并轨迹，再统一精调。`cache/*_profile.json`、`cache/sfm.json` 和最终 `result.json` 保存配对连接数、细项耗时及优化收敛；导航误差按最终模型计算，质量报告附带轨迹长度、主点变化与分角度误差。
+`.\package.ps1` 生成 `dist/` 独立运行包：EXE、CUDA/模型推理运行库、引擎和硬文档。支持 `-Models` 和 `-Output` 指定新包，已有目录拒绝覆盖。发布前用真实照片执行四个模型；默认使用准备模型时下载的公开 LoMa 样例，也可传 `-Image`。照片不进入发布包。包内 README 使用独立 EXE 命令，`check-models --image FILE` 可在目标机器检查真实推理。
+
+当前实现标记为 `pipeline_version=6`，旧版 work 需换用新目录，原成果仍可独立回读检查。前端使用整数双三次 GPU 缩放、GPU 掩码融合和有界读写队列。配对保留密集近邻和间隔连接，并按曝光序列分段检索、抑制同镜头的相近曝光；仅针对未注册或观测覆盖不足的图像加密补边。特征配额和几何验收保持不变。SfM 的两视图和 PnP 均按鱼眼像素误差判断，使用解析 BA 导数和迭代 Schur，颜色随特征缓存。末尾先标定、锁定内参补全与合并轨迹，再精调。配置 `calibration_tracks` 可选 `all`（默认）或 `stable`；后者以至少三视图、足够视差且覆盖完整的轨迹标定，再锁定内参优化全部点。`cache/*_profile.json`、`cache/sfm.json` 和 `result.json` 保存细项耗时、优化收敛与联合配准各项验收结果；质量报告附带轨迹长度、主点变化与分角度误差。
 
 约定：[输入与坐标](docs/input.md)、[输出](docs/output.md)、[模型](docs/models.md)、[缓存](docs/cache.md)。

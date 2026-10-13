@@ -540,24 +540,47 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
     const double before = base_quality.at("reprojection_px").at("p90"),
                  after = quality.at("reprojection_px").at("p90");
     bool image_stable = true;
+    Json unstable_images = Json::array();
     for (size_t i = 0; i < quality.at("images").size(); ++i) {
       const auto& previous = base_quality.at("images")[i];
       const auto& next = quality.at("images")[i];
       const double a = previous.at("reprojection_px").at("p90"),
                    b = next.at("reprojection_px").at("p90");
-      if (b > a * 1.1 + .1)
+      if (b > a * 1.1 + .1) {
         image_stable = false;
+        unstable_images.push_back({{"name", next.at("name")},
+                                   {"before_p90_px", a},
+                                   {"after_p90_px", b},
+                                   {"limit_px", a * 1.1 + .1}});
+      }
     }
     const bool improved = proposed.at("point_to_plane_m").at("median").get<double>() <
                           acceptance.at("point_to_plane_m").at("median").get<double>();
-    const bool accepted = quality.at("passed").get<bool>() && proposed.at("passed").get<bool>() &&
-                          after <= before * 1.05 + .05 && image_stable &&
-                          Quantile(displacement, .9) <= .1 && improved;
+    const Json checks = {{"visual_acceptance", quality.at("passed")},
+                         {"alignment_acceptance", proposed.at("passed")},
+                         {"global_reprojection", after <= before * 1.05 + .05},
+                         {"per_image_reprojection", image_stable},
+                         {"point_displacement", Quantile(displacement, .9) <= .1},
+                         {"plane_improvement", improved}};
+    Json failed_checks = Json::array();
+    for (const auto& [name, passed] : checks.items())
+      if (!passed.get<bool>())
+        failed_checks.push_back(name);
+    const bool accepted = failed_checks.empty();
     joint["used"] = accepted;
     joint["reason"] =
         accepted ? "accepted" : "candidate did not preserve visual fit or improve LAS fit";
     joint["optimization"] = solve;
     joint["candidate_alignment"] = proposed;
+    joint["candidate_quality"] = quality;
+    joint["checks"] = checks;
+    joint["failed_checks"] = failed_checks;
+    joint["unstable_images"] = unstable_images;
+    joint["point_displacement_m"] = Statistics(displacement);
+    joint["comparison"] = {{"before_reprojection_p90_px", before},
+                           {"after_reprojection_p90_px", after},
+                           {"reprojection_limit_px", before * 1.05 + .05},
+                           {"point_displacement_p90_limit_m", .1}};
     if (accepted) {
       model = std::move(candidate);
       acceptance = proposed;

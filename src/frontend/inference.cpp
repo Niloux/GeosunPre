@@ -161,6 +161,8 @@ Models::Models(const fs::path& root) : impl_(std::make_unique<Implementation>())
   if (impl_->manifest.at("version") != 1 || impl_->manifest.at("tensorrt") != "10.13.3.9")
     throw std::runtime_error("Models require the pinned TensorRT 10.13.3.9 runtime");
   CudaCheck(cudaSetDevice(0));
+  if (impl_->manifest.at("gpu") != GpuInfo().at("name"))
+    throw std::runtime_error("Model GPU differs; prepare a new model package for this GPU");
   CudaCheck(cudaStreamCreate(&impl_->stream));
   using Create = void* (*)(void*, int32_t);
   Create create = nullptr;

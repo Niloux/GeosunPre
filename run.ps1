@@ -1,6 +1,11 @@
 $ErrorActionPreference = 'Stop'
-$program = Join-Path $PSScriptRoot 'dist\geosunpre.exe'
-if (-not (Test-Path -LiteralPath $program)) { $program = Join-Path $PSScriptRoot 'build\bin\Release\geosunpre.exe' }
+$program = Join-Path $PSScriptRoot 'build\bin\Release\geosunpre.exe'
 if (-not (Test-Path -LiteralPath $program)) { throw 'Run build.ps1 first.' }
-& $program @args
-exit $LASTEXITCODE
+$previousModels = $env:GEOSUNPRE_MODELS
+try {
+    $env:GEOSUNPRE_MODELS = Join-Path $PSScriptRoot 'models'
+    Write-Host "Development executable: $program"
+    & $program @args
+    $code = $LASTEXITCODE
+} finally { $env:GEOSUNPRE_MODELS = $previousModels }
+exit $code

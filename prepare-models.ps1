@@ -3,6 +3,7 @@ param(
     [string]$Models = (Join-Path $PSScriptRoot 'models'),
     [ValidateRange(1, 2147483647)][int]$ImageWidth = 3000,
     [ValidateRange(1, 2147483647)][int]$ImageHeight = 4000,
+    [ValidateSet('fp32', 'tf32', 'fp16')][string]$MatcherPrecision = 'fp32',
     [string]$OnnxFrom,
     [string[]]$Images
 )
@@ -54,7 +55,7 @@ try {
     }
     $modelRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Models).TrimEnd([char[]]'\/')
     $arguments = @('-B', '-X', 'utf8', (Join-Path $PSScriptRoot 'tools\models\prepare.py'), '--models', $modelRoot,
-        '--image-width', "$ImageWidth", '--image-height', "$ImageHeight")
+        '--image-width', "$ImageWidth", '--image-height', "$ImageHeight", '--matcher-precision', $MatcherPrecision)
     if ($OnnxFrom) { $arguments += @('--onnx-from', $OnnxFrom) }
     if ($Images) {
         $arguments += @('--images') + $Images

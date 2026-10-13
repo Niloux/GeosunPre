@@ -2,7 +2,6 @@
 #include "sfm/optimization.h"
 #include "io/cache.h"
 #include <opencv2/calib3d.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <Eigen/SVD>
 #include <Eigen/Eigenvalues>
 #include <atomic>
@@ -561,49 +560,93 @@ bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
   const auto& cam = model.cameras[image.camera];
   Pose selected;
   size_t maximum = 0;
-  for (double threshold : {4., 12., 32.}) {
-    cv::Mat rv, tv, inliers;
-    if (!cv::solvePnPRansac(xyz, xy, cv::Mat::eye(3, 3, CV_64F), cv::noArray(), rv, tv, false, 2000,
-                            float(threshold / std::min(cam.params[0], cam.params[1])), .999,
-                            inliers, cv::SOLVEPNP_EPNP) ||
-        inliers.rows < 24)
-      continue;
+  double best_cost = INFINITY;
+  auto score = [&](const Pose& pose) {
+    size_t support = 0;
+    double cost = 0;
+    for (size_t i = 0; i < xyz.size(); ++i) {
+      const auto v = pose.Apply({xyz[i].x, xyz[i].y, xyz[i].z});
+      const double error =
+          v.z() > 0 ? (cam.Project(v) - image.pixels[features[i]]).squaredNorm() : INFINITY;
+      support += error <= 36;
+      cost += std::min(error, 36.);
+    }
+    if (support > maximum || (support == maximum && cost < best_cost)) {
+      selected = pose;
+      maximum = support;
+      best_cost = cost;
+      return true;
+    }
+    return false;
+  };
+  auto hypothesis = [&](const cv::Mat& rv, const cv::Mat& tv) {
+    if (!cv::checkRange(rv) || !cv::checkRange(tv))
+      return;
     cv::Mat R;
     cv::Rodrigues(rv, R);
     Pose pose;
     pose.Set(Eigen::Quaterniond(Matrix(R)), {tv.at<double>(0), tv.at<double>(1), tv.at<double>(2)});
+    score(pose);
+  };
+  // Perspective coordinates are only used by the minimal solver. Every
+  // consensus decision is measured in the original fisheye image pixels.
+  std::mt19937 rng(id * 73856093u + uint32_t(xyz.size()));
+  std::uniform_int_distribution<size_t> choose(0, xyz.size() - 1);
+  size_t trials = 2000;
+  for (size_t trial = 0; trial < trials; ++trial) {
+    std::array<size_t, 4> ids;
+    std::vector<cv::Point3d> sample_xyz;
+    std::vector<cv::Point2d> sample_xy;
+    for (size_t k = 0; k < ids.size(); ++k) {
+      size_t picked;
+      do {
+        picked = choose(rng);
+      } while (std::find(ids.begin(), ids.begin() + k, picked) != ids.begin() + k);
+      ids[k] = picked;
+      sample_xyz.push_back(xyz[picked]);
+      sample_xy.push_back(xy[picked]);
+    }
+    const auto ab = sample_xyz[1] - sample_xyz[0], ac = sample_xyz[2] - sample_xyz[0];
+    if (cv::norm(ab.cross(ac)) <= 1e-8 * cv::norm(ab) * cv::norm(ac))
+      continue;
+    std::vector<cv::Mat> rotations, translations;
+    cv::solvePnPGeneric(sample_xyz, sample_xy, cv::Mat::eye(3, 3, CV_64F), cv::noArray(), rotations,
+                        translations, false, cv::SOLVEPNP_AP3P);
+    for (size_t k = 0; k < rotations.size(); ++k)
+      hypothesis(rotations[k], translations[k]);
+    if (maximum >= 24) {
+      const double success = std::pow(double(maximum) / xyz.size(), 4);
+      const double needed = success >= 1 ? 32 : std::ceil(std::log(.001) / std::log1p(-success));
+      trials = std::min(trials, size_t(std::clamp(needed, 32., 2000.)));
+    }
+  }
+  if (maximum < 24)
+    return false;
+  for (int round = 0; round < 2; ++round) {
     std::vector<Eigen::Vector3d> fit_points;
     std::vector<Eigen::Vector2d> fit_pixels;
     for (size_t i = 0; i < xyz.size(); ++i) {
       const Eigen::Vector3d point(xyz[i].x, xyz[i].y, xyz[i].z);
-      const auto v = pose.Apply(point);
+      const auto v = selected.Apply(point);
       const auto& pixel = image.pixels[features[i]];
-      if (v.z() > 0 && (cam.Project(v) - pixel).norm() <= 12) {
+      if (v.z() > 0 && (cam.Project(v) - pixel).norm() <= 6) {
         fit_points.push_back(point);
         fit_pixels.push_back(pixel);
       }
     }
-    if (fit_points.size() < 24)
-      continue;
+    Pose pose = selected;
     RefinePose(cam, pose, fit_points, fit_pixels);
-    size_t support = 0;
-    std::set<int> cells;
-    for (size_t i = 0; i < xyz.size(); ++i) {
-      const auto v = pose.Apply({xyz[i].x, xyz[i].y, xyz[i].z});
-      const auto& pixel = image.pixels[features[i]];
-      if (v.z() > 0 && (cam.Project(v) - pixel).norm() <= 6) {
-        ++support;
-        cells.insert(int(pixel.x() / cam.width * 8) + 8 * int(pixel.y() / cam.height * 8));
-      }
-    }
-    if (support >= 32 && cells.size() >= 8 && support > maximum) {
-      selected = pose;
-      maximum = support;
-    }
-    if (maximum >= std::max<size_t>(100, xyz.size() / 2))
+    if (!score(pose))
       break;
   }
-  if (!maximum)
+  std::set<int> cells;
+  for (size_t i = 0; i < xyz.size(); ++i) {
+    const auto v = selected.Apply({xyz[i].x, xyz[i].y, xyz[i].z});
+    const auto& pixel = image.pixels[features[i]];
+    if (v.z() > 0 && (cam.Project(v) - pixel).norm() <= 6)
+      cells.insert(int(pixel.x() / cam.width * 8) + 8 * int(pixel.y() / cam.height * 8));
+  }
+  if (maximum < 32 || cells.size() < 8)
     return false;
   image.pose = selected;
   image.registered = true;
@@ -617,10 +660,23 @@ bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
   return true;
 }
 }  // namespace
-Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report) {
+Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report,
+                           bool stable_calibration) {
   const auto started = Clock::now();
   Reconstruction m;
   const auto checkpoint = work / "cache/incremental.bin";
+  double selection_seconds = 0, registration_seconds = 0, triangulation_seconds = 0,
+         filter_seconds = 0, checkpoint_seconds = 0;
+  auto filter = [&] {
+    const auto phase = Clock::now();
+    m.Filter();
+    filter_seconds += Seconds(phase);
+  };
+  auto save_checkpoint = [&] {
+    const auto phase = Clock::now();
+    WriteModel(checkpoint, m);
+    checkpoint_seconds += Seconds(phase);
+  };
   const bool resumed = fs::exists(checkpoint);
   if (resumed) {
     m = ReadModel(checkpoint);
@@ -631,8 +687,9 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     m.cameras = scene.cameras;
     m.images.resize(scene.images.size());
   }
+  std::vector<std::vector<std::array<uint8_t, 3>>> colors(m.images.size());
   for (uint32_t id = 0; id < m.images.size(); ++id) {
-    const auto f = ReadFeatures(FeaturePath(work, id));
+    auto f = ReadFeatures(FeaturePath(work, id));
     if (f.image != id)
       throw std::runtime_error("Feature/image identity differs");
     if (resumed) {
@@ -648,7 +705,9 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         m.images[id].pixels.emplace_back(p[0], p[1]);
       m.images[id].points.assign(f.pixels.size(), NoPoint);
     }
+    colors[id] = std::move(f.colors);
   }
+  const double cache_read_seconds = Seconds(started);
   const auto catalog = ReadJson(work / "cache/pairs.json");
   std::vector<std::array<uint32_t, 2>> candidates;
   for (const auto& pair : catalog.at("pairs"))
@@ -686,6 +745,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   if (error)
     std::rethrow_exception(error);
   const double geometry_seconds = Seconds(geometry_started);
+  const auto graph_started = Clock::now();
   Tracks graph(m, pairs);
   std::vector<uint64_t> points(graph.tracks.size(), NoPoint);
   std::vector<std::vector<size_t>> adjacency(m.images.size());
@@ -696,6 +756,8 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     }
   Json optimization = Json::array();
   Json completion = Json::array();
+  Json calibration_selection = Json::array();
+  const double graph_seconds = Seconds(graph_started);
   if (resumed) {
     for (size_t i = 0; i < graph.tracks.size(); ++i) {
       std::set<uint64_t> existing;
@@ -726,11 +788,13 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     m.images[seed->a].registered = true;
     m.images[seed->b].registered = true;
     m.images[seed->b].pose = seed->relative;
+    const auto triangulation_started = Clock::now();
     for (uint32_t i = 0; i < graph.tracks.size(); ++i)
       AddPoint(m, graph.tracks[i], points[i]);
     m.RebuildReferences();
+    triangulation_seconds += Seconds(triangulation_started);
     optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 100));
-    m.Filter();
+    filter();
     Log("Seed " + scene.images[seed->a].name + " + " + scene.images[seed->b].name);
   }
   size_t last_global = m.Registered();
@@ -744,25 +808,32 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   bool calibrated =
       resumed && m.Registered() >= 32 && resumed_counts[0] >= 8 && resumed_counts[1] >= 8;
   while (m.Registered() < m.images.size()) {
+    const auto selection_started = Clock::now();
     std::vector<std::pair<size_t, uint32_t>> options;
     for (uint32_t id = 0; id < m.images.size(); ++id)
       if (!m.images[id].registered)
         options.emplace_back(Correspondences(m, pairs, adjacency[id], id), id);
     std::sort(options.rbegin(), options.rend());
+    selection_seconds += Seconds(selection_started);
     bool added = false;
     for (const auto& [count, id] : options) {
       if (count < 24)
         break;
-      if (!Register(m, pairs, adjacency[id], id))
+      const auto registration_started = Clock::now();
+      const bool success = Register(m, pairs, adjacency[id], id);
+      registration_seconds += Seconds(registration_started);
+      if (!success)
         continue;
       added = true;
       recent.insert(id);
+      const auto triangulation_started = Clock::now();
       std::set<uint32_t> touched;
       for (uint32_t track : graph.lookup[id])
         if (track != UINT32_MAX)
           touched.insert(track);
       for (uint32_t track : touched)
         AddPoint(m, graph.tracks[track], points[track]);
+      triangulation_seconds += Seconds(triangulation_started);
       const auto registered = m.Registered();
       if (registered % 8 == 0) {
         std::set<uint32_t> local = recent;
@@ -780,7 +851,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         for (size_t k = 0; k < std::min<size_t>(8, neighbors.size()); ++k)
           local.insert(neighbors[k].second);
         optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 30, local));
-        m.Filter();
+        filter();
         recent.clear();
       }
       if (registered >= 32 && !calibrated) {
@@ -790,10 +861,10 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
             ++counts[image.camera];
         if (counts[0] >= 8 && counts[1] >= 8) {
           optimization.push_back(Optimize(m, scene.cameras, "focal", workers, 100));
-          m.Filter();
+          filter();
           completion.push_back(CompleteTracks(m, graph, points));
           optimization.push_back(Optimize(m, scene.cameras, "radial", workers, 100));
-          m.Filter();
+          filter();
           completion.push_back(CompleteTracks(m, graph, points));
           calibrated = true;
           last_global = registered;
@@ -801,20 +872,20 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       } else if (registered >= std::max(last_global + 40, size_t(last_global * 1.35))) {
         optimization.push_back(
             Optimize(m, scene.cameras, calibrated ? "radial" : "fixed", workers, 100));
-        m.Filter();
+        filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = registered;
       }
       if (registered % 16 == 0)
         Log("Registered " + std::to_string(registered) + "/" + std::to_string(m.images.size()));
       if (registered % 8 == 0)
-        WriteModel(checkpoint, m);
+        save_checkpoint();
       break;
     }
     if (!added) {
       if (m.Registered() > last_global) {
         optimization.push_back(Optimize(m, scene.cameras, "radial", workers, 150));
-        m.Filter();
+        filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = m.Registered();
         continue;
@@ -824,7 +895,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         if (!m.images[id].registered)
           missing.push_back(id);
       WriteJson(work / "cache/unregistered.json", missing);
-      WriteModel(checkpoint, m);
+      save_checkpoint();
       for (uint32_t id : missing.get<std::vector<uint32_t>>())
         Log("Unregistered " + scene.images[id].name + ": " +
             std::to_string(Correspondences(m, pairs, adjacency[id], id)) +
@@ -837,10 +908,78 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   // Growth has already refined focal length and distortion. Calibrate the
   // complete image set once, hold intrinsics while incorporating new tracks,
   // then finish with a strict joint refinement of all parameters.
-  optimization.push_back(Optimize(m, scene.cameras, "principal", workers, 150));
+  auto calibrate = [&](int iterations) {
+    std::set<uint64_t> selected;
+    if (stable_calibration) {
+      filter();
+      std::vector<size_t> observations(m.images.size());
+      std::vector<std::set<int>> cells(m.images.size());
+      std::vector<uint32_t> parent(m.images.size());
+      std::iota(parent.begin(), parent.end(), 0);
+      auto root = [&](uint32_t id) {
+        while (parent[id] != id) {
+          parent[id] = parent[parent[id]];
+          id = parent[id];
+        }
+        return id;
+      };
+      std::array<std::array<size_t, 4>, 2> angles{};
+      for (uint64_t id = 0; id < m.points.size(); ++id) {
+        const auto& point = m.points[id];
+        if (point.track.size() < 3 || point.error > 2)
+          continue;
+        bool parallax = false;
+        for (size_t a = 0; a < point.track.size() && !parallax; ++a)
+          for (size_t b = a + 1; b < point.track.size(); ++b) {
+            const auto ra = (point.xyz - m.images[point.track[a].image].pose.Center()).normalized();
+            const auto rb = (point.xyz - m.images[point.track[b].image].pose.Center()).normalized();
+            if (ra.dot(rb) <= std::cos(Pi / 180)) {
+              parallax = true;
+              break;
+            }
+          }
+        if (!parallax)
+          continue;
+        selected.insert(id);
+        for (const auto& o : point.track) {
+          parent[root(o.image)] = root(point.track.front().image);
+          const auto& im = m.images[o.image];
+          const auto& camera = scene.cameras[im.camera];
+          const auto& xy = im.pixels[o.feature];
+          ++observations[o.image];
+          cells[o.image].insert(std::clamp(int(xy.x() / camera.width * 8), 0, 7) +
+                                8 * std::clamp(int(xy.y() / camera.height * 8), 0, 7));
+          const double angle = std::acos(std::clamp(camera.Ray(xy).z(), -1., 1.));
+          ++angles[im.camera][std::clamp(int(angle * 180 / Pi / 20), 0, 3)];
+        }
+      }
+      for (uint32_t id = 0; id < m.images.size(); ++id)
+        if (m.images[id].registered) {
+          if (observations[id] < 32 || cells[id].size() < 8)
+            throw std::runtime_error("Stable calibration lacks image coverage: " +
+                                     scene.images[id].name);
+          if (root(id) != root(m.gauge_image))
+            throw std::runtime_error("Stable calibration track graph is disconnected");
+        }
+      for (const auto& bins : angles)
+        if (std::count_if(bins.begin(), bins.end(), [](size_t n) { return n >= 100; }) < 3)
+          throw std::runtime_error(
+              "Stable calibration needs at least three supported angle bands per lens");
+      calibration_selection.push_back(
+          {{"points", selected.size()},
+           {"observations", std::accumulate(observations.begin(), observations.end(), size_t(0))},
+           {"minimum_track_length", 3},
+           {"minimum_angle_degrees", 1},
+           {"maximum_mean_error_px", 2},
+           {"observations_by_angle", angles}});
+    }
+    optimization.push_back(
+        Optimize(m, scene.cameras, "principal", workers, iterations, {}, {}, {}, selected));
+  };
+  calibrate(150);
   for (int round = 0; round < 3; ++round) {
     const size_t before = m.Observations();
-    m.Filter();
+    filter();
     const size_t removed = before - m.Observations();
     auto completed = CompleteTracks(m, graph, points);
     const size_t total_removed = removed + completed.at("removed_observations").get<size_t>();
@@ -852,19 +991,18 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       break;
     optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 100));
   }
-  optimization.push_back(Optimize(m, scene.cameras, "principal", workers, 200));
-  m.Filter();
+  calibrate(200);
+  if (stable_calibration)
+    optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 200));
+  filter();
+  const auto color_started = Clock::now();
   for (uint32_t id = 0; id < m.images.size(); ++id) {
-    const auto rgb = ReadImage(scene.images[id].source, cv::IMREAD_COLOR);
     for (uint32_t k = 0; k < m.images[id].points.size(); ++k)
       if (m.images[id].points[k] != NoPoint) {
         auto& p = m.points[m.images[id].points[k]];
         if (p.track.front().image != id)
           continue;
-        const auto& xy = m.images[id].pixels[k];
-        const auto color = rgb.at<cv::Vec3b>(std::clamp(int(xy.y()), 0, rgb.rows - 1),
-                                             std::clamp(int(xy.x()), 0, rgb.cols - 1));
-        p.color = {color[2], color[1], color[0]};
+        p.color = colors[id][k];
       }
   }
   report = {{"verified_pairs", std::count_if(pairs.begin(), pairs.end(),
@@ -872,7 +1010,18 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
             {"tracks", graph.tracks.size()},
             {"seconds", Seconds(started)},
             {"geometry_seconds", geometry_seconds},
+            {"timing",
+             {{"cache_read_seconds", cache_read_seconds},
+              {"track_build_seconds", graph_seconds},
+              {"candidate_selection_seconds", selection_seconds},
+              {"pose_registration_seconds", registration_seconds},
+              {"triangulation_seconds", triangulation_seconds},
+              {"filter_seconds", filter_seconds},
+              {"checkpoint_seconds", checkpoint_seconds},
+              {"color_seconds", Seconds(color_started)}}},
             {"completion", completion},
+            {"calibration_tracks", stable_calibration ? "stable" : "all"},
+            {"calibration_selection", calibration_selection},
             {"optimization", optimization}};
   fs::remove(work / "cache/unregistered.json");
   return m;

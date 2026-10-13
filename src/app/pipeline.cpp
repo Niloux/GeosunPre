@@ -52,9 +52,13 @@ class Lock {
   }
 };
 Json Settings(const fs::path& file) {
-  Json result = {{"workers", 4},         {"quality_median_px", 2.},
-                 {"quality_p90_px", 4.}, {"las_support_fraction", .25},
-                 {"las_median_m", .1},   {"las_p90_m", .3}};
+  Json result = {{"workers", 4},
+                 {"quality_median_px", 2.},
+                 {"quality_p90_px", 4.},
+                 {"las_support_fraction", .25},
+                 {"las_median_m", .1},
+                 {"las_p90_m", .3},
+                 {"calibration_tracks", "all"}};
   if (!file.empty()) {
     const auto configured = ReadJson(file);
     if (!configured.is_object())
@@ -69,9 +73,11 @@ Json Settings(const fs::path& file) {
       result.at("workers").get<int>() > 32)
     throw std::runtime_error("workers must be 1-32");
   for (const auto& [key, value] : result.items())
-    if (key != "workers" &&
+    if (key != "workers" && key != "calibration_tracks" &&
         (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() <= 0))
       throw std::runtime_error("Expected positive numeric setting: " + key);
+  if (result.at("calibration_tracks") != "all" && result.at("calibration_tracks") != "stable")
+    throw std::runtime_error("calibration_tracks must be all or stable");
   if (result.at("las_support_fraction").get<double>() > 1 ||
       result.at("quality_median_px").get<double>() > result.at("quality_p90_px").get<double>() ||
       result.at("las_median_m").get<double>() > result.at("las_p90_m").get<double>())
@@ -108,7 +114,7 @@ void Run(const Arguments& args) {
   Json state = fs::exists(state_path) ? ReadJson(state_path) : Json::object();
   if (!state.empty() && state.at("version") != 1)
     throw std::runtime_error("Unsupported work format; choose a new work directory");
-  if (!state.empty() && state.value("pipeline_version", 0) != 5)
+  if (!state.empty() && state.value("pipeline_version", 0) != PipelineVersion)
     throw std::runtime_error("Reconstruction implementation changed; choose a new work directory");
   const auto input = args.Get("--input").empty() ? fs::u8path(state.at("input").get<std::string>())
                                                  : args.Path("--input");
@@ -126,15 +132,19 @@ void Run(const Arguments& args) {
   ReadLasHeader(scene.las);
   const auto prepared = scene.ToJson();
   if (state.empty()) {
-    state = {{"version", 1},         {"pipeline_version", 5}, {"input", scene.input.u8string()},
-             {"settings", settings}, {"scene", prepared},     {"stages", Json::object()}};
+    state = {{"version", 1},
+             {"pipeline_version", PipelineVersion},
+             {"input", scene.input.u8string()},
+             {"settings", settings},
+             {"scene", prepared},
+             {"stages", Json::object()}};
     WriteJson(work / "scene.json", prepared);
   } else if (state.at("scene") != prepared || state.at("settings") != settings)
     throw std::runtime_error("Inputs/settings changed; choose a new work directory");
   const auto root =
       args.Get("--models").empty()
           ? (state.contains("models") ? fs::u8path(state.at("models").get<std::string>())
-                                      : fs::absolute("models"))
+                                      : DefaultModels())
           : args.Path("--models");
   const auto requested = args.Get("--stage", args.command == "prepare" ? "prepare" : "all");
   const std::vector<std::string> stages = {"prepare", "masks", "features", "matches",
@@ -147,6 +157,7 @@ void Run(const Arguments& args) {
   const bool ply = args.Get("--no-ply") != "true";
   const double voxel = args.Number("--ply-voxel", .05);
   state["status"] = "running";
+  state["build"] = BuildInfo();
   state["error"] = nullptr;
   WriteJson(state_path, state);
   const auto started = Clock::now();
@@ -205,7 +216,8 @@ void Run(const Arguments& args) {
         for (int repair = 0;; ++repair) {
           std::set<uint32_t> deficient;
           try {
-            model = Reconstruct(scene, work, workers, report);
+            model = Reconstruct(scene, work, workers, report,
+                                settings.at("calibration_tracks") == "stable");
             quality = model.Quality(scene, settings.at("quality_median_px"),
                                     settings.at("quality_p90_px"));
             if (quality.at("passed").get<bool>())
@@ -250,6 +262,7 @@ void Run(const Arguments& args) {
           result["frontend"][name] =
               ReadJson(work / "cache" / (std::string(name) + "_profile.json"));
         result["runtime"] = "C++/CUDA/TensorRT";
+        result["build"] = BuildInfo();
         result["input"] = scene.input.u8string();
         WriteModel(work / "cache/aligned.bin", model);
         WriteJson(work / "result.json", result);

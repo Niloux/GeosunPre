@@ -9,5 +9,6 @@ class RegistrationIncomplete : public std::runtime_error {
       : std::runtime_error("SfM could not register all selected exposures"),
         images(std::move(ids)) {}
 };
-Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report);
+Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report,
+                           bool stable_calibration = false);
 }  // namespace geosun

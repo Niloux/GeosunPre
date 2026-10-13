@@ -11,6 +11,10 @@ namespace fs = std::filesystem;
 namespace geosun {
 using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
+constexpr int PipelineVersion = 6;
+fs::path ExecutablePath();
+fs::path DefaultModels();
+Json BuildInfo();
 double Seconds(Clock::time_point start);
 Json ReadJson(const fs::path& path);
 void WriteJson(const fs::path& path, const Json& value);

@@ -58,7 +58,7 @@ fs::path MatchPath(const fs::path& work, uint32_t a, uint32_t b) {
 }
 void WriteFeatures(const fs::path& path, const FeatureSet& f) {
   BinaryWriter out(path);
-  out.String("GEOSUN_FEATURES_1");
+  out.String("GEOSUN_FEATURES_2");
   out.Value(f.image);
   out.Value(f.dimension);
   out.Value(uint64_t(f.pixels.size()));
@@ -69,11 +69,12 @@ void WriteFeatures(const fs::path& path, const FeatureSet& f) {
   }
   out.Bytes(f.descriptors.data(), f.descriptors.size() * sizeof(float));
   out.Value(f.retrieval);
+  out.Bytes(f.colors.data(), f.colors.size() * sizeof(f.colors[0]));
   out.Commit();
 }
 FeatureSet ReadFeatures(const fs::path& path) {
   BinaryReader in(path);
-  if (in.String() != "GEOSUN_FEATURES_1")
+  if (in.String() != "GEOSUN_FEATURES_2")
     throw std::runtime_error("Unsupported feature cache");
   FeatureSet f;
   f.image = in.Value<uint32_t>();
@@ -92,6 +93,8 @@ FeatureSet ReadFeatures(const fs::path& path) {
   }
   in.Bytes(f.descriptors.data(), f.descriptors.size() * sizeof(float));
   f.retrieval = in.Value<std::array<float, 256>>();
+  f.colors.resize(n);
+  in.Bytes(f.colors.data(), f.colors.size() * sizeof(f.colors[0]));
   in.End();
   for (float x : f.descriptors)
     if (!std::isfinite(x))

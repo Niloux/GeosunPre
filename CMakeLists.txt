@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "Target CUDA architectures")
 endif()
-project(GeosunPre VERSION 1.0.0 LANGUAGES CXX CUDA)
+project(GeosunPre VERSION 1.1.0 LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
@@ -16,6 +16,14 @@ add_executable(geosunpre
   src/geometry/camera.cpp src/geometry/model.cpp
   src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/preprocessing.cu src/frontend/frontend.cpp
   src/sfm/reconstruction.cpp src/sfm/optimization.cpp src/alignment/alignment.cpp)
+execute_process(COMMAND git describe --always --dirty WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  OUTPUT_VARIABLE GEOSUN_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT GEOSUN_REVISION)
+  set(GEOSUN_REVISION "source-archive")
+endif()
+string(TIMESTAMP GEOSUN_BUILD_TIME "%Y-%m-%dT%H:%M:%SZ" UTC)
+target_compile_definitions(geosunpre PRIVATE GEOSUN_VERSION="${PROJECT_VERSION}"
+  GEOSUN_REVISION="${GEOSUN_REVISION}" GEOSUN_BUILD_TIME="${GEOSUN_BUILD_TIME}")
 target_include_directories(geosunpre PRIVATE src ${tensorrt_SOURCE_DIR}/include ${OpenCV_INCLUDE_DIRS})
 target_include_directories(geosunpre SYSTEM PRIVATE ${opencv_BINARY_DIR} ${CMAKE_BINARY_DIR}
   ${opencv_SOURCE_DIR}/modules/core/include ${opencv_SOURCE_DIR}/modules/imgproc/include

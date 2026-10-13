@@ -267,6 +267,94 @@ class FeatureCache {
   }
 };
 }  // namespace
+Json CheckModels(const fs::path& root, const fs::path& image) {
+  auto rgb = ReadImage(image, cv::IMREAD_COLOR);
+  cv::cvtColor(rgb, rgb, cv::COLOR_BGR2RGB);
+  const auto manifest = ReadJson(root / "manifest.json");
+  const auto size = manifest.at("detector_size").get<std::array<int, 2>>();
+  auto check = [](const Tensor& tensor, const std::vector<int64_t>& shape) {
+    if (tensor.shape != shape)
+      throw std::runtime_error("Model verification: unexpected output shape");
+    const auto* values = tensor.Floats();
+    for (size_t i = 0; i < tensor.Count(); ++i)
+      if (!std::isfinite(values[i]))
+        throw std::runtime_error("Model verification: nonfinite output");
+  };
+  Json report = {{"passed", true}, {"models", root.u8string()}, {"gpu", GpuInfo()}};
+  std::vector<float> keypoints;
+  Tensor descriptors;
+  {
+    Models models(root);
+    ImagePreprocessor pixels(models.Stream());
+    pixels.Upload(rgb);
+    const auto logits = models.Predict("detector", {pixels.Normalize(size[0], size[1])})[0];
+    check(logits, {1, 1, size[1], size[0]});
+    for (const auto& point : DetectKeypoints(logits, size[0], size[1], 3072, models.Stream())) {
+      keypoints.push_back(point[0]);
+      keypoints.push_back(point[1]);
+    }
+    report["inference"]["detector"] = models.Profile().at("detector");
+  }
+  const int64_t count = int64_t(keypoints.size() / 2);
+  if (count < 32)
+    throw std::runtime_error("Model verification image has fewer than 32 features");
+  {
+    Models models(root);
+    ImagePreprocessor pixels(models.Stream());
+    pixels.Upload(rgb);
+    descriptors = models.Predict(
+        "descriptor", {pixels.Normalize(784, 784),
+                       Tensor::Float({1, count, 2}, keypoints.data(), keypoints.size())})[0];
+    check(descriptors, {1, count, 256});
+    if (std::all_of(descriptors.Floats(), descriptors.Floats() + descriptors.Count(),
+                    [](float value) { return value == 0; }))
+      throw std::runtime_error("Model verification: empty descriptors");
+    report["inference"]["descriptor"] = models.Profile().at("descriptor");
+  }
+  {
+    Models models(root);
+    const auto k = Tensor::Upload({1, 3072, 2}, keypoints.data(), keypoints.size());
+    const auto d = Tensor::Upload({1, 3072, 256}, descriptors.Floats(), descriptors.Count());
+    const std::vector<float> valid(size_t(count), 1.f);
+    const auto mask = Tensor::Upload({1, 3072}, valid.data(), valid.size());
+    const auto matched = models.Predict("matcher", {k, k, d, d, mask, mask});
+    if (matched.size() != 2 || matched[0].type != 2 ||
+        matched[0].shape != std::vector<int64_t>{1, 3072})
+      throw std::runtime_error("Model verification: invalid matcher output");
+    check(matched[1], {1, 3072});
+    size_t identities = 0;
+    for (size_t i = 0; i < 3072; ++i) {
+      const auto index = matched[0].Index(i);
+      const float confidence = matched[1].Floats()[i];
+      if (index < -1 || (index >= 0 && (i >= size_t(count) || index != int64_t(i))) ||
+          confidence < 0 || confidence > 1.00001f)
+        throw std::runtime_error("Model verification: invalid identity match");
+      identities += index >= 0;
+    }
+    if (!identities)
+      throw std::runtime_error("Model verification: no identity matches");
+    report["identity_matches"] = identities;
+    report["inference"]["matcher"] = models.Profile().at("matcher");
+  }
+  {
+    Models models(root);
+    ImagePreprocessor pixels(models.Stream());
+    pixels.Upload(rgb);
+    const auto mean = manifest.at("segmentation_mean").get<std::array<float, 3>>();
+    const auto deviation = manifest.at("segmentation_std").get<std::array<float, 3>>();
+    const auto probabilities =
+        models.Predict("segmentation", {pixels.Normalize(512, 512, mean, deviation)})[0];
+    check(probabilities, {1, 2, 512, 512});
+    for (size_t i = 0; i < 512 * 512; ++i) {
+      const auto* values = probabilities.Floats();
+      if (values[i] < 0 || values[i + 512 * 512] < 0 ||
+          values[i] + values[i + 512 * 512] > 1.00001f)
+        throw std::runtime_error("Model verification: invalid semantic probability");
+    }
+    report["inference"]["segmentation"] = models.Profile().at("segmentation");
+  }
+  return report;
+}
 Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
   const auto started = Clock::now();
   FrontendTiming timing;
@@ -386,6 +474,8 @@ Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
       f.pixels.push_back({p[0], p[1]});
       f.normalized.push_back({2 * p[0] / camera.width - 1, 2 * p[1] / camera.height - 1});
       f.scores.push_back(p[2]);
+      const auto color = image.rgb.at<cv::Vec3b>(int(p[1]), int(p[0]));
+      f.colors.push_back({color[0], color[1], color[2]});
     }
     timing.postprocess += Seconds(phase);
     phase = Clock::now();

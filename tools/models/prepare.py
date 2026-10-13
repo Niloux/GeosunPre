@@ -195,7 +195,7 @@ def export_models(directory, shapes, source, images, references):
         torch.cuda.empty_cache()
 
 
-def build_engine(path, name, shapes):
+def build_engine(path, name, shapes, matcher_precision='fp32'):
     if path.is_file():
         print(f'Reuse engine: {name}', flush=True)
         return
@@ -207,6 +207,18 @@ def build_engine(path, name, shapes):
     if name != 'matcher':
         config.set_flag(trt.BuilderFlag.FP16)
     config.clear_flag(trt.BuilderFlag.TF32)
+    if name == 'matcher' and matcher_precision == 'tf32':
+        config.set_flag(trt.BuilderFlag.TF32)
+    elif name == 'matcher' and matcher_precision == 'fp16':
+        config.set_flag(trt.BuilderFlag.FP16)
+        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+        for index in range(network.num_layers):
+            layer = network.get_layer(index)
+            if layer.type in (trt.LayerType.SOFTMAX, trt.LayerType.REDUCE, trt.LayerType.NORMALIZATION):
+                layer.precision = trt.float32
+                for output in range(layer.num_outputs):
+                    layer.set_output_type(output, trt.float32)
+    config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
     if name == 'descriptor':
         profile = builder.create_optimization_profile()
         profile.set_shape('keypoints', (1, 32, 2), (1, 1024, 2), (1, MAX_FEATURES, 2))
@@ -359,6 +371,8 @@ def verify_package(root, settings, shapes, images):
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
     if manifest.get('version') != 1 or any(manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt', 'detector_size')):
         raise RuntimeError('Existing model GPU/version/resolution differs. Choose a new -Models directory.')
+    if manifest.get('matcher_precision', 'fp32') != settings['matcher_precision']:
+        raise RuntimeError('Existing matcher precision differs. Choose a new -Models directory.')
     for name, (inputs, outputs) in CONTRACTS.items():
         spec = manifest['models'][name]
         if spec['inputs'] != inputs or spec['outputs'] != outputs or spec['shapes'] != shapes[name]:
@@ -375,6 +389,7 @@ def main():
     parser.add_argument('--models', type=Path, required=True)
     parser.add_argument('--image-width', type=int, default=3000)
     parser.add_argument('--image-height', type=int, default=4000)
+    parser.add_argument('--matcher-precision', choices=('fp32', 'tf32', 'fp16'), default='fp32')
     parser.add_argument('--onnx-from', type=Path)
     parser.add_argument('--images', type=Path, nargs=2)
     args = parser.parse_args()
@@ -400,6 +415,7 @@ def main():
     recipe = ''.join(sha256(Path(__file__).with_name(name)) for name in ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt'))
     settings = {'gpu': torch.cuda.get_device_name(0), 'tensorrt': TRT_VERSION,
                 'detector_size': [width, height],
+                'matcher_precision': args.matcher_precision,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest()}
     if args.onnx_from:
         origin = args.onnx_from.resolve()
@@ -447,9 +463,23 @@ def main():
             elif sha256(destination) != settings['onnx_from'][name]:
                 raise RuntimeError(f'Unfinished ONNX differs from the requested source: {destination}')
     export_models(pending / 'onnx', shapes, source, images, references)
+    # Reuse unchanged engines only from the complete package supplying these ONNX files.
+    reuse_manifest = None
+    if args.onnx_from and (origin.parent / 'manifest.json').is_file():
+        reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
+        if any(reuse_manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt', 'detector_size')):
+            reuse_manifest = None
     for name in CONTRACTS:
         check_onnx(pending / 'onnx' / f'{name}.onnx', name, shapes[name])
-        build_engine(pending / 'engines' / f'{name}.engine', name, shapes[name])
+        destination = pending / 'engines' / f'{name}.engine'
+        same_precision = name != 'matcher' or (reuse_manifest or {}).get('matcher_precision', 'fp32') == args.matcher_precision
+        if reuse_manifest and same_precision and not destination.exists():
+            spec = reuse_manifest['models'][name]
+            candidate = origin.parent / 'engines' / f'{name}.engine'
+            if spec['shapes'] != shapes[name] or sha256(candidate) != spec['sha256']:
+                raise RuntimeError(f'Source engine contract/checksum differs: {name}')
+            shutil.copy2(candidate, destination)
+        build_engine(destination, name, shapes[name], args.matcher_precision)
         gc.collect()
         torch.cuda.empty_cache()
     runtime = installed_runtime()
@@ -463,6 +493,7 @@ def main():
         compare_reference(pending, name, shapes, references)
     verify(pending, shapes, images)
     manifest = {'version': 1, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
+                'matcher_precision': args.matcher_precision,
                 'detector_size': [width, height], 'descriptor_size': [784, 784],
                 'max_features': MAX_FEATURES, 'descriptor_dimension': 256,
                 'segmentation_mean': [.485, .456, .406], 'segmentation_std': [.229, .224, .225],

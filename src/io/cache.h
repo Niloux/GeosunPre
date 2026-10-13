@@ -41,6 +41,7 @@ struct FeatureSet {
   uint32_t image = 0, dimension = 256;
   std::vector<std::array<float, 2>> pixels, normalized;
   std::vector<float> scores, descriptors;
+  std::vector<std::array<uint8_t, 3>> colors;
   std::array<float, 256> retrieval{};
 };
 struct Match {

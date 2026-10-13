@@ -2,6 +2,7 @@
 #include "io/colmap.h"
 #include "io/las.h"
 #include "frontend/inference.h"
+#include "frontend/frontend.h"
 #include <opencv2/core.hpp>
 #include <iostream>
 
@@ -10,9 +11,10 @@ int Main(const std::vector<std::string>& argv) {
   try {
     cv::setNumThreads(1);
     Arguments args(argv);
-    if (args.command == "run" || args.command == "prepare")
+    if (args.command == "run" || args.command == "prepare") {
+      Log("GeosunPre: " + BuildInfo().dump());
       Run(args);
-    else if (args.command == "export")
+    } else if (args.command == "export")
       Export(args);
     else if (args.command == "check") {
       args.Validate({"--output", "--work"});
@@ -22,9 +24,16 @@ int Main(const std::vector<std::string>& argv) {
                 << '\n';
     } else if (args.command == "info") {
       args.Validate({});
-      std::cout << Json({{"version", "1.0.0"},
-                         {"runtime", "C++17/CUDA/TensorRT 10.13"},
-                         {"gpu", GpuInfo()}})
+      auto info = BuildInfo();
+      info["runtime"] = "C++17/CUDA/TensorRT 10.13";
+      info["gpu"] = GpuInfo();
+      info["default_models"] = DefaultModels().u8string();
+      std::cout << info.dump(2) << '\n';
+    } else if (args.command == "check-models") {
+      args.Validate({"--models", "--image"});
+      std::cout << CheckModels(
+                       args.Get("--models").empty() ? DefaultModels() : args.Path("--models"),
+                       args.Path("--image"))
                        .dump(2)
                 << '\n';
     } else if (args.command == "las-ply") {
@@ -34,14 +43,16 @@ int Main(const std::vector<std::string>& argv) {
                        .dump(2)
                 << '\n';
     } else if (args.command == "help" || args.command == "--help") {
-      std::cout << "GeosunPre 1.0 - native dual-fisheye/LAS reconstruction\n"
-                   "  geosunpre run --input INPUT --work WORK --models MODELS [--config JSON]\n"
+      std::cout << "GeosunPre " GEOSUN_VERSION
+                   " - native dual-fisheye/LAS reconstruction\n"
+                   "  geosunpre run --input INPUT --work WORK [--models MODELS] [--config JSON]\n"
                    "  geosunpre run --work WORK [--stage "
                    "prepare|masks|features|matches|sfm|align|export]\n"
                    "  geosunpre prepare --input INPUT --work WORK\n"
                    "  geosunpre export --work WORK [--output DIR] [--no-ply] [--ply-voxel METRES]\n"
                    "  geosunpre check --output DIR\n"
                    "  geosunpre info\n"
+                   "  geosunpre check-models --image FILE [--models MODELS]\n"
                    "  geosunpre las-ply --las FILE --output FILE [--voxel METRES]\n";
     } else
       throw std::runtime_error("Unknown command: " + args.command);
