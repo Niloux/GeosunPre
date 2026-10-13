@@ -1,5 +1,6 @@
 #pragma once
 #include "geometry/model.h"
+#include "sfm/optimization.h"
 
 namespace geosun {
 struct AlignmentLimits {
@@ -7,4 +8,8 @@ struct AlignmentLimits {
   double median_px = 2, p90_px = 4;
 };
 Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits);
+std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstruction& model,
+                                            int workers);
+Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
+                               const AlignmentLimits& limits);
 }  // namespace geosun

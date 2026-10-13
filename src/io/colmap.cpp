@@ -257,7 +257,7 @@ Reconstruction ReadColmap(const fs::path& path, Scene& scene) {
 void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report) {
   const Json request = {{"scene_file", FileMetadata(work / "scene.json")},
-                        {"model_file", FileMetadata(work / "cache/aligned.bin")},
+                        {"model_file", FileMetadata(SelectedModelPath(work, report))},
                         {"include_ply", include_ply},
                         {"voxel", voxel}};
   if (fs::exists(output)) {

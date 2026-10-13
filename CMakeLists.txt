@@ -15,7 +15,8 @@ add_executable(geosunpre
   src/io/scene.cpp src/io/cache.cpp src/io/las.cpp src/io/colmap.cpp
   src/geometry/camera.cpp src/geometry/model.cpp
   src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/preprocessing.cu src/frontend/frontend.cpp
-  src/sfm/reconstruction.cpp src/sfm/optimization.cpp src/alignment/alignment.cpp)
+  src/sfm/reconstruction.cpp src/sfm/optimization.cpp src/sfm/photometric.cpp
+  src/alignment/alignment.cpp)
 execute_process(COMMAND git describe --always --dirty WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
   OUTPUT_VARIABLE GEOSUN_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
 if(NOT GEOSUN_REVISION)

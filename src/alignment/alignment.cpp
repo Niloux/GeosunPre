@@ -414,6 +414,164 @@ Similarity NavigationFit(const std::vector<Eigen::Vector3d>& centers,
   return selected;
 }
 }  // namespace
+std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstruction& model,
+                                            int workers) {
+  const auto header = ReadLasHeader(scene.las);
+  const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
+  Json sampling;
+  auto target = SampleLas(scene.las, header, sampling);
+  for (auto& p : target)
+    p -= origin;
+  auto surface = CoherentSurfaces(target, .025, workers);
+  std::vector<PlaneConstraint> planes;
+  for (uint64_t id = 0; id < model.points.size(); ++id) {
+    const auto& p = model.points[id];
+    if (p.track.size() < 3 || p.error > 2)
+      continue;
+    const Eigen::Vector3d local = p.xyz - origin;
+    size_t nearest;
+    double squared;
+    surface->tree->knnSearch(local.data(), 1, &nearest, &squared);
+    if (squared > .01 || !surface->coherent[nearest])
+      continue;
+    planes.push_back({id, surface->centres[nearest] + origin, surface->normals[nearest],
+                      std::max({.01, surface->noise[nearest], header.scale.maxCoeff()})});
+  }
+  return planes;
+}
+Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
+                               const AlignmentLimits& limits) {
+  const auto header = ReadLasHeader(scene.las);
+  const double max_error = std::min(3., limits.p90_px),
+               max_sigma = std::max(.5 * limits.median_m, 3 * header.scale.maxCoeff()),
+               max_distance = std::max(limits.median_m, 3 * header.scale.maxCoeff());
+  const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
+  Json sampling;
+  Surface target;
+  target.points = SampleLas(scene.las, header, sampling);
+  for (auto& p : target.points)
+    p -= origin;
+  target.Index();
+  size_t before = 0, short_tracks = 0, uncertain = 0, unsupported = 0, retained = 0;
+  for (const auto& p : model.points)
+    before += !p.track.empty();
+  model.Filter(max_error, 1.5);
+  std::vector<double> distances, uncertainty;
+  for (auto& point : model.points) {
+    if (point.track.empty())
+      continue;
+    if (point.track.size() < 3) {
+      point.track.clear();
+      ++short_tracks;
+      continue;
+    }
+    Eigen::Matrix3d information = Eigen::Matrix3d::Zero();
+    for (const auto& o : point.track) {
+      const auto& image = model.images[o.image];
+      const Eigen::Matrix<double, 2, 3> j =
+          model.cameras[image.camera].ProjectionJacobian(image.pose.Apply(point.xyz)) *
+          image.pose.Rotation().toRotationMatrix();
+      information.noalias() += j.transpose() * j;
+    }
+    const auto eigen = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(information).eigenvalues().eval();
+    const double sigma = std::max(.5, point.error) / std::sqrt(std::max(eigen[0], 1e-18));
+    if (sigma > max_sigma) {
+      point.track.clear();
+      ++uncertain;
+      continue;
+    }
+    const Eigen::Vector3d local = point.xyz - origin;
+    size_t nearest;
+    double squared;
+    target.tree->knnSearch(local.data(), 1, &nearest, &squared);
+    if (squared > max_distance * max_distance) {
+      point.track.clear();
+      ++unsupported;
+      continue;
+    }
+    ++retained;
+    distances.push_back(std::sqrt(squared));
+    uncertainty.push_back(sigma);
+  }
+  const size_t initially_retained = retained;
+  Json removed_images = Json::array();
+  for (;;) {
+    model.RebuildReferences();
+    bool changed = false;
+    for (uint32_t id = 0; id < model.images.size(); ++id) {
+      auto& image = model.images[id];
+      if (!image.registered)
+        continue;
+      size_t count = 0;
+      std::set<int> cells;
+      const auto& camera = model.cameras[image.camera];
+      for (size_t feature = 0; feature < image.points.size(); ++feature)
+        if (image.points[feature] != NoPoint) {
+          ++count;
+          const auto& pixel = image.pixels[feature];
+          cells.insert(std::clamp(int(pixel.x() / camera.width * 8), 0, 7) +
+                       8 * std::clamp(int(pixel.y() / camera.height * 8), 0, 7));
+        }
+      if (count < 32 || cells.size() < 8) {
+        image.registered = false;
+        changed = true;
+        removed_images.push_back({{"image_index", id}, {"name", scene.images[id].name},
+                                  {"observations", count}, {"occupied_cells", cells.size()}});
+      }
+    }
+    if (!changed)
+      break;
+    for (auto& point : model.points) {
+      const size_t before_track = point.track.size();
+      point.track.erase(std::remove_if(point.track.begin(), point.track.end(),
+                                       [&](const auto& o) { return !model.images[o.image].registered; }),
+                        point.track.end());
+      if (point.track.size() < 3)
+        point.track.clear();
+      else if (point.track.size() != before_track)
+        RefinePoint(model, point.track, point.xyz);
+    }
+    model.Filter(max_error, 1.5);
+  }
+  distances.clear();
+  uncertainty.clear();
+  retained = 0;
+  for (auto& point : model.points) {
+    if (point.track.empty())
+      continue;
+    Eigen::Matrix3d information = Eigen::Matrix3d::Zero();
+    for (const auto& o : point.track) {
+      const auto& image = model.images[o.image];
+      const Eigen::Matrix<double, 2, 3> j =
+          model.cameras[image.camera].ProjectionJacobian(image.pose.Apply(point.xyz)) *
+          image.pose.Rotation().toRotationMatrix();
+      information.noalias() += j.transpose() * j;
+    }
+    const auto eigen = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(information).eigenvalues().eval();
+    const double sigma = std::max(.5, point.error) / std::sqrt(std::max(eigen[0], 1e-18));
+    const Eigen::Vector3d local = point.xyz - origin;
+    size_t nearest;
+    double squared;
+    target.tree->knnSearch(local.data(), 1, &nearest, &squared);
+    if (point.track.size() < 3 || sigma > max_sigma || squared > max_distance * max_distance) {
+      point.track.clear();
+      continue;
+    }
+    ++retained;
+    distances.push_back(std::sqrt(squared));
+    uncertainty.push_back(sigma);
+  }
+  model.RebuildReferences();
+  return {{"points_before", before}, {"points_after", retained},
+          {"removed_reprojection_or_parallax", before - initially_retained - short_tracks - uncertain - unsupported},
+          {"removed_short_tracks", short_tracks}, {"removed_uncertain_depth", uncertain},
+          {"removed_las_unsupported", unsupported}, {"removed_with_weak_images", initially_retained - retained},
+          {"removed_images", removed_images}, {"nearest_las_m", Statistics(distances)},
+          {"fixed_camera_position_sigma_proxy_m", Statistics(uncertainty)},
+          {"limits", {{"minimum_track_length", 3}, {"minimum_parallax_degrees", 1.5},
+                      {"maximum_reprojection_px", max_error}, {"maximum_sigma_proxy_m", max_sigma},
+                      {"maximum_nearest_las_m", max_distance}}}};
+}
 Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits) {
   const auto header = ReadLasHeader(scene.las);
   Json sampling;

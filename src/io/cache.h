@@ -58,4 +58,5 @@ void WriteMatches(const fs::path& path, const MatchSet& matches);
 MatchSet ReadMatches(const fs::path& path);
 fs::path FeaturePath(const fs::path& work, uint32_t image);
 fs::path MatchPath(const fs::path& work, uint32_t a, uint32_t b);
+fs::path SelectedModelPath(const fs::path& work, const Json& result);
 }  // namespace geosun

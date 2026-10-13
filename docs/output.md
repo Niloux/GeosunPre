@@ -31,6 +31,8 @@ quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 
 
 工作目录 `result.json` 的 joint 保存联合优化候选的完整质量、点位移统计、逐图退化明细、各项接受条件及 failed_checks；候选被拒绝时保留所选原模型，验收阈值不因诊断而放宽。
 
+默认在 LAS 对齐后精修，再导出最终所选模型。`result.json` 的 alignment、joint、sfm 是各阶段原报告；refinement 保存精修的留出误差、同组 LAS 平面误差、优化验收和独立清理验收，quality 与 navigation_error_m 更新为最终模型统计。相机候选未通过时导出对齐模型；清理候选未通过时导出未强力清理的精修模型，未采用原因明确记录。允许清理最多 1% 的已注册照片，且每镜头至少保留 98%、可靠 LAS 支撑轨迹至少保留 90%；最终照片名单以交付 registration 为准。
+
 同级 `.pending` 中完成写入及回读后重命名发布。同一请求的完整包可复用，不同请求拒绝覆盖。`check --output` 只依赖交付包，检查结构、引用、尺寸、PLY 和几何拟合，不代表独立精度或渲染效果。
 
 格式依据：[COLMAP output format](https://colmap.github.io/format.html)。

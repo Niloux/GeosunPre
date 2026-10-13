@@ -6,6 +6,7 @@
 #include "frontend/frontend.h"
 #include "frontend/inference.h"
 #include "sfm/reconstruction.h"
+#include "sfm/photometric.h"
 #include "alignment/alignment.h"
 #include <set>
 #include <iostream>
@@ -148,7 +149,7 @@ void Run(const Arguments& args) {
           : args.Path("--models");
   const auto requested = args.Get("--stage", args.command == "prepare" ? "prepare" : "all");
   const std::vector<std::string> stages = {"prepare", "masks", "features", "matches",
-                                           "sfm",     "align", "export"};
+                                           "sfm",     "align", "refine", "export"};
   if (requested != "all" && std::find(stages.begin(), stages.end(), requested) == stages.end())
     throw std::runtime_error("Unknown stage: " + requested);
   const auto output = args.Get("--output").empty() ? work / "colmap" : args.Path("--output");
@@ -170,6 +171,8 @@ void Run(const Arguments& args) {
         const size_t index = std::find(stages.begin(), stages.end(), stage) - stages.begin();
         if (!state.at("stages").contains(stages[index - 1]))
           throw std::runtime_error("Run prerequisite stage: " + stages[index - 1]);
+        if (stage == "refine" || stage == "export")
+          Verify(work, state.at("stages").at(stages[index - 1]).at("files"));
         if (stage == "masks" || stage == "features" || stage == "matches") {
           Json identity = {{"manifest", FileMetadata(root / "manifest.json")}};
           const auto manifest = ReadJson(root / "manifest.json");
@@ -189,8 +192,9 @@ void Run(const Arguments& args) {
       if (state.at("stages").contains(stage)) {
         Verify(work, state.at("stages").at(stage).at("files"));
         if (stage == "export") {
-          ExportBundle(scene, ReadModel(work / "cache/aligned.bin"), work, output, ply, voxel,
-                       ReadJson(work / "result.json"));
+          const auto result = ReadJson(work / "result.json");
+          ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, ply, voxel,
+                       result);
         }
         Log("Reused " + stage);
         continue;
@@ -273,11 +277,29 @@ void Run(const Arguments& args) {
         result["build"] = BuildInfo();
         result["input"] = scene.input.u8string();
         WriteModel(work / "cache/aligned.bin", model);
+        WriteJson(work / "cache/alignment.json", result);
+        products = {work / "cache/aligned.bin", work / "cache/alignment.json"};
+      } else if (stage == "refine") {
+        const auto model = ReadModel(work / "cache/aligned.bin");
+        const auto original = ReadJson(work / "cache/alignment.json");
+        const AlignmentLimits limits{settings.at("las_support_fraction"),
+                                     settings.at("las_median_m"), settings.at("las_p90_m"),
+                                     settings.at("quality_median_px"), settings.at("quality_p90_px")};
+        auto refinement = RefinePhotometric(scene, model, workers, limits);
+        const auto& selected = refinement.accepted ? refinement.candidate : model;
+        const auto result = RefinementResult(scene, selected, original, refinement.report);
+        WriteModel(work / "cache/refinement_candidate.bin", refinement.candidate);
+        WriteModel(work / "cache/refined.bin", selected);
+        WriteJson(work / "cache/refinement.json", refinement.report);
         WriteJson(work / "result.json", result);
-        products = {work / "cache/aligned.bin", work / "result.json"};
+        state["registration"] = result.at("quality").at("registration");
+        Log("Photometric refinement " + refinement.report.at("reason").get<std::string>() +
+            "; pruning " + refinement.report.at("structure_filter").at("reason").get<std::string>());
+        products = {work / "cache/refinement_candidate.bin", work / "cache/refined.bin",
+                    work / "cache/refinement.json", work / "result.json"};
       } else {
-        ExportBundle(scene, ReadModel(work / "cache/aligned.bin"), work, output, ply, voxel,
-                     ReadJson(work / "result.json"));
+        const auto result = ReadJson(work / "result.json");
+        ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, ply, voxel, result);
         products = {output / "manifest.json"};
       }
       state["stages"][stage] = {{"seconds", Seconds(begin)}, {"files", Inventory(work, products)}};
@@ -306,13 +328,22 @@ void Export(const Arguments& args) {
   args.Validate({"--work", "--output", "--no-ply", "--ply-voxel"});
   const auto work = args.Path("--work");
   Lock lock(work);
+  if (fs::exists(work / "state.json")) {
+    const auto state = ReadJson(work / "state.json");
+    if (state.value("pipeline_version", 0) == PipelineVersion) {
+      if (!state.at("stages").contains("refine"))
+        throw std::runtime_error("Run prerequisite stage: refine");
+      Verify(work, state.at("stages").at("refine").at("files"));
+    }
+  }
   const auto scene = Scene::FromJson(ReadJson(work / "scene.json"));
-  const auto model = ReadModel(work / "cache/aligned.bin");
+  const auto result = ReadJson(work / "result.json");
+  const auto model = ReadModel(SelectedModelPath(work, result));
   const auto output = args.Get("--output").empty() ? work / "colmap" : args.Path("--output");
   if (Contains(scene.input, output) || Contains(output, scene.input))
     throw std::runtime_error("Output must be separate from input");
   ExportBundle(scene, model, work, output, args.Get("--no-ply") != "true",
-               args.Number("--ply-voxel", .05), ReadJson(work / "result.json"));
+               args.Number("--ply-voxel", .05), result);
   std::cout << CheckBundle(output).dump() << '\n';
 }
 }  // namespace geosun

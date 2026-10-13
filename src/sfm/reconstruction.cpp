@@ -291,57 +291,6 @@ struct Tracks {
     }
   }
 };
-double PointCost(const Reconstruction& model, const std::vector<Observation>& track,
-                 const Eigen::Vector3d& point) {
-  double cost = 0;
-  for (const auto& o : track) {
-    const auto& image = model.images[o.image];
-    const Eigen::Vector3d v = image.pose.Apply(point);
-    if (v.z() <= 0)
-      return INFINITY;
-    const double error = (model.cameras[image.camera].Project(v) - image.pixels[o.feature]).norm();
-    cost += error <= 2 ? .5 * error * error : 2 * (error - 1);
-  }
-  return cost;
-}
-void RefinePoint(const Reconstruction& model, const std::vector<Observation>& track,
-                 Eigen::Vector3d& point) {
-  double cost = PointCost(model, track, point);
-  for (int iteration = 0; iteration < 6; ++iteration) {
-    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
-    Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
-    for (const auto& o : track) {
-      const auto& image = model.images[o.image];
-      const auto& camera = model.cameras[image.camera];
-      const Eigen::Vector3d v = image.pose.Apply(point);
-      const Eigen::Vector2d residual = camera.Project(v) - image.pixels[o.feature];
-      const Eigen::Matrix<double, 2, 3> j =
-          camera.ProjectionJacobian(v) * image.pose.Rotation().toRotationMatrix();
-      const double weight = std::min(1., 2 / std::max(residual.norm(), 1e-12));
-      normal.noalias() += weight * j.transpose() * j;
-      rhs.noalias() -= weight * j.transpose() * residual;
-    }
-    const Eigen::Vector3d step = normal.ldlt().solve(rhs);
-    if (!step.allFinite())
-      throw std::runtime_error("Nonfinite triangulation refinement");
-    bool accepted = false;
-    for (int backtrack = 0; backtrack < 6; ++backtrack) {
-      const Eigen::Vector3d candidate = point + step * std::pow(.5, backtrack);
-      const double next = PointCost(model, track, candidate);
-      if (std::isfinite(next) && next < cost) {
-        point = candidate;
-        const double improvement = cost - next;
-        cost = next;
-        accepted = true;
-        if (improvement < 1e-7 * std::max(1., cost))
-          return;
-        break;
-      }
-    }
-    if (!accepted)
-      break;
-  }
-}
 bool AddPoint(Reconstruction& model, const std::vector<Observation>& observations,
               uint64_t& identity, bool refine = false) {
   if (identity != NoPoint && !model.points[identity].track.empty()) {

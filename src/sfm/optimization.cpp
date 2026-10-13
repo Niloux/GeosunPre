@@ -158,6 +158,57 @@ class Progress : public ceres::IterationCallback {
   }
 };
 }  // namespace
+double PointCost(const Reconstruction& model, const std::vector<Observation>& track,
+                 const Eigen::Vector3d& point) {
+  double cost = 0;
+  for (const auto& o : track) {
+    const auto& image = model.images[o.image];
+    const Eigen::Vector3d v = image.pose.Apply(point);
+    if (v.z() <= 0)
+      return INFINITY;
+    const double error = (model.cameras[image.camera].Project(v) - image.pixels[o.feature]).norm();
+    cost += error <= 2 ? .5 * error * error : 2 * (error - 1);
+  }
+  return cost;
+}
+void RefinePoint(const Reconstruction& model, const std::vector<Observation>& track,
+                 Eigen::Vector3d& point) {
+  double cost = PointCost(model, track, point);
+  for (int iteration = 0; iteration < 6; ++iteration) {
+    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+    for (const auto& o : track) {
+      const auto& image = model.images[o.image];
+      const auto& camera = model.cameras[image.camera];
+      const Eigen::Vector3d v = image.pose.Apply(point);
+      const Eigen::Vector2d residual = camera.Project(v) - image.pixels[o.feature];
+      const Eigen::Matrix<double, 2, 3> j =
+          camera.ProjectionJacobian(v) * image.pose.Rotation().toRotationMatrix();
+      const double weight = std::min(1., 2 / std::max(residual.norm(), 1e-12));
+      normal.noalias() += weight * j.transpose() * j;
+      rhs.noalias() -= weight * j.transpose() * residual;
+    }
+    const Eigen::Vector3d step = normal.ldlt().solve(rhs);
+    if (!step.allFinite())
+      throw std::runtime_error("Nonfinite triangulation refinement");
+    bool accepted = false;
+    for (int backtrack = 0; backtrack < 6; ++backtrack) {
+      const Eigen::Vector3d candidate = point + step * std::pow(.5, backtrack);
+      const double next = PointCost(model, track, candidate);
+      if (std::isfinite(next) && next < cost) {
+        point = candidate;
+        const double improvement = cost - next;
+        cost = next;
+        accepted = true;
+        if (improvement < 1e-7 * std::max(1., cost))
+          return;
+        break;
+      }
+    }
+    if (!accepted)
+      break;
+  }
+}
 void RefinePose(const Camera& camera, Pose& pose, const std::vector<Eigen::Vector3d>& points,
                 const std::vector<Eigen::Vector2d>& pixels) {
   auto calibration = camera.params;
@@ -185,15 +236,17 @@ void RefinePose(const Camera& camera, Pose& pose, const std::vector<Eigen::Vecto
 Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std::string& stage,
               int workers, int iterations, const std::set<uint32_t>& variable_images,
               const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav,
-              const std::set<uint64_t>& selected_points) {
+              const std::set<uint64_t>& selected_points,
+              const std::vector<std::vector<uint8_t>>& precise_observations) {
   const auto started = Clock::now();
   ceres::Problem problem;
-  // Own losses through residual blocks; all generated observations share the
-  // same robust reprojection loss and the problem deletes it exactly once.
+  // Each precision group shares one loss owned by its residual blocks.
   auto ordering = std::make_shared<ceres::ParameterBlockOrdering>();
   auto* loss = new ceres::HuberLoss(2.);
+  ceres::LossFunction* coarse_loss = nullptr;
   std::set<uint32_t> used_images, used_cameras;
   size_t observations = 0;
+  size_t precise_count = 0;
   const bool metric = !nav.empty() && !planes.empty();
   size_t variable_count = 0;
   for (auto& p : m.points)
@@ -210,7 +263,15 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         const double depth = image.pose.Apply(p.xyz).z();
         if (depth <= 0)
           throw std::runtime_error("BA requires positive initial depth");
-        problem.AddResidualBlock(new Reprojection(image.pixels[o.feature]), loss,
+        ceres::LossFunction* observation_loss = loss;
+        const bool precise = !precise_observations.empty() && precise_observations[o.image][o.feature];
+        precise_count += precise;
+        if (!precise_observations.empty() && !precise) {
+          if (!coarse_loss)
+            coarse_loss = new ceres::ScaledLoss(new ceres::HuberLoss(2.), .25, ceres::TAKE_OWNERSHIP);
+          observation_loss = coarse_loss;
+        }
+        problem.AddResidualBlock(new Reprojection(image.pixels[o.feature]), observation_loss,
                                  image.pose.params.data(), p.xyz.data(),
                                  m.cameras[image.camera].params.data());
         problem.AddResidualBlock(new Depth(.05 * depth, 1000 / depth), nullptr,
@@ -307,6 +368,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"variable_images", variable_count},
           {"metric_constraints", metric},
           {"observations", observations},
+          {"precise_observations", precise_count},
           {"solver", ceres::LinearSolverTypeToString(summary.linear_solver_type_used)},
           {"explicit_schur", options.use_explicit_schur_complement},
           {"build_seconds", build_seconds},
