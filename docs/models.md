@@ -10,13 +10,15 @@
 .\prepare-models.ps1
 ```
 
-默认向 `models/` 准备四个引擎，原图尺寸为宽 3000、高 4000，匹配器精度为 FP16。Softmax、Reduce 和 Normalization 层保留 FP32，所有浮点输入输出保持 float32。`run.ps1` 和 `package.ps1` 默认使用这个目录。
+默认向 `models/` 准备四个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器精度为 FP16，Softmax、Reduce 和 Normalization 层保留 FP32，所有浮点输入输出保持 float32。`run.ps1` 和 `package.ps1` 默认使用这个目录。
 
-首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。GPU、尺寸或精度不匹配时需指定新的输出目录。
+首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。同 GPU 上更换照片分辨率、横竖方向或宽高比不需要重建模型。更换 GPU、模型协议或精度时需指定新的输出目录。
 
 ## 模型接口
 
-manifest.json：version=1、tensorrt=`10.13.3.9`、gpu、matcher_precision、detector_size、descriptor_size、max_features=3072、descriptor_dimension=256、segmentation_mean、segmentation_std、models。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256。
+manifest.json：version=2、tensorrt=`10.13.3.9`、gpu、matcher_precision、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、segmentation_mean、segmentation_std、models。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`。
+
+detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max=[1536,1536]`。opt 只用于 TensorRT 编译优化，不限制原图尺寸。运行端仍兼容 version=1 的固定尺寸包，但该包继续受 detector_size 限制。
 
 | 引擎 | 输入 | 输出 |
 | --- | --- | --- |
@@ -25,7 +27,9 @@ manifest.json：version=1、tensorrt=`10.13.3.9`、gpu、matcher_precision、det
 | matcher | ka/kb float32 `[1,3072,2]`；da/db `[1,3072,256]`；mask_a/mask_b float32 `[1,3072]` | matches int32 `[1,3072]`；confidence float32 `[1,3072]` |
 | segmentation | image float32 `[1,3,512,512]`，RGB/255 后按 mean/std 归一化 | probabilities float32 `[1,2,512,512]`，天空/人物 |
 
-检测最长边 1536，各边向下取 8 的倍数；3000×4000 输入对应 W=1152、H=1536。检测和描述使用双三次预处理，避免重复模型内归一化。CPU 参考与 GPU 实现共享 22 位整数系数，横向和纵向各自舍入并截断为 uint8，再按原规则归一化。
+检测最长边缩放到 1536，各边向下取 8 的倍数；3000×4000 输入对应 W=1152、H=1536，4000×3000 对应 W=1536、H=1152，1920×1080 对应 W=1536、H=864，均使用同一引擎。范围约束作用于缩放后的检测输入，原图无需限制为这些尺寸；短边缩放后小于 16 时明确报错。原图与 `.pro` 标定尺寸仍须一致。
+
+检测和描述使用双三次预处理，避免重复模型内归一化。CPU 参考与 GPU 实现共享 22 位整数系数，横向和纵向各自舍入并截断为 uint8，再按原规则归一化。
 
 检测输出稠密 logits，原生 CUDA 执行 3×3 NMS，选最多 12288 个候选，用温度 0.5 的局部 softmax 修正子像素。有效域和语义筛选后，用 8×8 网格配额和置信度选最多 3072 个。归一化关键点 `(2x/W-1,2y/H-1)`。
 
@@ -42,22 +46,23 @@ manifest.json：version=1、tensorrt=`10.13.3.9`、gpu、matcher_precision、det
 
 ## 自定义参数
 
-按实际图像尺寸或目标设备调整准备参数：
+按目标设备或精度调整准备参数；升级旧固定尺寸模型包时使用新目录：
 
 ```powershell
 .\prepare-models.ps1 -Models models/other-gpu -OnnxFrom models
-.\prepare-models.ps1 -Models models/landscape -ImageWidth 4000 -ImageHeight 3000
+.\prepare-models.ps1 -Models models/dynamic -OnnxFrom models
 .\prepare-models.ps1 -Images "D:/照片/A.JPG","D:/照片/B.JPG"
 ```
 
-- `-Models`：输出目录，默认 `models`。完整且兼容的包检查清单、引擎 SHA256、推理 DLL 与真实推理后复用，不重建；版本、GPU、尺寸、匹配精度或校验值不符时报错，应指定新目录。
-- `-ImageWidth` / `-ImageHeight`：原图宽高，默认 3000 / 4000。按最长边 1536、各边向下取 8 的倍数确定检测输入尺寸。
-- `-OnnxFrom`：可传已有模型目录或 `onnx/` 目录。四个单文件 ONNX 的名称、float32 输入与形状必须满足当前契约；尺寸改变时重新导出。
+- `-Models`：输出目录，默认 `models`。完整且兼容的包检查清单、引擎 SHA256、推理 DLL 与真实推理后复用，不重建；版本、GPU、动态范围、匹配精度或校验值不符时报错，应指定新目录。
+- `-OnnxFrom`：可传已有模型目录或 `onnx/` 目录。四个单文件 ONNX 的名称、float32 输入与形状必须满足当前契约。来源为有清单的 version=1 固定尺寸包时，重新导出动态检测器，复用其他三个 ONNX；只提供旧静态 ONNX 而缺少清单时拒绝导入。
 - `-MatcherPrecision`：`fp16`（默认）、`fp32` 或 `tf32`，用于显式调整匹配引擎的计算精度。TF32 允许 Tensor Core 矩阵乘法。模型清单保存该选择；未声明 `matcher_precision` 的清单按 FP32 解析。修改精度时使用新目录，并用真实场景检查最终几何质量。
-- 当 `-OnnxFrom` 指向同 GPU、版本和尺寸的完整模型包时，复用未改变精度且清单及校验通过的引擎；切换匹配精度只需重建 matcher。
-- `-Images`：两张真实验证照片；默认使用固定 LoMa 源码包中的 `0015_A.jpg` / `0015_B.jpg`。验证包括四模型有限输出及形状、描述子数量 32 / 127 / 3072、匹配有效数量不等、补零值变化不影响有效结果、同图匹配和语义概率范围。新导出的图还比较 PyTorch 与 TensorRT 输出。
+- 当 `-OnnxFrom` 指向同 GPU、TensorRT 版本的完整模型包时，复用未改变接口和精度且清单及校验通过的引擎；升级固定尺寸包只需重建 detector，切换匹配精度只需重建 matcher。
+- `-Images`：两张真实验证照片；默认使用固定 LoMa 源码包中的 `0015_A.jpg` / `0015_B.jpg`。验证包括检测器动态宽高及边界、四模型有限输出及形状、描述子数量 32 / 127 / 3072、匹配有效数量不等、补零值变化不影响有效结果、同图匹配和语义概率范围。新导出的检测图在横图、竖图、方图及短边边界上比较 PyTorch 与 TensorRT 输出。
 
 使用自定义目录时，运行指定 `--models`，打包指定 `-Models`。复用 ONNX 可以省去权重导出；更换 GPU 时仍需在目标 GPU 上重新构建并校验引擎。
+
+`-ImageWidth` / `-ImageHeight` 已移除。旧固定尺寸引擎升级时需要一次重新导出和构建检测器，以后更换场景尺寸无需重编译。原始模型目录与已有工作目录保持不变，使用新模型时另建 work。
 
 ## 缓存与校验
 

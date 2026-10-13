@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <deque>
+#include <algorithm>
 #ifdef _WIN32
 #include <Windows.h>
 #else
@@ -158,7 +159,8 @@ struct Models::Implementation {
 Models::Models(const fs::path& root) : impl_(std::make_unique<Implementation>()) {
   impl_->root = root;
   impl_->manifest = ReadJson(root / "manifest.json");
-  if (impl_->manifest.at("version") != 1 || impl_->manifest.at("tensorrt") != "10.13.3.9")
+  const int version = impl_->manifest.at("version");
+  if ((version != 1 && version != 2) || impl_->manifest.at("tensorrt") != "10.13.3.9")
     throw std::runtime_error("Models require the pinned TensorRT 10.13.3.9 runtime");
   CudaCheck(cudaSetDevice(0));
   if (impl_->manifest.at("gpu") != GpuInfo().at("name"))
@@ -188,6 +190,26 @@ Models::Models(const fs::path& root) : impl_(std::make_unique<Implementation>())
 }
 Models::~Models() = default;
 const Json& Models::Manifest() const { return impl_->manifest; }
+std::array<int, 2> Models::DetectorSize(int width, int height) const {
+  const int longest = std::max(width, height);
+  const std::array<int, 2> size{int(int64_t(width) * 1536 / longest) / 8 * 8,
+                                int(int64_t(height) * 1536 / longest) / 8 * 8};
+  if (impl_->manifest.at("version") == 1) {
+    if (size != impl_->manifest.at("detector_size").get<std::array<int, 2>>())
+      throw std::runtime_error(
+          "Static detector resolution differs; upgrade the model package with prepare-models.ps1 "
+          "-Models models/dynamic -OnnxFrom models");
+  } else {
+    const auto& profile = impl_->manifest.at("detector_profile");
+    const auto minimum = profile.at("min").get<std::array<int, 2>>(),
+               maximum = profile.at("max").get<std::array<int, 2>>();
+    for (size_t axis = 0; axis < size.size(); ++axis)
+      if (size[axis] < minimum[axis] || size[axis] > maximum[axis])
+        throw std::runtime_error("Resized detector input is outside the model profile: " +
+                                 std::to_string(size[0]) + "x" + std::to_string(size[1]));
+  }
+  return size;
+}
 cudaStream_t Models::Stream() const { return impl_->stream; }
 Json Models::Profile() {
   impl_->Collect(true);

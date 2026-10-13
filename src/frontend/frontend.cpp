@@ -271,7 +271,6 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
   auto rgb = ReadImage(image, cv::IMREAD_COLOR);
   cv::cvtColor(rgb, rgb, cv::COLOR_BGR2RGB);
   const auto manifest = ReadJson(root / "manifest.json");
-  const auto size = manifest.at("detector_size").get<std::array<int, 2>>();
   auto check = [](const Tensor& tensor, const std::vector<int64_t>& shape) {
     if (tensor.shape != shape)
       throw std::runtime_error("Model verification: unexpected output shape");
@@ -285,6 +284,10 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
   Tensor descriptors;
   {
     Models models(root);
+    const auto size = manifest.at("version") == 1
+                          ? manifest.at("detector_size").get<std::array<int, 2>>()
+                          : models.DetectorSize(rgb.cols, rgb.rows);
+    report["detector_size"] = size;
     ImagePreprocessor pixels(models.Stream());
     pixels.Upload(rgb);
     const auto logits = models.Predict("detector", {pixels.Normalize(size[0], size[1])})[0];
@@ -433,16 +436,12 @@ Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
     return timing.Report(started);
   Models models(root);
   ImagePreprocessor pixels(models.Stream());
-  const auto expected = models.Manifest().at("detector_size").get<std::array<int, 2>>();
   ImageReader reader(pending, work);
   AsyncWriter writer;
   for (const auto& record : pending) {
     const auto& camera = scene.cameras[record.camera];
-    const double scale = 1536. / std::max(camera.width, camera.height);
-    const int width = int(scale * camera.width) / 8 * 8,
-              height = int(scale * camera.height) / 8 * 8;
-    if (expected != std::array<int, 2>{width, height})
-      throw std::runtime_error("Detector engine resolution differs from camera input");
+    const auto size = models.DetectorSize(camera.width, camera.height);
+    const int width = size[0], height = size[1];
     auto phase = Clock::now();
     auto image = reader.Next();
     timing.wait += Seconds(phase);

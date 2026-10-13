@@ -54,18 +54,23 @@ void WriteColmap(const fs::path& path, const Scene& scene, const Reconstruction&
   BinaryWriter frames(path / "frames.bin"), images(path / "images.bin");
   frames.Value(uint64_t(model.Registered()));
   images.Value(uint64_t(model.Registered()));
+  std::vector<uint32_t> image_ids(model.images.size());
+  uint32_t next_image_id = 1;
+  for (uint32_t i = 0; i < model.images.size(); ++i)
+    if (model.images[i].registered)
+      image_ids[i] = next_image_id++;
   for (uint32_t i = 0; i < model.images.size(); ++i) {
     const auto& image = model.images[i];
     if (!image.registered)
       continue;
-    frames.Value(i + 1);
+    frames.Value(image_ids[i]);
     frames.Value(image.camera + 1);
     PoseOut(frames, image.pose);
     frames.Value(uint32_t(1));
     frames.Value(int32_t(0));
     frames.Value(image.camera + 1);
-    frames.Value(uint64_t(i + 1));
-    images.Value(i + 1);
+    frames.Value(uint64_t(image_ids[i]));
+    images.Value(image_ids[i]);
     PoseOut(images, image.pose);
     images.Value(image.camera + 1);
     const auto& name = scene.images[i].name;
@@ -96,7 +101,7 @@ void WriteColmap(const fs::path& path, const Scene& scene, const Reconstruction&
     points.Value(p.error);
     points.Value(uint64_t(p.track.size()));
     for (const auto& o : p.track) {
-      points.Value(o.image + 1);
+      points.Value(image_ids[o.image]);
       points.Value(o.feature);
     }
   }
@@ -274,13 +279,16 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
   WriteColmap(pending / "sparse/0", scene, model);
   Json photos = Json::array();
   for (const auto& e : scene.images) {
+    if (!model.images[e.id].registered)
+      continue;
     const auto destination = pending / "images" / fs::u8path(e.name);
     fs::create_directories(destination.parent_path());
     fs::copy_file(e.source, destination);
     const auto mask = pending / "masks" / fs::u8path(e.name + ".png");
     fs::create_directories(mask.parent_path());
     fs::copy_file(MaskPath(work, e.id), mask);
-    photos.push_back({{"name", e.name},
+    photos.push_back({{"image_index", e.id},
+                      {"name", e.name},
                       {"camera", e.camera},
                       {"image_size", fs::file_size(destination)},
                       {"mask_size", fs::file_size(mask)}});
@@ -288,7 +296,10 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
   Json initialization = nullptr;
   if (include_ply)
     initialization = ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);
-  WriteJson(pending / "quality.json", report.at("quality"));
+  const auto registration = model.Registration(scene);
+  auto quality = report.at("quality");
+  quality["registration"] = registration;
+  WriteJson(pending / "quality.json", quality);
   if (include_ply)
     WriteJson(pending / "initialization.json", initialization);
   Json sizes = Json::object();
@@ -296,6 +307,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
     sizes[file] = fs::file_size(pending / "sparse/0" / file);
   WriteJson(pending / "manifest.json", {{"version", 1},
                                         {"request", request},
+                                        {"registration", registration},
                                         {"images", photos},
                                         {"model_files", sizes},
                                         {"initialization", initialization}});
@@ -334,11 +346,20 @@ Json CheckBundle(const fs::path& output) {
   if (!manifest.at("initialization").is_null())
     VerifyInitializationPly(sparse / "points3D.ply", manifest.at("initialization").at("points"));
   const auto saved = ReadJson(output / "quality.json");
+  const auto registration = manifest.value("registration", model.Registration(scene));
+  if (manifest.contains("registration") &&
+      (registration != saved.at("registration") ||
+       registration.at("registered_images") != model.Registered() ||
+       registration.at("selected_images").get<size_t>() !=
+           model.Registered() + registration.at("unregistered_images").size() ||
+       registration.at("complete") != registration.at("unregistered_images").empty()))
+    throw std::runtime_error("Bundle registration summary differs");
   const auto quality =
       model.Quality(scene, saved.at("limits").at("median_px"), saved.at("limits").at("p90_px"));
   if (!saved.at("passed").get<bool>() || !quality.at("passed").get<bool>())
     throw std::runtime_error("Bundle geometry failed acceptance");
   return {{"passed", true},
+          {"registration", registration},
           {"images", model.Registered()},
           {"points", quality.at("points")},
           {"observations", quality.at("observations")}};

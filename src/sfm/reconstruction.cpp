@@ -661,7 +661,7 @@ bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
 }
 }  // namespace
 Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report,
-                           bool stable_calibration) {
+                           bool stable_calibration, bool allow_partial) {
   const auto started = Clock::now();
   Reconstruction m;
   const auto checkpoint = work / "cache/incremental.bin";
@@ -902,11 +902,14 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
             " candidate observations");
       Log("SfM stalled at " + std::to_string(m.Registered()) + "/" +
           std::to_string(m.images.size()));
-      throw RegistrationIncomplete(missing.get<std::vector<uint32_t>>());
+      if (!allow_partial)
+        throw RegistrationIncomplete(missing.get<std::vector<uint32_t>>());
+      Log("Finalize registered subset after repair matching");
+      break;
     }
   }
   // Growth has already refined focal length and distortion. Calibrate the
-  // complete image set once, hold intrinsics while incorporating new tracks,
+  // registered image set once, hold intrinsics while incorporating new tracks,
   // then finish with a strict joint refinement of all parameters.
   auto calibrate = [&](int iterations) {
     std::set<uint64_t> selected;
@@ -961,10 +964,15 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           if (root(id) != root(m.gauge_image))
             throw std::runtime_error("Stable calibration track graph is disconnected");
         }
-      for (const auto& bins : angles)
-        if (std::count_if(bins.begin(), bins.end(), [](size_t n) { return n >= 100; }) < 3)
+      for (uint32_t cid = 0; cid < angles.size(); ++cid) {
+        const auto& bins = angles[cid];
+        const bool used = std::any_of(m.images.begin(), m.images.end(), [&](const auto& image) {
+          return image.registered && image.camera == cid;
+        });
+        if (used && std::count_if(bins.begin(), bins.end(), [](size_t n) { return n >= 100; }) < 3)
           throw std::runtime_error(
               "Stable calibration needs at least three supported angle bands per lens");
+      }
       calibration_selection.push_back(
           {{"points", selected.size()},
            {"observations", std::accumulate(observations.begin(), observations.end(), size_t(0))},
@@ -1023,7 +1031,8 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
             {"calibration_tracks", stable_calibration ? "stable" : "all"},
             {"calibration_selection", calibration_selection},
             {"optimization", optimization}};
-  fs::remove(work / "cache/unregistered.json");
+  if (m.Registered() == m.images.size())
+    fs::remove(work / "cache/unregistered.json");
   return m;
 }
 }  // namespace geosun

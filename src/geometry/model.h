@@ -27,6 +27,7 @@ struct Reconstruction {
   double gauge_baseline = 1;
   size_t Registered() const;
   size_t Observations() const;
+  Json Registration(const Scene& scene) const;
   void Apply(const Similarity& transform);
   void RebuildReferences();
   void Filter(double max_error = 6, double min_angle_degrees = .5);

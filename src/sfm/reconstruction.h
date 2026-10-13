@@ -10,5 +10,5 @@ class RegistrationIncomplete : public std::runtime_error {
         images(std::move(ids)) {}
 };
 Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report,
-                           bool stable_calibration = false);
+                           bool stable_calibration = false, bool allow_partial = false);
 }  // namespace geosun

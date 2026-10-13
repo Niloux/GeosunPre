@@ -37,6 +37,7 @@ class Models {
   explicit Models(const fs::path& root);
   ~Models();
   const Json& Manifest() const;
+  std::array<int, 2> DetectorSize(int width, int height) const;
   std::vector<Tensor> Predict(const std::string& model, const std::vector<Tensor>& inputs,
                               bool device_output = false);
   cudaStream_t Stream() const;

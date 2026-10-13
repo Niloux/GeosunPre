@@ -13,6 +13,18 @@ size_t Reconstruction::Observations() const {
     n += p.track.size();
   return n;
 }
+Json Reconstruction::Registration(const Scene& scene) const {
+  Json missing = Json::array();
+  for (uint32_t id = 0; id < images.size(); ++id)
+    if (!images[id].registered)
+      missing.push_back({{"image_index", id},
+                         {"name", scene.images[id].name},
+                         {"camera", images[id].camera}});
+  return {{"complete", missing.empty()},
+          {"selected_images", images.size()},
+          {"registered_images", Registered()},
+          {"unregistered_images", missing}};
+}
 void Reconstruction::Apply(const Similarity& s) {
   for (auto& p : points)
     p.xyz = s.Apply(p.xyz);
@@ -75,6 +87,7 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
   Json rows = Json::array(), failures = Json::array();
   std::vector<double> errors;
   std::array<std::vector<double>, 2> by_camera;
+  std::array<size_t, 2> camera_images{};
   std::array<std::array<std::vector<double>, 4>, 2> by_angle;
   uint64_t invalid = 0;
   size_t active = 0;
@@ -93,9 +106,15 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
     std::vector<double> e;
     std::set<int> cells;
     if (!image.registered) {
-      failures.push_back("Unregistered image: " + scene.images[id].name);
+      rows.push_back({{"image_index", id},
+                      {"name", scene.images[id].name},
+                      {"registered", false},
+                      {"observations", 0},
+                      {"occupied_cells", 0},
+                      {"reprojection_px", Statistics(e)}});
       continue;
     }
+    ++camera_images[image.camera];
     for (size_t k = 0; k < image.points.size(); ++k)
       if (image.points[k] != NoPoint) {
         const auto xyz = image.pose.Apply(points.at(image.points[k]).xyz);
@@ -115,7 +134,9 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
         cells.insert(std::clamp(int(xy.x() / c.width * 8), 0, 7) +
                      8 * std::clamp(int(xy.y() / c.height * 8), 0, 7));
       }
-    rows.push_back({{"name", scene.images[id].name},
+    rows.push_back({{"image_index", id},
+                    {"name", scene.images[id].name},
+                    {"registered", true},
                     {"observations", e.size()},
                     {"occupied_cells", cells.size()},
                     {"reprojection_px", Statistics(e)}});
@@ -137,6 +158,7 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
       bins.push_back({{"angle_degrees", {bin * 20, (bin + 1) * 20}},
                       {"reprojection_px", Statistics(by_angle[cid][bin])}});
     calibration[cameras[cid].label] = {
+        {"registered_images", camera_images[cid]},
         {"initial_params", base},
         {"params", cameras[cid].params},
         {"principal_shift_px",
@@ -147,11 +169,13 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
       if (std::abs(cameras[cid].params[j] - base[j]) >= bounds[j] * (1 - 1e-4))
         failures.push_back("Camera parameter reached calibration bound: " + cameras[cid].label +
                            "/" + std::to_string(j));
-    if (by_camera[cid].empty() || Quantile(by_camera[cid], .5) > median_limit ||
-        Quantile(by_camera[cid], .9) > p90_limit)
+    if (camera_images[cid] &&
+        (by_camera[cid].empty() || Quantile(by_camera[cid], .5) > median_limit ||
+         Quantile(by_camera[cid], .9) > p90_limit))
       failures.push_back("Camera reprojection error exceeds limit: " + cameras[cid].label);
   }
   return {{"passed", failures.empty()},
+          {"registration", Registration(scene)},
           {"calibration", calibration},
           {"failures", failures},
           {"registered_images", Registered()},

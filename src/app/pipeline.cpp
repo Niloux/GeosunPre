@@ -213,16 +213,21 @@ void Run(const Arguments& args) {
         Json report;
         Json quality;
         Reconstruction model;
-        for (int repair = 0;; ++repair) {
+        const auto profile_path = work / "cache/matches_profile.json";
+        const int completed_repairs =
+            int(ReadJson(profile_path).value("repairs", Json::array()).size());
+        for (int repair = completed_repairs;; ++repair) {
           std::set<uint32_t> deficient;
           try {
             model = Reconstruct(scene, work, workers, report,
-                                settings.at("calibration_tracks") == "stable");
+                                settings.at("calibration_tracks") == "stable", repair >= 2);
             quality = model.Quality(scene, settings.at("quality_median_px"),
                                     settings.at("quality_p90_px"));
             if (quality.at("passed").get<bool>())
               break;
             for (uint32_t id = 0; id < model.images.size(); ++id) {
+              if (!model.images[id].registered)
+                continue;
               const auto& row = quality.at("images")[id];
               if (row.at("observations").get<size_t>() < 32 ||
                   row.at("occupied_cells").get<size_t>() < 8)
@@ -238,7 +243,6 @@ void Run(const Arguments& args) {
             deficient.insert(missing.images.begin(), missing.images.end());
           }
           Log("Repair matching support for " + std::to_string(deficient.size()) + " images");
-          const auto profile_path = work / "cache/matches_profile.json";
           auto profile = ReadJson(profile_path);
           profile["repairs"].push_back(MakeMatches(scene, work, root, deficient));
           WriteJson(profile_path, profile);
@@ -249,6 +253,10 @@ void Run(const Arguments& args) {
         WriteModel(work / "cache/visual.bin", model);
         report["quality"] = quality;
         WriteJson(work / "cache/sfm.json", report);
+        state["registration"] = quality.at("registration");
+        if (model.Registered() != model.images.size())
+          Log("Partial reconstruction accepted: " + std::to_string(model.Registered()) + "/" +
+              std::to_string(model.images.size()) + "; see quality.registration for missing images");
         products = {work / "cache/visual.bin", work / "cache/sfm.json"};
       } else if (stage == "align") {
         auto model = ReadModel(work / "cache/visual.bin");
@@ -289,6 +297,7 @@ void Run(const Arguments& args) {
   }
   std::cout << Json({{"work", work.u8string()},
                      {"status", state.at("status")},
+                     {"registration", state.value("registration", Json(nullptr))},
                      {"seconds", Seconds(started)}})
                    .dump()
             << '\n';

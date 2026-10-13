@@ -19,6 +19,9 @@ from networks import Detector, Descriptor, Matcher, Segmentation, fix_descriptor
 
 TRT_VERSION = '10.13.3.9'
 MAX_FEATURES = 3072
+DETECTOR_PROFILE = {'min': [16, 16], 'opt': [1152, 1536], 'max': [1536, 1536]}
+DETECTOR_CHECK_SIZES = ((1152, 1536), (1536, 1152), (1536, 864), (1000, 1536),
+                        (1536, 1536), (16, 1536), (1536, 16))
 LOGGER = trt.Logger(trt.Logger.WARNING)
 CONTRACTS = {
     'detector': (['image'], ['logits']),
@@ -88,9 +91,16 @@ def load_loma(source):
     return model
 
 
-def expected_shapes(width, height):
+def detector_size(width, height):
+    size = [value * 1536 // max(width, height) // 8 * 8 for value in (width, height)]
+    if min(size) < 16:
+        raise RuntimeError('Image aspect ratio produces a detector side below 16 pixels')
+    return size
+
+
+def expected_shapes():
     return {
-        'detector': [[1, 3, height, width]],
+        'detector': [[1, 3, -1, -1]],
         'descriptor': [[1, 3, 784, 784], [1, MAX_FEATURES, 2]],
         'matcher': [[1, MAX_FEATURES, 2], [1, MAX_FEATURES, 2],
                     [1, MAX_FEATURES, 256], [1, MAX_FEATURES, 256],
@@ -113,9 +123,9 @@ def check_onnx(path, name, shapes):
         if len(dims) != len(expected):
             raise RuntimeError(f'ONNX input rank differs: {path}: {value.name}')
         for axis, (dim, size) in enumerate(zip(dims, expected)):
-            if name == 'descriptor' and value.name == 'keypoints' and axis == 1:
+            if size == -1 or (name == 'descriptor' and value.name == 'keypoints' and axis == 1):
                 if not dim.dim_param:
-                    raise RuntimeError(f'Descriptor keypoints must have a dynamic count: {path}')
+                    raise RuntimeError(f'ONNX input axis must be dynamic: {path}: {value.name}/{axis}')
             elif dim.dim_value != size:
                 raise RuntimeError(f'ONNX input size differs: {path}: {value.name}')
     onnx.checker.check_model(str(path))
@@ -139,6 +149,8 @@ def export_graph(name, module, inputs, directory, shapes, references):
     print(f'Export ONNX: {name}', flush=True)
     temporary = path.with_name(path.name + '.writing')
     dynamic = {'keypoints': {1: 'N'}, 'descriptors': {1: 'N'}} if name == 'descriptor' else None
+    if name == 'detector':
+        dynamic = {'image': {2: 'H', 3: 'W'}, 'logits': {2: 'H', 3: 'W'}}
     with torch.inference_mode():
         expected = module(*inputs)
         expected = expected if isinstance(expected, tuple) else (expected,)
@@ -161,7 +173,7 @@ def export_models(directory, shapes, source, images, references):
         if source is None:
             source = loma_source()
         model = load_loma(source)
-        detector_image = image_tensor(images[0], shapes['detector'][0][3], shapes['detector'][0][2])
+        detector_image = image_tensor(images[0], *DETECTOR_PROFILE['opt'])
         descriptor_image = image_tensor(images[0], 784, 784)
         with torch.inference_mode():
             ka = keypoints(Detector(model._detector)(detector_image))
@@ -180,6 +192,14 @@ def export_models(directory, shapes, source, images, references):
         ):
             if name in required:
                 export_graph(name, module, inputs, directory, shapes[name], references)
+                if name == 'detector':
+                    with torch.inference_mode():
+                        for width, height in DETECTOR_CHECK_SIZES:
+                            pixels = image_tensor(images[0], width, height)
+                            logits = module(pixels)
+                            np.savez(references / f'detector_{width}x{height}.npz',
+                                     input0=pixels.cpu().numpy(), output0=logits.cpu().numpy())
+                    del pixels, logits
         del model, module, inputs, detector_image, descriptor_image, ka, da
         gc.collect()
         torch.cuda.empty_cache()
@@ -219,6 +239,11 @@ def build_engine(path, name, shapes, matcher_precision='fp16'):
                 for output in range(layer.num_outputs):
                     layer.set_output_type(output, trt.float32)
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+    if name == 'detector':
+        profile = builder.create_optimization_profile()
+        profile.set_shape('image', *[(1, 3, height, width)
+                                    for width, height in DETECTOR_PROFILE.values()])
+        config.add_optimization_profile(profile)
     if name == 'descriptor':
         profile = builder.create_optimization_profile()
         profile.set_shape('keypoints', (1, 32, 2), (1, 1024, 2), (1, MAX_FEATURES, 2))
@@ -252,6 +277,11 @@ class Engine:
             expected = (1, -1, 2) if name == 'descriptor' and label == 'keypoints' else tuple(shape)
             if actual != expected or self.engine.get_tensor_dtype(label) != trt.float32:
                 raise RuntimeError(f'Engine input contract differs: {name}: {label}: {actual}')
+        if name == 'detector':
+            profile = [tuple(dims) for dims in self.engine.get_tensor_profile_shape('image', 0)]
+            expected = [(1, 3, height, width) for width, height in DETECTOR_PROFILE.values()]
+            if profile != expected:
+                raise RuntimeError(f'Detector optimization profile differs: {profile}')
 
     def __call__(self, *inputs):
         inputs = [value.contiguous() for value in inputs]
@@ -277,29 +307,31 @@ class Engine:
 
 
 def compare_reference(root, name, shapes, references):
-    path = references / f'{name}.npz'
-    if not path.is_file():
+    paths = sorted(references.glob('detector*.npz')) if name == 'detector' else [references / f'{name}.npz']
+    paths = [path for path in paths if path.is_file()]
+    if not paths:
         return  # --onnx-from verifies existing exported graphs by their runtime behavior.
     engine = Engine(root, name, shapes[name])
-    with np.load(path) as example, torch.inference_mode():
-        inputs = [torch.from_numpy(example[f'input{i}']).cuda() for i in range(len(CONTRACTS[name][0]))]
-        outputs = engine(*inputs)
-        for i, actual in enumerate(outputs):
-            expected = torch.from_numpy(example[f'output{i}']).cuda()
-            if expected.shape != actual.shape:
-                raise RuntimeError(f'Engine output differs from the export reference: {name}')
-            if not expected.is_floating_point():
-                passed = torch.equal(expected, actual)
-                error = int((expected != actual).sum())
-            elif name == 'segmentation':
-                error = float((expected - actual).abs().max())
-                passed = error < .03
-            else:
-                error = float((expected - actual).norm() / expected.norm().clamp_min(1e-8))
-                passed = error < (.005 if name == 'matcher' else .02)
-            if not passed:
-                raise RuntimeError(f'TensorRT output differs from PyTorch: {name}/{i}: error={error}')
-            print(f'PyTorch/TensorRT comparison: {name}/{i}: error={error:.6g}', flush=True)
+    for path in paths:
+        with np.load(path) as example, torch.inference_mode():
+            inputs = [torch.from_numpy(example[f'input{i}']).cuda() for i in range(len(CONTRACTS[name][0]))]
+            outputs = engine(*inputs)
+            for i, actual in enumerate(outputs):
+                expected = torch.from_numpy(example[f'output{i}']).cuda()
+                if expected.shape != actual.shape:
+                    raise RuntimeError(f'Engine output differs from the export reference: {path.stem}')
+                if not expected.is_floating_point():
+                    passed = torch.equal(expected, actual)
+                    error = int((expected != actual).sum())
+                elif name == 'segmentation':
+                    error = float((expected - actual).abs().max())
+                    passed = error < .03
+                else:
+                    error = float((expected - actual).norm() / expected.norm().clamp_min(1e-8))
+                    passed = error < (.005 if name == 'matcher' else .02)
+                if not passed:
+                    raise RuntimeError(f'TensorRT output differs from PyTorch: {path.stem}/{i}: error={error}')
+                print(f'PyTorch/TensorRT comparison: {path.stem}/{i}: error={error:.6g}', flush=True)
 
 
 def installed_runtime():
@@ -315,10 +347,16 @@ def verify(root, shapes, images):
         detector = Engine(root, 'detector', shapes['detector'])
         points = []
         for path in images:
-            logits, = detector(image_tensor(path, shapes['detector'][0][3], shapes['detector'][0][2]))
-            if tuple(logits.shape) != (1, 1, shapes['detector'][0][2], shapes['detector'][0][3]):
+            with Image.open(path) as image:
+                width, height = detector_size(*image.size)
+            logits, = detector(image_tensor(path, width, height))
+            if tuple(logits.shape) != (1, 1, height, width):
                 raise RuntimeError('Detector output shape differs')
             points.append(keypoints(logits))
+        for width, height in DETECTOR_CHECK_SIZES:
+            logits, = detector(image_tensor(images[0], width, height))
+            if tuple(logits.shape) != (1, 1, height, width):
+                raise RuntimeError(f'Dynamic detector output shape differs: {width}x{height}')
         del detector
         descriptor = Engine(root, 'descriptor', shapes['descriptor'])
         descriptions = []
@@ -364,13 +402,13 @@ def verify(root, shapes, images):
             probabilities, = segmentation((image_tensor(path, 512, 512) - mean) / std)
             if tuple(probabilities.shape) != (1, 2, 512, 512) or (probabilities < 0).any() or (probabilities > 1.00001).any() or (probabilities.sum(1) > 1.00001).any():
                 raise RuntimeError('Segmentation output contract differs')
-    print(f'Verified: four engines; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}', flush=True)
+    print(f'Verified: four engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}', flush=True)
 
 
 def verify_package(root, settings, shapes, images):
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
-    if manifest.get('version') != 1 or any(manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt', 'detector_size')):
-        raise RuntimeError('Existing model GPU/version/resolution differs. Choose a new -Models directory.')
+    if manifest.get('version') != 2 or any(manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt', 'detector_profile')):
+        raise RuntimeError('Existing model GPU/version/profile differs. Choose a new -Models directory; use -OnnxFrom to upgrade a static package.')
     if manifest.get('matcher_precision', 'fp32') != settings['matcher_precision']:
         raise RuntimeError('Existing matcher precision differs. Choose a new -Models directory.')
     for name, (inputs, outputs) in CONTRACTS.items():
@@ -387,8 +425,6 @@ def verify_package(root, settings, shapes, images):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--models', type=Path, required=True)
-    parser.add_argument('--image-width', type=int, default=3000)
-    parser.add_argument('--image-height', type=int, default=4000)
     parser.add_argument('--matcher-precision', choices=('fp32', 'tf32', 'fp16'), default='fp16',
                         help='matcher engine precision (default: %(default)s)')
     parser.add_argument('--onnx-from', type=Path)
@@ -407,22 +443,21 @@ def main():
     torch.backends.cuda.enable_mem_efficient_sdp(False)
     torch.backends.cuda.enable_cudnn_sdp(False)
     torch.backends.cuda.enable_math_sdp(True)
-    scale = 1536 / max(args.image_width, args.image_height)
-    width, height = (int(value * scale) // 8 * 8 for value in (args.image_width, args.image_height))
-    if min(width, height) < 8:
-        raise RuntimeError('Image aspect ratio produces an empty detector input')
-    shapes = expected_shapes(width, height)
+    shapes = expected_shapes()
     root = args.models.resolve()
     recipe = ''.join(sha256(Path(__file__).with_name(name)) for name in ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt'))
     settings = {'gpu': torch.cuda.get_device_name(0), 'tensorrt': TRT_VERSION,
-                'detector_size': [width, height],
+                'detector_profile': DETECTOR_PROFILE,
                 'matcher_precision': args.matcher_precision,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest()}
+    reuse_manifest = None
     if args.onnx_from:
         origin = args.onnx_from.resolve()
         if (origin / 'onnx').is_dir():
             origin = origin / 'onnx'
         settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in CONTRACTS}
+        if (origin.parent / 'manifest.json').is_file():
+            reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
     source = None if args.images else loma_source()
     images = args.images or [source / 'assets' / f'0015_{letter}.jpg' for letter in ('A', 'B')]
     images = [path.resolve() for path in images]
@@ -451,30 +486,33 @@ def main():
     references.mkdir(parents=True, exist_ok=True)
     for directory in ('onnx', 'engines', 'runtime'):
         (pending / directory).mkdir(exist_ok=True)
+    copied = set()
     if args.onnx_from:
         origin = args.onnx_from.resolve()
         if (origin / 'onnx').is_dir():
             origin = origin / 'onnx'
         for name in CONTRACTS:
             candidate = origin / f'{name}.onnx'
+            if name == 'detector' and (reuse_manifest or {}).get('version') == 1:
+                check_onnx(candidate, name, reuse_manifest['models'][name]['shapes'])
+                print('Upgrade static detector: re-export with dynamic height/width', flush=True)
+                continue
             check_onnx(candidate, name, shapes[name])
             destination = pending / 'onnx' / candidate.name
             if not destination.exists():
                 shutil.copy2(candidate, destination)
             elif sha256(destination) != settings['onnx_from'][name]:
                 raise RuntimeError(f'Unfinished ONNX differs from the requested source: {destination}')
+            copied.add(name)
     export_models(pending / 'onnx', shapes, source, images, references)
     # Reuse unchanged engines only from the complete package supplying these ONNX files.
-    reuse_manifest = None
-    if args.onnx_from and (origin.parent / 'manifest.json').is_file():
-        reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
-        if any(reuse_manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt', 'detector_size')):
-            reuse_manifest = None
+    if reuse_manifest and any(reuse_manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt')):
+        reuse_manifest = None
     for name in CONTRACTS:
         check_onnx(pending / 'onnx' / f'{name}.onnx', name, shapes[name])
         destination = pending / 'engines' / f'{name}.engine'
         same_precision = name != 'matcher' or (reuse_manifest or {}).get('matcher_precision', 'fp32') == args.matcher_precision
-        if reuse_manifest and same_precision and not destination.exists():
+        if reuse_manifest and name in copied and same_precision and not destination.exists():
             spec = reuse_manifest['models'][name]
             candidate = origin.parent / 'engines' / f'{name}.engine'
             if spec['shapes'] != shapes[name] or sha256(candidate) != spec['sha256']:
@@ -493,9 +531,9 @@ def main():
     for name in CONTRACTS:
         compare_reference(pending, name, shapes, references)
     verify(pending, shapes, images)
-    manifest = {'version': 1, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
+    manifest = {'version': 2, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
                 'matcher_precision': args.matcher_precision,
-                'detector_size': [width, height], 'descriptor_size': [784, 784],
+                'detector_profile': DETECTOR_PROFILE, 'descriptor_size': [784, 784],
                 'max_features': MAX_FEATURES, 'descriptor_dimension': 256,
                 'segmentation_mean': [.485, .456, .406], 'segmentation_std': [.229, .224, .225],
                 'models': {name: {'inputs': names[0], 'outputs': names[1], 'shapes': shapes[name],

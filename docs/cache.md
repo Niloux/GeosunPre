@@ -6,7 +6,7 @@ scene.json 保存曝光、初始相机和输入元数据。state.json 版本 1�
 
 state.json 的 pipeline_version=6 标识当前实现，恢复时须与程序的实现标记一致；不匹配时使用新目录。状态与结果保存本次执行的构建版本、时间和 EXE 路径。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，最终 result.json 同时包含此报告。timing 细分缓存读取、轨迹构建、候选选择、位姿注册、三角化、过滤、检查点和着色耗时。导航误差按最终所选模型计算。
 
-cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用数量、读图或缓存读取、预处理、输入等待、写入和推理耗时，最终 result.json 的 frontend 字段包含这些报告。匹配报告还保存配对总数、每图连接数及定向补边的图像编号。GPU 推理由 CUDA 事件测量；累计工作时间可以重叠，不能简单相加为总耗时。恢复运行的报告仅计本次计算，补匹配记录在 matches 报告的 repairs 数组。
+cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用数量、读图或缓存读取、预处理、输入等待、写入和推理耗时，最终 result.json 的 frontend 字段包含这些报告。匹配报告还保存配对总数、每图连接数及定向补边的图像编号。GPU 推理由 CUDA 事件测量；累计工作时间可以重叠，不能简单相加为总耗时。恢复运行的报告仅计本次计算，补匹配记录在 matches 报告的 repairs 数组，续跑沿用已完成的轮数。
 
 `cache/features/索引.bin`：字符串标记 `GEOSUN_FEATURES_2`；uint32 image、dimension；uint64 N（32–3072）；N 条 float32 `(x,y,nx,ny,score)`；N×256 个 float32 描述子；256 个 float32 检索向量（描述子均值的 L2 归一化）；N 条 uint8 RGB。颜色取原图对应像素，避免 SfM 末尾重复解码照片。
 
@@ -17,3 +17,5 @@ cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用
 掩码为 `cache/masks/索引.png`。阶段完成后才提交状态，中断时保留完成的单图/单对缓存；`.writing` 不作为完成依据。残留交付 `.pending` 在重试时改名保留，再重新生成。
 
 `cache/incremental.bin` 使用同一重建格式，保存 SfM 的部分注册结果，每次局部优化后原子更新。补匹配及中断恢复会重新验证匹配几何、重建候选关联，保留已有位姿、三维点和观测身份；该文件不作为视觉验收或导出依据。
+
+两轮补匹配后仍未全部注册时，对已注册部分完成最终优化和验收，通过后写入 visual.bin 并继续配准、导出。visual.bin 和 aligned.bin 保留全部输入索引及 registered 标记，未注册图像不出现在点轨迹中。cache/unregistered.json 保留未注册的原输入索引；全部注册后删除。state.registration 和 sfm 报告的 quality.registration 保存注册统计及未注册照片名单，status=completed 表示交付完成，是否全注册看 registration.complete。

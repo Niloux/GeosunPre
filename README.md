@@ -17,7 +17,7 @@
 | 步骤 | 默认行为 |
 | --- | --- |
 | `build.ps1` | 编译 Release 程序到 `build/bin/Release/geosunpre.exe`，自动应用 Ceres Schur 回代修复 |
-| `prepare-models.ps1` | 为 GPU 0 准备 `models/`，匹配器默认 FP16，原图尺寸默认宽 3000、高 4000 |
+| `prepare-models.ps1` | 为 GPU 0 准备 `models/`，匹配器默认 FP16，检测器支持动态宽高 |
 | `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准及 COLMAP/PLY 导出 |
 
 首次构建下载固定依赖到 `build/_deps/`；首次准备模型下载转换工具和固定权重到 `.cache/model-prepare/`，需要联网及数 GB 下载空间。此后复用缓存。模型准备使用独立 Python 环境，运行程序与独立运行包使用 C++/CUDA/TensorRT。
@@ -36,6 +36,8 @@
 
 阶段为 `prepare → masks → features → matches → sfm → align → export`。`run --work WORK` 复用已完成阶段并恢复检查点；`run --work WORK --stage 阶段` 单独执行指定阶段，须先完成前置阶段。`prepare` 检查真实输入、相机和导航转换，不加载模型。
 
+SfM 最多补匹配两轮；仍有照片无法注册时，对已注册部分完成优化、几何验收及 LAS 配准，通过后照常交付 COLMAP。交付仅包含已注册照片及其掩码，`manifest.json` 和 `quality.json` 的 `registration` 保存注册数量与未注册照片名单；`complete=false` 表示部分注册。验收不通过仍明确报错。
+
 默认配置见 [configs/default.json](configs/default.json)，可通过 `--config` 指定。内参标定默认使用全部有效轨迹（`calibration_tracks=all`），随后锁定内参补全轨迹并精调。标定选项及坐标约定见[输入文档](docs/input.md)。
 
 `run.ps1` 固定启动 `build/bin/Release/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
@@ -51,9 +53,9 @@ models/
   runtime/nvinfer_10.dll
 ```
 
-匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32。模型准备后自动用真实照片验证四模型输出、动态描述子数量和匹配补零行为。图像尺寸、设备和精度定制参数见[模型文档](docs/models.md)。
+匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32。原图按最长边 1536 缩放后送入动态检测器，横图、竖图及不同分辨率共用同一模型包。模型准备后自动用真实照片验证动态宽高、四模型输出、动态描述子数量和匹配补零行为。输入范围、设备和精度参数见[模型文档](docs/models.md)。
 
-模型目录中完整且兼容的包会校验后复用。更换 GPU、图像尺寸或匹配精度时使用新模型目录，并用 `--models` 指定；新生成的目录同时保留 ONNX 和准备元数据。模型资源不进入 Git。
+模型目录中完整且兼容的包会校验后复用。更换 GPU 或匹配精度时使用新模型目录，并用 `--models` 指定；更换图像分辨率不需要重建。已有固定尺寸包可执行 `.\prepare-models.ps1 -Models models/dynamic -OnnxFrom models`，只重建检测器，然后使用 `--models models/dynamic`。新生成的目录同时保留 ONNX 和准备元数据，模型资源不进入 Git。
 
 工作目录保存冻结的输入、配置和模型位置。输入、配置或模型改变时使用新工作目录；续跑使用工作目录中记录的模型。不同请求的交付包拒绝覆盖。缓存格式与实现标记须匹配，详见[缓存约定](docs/cache.md)。
 

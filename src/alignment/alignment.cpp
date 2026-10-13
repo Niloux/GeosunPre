@@ -542,6 +542,8 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
     bool image_stable = true;
     Json unstable_images = Json::array();
     for (size_t i = 0; i < quality.at("images").size(); ++i) {
+      if (!model.images[i].registered)
+        continue;
       const auto& previous = base_quality.at("images")[i];
       const auto& next = quality.at("images")[i];
       const double a = previous.at("reprojection_px").at("p90"),
