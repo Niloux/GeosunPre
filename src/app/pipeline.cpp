@@ -108,7 +108,7 @@ void Run(const Arguments& args) {
   Json state = fs::exists(state_path) ? ReadJson(state_path) : Json::object();
   if (!state.empty() && state.at("version") != 1)
     throw std::runtime_error("Unsupported work format; choose a new work directory");
-  if (!state.empty() && state.value("pipeline_version", 0) != 4)
+  if (!state.empty() && state.value("pipeline_version", 0) != 5)
     throw std::runtime_error("Reconstruction implementation changed; choose a new work directory");
   const auto input = args.Get("--input").empty() ? fs::u8path(state.at("input").get<std::string>())
                                                  : args.Path("--input");
@@ -126,7 +126,7 @@ void Run(const Arguments& args) {
   ReadLasHeader(scene.las);
   const auto prepared = scene.ToJson();
   if (state.empty()) {
-    state = {{"version", 1},         {"pipeline_version", 4}, {"input", scene.input.u8string()},
+    state = {{"version", 1},         {"pipeline_version", 5}, {"input", scene.input.u8string()},
              {"settings", settings}, {"scene", prepared},     {"stages", Json::object()}};
     WriteJson(work / "scene.json", prepared);
   } else if (state.at("scene") != prepared || state.at("settings") != settings)
@@ -200,31 +200,40 @@ void Run(const Arguments& args) {
                     work / "cache/matches_profile.json"};
       } else if (stage == "sfm") {
         Json report;
+        Json quality;
         Reconstruction model;
         for (int repair = 0;; ++repair) {
+          std::set<uint32_t> deficient;
           try {
             model = Reconstruct(scene, work, workers, report);
-            break;
+            quality = model.Quality(scene, settings.at("quality_median_px"),
+                                    settings.at("quality_p90_px"));
+            if (quality.at("passed").get<bool>())
+              break;
+            for (uint32_t id = 0; id < model.images.size(); ++id) {
+              const auto& row = quality.at("images")[id];
+              if (row.at("observations").get<size_t>() < 32 ||
+                  row.at("occupied_cells").get<size_t>() < 8)
+                deficient.insert(id);
+            }
+            if (deficient.empty() || repair >= 2)
+              throw std::runtime_error("Visual acceptance rejected: " +
+                                       quality.at("failures").dump());
+            WriteModel(work / "cache/incremental.bin", model);
           } catch (const RegistrationIncomplete& missing) {
             if (repair >= 2)
               throw;
-            Log("Repair matching support for " + std::to_string(missing.images.size()) +
-                " unregistered images");
-            const auto profile_path = work / "cache/matches_profile.json";
-            auto profile = ReadJson(profile_path);
-            profile["repairs"].push_back(
-                MakeMatches(scene, work, root,
-                            std::set<uint32_t>(missing.images.begin(), missing.images.end())));
-            WriteJson(profile_path, profile);
-            state["stages"]["matches"]["files"] =
-                Inventory(work, {work / "cache/matches", work / "cache/pairs.json", profile_path});
-            WriteJson(state_path, state);
+            deficient.insert(missing.images.begin(), missing.images.end());
           }
+          Log("Repair matching support for " + std::to_string(deficient.size()) + " images");
+          const auto profile_path = work / "cache/matches_profile.json";
+          auto profile = ReadJson(profile_path);
+          profile["repairs"].push_back(MakeMatches(scene, work, root, deficient));
+          WriteJson(profile_path, profile);
+          state["stages"]["matches"]["files"] =
+              Inventory(work, {work / "cache/matches", work / "cache/pairs.json", profile_path});
+          WriteJson(state_path, state);
         }
-        const auto quality =
-            model.Quality(scene, settings.at("quality_median_px"), settings.at("quality_p90_px"));
-        if (!quality.at("passed").get<bool>())
-          throw std::runtime_error("Visual acceptance rejected: " + quality.at("failures").dump());
         WriteModel(work / "cache/visual.bin", model);
         report["quality"] = quality;
         WriteJson(work / "cache/sfm.json", report);

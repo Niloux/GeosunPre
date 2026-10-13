@@ -78,9 +78,15 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
   std::array<std::array<std::vector<double>, 4>, 2> by_angle;
   uint64_t invalid = 0;
   size_t active = 0;
+  std::vector<double> lengths;
+  size_t long_tracks = 0, extended_tracks = 0;
   for (const auto& p : points)
-    if (!p.track.empty())
+    if (!p.track.empty()) {
       ++active;
+      lengths.push_back(double(p.track.size()));
+      long_tracks += p.track.size() >= 3;
+      extended_tracks += p.track.size() >= 8;
+    }
   for (uint32_t id = 0; id < images.size(); ++id) {
     const auto& image = images[id];
     const auto& c = cameras[image.camera];
@@ -151,6 +157,9 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
           {"registered_images", Registered()},
           {"expected_images", scene.images.size()},
           {"points", active},
+          {"track_lengths", Statistics(lengths)},
+          {"tracks_at_least_3", long_tracks},
+          {"tracks_at_least_8", extended_tracks},
           {"observations", errors.size()},
           {"invalid_depth", invalid},
           {"reprojection_px", Statistics(errors)},

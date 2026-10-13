@@ -441,8 +441,14 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
     if (!repair.empty() && !repair.count(id))
       continue;
     const uint32_t span = repair.empty() ? 12 : 48;
-    for (uint32_t k = id > span ? id - span : 0; k < std::min(n, id + span + 1); ++k)
+    for (uint32_t k = id > span ? id - span : 0; k < std::min(n, id + span + 1); ++k) {
+      const uint32_t distance = id > k ? id - k : k - id;
+      // Keep the closest exposures dense, then spread connections over the
+      // remaining window. Repair only the requested images with dense edges.
+      if (repair.empty() && distance > 4 && distance % 2 != 0)
+        continue;
       add(id, k);
+    }
     // Retrieve independently over multiple time distances, so near-duplicate
     // neighbors do not occupy every loop-closure slot.
     for (const auto range : std::vector<std::array<uint32_t, 2>>{{12, 48}, {48, 160}, {160, n}}) {
@@ -457,8 +463,25 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
         options.emplace_back(similarity, j);
       }
       std::sort(options.rbegin(), options.rend());
-      for (size_t k = 0; k < std::min<size_t>(repair.empty() ? 4 : 12, options.size()); ++k)
-        add(id, options[k].second);
+      std::vector<uint32_t> selected;
+      for (size_t k = 0; k < std::min<size_t>(repair.empty() ? 4 : 12, options.size()); ++k) {
+        const auto j = options[k].second;
+        if (repair.empty()) {
+          if (selected.size() == 3)
+            break;
+          const auto& candidate = scene.images[j];
+          const bool duplicate = std::any_of(selected.begin(), selected.end(), [&](uint32_t p) {
+            const auto& previous = scene.images[p];
+            const double seconds =
+                (candidate.week - previous.week) * 604800. + candidate.seconds - previous.seconds;
+            return candidate.camera == previous.camera && std::abs(seconds) < 2.;
+          });
+          if (duplicate)
+            continue;
+        }
+        selected.push_back(j);
+        add(id, j);
+      }
     }
   }
   std::vector<std::pair<uint32_t, uint32_t>> pending;
@@ -468,6 +491,7 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
     else
       pending.emplace_back(a, b);
   }
+  Json report;
   if (!pending.empty()) {
     Models models(root);
     FeatureCache cache(work);
@@ -511,17 +535,21 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
     timing.decode = cache.read_seconds;
     timing.wait = cache.wait_seconds;
     timing.preprocess = cache.upload_seconds;
-    auto report = timing.Report(started, &models);
-    Json list = Json::array();
-    for (const auto& [a, b] : pairs)
-      list.push_back({a, b});
-    WriteJson(work / "cache/pairs.json", {{"version", 1}, {"pairs", list}});
-    return report;
-  }
+    report = timing.Report(started, &models);
+  } else
+    report = timing.Report(started);
   Json list = Json::array();
-  for (const auto& [a, b] : pairs)
+  std::vector<double> degrees(n, 0);
+  for (const auto& [a, b] : pairs) {
     list.push_back({a, b});
+    ++degrees[a];
+    ++degrees[b];
+  }
   WriteJson(work / "cache/pairs.json", {{"version", 1}, {"pairs", list}});
-  return timing.Report(started);
+  report["pairs"] = pairs.size();
+  report["pair_degree"] = Statistics(degrees);
+  report["pair_degree"]["minimum"] = *std::min_element(degrees.begin(), degrees.end());
+  report["repair_images"] = repair;
+  return report;
 }
 }  // namespace geosun
