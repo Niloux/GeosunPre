@@ -14,7 +14,24 @@ Windows x64：Visual Studio 2022 C++ 桌面工具链、Windows SDK、CUDA Toolki
 
 ## 模型
 
-将符合[模型契约](docs/models.md)的四个 TensorRT 引擎、清单与推理 DLL 放入 `models/`。资源不进入 Git。引擎为实际 GPU 构建，TensorRT 固定为 10.13.3.9；导出是独立资源准备，工程不包含 Python 转换环境。
+运行一次模型准备，再编译和运行：
+
+```powershell
+.\prepare-models.ps1
+.\build.ps1
+.\run.ps1 run --input "D:/数据/场景" --work "work/场景" --models models
+```
+
+`prepare-models.ps1` 自动在 `.cache/model-prepare/` 安装独立转换环境，下载固定权重、导出 ONNX、为 GPU 0 构建四个 TensorRT 引擎，并用真实照片检查输出、动态描述子数量和匹配补零行为。首次需要联网，工具和权重下载为数 GB；之后复用缓存。已有匹配当前 GPU、版本和图像尺寸的完整模型包只校验并复用。
+
+默认原图尺寸为宽 3000、高 4000，可用 `-ImageWidth`、`-ImageHeight` 指定实际尺寸。更换 GPU 或尺寸时使用新模型目录；相同尺寸可复用已有 ONNX，省去权重导出：
+
+```powershell
+.\prepare-models.ps1 -Models models/new-gpu -OnnxFrom models
+.\prepare-models.ps1 -Models models/new-size -ImageWidth 4000 -ImageHeight 3000
+```
+
+资源不进入 Git。TensorRT 固定为 10.13.3.9，完整参数与固定来源见[模型契约](docs/models.md)。Python 仅用于独立资源准备，原生程序和 `dist/` 运行包不使用它。
 
 ```text
 models/
@@ -22,6 +39,8 @@ models/
   engines/{detector,descriptor,matcher,segmentation}.engine
   runtime/nvinfer_10.dll
 ```
+
+新生成的目录还保留 `onnx/` 和准备元数据；`package.ps1` 只复制运行所需的清单、引擎及推理 DLL。
 
 ## 使用
 

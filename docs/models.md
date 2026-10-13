@@ -24,4 +24,24 @@ manifest.json：version=1、tensorrt=`10.13.3.9`、gpu、detector_size、descrip
 - [DINOv2](https://github.com/facebookresearch/dinov2)：ViT-L/14。
 - [SegFormer B2 ADE20K](https://huggingface.co/nvidia/segformer-b2-finetuned-ade-512-512)：revision `de01bae28967510f9ddd496c60a969357195400c`。
 
-导出和 ONNX→TensorRT 编译是独立资源准备。引擎针对构建 GPU，更换 GPU 时重新构建，不默认承诺跨型号兼容。转换后需用真实图像检查有限输出、动态形状、描述子与匹配行为。
+导出和 ONNX→TensorRT 编译是独立资源准备，由根目录 `prepare-models.ps1` 完成。引擎针对构建 GPU，更换 GPU 时重新构建，不默认承诺跨型号兼容。
+
+## 一键准备
+
+```powershell
+.\prepare-models.ps1
+.\prepare-models.ps1 -Models models/other-gpu -OnnxFrom models
+.\prepare-models.ps1 -Models models/landscape -ImageWidth 4000 -ImageHeight 3000
+.\prepare-models.ps1 -Images "D:/照片/A.JPG","D:/照片/B.JPG"
+```
+
+- `-Models`：输出目录，默认 `models`。完整且兼容的包检查清单、引擎 SHA256、推理 DLL 与真实推理后复用，不重建；版本、GPU、尺寸或校验值不符时报错，应指定新目录。
+- `-ImageWidth` / `-ImageHeight`：原图宽高，默认 3000 / 4000。按最长边 1536、各边向下取 8 的倍数确定检测输入尺寸。
+- `-OnnxFrom`：可传已有模型目录或 `onnx/` 目录。四个单文件 ONNX 的名称、float32 输入与形状必须满足当前契约；尺寸改变时重新导出。
+- `-Images`：两张真实验证照片；默认使用固定 LoMa 源码包中的 `0015_A.jpg` / `0015_B.jpg`。验证包括四模型有限输出及形状、描述子数量 32 / 127 / 3072、匹配有效数量不等、补零值变化不影响有效结果、同图匹配和语义概率范围。新导出的图还比较 PyTorch 与 TensorRT 输出。
+
+脚本自动准备项目内 uv、Python 3.11.13、PyTorch 2.8.0（CUDA 12.8）、ONNX 与 TensorRT，均缓存于 `.cache/model-prepare/`，不修改系统 Python。首次需要联网；缓存完整后可离线准备与校验。已有 `models/source/` 的固定源码与权重按 SHA256 校验后直接复用。
+
+新模型在同级 `目录.pending/` 中准备，通过验证后才改名为目标目录。中断后相同请求复用已完成的 ONNX 和引擎；参数或导出脚本变化时拒绝混用未完成目录。保留原始权重、已有模型和运行成果。新目录包含清单、`engines/`、`runtime/`、`onnx/` 与 `preparation.json`；打包仅携带运行资源。
+
+DaD 的 ImageNet 归一化留在检测图内；描述图不增加归一化，并固定 784×784 对应的 DINO 位置编码。匹配图在自注意力、交叉注意力和双 softmax 中屏蔽补齐项。检测、描述与分割引擎允许 FP16 内部计算，匹配引擎采用 FP32；所有浮点输入输出保持 float32。

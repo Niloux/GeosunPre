@@ -1,0 +1,10 @@
+# Export/build tools only. The native application and dist do not use Python.
+# PyTorch 2.8.0 / torchvision 0.23.0 are installed from the CUDA 12.8 index.
+numpy==2.2.6
+pillow==12.0.0
+opencv-python-headless==4.12.0.88
+onnx==1.19.1
+transformers==4.57.1
+einops==0.8.1
+tensorrt-cu12==10.13.3.9
+nvidia-cuda-runtime-cu12==12.9.79
