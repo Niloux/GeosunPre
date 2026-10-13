@@ -355,6 +355,21 @@ def verify(root, shapes, images):
     print(f'Verified: four engines; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}', flush=True)
 
 
+def verify_package(root, settings, shapes, images):
+    manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
+    if manifest.get('version') != 1 or any(manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt', 'detector_size')):
+        raise RuntimeError('Existing model GPU/version/resolution differs. Choose a new -Models directory.')
+    for name, (inputs, outputs) in CONTRACTS.items():
+        spec = manifest['models'][name]
+        if spec['inputs'] != inputs or spec['outputs'] != outputs or spec['shapes'] != shapes[name]:
+            raise RuntimeError(f'Existing model manifest contract differs: {name}')
+        if sha256(root / 'engines' / f'{name}.engine') != spec['sha256']:
+            raise RuntimeError(f'Existing engine checksum differs: {name}. Choose a new -Models directory.')
+    if not (root / 'runtime' / 'nvinfer_10.dll').is_file():
+        raise RuntimeError('Existing model runtime DLL is missing')
+    verify(root, shapes, images)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--models', type=Path, required=True)
@@ -397,25 +412,17 @@ def main():
     for path in images:
         if not path.is_file():
             raise FileNotFoundError(path)
-    manifest_path = root / 'manifest.json'
-    if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-        if manifest.get('version') != 1 or any(manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt', 'detector_size')):
-            raise RuntimeError('Existing model GPU/version/resolution differs. Choose a new -Models directory.')
-        for name, (inputs, outputs) in CONTRACTS.items():
-            spec = manifest['models'][name]
-            if spec['inputs'] != inputs or spec['outputs'] != outputs or spec['shapes'] != shapes[name]:
-                raise RuntimeError(f'Existing model manifest contract differs: {name}')
-            if sha256(root / 'engines' / f'{name}.engine') != spec['sha256']:
-                raise RuntimeError(f'Existing engine checksum differs: {name}. Choose a new -Models directory.')
-        if not (root / 'runtime' / 'nvinfer_10.dll').is_file():
-            raise RuntimeError('Existing model runtime DLL is missing')
-        verify(root, shapes, images)
+    if (root / 'manifest.json').is_file():
+        verify_package(root, settings, shapes, images)
         print(f'Reuse complete model package: {root}', flush=True)
         return
     if root.exists():
         raise RuntimeError('Output already exists without a manifest. Choose a new -Models directory.')
     pending = root.with_name(root.name + '.pending')
+    if (pending / 'manifest.json').is_file():
+        verify_package(pending, settings, shapes, images)
+        print(f'Reuse verified pending model package: {pending}', flush=True)
+        return
     settings_path = pending / 'preparation.json'
     if pending.is_dir() and any(pending.iterdir()) and not settings_path.is_file():
         raise RuntimeError(f'Existing pending directory has no preparation record: {pending}. Choose a new -Models directory.')
@@ -463,8 +470,8 @@ def main():
                                  'sha256': sha256(pending / 'engines' / f'{name}.engine')}
                            for name, names in CONTRACTS.items()}}
     write_json(pending / 'manifest.json', manifest)
-    pending.rename(root)
-    print(f'Models ready: {root}', flush=True)
+    # Publish in PowerShell after this process releases any Windows file handles.
+    print(f'Model package verified: {pending}', flush=True)
 
 
 if __name__ == '__main__':

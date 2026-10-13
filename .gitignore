@@ -2,6 +2,7 @@
 /dist/
 /.cache/
 /models/
+/models.pending/
 /input/
 /work/
 /.codegraph/

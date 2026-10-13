@@ -42,6 +42,6 @@ manifest.json：version=1、tensorrt=`10.13.3.9`、gpu、detector_size、descrip
 
 脚本自动准备项目内 uv、Python 3.11.13、PyTorch 2.8.0（CUDA 12.8）、ONNX 与 TensorRT，均缓存于 `.cache/model-prepare/`，不修改系统 Python。首次需要联网；缓存完整后可离线准备与校验。已有 `models/source/` 的固定源码与权重按 SHA256 校验后直接复用。
 
-新模型在同级 `目录.pending/` 中准备，通过验证后才改名为目标目录。中断后相同请求复用已完成的 ONNX 和引擎；参数或导出脚本变化时拒绝混用未完成目录。保留原始权重、已有模型和运行成果。新目录包含清单、`engines/`、`runtime/`、`onnx/` 与 `preparation.json`；打包仅携带运行资源。
+新模型在同级 `目录.pending/` 中准备，通过验证且 Python 进程退出后，由 PowerShell 改名为目标目录，避免进程中的 Windows 文件占用阻止发布。中断后相同请求复用已完成的 ONNX 和引擎；已有完整清单的 `.pending` 包重新校验后直接发布。参数或导出脚本变化时拒绝混用未完成目录。保留原始权重、已有模型和运行成果。新目录包含清单、`engines/`、`runtime/`、`onnx/` 与 `preparation.json`；打包仅携带运行资源。
 
 DaD 的 ImageNet 归一化留在检测图内；描述图不增加归一化，并固定 784×784 对应的 DINO 位置编码。匹配图在自注意力、交叉注意力和双 softmax 中屏蔽补齐项。检测、描述与分割引擎允许 FP16 内部计算，匹配引擎采用 FP32；所有浮点输入输出保持 float32。

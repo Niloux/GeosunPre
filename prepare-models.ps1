@@ -52,13 +52,23 @@ try {
         Invoke-Tool $uvPath @('pip', 'install', '--python', $python, '-r', $requirements, '--extra-index-url', 'https://pypi.nvidia.com')
         Set-Content -LiteralPath $stamp -Value $identity -Encoding ASCII
     }
-    $arguments = @('-B', '-X', 'utf8', (Join-Path $PSScriptRoot 'tools\models\prepare.py'), '--models', $Models,
+    $modelRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Models).TrimEnd([char[]]'\/')
+    $arguments = @('-B', '-X', 'utf8', (Join-Path $PSScriptRoot 'tools\models\prepare.py'), '--models', $modelRoot,
         '--image-width', "$ImageWidth", '--image-height', "$ImageHeight")
     if ($OnnxFrom) { $arguments += @('--onnx-from', $OnnxFrom) }
     if ($Images) {
         $arguments += @('--images') + $Images
     }
     Invoke-Tool $python $arguments
+    if (-not (Test-Path -LiteralPath $modelRoot)) {
+        $pending = $modelRoot + '.pending'
+        try {
+            [IO.Directory]::Move($pending, $modelRoot)
+        } catch [IO.IOException], [UnauthorizedAccessException] {
+            throw "Cannot publish models: $($_.Exception.Message) Verified files remain in '$pending'. Close programs using this directory and rerun prepare-models.ps1."
+        }
+        Write-Host "Models ready: $modelRoot"
+    }
 } finally {
     foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process') }
     Pop-Location
