@@ -54,6 +54,7 @@ class Lock {
 };
 Json Settings(const fs::path& file) {
   Json result = {{"workers", 4},
+                 {"sfm_repair_rounds", 0},
                  {"quality_median_px", 2.},
                  {"quality_p90_px", 4.},
                  {"las_support_fraction", .25},
@@ -73,8 +74,11 @@ Json Settings(const fs::path& file) {
   if (!result.at("workers").is_number_integer() || result.at("workers").get<int>() < 1 ||
       result.at("workers").get<int>() > 32)
     throw std::runtime_error("workers must be 1-32");
+  if (!result.at("sfm_repair_rounds").is_number_integer() ||
+      result.at("sfm_repair_rounds") < 0 || result.at("sfm_repair_rounds") > 2)
+    throw std::runtime_error("sfm_repair_rounds must be an integer from 0 to 2");
   for (const auto& [key, value] : result.items())
-    if (key != "workers" && key != "calibration_tracks" &&
+    if (key != "workers" && key != "calibration_tracks" && key != "sfm_repair_rounds" &&
         (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() <= 0))
       throw std::runtime_error("Expected positive numeric setting: " + key);
   if (result.at("calibration_tracks") != "all" && result.at("calibration_tracks") != "stable")
@@ -220,11 +224,12 @@ void Run(const Arguments& args) {
         const auto profile_path = work / "cache/matches_profile.json";
         const int completed_repairs =
             int(ReadJson(profile_path).value("repairs", Json::array()).size());
+        const int max_repairs = settings.at("sfm_repair_rounds");
         for (int repair = completed_repairs;; ++repair) {
           std::set<uint32_t> deficient;
           try {
             model = Reconstruct(scene, work, workers, report,
-                                settings.at("calibration_tracks") == "stable", repair >= 2);
+                                settings.at("calibration_tracks") == "stable", repair >= max_repairs);
             quality = model.Quality(scene, settings.at("quality_median_px"),
                                     settings.at("quality_p90_px"));
             if (quality.at("passed").get<bool>())
@@ -237,12 +242,12 @@ void Run(const Arguments& args) {
                   row.at("occupied_cells").get<size_t>() < 8)
                 deficient.insert(id);
             }
-            if (deficient.empty() || repair >= 2)
+            if (deficient.empty() || repair >= max_repairs)
               throw std::runtime_error("Visual acceptance rejected: " +
                                        quality.at("failures").dump());
             WriteModel(work / "cache/incremental.bin", model);
           } catch (const RegistrationIncomplete& missing) {
-            if (repair >= 2)
+            if (repair >= max_repairs)
               throw;
             deficient.insert(missing.images.begin(), missing.images.end());
           }

@@ -36,7 +36,7 @@
 
 阶段为 `prepare → masks → features → matches → sfm → align → refine → export`。`run --work WORK` 复用已完成阶段并恢复检查点；`run --work WORK --stage 阶段` 单独执行指定阶段，须先完成前置阶段。`prepare` 检查真实输入、相机和导航转换，不加载模型。
 
-SfM 最多补匹配两轮；仍有照片无法注册时，对已注册部分完成优化、几何验收及 LAS 配准，通过后照常交付 COLMAP。交付仅包含已注册照片及其掩码，`manifest.json` 和 `quality.json` 的 `registration` 保存注册数量与未注册照片名单；`complete=false` 表示部分注册。验收不通过仍明确报错。
+SfM 默认不自动补匹配；首次停滞时，对已注册部分完成优化、几何验收及 LAS 配准，通过后照常交付 COLMAP。配置 `sfm_repair_rounds` 可设为 `0`（默认）、`1` 或 `2`，表示停滞或照片支撑不足时最多补匹配的轮数，用完后处理已注册部分。交付仅包含已注册照片及其掩码，`manifest.json` 和 `quality.json` 的 `registration` 保存注册数量与未注册照片名单；`complete=false` 表示部分注册。验收不通过仍明确报错。
 
 默认配置见 [configs/default.json](configs/default.json)，可通过 `--config` 指定。内参标定默认使用全部有效轨迹（`calibration_tracks=all`），随后锁定内参补全轨迹并精调。标定选项及坐标约定见[输入文档](docs/input.md)。
 
@@ -50,7 +50,7 @@ SfM 最多补匹配两轮；仍有照片无法注册时，对已注册部分完�
 
 稀疏点清理作为单独候选：至少三次观测、视差至少 1.5°，单观测误差不超过 `min(3 px, quality_p90_px)`。距离和点位不确定度门限按 `las_median_m` 及 LAS 量化精度计算，默认分别为 10 cm 和 5 cm；该不确定度是固定相机的局部估计，不代表独立精度。清理后支撑不足的照片会从候选移除，但只有总照片保留至少 99%、每个镜头保留至少 98%、原可靠 LAS 支撑轨迹保留至少 90%，且图像图仍连通、剩余照片达到 32 个观测和 8 个覆盖格子、几何质量通过，才采用清理。否则保留相机精修结果，不强行删点。
 
-最终所选模型在 `cache/refined.bin`，精修前模型在 `cache/aligned.bin`。独立精修的新交付在新目录的 `colmap/`；原始输入、工作目录及已有训练结果保持原样。独立精修目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 7，旧版工作目录继续保留；使用默认新流程时另建工作目录。
+最终所选模型在 `cache/refined.bin`，精修前模型在 `cache/aligned.bin`。独立精修的新交付在新目录的 `colmap/`；原始输入、工作目录及已有训练结果保持原样。独立精修目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 8，旧版工作目录继续保留；使用默认新流程时另建工作目录。
 
 `run.ps1` 固定启动 `build/bin/Release/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
 

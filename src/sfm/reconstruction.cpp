@@ -853,7 +853,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           std::to_string(m.images.size()));
       if (!allow_partial)
         throw RegistrationIncomplete(missing.get<std::vector<uint32_t>>());
-      Log("Finalize registered subset after repair matching");
+      Log("Finalize registered subset");
       break;
     }
   }
