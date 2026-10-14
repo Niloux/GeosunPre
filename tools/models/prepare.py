@@ -232,12 +232,26 @@ def build_engine(path, name, shapes, matcher_precision='fp16'):
     elif name == 'matcher' and matcher_precision == 'fp16':
         config.set_flag(trt.BuilderFlag.FP16)
         config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+        scoring = False
         for index in range(network.num_layers):
             layer = network.get_layer(index)
-            if layer.type in (trt.LayerType.SOFTMAX, trt.LayerType.REDUCE, trt.LayerType.NORMALIZATION):
+            # Softmax cannot recover precision already lost in its score inputs.
+            # Keep final projections, similarity and match selection in FP32.
+            scoring = scoring or layer.name == '/final_proj/MatMul'
+            sensitive = layer.type in (trt.LayerType.SOFTMAX, trt.LayerType.REDUCE, trt.LayerType.NORMALIZATION)
+            score_operation = scoring and layer.type in (
+                trt.LayerType.MATRIX_MULTIPLY, trt.LayerType.ELEMENTWISE,
+                trt.LayerType.SELECT, trt.LayerType.TOPK)
+            if sensitive or score_operation:
+                floating = [i for i in range(layer.num_outputs)
+                            if layer.get_output(i).dtype == trt.float32]
+                if not floating:
+                    continue
                 layer.precision = trt.float32
-                for output in range(layer.num_outputs):
+                for output in floating:
                     layer.set_output_type(output, trt.float32)
+        if not scoring:
+            raise RuntimeError('FP16 matcher ONNX is missing the final scoring projection')
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
     if name == 'detector':
         profile = builder.create_optimization_profile()
@@ -405,12 +419,17 @@ def verify(root, shapes, images):
     print(f'Verified: four engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}', flush=True)
 
 
+def matcher_precisions(manifest):
+    precision = manifest.get('matcher_precision', 'fp32')
+    return precision, manifest.get('matcher_score_precision', precision)
+
+
 def verify_package(root, settings, shapes, images):
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
     if manifest.get('version') != 2 or any(manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt', 'detector_profile')):
         raise RuntimeError('Existing model GPU/version/profile differs. Choose a new -Models directory; use -OnnxFrom to upgrade a static package.')
-    if manifest.get('matcher_precision', 'fp32') != settings['matcher_precision']:
-        raise RuntimeError('Existing matcher precision differs. Choose a new -Models directory.')
+    if matcher_precisions(manifest) != matcher_precisions(settings):
+        raise RuntimeError('Existing matcher calculation/scoring precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
     for name, (inputs, outputs) in CONTRACTS.items():
         spec = manifest['models'][name]
         if spec['inputs'] != inputs or spec['outputs'] != outputs or spec['shapes'] != shapes[name]:
@@ -449,6 +468,7 @@ def main():
     settings = {'gpu': torch.cuda.get_device_name(0), 'tensorrt': TRT_VERSION,
                 'detector_profile': DETECTOR_PROFILE,
                 'matcher_precision': args.matcher_precision,
+                'matcher_score_precision': 'fp32' if args.matcher_precision == 'fp16' else args.matcher_precision,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest()}
     reuse_manifest = None
     if args.onnx_from:
@@ -511,7 +531,7 @@ def main():
     for name in CONTRACTS:
         check_onnx(pending / 'onnx' / f'{name}.onnx', name, shapes[name])
         destination = pending / 'engines' / f'{name}.engine'
-        same_precision = name != 'matcher' or (reuse_manifest or {}).get('matcher_precision', 'fp32') == args.matcher_precision
+        same_precision = name != 'matcher' or matcher_precisions(reuse_manifest or {}) == matcher_precisions(settings)
         if reuse_manifest and name in copied and same_precision and not destination.exists():
             spec = reuse_manifest['models'][name]
             candidate = origin.parent / 'engines' / f'{name}.engine'
@@ -533,6 +553,7 @@ def main():
     verify(pending, shapes, images)
     manifest = {'version': 2, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
                 'matcher_precision': args.matcher_precision,
+                'matcher_score_precision': settings['matcher_score_precision'],
                 'detector_profile': DETECTOR_PROFILE, 'descriptor_size': [784, 784],
                 'max_features': MAX_FEATURES, 'descriptor_dimension': 256,
                 'segmentation_mean': [.485, .456, .406], 'segmentation_std': [.229, .224, .225],

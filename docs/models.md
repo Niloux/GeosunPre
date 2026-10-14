@@ -10,13 +10,13 @@
 .\prepare-models.ps1
 ```
 
-默认向 `models/` 准备四个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器精度为 FP16，Softmax、Reduce 和 Normalization 层保留 FP32，所有浮点输入输出保持 float32。`run.ps1` 和 `package.ps1` 默认使用这个目录。
+默认向 `models/` 准备四个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32。`run.ps1` 和 `package.ps1` 默认使用这个目录。
 
 首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。同 GPU 上更换照片分辨率、横竖方向或宽高比不需要重建模型。更换 GPU、模型协议或精度时需指定新的输出目录。
 
 ## 模型接口
 
-manifest.json：version=2、tensorrt=`10.13.3.9`、gpu、matcher_precision、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、segmentation_mean、segmentation_std、models。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`。
+manifest.json：version=2、tensorrt=`10.13.3.9`、gpu、matcher_precision、matcher_score_precision、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、segmentation_mean、segmentation_std、models。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`。matcher_score_precision 记录最终评分精度，默认 FP16 主干搭配 FP32 评分；旧清单缺少该字段时按 matcher_precision 解析。
 
 detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max=[1536,1536]`。opt 只用于 TensorRT 编译优化，不限制原图尺寸。运行端仍兼容 version=1 的固定尺寸包，但该包继续受 detector_size 限制。
 
@@ -58,6 +58,7 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 - `-OnnxFrom`：可传已有模型目录或 `onnx/` 目录。四个单文件 ONNX 的名称、float32 输入与形状必须满足当前契约。来源为有清单的 version=1 固定尺寸包时，重新导出动态检测器，复用其他三个 ONNX；只提供旧静态 ONNX 而缺少清单时拒绝导入。
 - `-MatcherPrecision`：`fp16`（默认）、`fp32` 或 `tf32`，用于显式调整匹配引擎的计算精度。TF32 允许 Tensor Core 矩阵乘法。模型清单保存该选择；未声明 `matcher_precision` 的清单按 FP32 解析。修改精度时使用新目录，并用真实场景检查最终几何质量。
 - 当 `-OnnxFrom` 指向同 GPU、TensorRT 版本的完整模型包时，复用未改变接口和精度且清单及校验通过的引擎；升级固定尺寸包只需重建 detector，切换匹配精度只需重建 matcher。
+- 旧 FP16 模型未保留最终评分的 FP32 精度时，使用新目录和 `-OnnxFrom` 升级；复用 ONNX 和其他引擎，只重建 matcher。置信度仍按原有相对误差 `<0.005` 验收，不放宽门限。
 - `-Images`：两张真实验证照片；默认使用固定 LoMa 源码包中的 `0015_A.jpg` / `0015_B.jpg`。验证包括检测器动态宽高及边界、四模型有限输出及形状、描述子数量 32 / 127 / 3072、匹配有效数量不等、补零值变化不影响有效结果、同图匹配和语义概率范围。新导出的检测图在横图、竖图、方图及短边边界上比较 PyTorch 与 TensorRT 输出。
 
 使用自定义目录时，运行指定 `--models`，打包指定 `-Models`。复用 ONNX 可以省去权重导出；更换 GPU 时仍需在目标 GPU 上重新构建并校验引擎。
