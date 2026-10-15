@@ -428,6 +428,37 @@ Json CompleteTracks(Reconstruction& model, const Tracks& graph, std::vector<uint
           {"merged_points", merged},
           {"seconds", Seconds(started)}};
 }
+Json CompleteUnassignedTracks(Reconstruction& model, const Tracks& graph) {
+  const auto started = Clock::now();
+  constexpr int maximum_rounds = 3;
+  const size_t before_points = std::count_if(model.points.begin(), model.points.end(),
+                                           [](const auto& p) { return !p.track.empty(); });
+  const size_t before_observations = model.Observations();
+  // A matching component can contain more than one landmark. Once its primary
+  // point is established, observations rejected by that point must still get
+  // a chance to form independent tracks. Keep the calibrated cameras fixed.
+  for (int round = 0; round < maximum_rounds; ++round) {
+    const size_t before = model.Observations();
+    for (const auto& track : graph.tracks) {
+      std::vector<Observation> unassigned;
+      for (const auto& o : track)
+        if (model.images[o.image].registered && model.images[o.image].points[o.feature] == NoPoint)
+          unassigned.push_back(o);
+      if (unassigned.size() < 2)
+        continue;
+      uint64_t identity = NoPoint;
+      AddPoint(model, unassigned, identity);
+    }
+    model.Filter();
+    if (model.Observations() == before)
+      break;
+  }
+  const size_t after_points = std::count_if(model.points.begin(), model.points.end(),
+                                          [](const auto& p) { return !p.track.empty(); });
+  return {{"added_points", after_points - before_points},
+          {"added_observations", model.Observations() - before_observations},
+          {"cameras_fixed", true}, {"seconds", Seconds(started)}};
+}
 size_t Correspondences(const Reconstruction& model, const std::vector<Pair>& pairs,
                        const std::vector<size_t>& neighbors, uint32_t id,
                        std::vector<cv::Point3d>* xyz = nullptr,
@@ -952,6 +983,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   if (stable_calibration)
     optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 200));
   filter();
+  const auto unassigned_completion = CompleteUnassignedTracks(m, graph);
   const auto color_started = Clock::now();
   for (uint32_t id = 0; id < m.images.size(); ++id) {
     for (uint32_t k = 0; k < m.images[id].points.size(); ++k)
@@ -977,6 +1009,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
               {"checkpoint_seconds", checkpoint_seconds},
               {"color_seconds", Seconds(color_started)}}},
             {"completion", completion},
+            {"unassigned_completion", unassigned_completion},
             {"calibration_tracks", stable_calibration ? "stable" : "all"},
             {"calibration_selection", calibration_selection},
             {"optimization", optimization}};

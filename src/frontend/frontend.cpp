@@ -18,6 +18,28 @@ fs::path MaskPath(const fs::path& work, uint32_t id) {
   return work / "cache/masks" / (std::to_string(id) + ".png");
 }
 namespace {
+std::vector<uint32_t> NavigationRevisitCandidates(const Scene& scene, uint32_t image) {
+  constexpr double radius_m = 5., minimum_seconds = 10.;
+  constexpr size_t maximum_candidates = 20;
+  std::vector<std::pair<double, uint32_t>> nearby;
+  const auto& exposure = scene.images[image];
+  for (uint32_t id = 0; id < scene.images.size(); ++id) {
+    const auto& other = scene.images[id];
+    const double seconds = (exposure.week - other.week) * 604800. +
+                           exposure.seconds - other.seconds;
+    if (std::abs(seconds) <= minimum_seconds)
+      continue;
+    const double squared_distance =
+        (exposure.navigation_raw - other.navigation_raw).squaredNorm();
+    if (squared_distance <= radius_m * radius_m)
+      nearby.emplace_back(squared_distance, id);
+  }
+  std::sort(nearby.begin(), nearby.end());
+  std::vector<uint32_t> candidates;
+  for (size_t k = 0; k < std::min(maximum_candidates, nearby.size()); ++k)
+    candidates.push_back(nearby[k].second);
+  return candidates;
+}
 struct Fusion {
   std::vector<MaskView> views;
   cv::Mat weight;
@@ -517,6 +539,7 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
   for (uint32_t id = 0; id < n; ++id)
     retrieval.push_back(ReadFeatures(FeaturePath(work, id)).retrieval);
   std::set<std::pair<uint32_t, uint32_t>> pairs;
+  size_t navigation_added_pairs = 0;
   auto add = [&](uint32_t a, uint32_t b) {
     if (a != b)
       pairs.emplace(std::min(a, b), std::max(a, b));
@@ -537,6 +560,15 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
       if (repair.empty() && distance > 4 && distance % 2 != 0)
         continue;
       add(id, k);
+    }
+    // Revisited surfaces can have poor global descriptor similarity because
+    // their scale and the surrounding scene changed. Navigation supplies
+    // independent candidates; matching and ray-space verification still decide
+    // whether the images actually overlap. Do not assume L/R synchronization.
+    for (uint32_t candidate : NavigationRevisitCandidates(scene, id)) {
+      const auto before = pairs.size();
+      add(id, candidate);
+      navigation_added_pairs += pairs.size() - before;
     }
     // Retrieve independently over multiple time distances, so near-duplicate
     // neighbors do not occupy every loop-closure slot.
@@ -636,6 +668,7 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
   }
   WriteJson(work / "cache/pairs.json", {{"version", 1}, {"pairs", list}});
   report["pairs"] = pairs.size();
+  report["navigation_added_pairs"] = navigation_added_pairs;
   report["pair_degree"] = Statistics(degrees);
   report["pair_degree"]["minimum"] = *std::min_element(degrees.begin(), degrees.end());
   report["repair_images"] = repair;

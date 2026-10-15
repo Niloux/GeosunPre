@@ -413,6 +413,19 @@ Similarity NavigationFit(const std::vector<Eigen::Vector3d>& centers,
   }
   return selected;
 }
+double FixedCameraPositionSigma(const Reconstruction& model, const ModelPoint& point) {
+  // Local uncertainty proxy with camera parameters fixed, not absolute accuracy.
+  Eigen::Matrix3d information = Eigen::Matrix3d::Zero();
+  for (const auto& o : point.track) {
+    const auto& image = model.images[o.image];
+    const Eigen::Matrix<double, 2, 3> j =
+        model.cameras[image.camera].ProjectionJacobian(image.pose.Apply(point.xyz)) *
+        image.pose.Rotation().toRotationMatrix();
+    information.noalias() += j.transpose() * j;
+  }
+  const auto eigen = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(information).eigenvalues().eval();
+  return std::max(.5, point.error) / std::sqrt(std::max(eigen[0], 1e-18));
+}
 }  // namespace
 std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstruction& model,
                                             int workers) {
@@ -441,6 +454,10 @@ std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstr
 }
 Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
                                const AlignmentLimits& limits) {
+  // Camera refinement requires >=3 views; reliable two-view points can still
+  // seed 3DGS when parallax, depth precision and LAS support pass.
+  constexpr size_t minimum_track_length = 2;
+  constexpr double minimum_parallax_degrees = 1.5;
   const auto header = ReadLasHeader(scene.las);
   const double max_error = std::min(3., limits.p90_px),
                max_sigma = std::max(.5 * limits.median_m, 3 * header.scale.maxCoeff()),
@@ -455,26 +472,17 @@ Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
   size_t before = 0, short_tracks = 0, uncertain = 0, unsupported = 0, retained = 0;
   for (const auto& p : model.points)
     before += !p.track.empty();
-  model.Filter(max_error, 1.5);
+  model.Filter(max_error, minimum_parallax_degrees);
   std::vector<double> distances, uncertainty;
   for (auto& point : model.points) {
     if (point.track.empty())
       continue;
-    if (point.track.size() < 3) {
+    if (point.track.size() < minimum_track_length) {
       point.track.clear();
       ++short_tracks;
       continue;
     }
-    Eigen::Matrix3d information = Eigen::Matrix3d::Zero();
-    for (const auto& o : point.track) {
-      const auto& image = model.images[o.image];
-      const Eigen::Matrix<double, 2, 3> j =
-          model.cameras[image.camera].ProjectionJacobian(image.pose.Apply(point.xyz)) *
-          image.pose.Rotation().toRotationMatrix();
-      information.noalias() += j.transpose() * j;
-    }
-    const auto eigen = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(information).eigenvalues().eval();
-    const double sigma = std::max(.5, point.error) / std::sqrt(std::max(eigen[0], 1e-18));
+    const double sigma = FixedCameraPositionSigma(model, point);
     if (sigma > max_sigma) {
       point.track.clear();
       ++uncertain;
@@ -526,12 +534,12 @@ Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
       point.track.erase(std::remove_if(point.track.begin(), point.track.end(),
                                        [&](const auto& o) { return !model.images[o.image].registered; }),
                         point.track.end());
-      if (point.track.size() < 3)
+      if (point.track.size() < minimum_track_length)
         point.track.clear();
       else if (point.track.size() != before_track)
         RefinePoint(model, point.track, point.xyz);
     }
-    model.Filter(max_error, 1.5);
+    model.Filter(max_error, minimum_parallax_degrees);
   }
   distances.clear();
   uncertainty.clear();
@@ -539,21 +547,13 @@ Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
   for (auto& point : model.points) {
     if (point.track.empty())
       continue;
-    Eigen::Matrix3d information = Eigen::Matrix3d::Zero();
-    for (const auto& o : point.track) {
-      const auto& image = model.images[o.image];
-      const Eigen::Matrix<double, 2, 3> j =
-          model.cameras[image.camera].ProjectionJacobian(image.pose.Apply(point.xyz)) *
-          image.pose.Rotation().toRotationMatrix();
-      information.noalias() += j.transpose() * j;
-    }
-    const auto eigen = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(information).eigenvalues().eval();
-    const double sigma = std::max(.5, point.error) / std::sqrt(std::max(eigen[0], 1e-18));
+    const double sigma = FixedCameraPositionSigma(model, point);
     const Eigen::Vector3d local = point.xyz - origin;
     size_t nearest;
     double squared;
     target.tree->knnSearch(local.data(), 1, &nearest, &squared);
-    if (point.track.size() < 3 || sigma > max_sigma || squared > max_distance * max_distance) {
+    if (point.track.size() < minimum_track_length || sigma > max_sigma ||
+        squared > max_distance * max_distance) {
       point.track.clear();
       continue;
     }
@@ -568,7 +568,8 @@ Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
           {"removed_las_unsupported", unsupported}, {"removed_with_weak_images", initially_retained - retained},
           {"removed_images", removed_images}, {"nearest_las_m", Statistics(distances)},
           {"fixed_camera_position_sigma_proxy_m", Statistics(uncertainty)},
-          {"limits", {{"minimum_track_length", 3}, {"minimum_parallax_degrees", 1.5},
+          {"limits", {{"minimum_track_length", minimum_track_length},
+                      {"minimum_parallax_degrees", minimum_parallax_degrees},
                       {"maximum_reprojection_px", max_error}, {"maximum_sigma_proxy_m", max_sigma},
                       {"maximum_nearest_las_m", max_distance}}}};
 }

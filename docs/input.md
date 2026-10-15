@@ -15,7 +15,7 @@ INPUT/
 
 文件名为 `GPS周-秒-毫秒_帧号-L或R.JPG`。CameraPos 每行 11 字段：文件名、设备编号、GPS 周、秒、XYZ、四元数四分量。仅使用位置，四元数不用于视觉初始化；不改写时间戳。
 
-鱼眼参数为 `fx fy cx cy k1 k2 k3 k4`。初值：`fx=fy=focalLength/pixelSize`，`cx=width/2+principalX/pixelSize`，`cy=height/2-principalY/pixelSize`，`k4=p3`。继承该设备映射，厂商主点方向和 p3 含义尚未独立核对。
+鱼眼参数为 `fx fy cx cy k1 k2 k3 k4`。初值：`fx=fy=focalLength/pixelSize`，`cx=width/2+principalX/pixelSize`，`cy=height/2+principalY/pixelSize`，`k4=p3`。主点偏移与 G203 参考流程采用相同的图像坐标方向；p3 含义尚未独立核对。旧版本对 principalY 使用减号，已有 scene.json 和特征缓存不能直接视为修正后的结果，须使用新工作目录。
 
 左上像素中心为 `(0.5,0.5)`。`theta=atan2(sqrt(X²+Y²),Z)`，径向多项式为 `theta*(1+k1*theta²+k2*theta⁴+k3*theta⁶+k4*theta⁸)`。有效域为完整视场 160°，多项式须单调。L/R 内参各共享一组，每次曝光独立位姿。
 
@@ -26,6 +26,8 @@ INPUT/
 两份导航表行身份须一致，前五列为 GPS 周、秒、XYZ，时序递增。由成对位置拟合 ECEF→ENH 转换：尺度偏离 1 不超过 0.001、逐行残差不超过 2 cm。CameraPos 位置经该转换形成导航先验。
 
 LAS 对齐后默认执行原图精修，以闭环一致的亚像素对应联合优化共享内参、位姿和可靠三视图点，保留 LAS 平面与导航约束。所有编号能被 5 整除的点固定留出，不参与相机优化；其中至少 50 条成功精修轨迹用于独立检查误差中位数和 P90。相机候选须在强力删点前通过原几何质量及 LAS 残差检查；支撑不足或候选未通过时保留对齐模型，并记录原因。稀疏点清理另行验收照片保留率、LAS 支撑轨迹保留率和图像图连通性，不以删点代替相机精度改善。
+
+相机优化的三视图要求不作为初始化点云的最低轨迹长度。精修清理允许双视图点，但仍须通过重投影、至少 1.5° 视差、固定相机下的深度不确定度及 LAS 距离检查；SfM 最终标定后还会对已验证匹配分量中未分配的观测单独三角化，保留通过几何过滤的独立轨迹。
 
 LAS 支持未压缩 1.2、点格式 0–3；多份使用 `--las` 选择。排除 withheld 和 class-7 噪声，RGB 支持 uint16 中的 8-bit/16-bit 范围，无 RGB 时灰色 127。
 

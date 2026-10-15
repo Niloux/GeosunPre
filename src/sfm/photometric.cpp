@@ -196,7 +196,10 @@ bool MatchPatch(const cv::Mat& raw_reference, const cv::Mat& image, const Eigen:
   return true;
 }
 Json PointErrors(Reconstruction& model, const std::set<uint64_t>& ids, bool refit = true) {
+  constexpr int columns = 16, rows = 12;
   std::vector<double> errors;
+  std::map<uint32_t, std::vector<double>> per_image;
+  std::map<uint32_t, std::map<int, std::vector<double>>> per_cell;
   for (auto id : ids) {
     auto& point = model.points[id];
     if (refit)
@@ -206,10 +209,28 @@ Json PointErrors(Reconstruction& model, const std::set<uint64_t>& ids, bool refi
       const auto v = image.pose.Apply(point.xyz);
       if (v.z() <= 0)
         throw std::runtime_error("Photometric refinement produced nonpositive depth");
-      errors.push_back((model.cameras[image.camera].Project(v) - image.pixels[o.feature]).norm());
+      const auto& camera = model.cameras[image.camera];
+      const auto& pixel = image.pixels[o.feature];
+      const double error = (camera.Project(v) - pixel).norm();
+      errors.push_back(error);
+      per_image[o.image].push_back(error);
+      const int column = std::clamp(int(pixel.x() / camera.width * columns), 0, columns - 1),
+                row = std::clamp(int(pixel.y() / camera.height * rows), 0, rows - 1);
+      per_cell[o.image][row * columns + column].push_back(error);
     }
   }
-  return Statistics(errors);
+  auto result = Statistics(errors);
+  result["grid_columns"] = columns;
+  result["grid_rows"] = rows;
+  result["per_image"] = Json::object();
+  for (const auto& [image, values] : per_image) {
+    auto statistics = Statistics(values);
+    statistics["cells"] = Json::object();
+    for (const auto& [cell, samples] : per_cell.at(image))
+      statistics["cells"][std::to_string(cell)] = Statistics(samples);
+    result["per_image"][std::to_string(image)] = std::move(statistics);
+  }
+  return result;
 }
 Json PlaneErrors(const Reconstruction& model, const std::vector<PlaneConstraint>& planes) {
   std::vector<double> errors;
@@ -522,7 +543,7 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   precise.RebuildReferences();
   auto& report = refined.report;
   report = {{"method", "cycle-consistent original-image graph with subpixel exposure-aware refinement"},
-                 {"refinement_version", 3}, {"accepted", false},
+                 {"refinement_version", 4}, {"accepted", false},
                  {"limits", {{"las_support_fraction", limits.support_fraction},
                              {"las_median_m", limits.median_m}, {"las_p90_m", limits.p90_m}}},
                  {"pixel_shift_px", graph.at("pixel_shift_px")},
@@ -547,6 +568,20 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
                                      training_planes, NavigationPositions(scene), training, precise_observations);
   const auto validation_after = PointErrors(precise, validation);
   report["validation_after_px"] = validation_after;
+  Json unvalidated = Json::array(), image_names = Json::object();
+  for (uint32_t image = 0; image < model.images.size(); ++image)
+    if (model.images[image].registered) {
+      const auto key = std::to_string(image);
+      image_names[key] = scene.images[image].name;
+      if (!validation_after.at("per_image").contains(key))
+        unvalidated.push_back(image);
+    }
+  report["image_names"] = std::move(image_names);
+  report["validation_coverage"] = {
+      {"registered_images", model.Registered()},
+      {"images_with_holdout", validation_after.at("per_image").size()},
+      {"images_without_holdout", unvalidated},
+      {"scope", "global acceptance does not certify images or cells without held-out observations"}};
   report["training_error_px"] = PointErrors(precise, training, false);
   const auto plane_before = PlaneErrors(source, planes);
   model.cameras = precise.cameras;

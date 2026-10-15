@@ -282,7 +282,7 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las) {
     c.params = {focal / pixel,
                 focal / pixel,
                 c.width / 2. + c.principal_offset[0],
-                c.height / 2. - c.principal_offset[1],
+                c.height / 2. + c.principal_offset[1],
                 p.at("k1"),
                 p.at("k2"),
                 p.at("k3"),
