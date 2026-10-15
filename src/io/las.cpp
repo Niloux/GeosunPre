@@ -12,20 +12,22 @@
 #include <sstream>
 
 namespace geosun {
+bool KeepLasPoint(const LasPoint& p) {
+  return !(p.classification & 128) && (p.classification & 31) != 7;
+}
+Eigen::Vector3d LasCoordinates(const LasHeader& h, const LasPoint& p) {
+  const Eigen::Vector3d point =
+      Eigen::Vector3d(p.raw[0], p.raw[1], p.raw[2]).cwiseProduct(h.scale) + h.origin;
+  if (!point.allFinite())
+    throw std::runtime_error("Nonfinite LAS coordinates");
+  return point;
+}
 namespace {
 template <typename T>
 T Read(const uint8_t* data, size_t offset) {
   T value;
   std::memcpy(&value, data + offset, sizeof(T));
   return value;
-}
-bool Keep(const LasPoint& p) { return !(p.classification & 128) && (p.classification & 31) != 7; }
-Eigen::Vector3d Coordinates(const LasHeader& h, const LasPoint& p) {
-  const Eigen::Vector3d point =
-      Eigen::Vector3d(p.raw[0], p.raw[1], p.raw[2]).cwiseProduct(h.scale) + h.origin;
-  if (!point.allFinite())
-    throw std::runtime_error("Nonfinite LAS coordinates");
-  return point;
 }
 struct Aggregate {
   uint64_t key, count;
@@ -231,8 +233,8 @@ std::vector<Eigen::Vector3d> SampleLas(const fs::path& path, const LasHeader& h,
   ScanLas(path, h, [&](uint64_t start, const std::vector<LasPoint>& points) {
     while (position < indices.size() && indices[position] < start + points.size()) {
       const auto& point = points.at(size_t(indices[position++] - start));
-      if (Keep(point))
-        xyz.push_back(Coordinates(h, point));
+      if (KeepLasPoint(point))
+        xyz.push_back(LasCoordinates(h, point));
       else
         ++rejected;
     }
@@ -306,12 +308,12 @@ Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel) {
     std::vector<Aggregate> values;
     values.reserve(block.size());
     for (const auto& p : block) {
-      if (!Keep(p)) {
+      if (!KeepLasPoint(p)) {
         ++rejected;
         continue;
       }
       ++accepted;
-      const auto xyz = Coordinates(h, p);
+      const auto xyz = LasCoordinates(h, p);
       uint64_t key = 0;
       for (int j = 0; j < 3; ++j) {
         const int64_t cell = int64_t(std::floor(xyz[j] / voxel)) - lower[j];

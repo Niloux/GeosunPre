@@ -11,5 +11,5 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
 std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstruction& model,
                                             int workers);
 Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
-                               const AlignmentLimits& limits);
+                               const AlignmentLimits& limits, int workers);
 }  // namespace geosun

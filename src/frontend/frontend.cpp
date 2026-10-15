@@ -380,6 +380,17 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
   }
   return report;
 }
+cv::Mat MaskDomain(const Camera& camera) {
+  const auto weight = VirtualViews(camera).weight;
+  auto domain = camera.Mask();
+  for (int y = 0; y < domain.rows; ++y) {
+    const int yy = int(y * (double(weight.rows) / domain.rows));
+    for (int x = 0; x < domain.cols; ++x)
+      if (weight.at<float>(yy, int(x * (double(weight.cols) / domain.cols))) <= 0)
+        domain.at<uint8_t>(y, x) = 0;
+  }
+  return domain;
+}
 Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
   const auto started = Clock::now();
   FrontendTiming timing;

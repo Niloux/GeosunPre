@@ -237,16 +237,15 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
               int workers, int iterations, const std::set<uint32_t>& variable_images,
               const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav,
               const std::set<uint64_t>& selected_points,
-              const std::vector<std::vector<uint8_t>>& precise_observations) {
+              const std::vector<std::vector<uint8_t>>& precise_observations,
+              const Reconstruction* reference) {
   const auto started = Clock::now();
   ceres::Problem problem;
-  // Each precision group shares one loss owned by its residual blocks.
   auto ordering = std::make_shared<ceres::ParameterBlockOrdering>();
   auto* loss = new ceres::HuberLoss(2.);
-  ceres::LossFunction* coarse_loss = nullptr;
   std::set<uint32_t> used_images, used_cameras;
   size_t observations = 0;
-  size_t precise_count = 0;
+  size_t precise_count = 0, reference_count = 0;
   const bool metric = !nav.empty() && !planes.empty();
   size_t variable_count = 0;
   for (auto& p : m.points)
@@ -263,17 +262,19 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         const double depth = image.pose.Apply(p.xyz).z();
         if (depth <= 0)
           throw std::runtime_error("BA requires positive initial depth");
-        ceres::LossFunction* observation_loss = loss;
         const bool precise = !precise_observations.empty() && precise_observations[o.image][o.feature];
         precise_count += precise;
-        if (!precise_observations.empty() && !precise) {
-          if (!coarse_loss)
-            coarse_loss = new ceres::ScaledLoss(new ceres::HuberLoss(2.), .25, ceres::TAKE_OWNERSHIP);
-          observation_loss = coarse_loss;
+        Eigen::Vector2d pixel = image.pixels[o.feature];
+        if (reference && !precise) {
+          // Refine relative to the accepted geometry instead of fitting the
+          // detector noise again on a different subset of its observations.
+          const auto& original = reference->images[o.image];
+          pixel = reference->cameras[original.camera].Project(
+              original.pose.Apply(reference->points[&p - m.points.data()].xyz));
+          ++reference_count;
         }
-        problem.AddResidualBlock(new Reprojection(image.pixels[o.feature]), observation_loss,
-                                 image.pose.params.data(), p.xyz.data(),
-                                 m.cameras[image.camera].params.data());
+        problem.AddResidualBlock(new Reprojection(pixel), loss, image.pose.params.data(),
+                                 p.xyz.data(), m.cameras[image.camera].params.data());
         problem.AddResidualBlock(new Depth(.05 * depth, 1000 / depth), nullptr,
                                  image.pose.params.data(), p.xyz.data());
         used_images.insert(o.image);
@@ -369,6 +370,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"metric_constraints", metric},
           {"observations", observations},
           {"precise_observations", precise_count},
+          {"reference_observations", reference_count},
           {"solver", ceres::LinearSolverTypeToString(summary.linear_solver_type_used)},
           {"explicit_schur", options.use_explicit_schur_complement},
           {"build_seconds", build_seconds},

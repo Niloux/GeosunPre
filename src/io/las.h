@@ -18,6 +18,8 @@ struct LasPoint {
   uint8_t classification = 0;
   double gps_time = 0;
 };
+bool KeepLasPoint(const LasPoint& point);
+Eigen::Vector3d LasCoordinates(const LasHeader& header, const LasPoint& point);
 LasHeader ReadLasHeader(const fs::path& path);
 void ScanLas(const fs::path& path, const LasHeader& header,
              const std::function<void(uint64_t, const std::vector<LasPoint>&)>& consume);

@@ -436,7 +436,7 @@ Json CompleteUnassignedTracks(Reconstruction& model, const Tracks& graph) {
   const size_t before_observations = model.Observations();
   // A matching component can contain more than one landmark. Once its primary
   // point is established, observations rejected by that point must still get
-  // a chance to form independent tracks. Keep the calibrated cameras fixed.
+  // a chance to form independent tracks. Keep the current cameras fixed.
   for (int round = 0; round < maximum_rounds; ++round) {
     const size_t before = model.Observations();
     for (const auto& track : graph.tracks) {
@@ -640,6 +640,94 @@ bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
   return true;
 }
 }  // namespace
+std::set<uint64_t> CalibrationTracks(const Scene& scene, const Reconstruction& model,
+                                     Json& report) {
+  std::set<uint64_t> selected;
+  std::vector<size_t> observations(model.images.size());
+  std::vector<std::set<int>> cells(model.images.size());
+  std::vector<uint32_t> parent(model.images.size());
+  std::iota(parent.begin(), parent.end(), 0);
+  auto root = [&](uint32_t id) {
+    while (parent[id] != id) {
+      parent[id] = parent[parent[id]];
+      id = parent[id];
+    }
+    return id;
+  };
+  std::array<std::array<size_t, 4>, 2> angles{};
+  for (uint64_t id = 0; id < model.points.size(); ++id) {
+    const auto& point = model.points[id];
+    if (point.track.size() < 3 || point.error > 2)
+      continue;
+    bool parallax = false;
+    for (size_t a = 0; a < point.track.size() && !parallax; ++a)
+      for (size_t b = a + 1; b < point.track.size(); ++b) {
+        const auto ra = (point.xyz - model.images[point.track[a].image].pose.Center()).normalized();
+        const auto rb = (point.xyz - model.images[point.track[b].image].pose.Center()).normalized();
+        if (ra.dot(rb) <= std::cos(Pi / 180)) {
+          parallax = true;
+          break;
+        }
+      }
+    if (!parallax)
+      continue;
+    selected.insert(id);
+    for (const auto& o : point.track) {
+      parent[root(o.image)] = root(point.track.front().image);
+      const auto& im = model.images[o.image];
+      const auto& camera = scene.cameras[im.camera];
+      const auto& xy = im.pixels[o.feature];
+      ++observations[o.image];
+      cells[o.image].insert(std::clamp(int(xy.x() / camera.width * 8), 0, 7) +
+                            8 * std::clamp(int(xy.y() / camera.height * 8), 0, 7));
+      const double angle = std::acos(std::clamp(camera.Ray(xy).z(), -1., 1.));
+      ++angles[im.camera][std::clamp(int(angle * 180 / Pi / 20), 0, 3)];
+    }
+  }
+  std::vector<uint32_t> insufficient;
+  bool connected = true;
+  Json per_image = Json::array();
+  for (uint32_t id = 0; id < model.images.size(); ++id)
+    if (model.images[id].registered) {
+      per_image.push_back({{"image_index", id},
+                           {"observations", observations[id]},
+                           {"occupied_cells", cells[id].size()}});
+      if (observations[id] < 32 || cells[id].size() < 8)
+        insufficient.push_back(id);
+      connected = connected && root(id) == root(model.gauge_image);
+    }
+  report = {{"points", selected.size()},
+            {"observations", std::accumulate(observations.begin(), observations.end(), size_t(0))},
+            {"minimum_track_length", 3},
+            {"minimum_angle_degrees", 1},
+            {"maximum_mean_error_px", 2},
+            {"minimum_image_observations", 32},
+            {"minimum_image_cells", 8},
+            {"minimum_supported_angle_bands", 3},
+            {"minimum_observations_per_angle_band", 100},
+            {"image_graph_connected", connected},
+            {"observations_by_angle", angles},
+            {"per_image", per_image},
+            {"insufficient_images", insufficient}};
+  if (!insufficient.empty()) {
+    const auto id = insufficient.front();
+    throw CalibrationCoverageIncomplete(
+        insufficient, "Calibration lacks image coverage: " + scene.images[id].name + " (" +
+                          std::to_string(observations[id]) + " observations, " +
+                          std::to_string(cells[id].size()) + " cells)");
+  }
+  if (!connected)
+    throw std::runtime_error("Calibration track graph is disconnected");
+  for (uint32_t cid = 0; cid < angles.size(); ++cid) {
+    const auto& bins = angles[cid];
+    const bool used = std::any_of(model.images.begin(), model.images.end(), [&](const auto& image) {
+      return image.registered && image.camera == cid;
+    });
+    if (used && std::count_if(bins.begin(), bins.end(), [](size_t n) { return n >= 100; }) < 3)
+      throw std::runtime_error("Calibration needs at least three supported angle bands per lens");
+  }
+  return selected;
+}
 Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report,
                            bool stable_calibration, bool allow_partial) {
   const auto started = Clock::now();
@@ -891,78 +979,50 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   // Growth has already refined focal length and distortion. Calibrate the
   // registered image set once, hold intrinsics while incorporating new tracks,
   // then finish with a strict joint refinement of all parameters.
+  Json calibration_completion = Json::array();
   auto calibrate = [&](int iterations) {
-    std::set<uint64_t> selected;
-    if (stable_calibration) {
+    for (;;) {
       filter();
-      std::vector<size_t> observations(m.images.size());
-      std::vector<std::set<int>> cells(m.images.size());
-      std::vector<uint32_t> parent(m.images.size());
-      std::iota(parent.begin(), parent.end(), 0);
-      auto root = [&](uint32_t id) {
-        while (parent[id] != id) {
-          parent[id] = parent[parent[id]];
-          id = parent[id];
+      calibration_completion.push_back(CompleteUnassignedTracks(m, graph));
+      Json support;
+      std::set<uint64_t> selected;
+      try {
+        selected = CalibrationTracks(scene, m, support);
+      } catch (const CalibrationCoverageIncomplete& missing) {
+        support["used"] = false;
+        calibration_selection.push_back(std::move(support));
+        if (!allow_partial) {
+          save_checkpoint();
+          throw RegistrationIncomplete(missing.images);
         }
-        return id;
-      };
-      std::array<std::array<size_t, 4>, 2> angles{};
-      for (uint64_t id = 0; id < m.points.size(); ++id) {
-        const auto& point = m.points[id];
-        if (point.track.size() < 3 || point.error > 2)
-          continue;
-        bool parallax = false;
-        for (size_t a = 0; a < point.track.size() && !parallax; ++a)
-          for (size_t b = a + 1; b < point.track.size(); ++b) {
-            const auto ra = (point.xyz - m.images[point.track[a].image].pose.Center()).normalized();
-            const auto rb = (point.xyz - m.images[point.track[b].image].pose.Center()).normalized();
-            if (ra.dot(rb) <= std::cos(Pi / 180)) {
-              parallax = true;
-              break;
-            }
-          }
-        if (!parallax)
-          continue;
-        selected.insert(id);
-        for (const auto& o : point.track) {
-          parent[root(o.image)] = root(point.track.front().image);
-          const auto& im = m.images[o.image];
-          const auto& camera = scene.cameras[im.camera];
-          const auto& xy = im.pixels[o.feature];
-          ++observations[o.image];
-          cells[o.image].insert(std::clamp(int(xy.x() / camera.width * 8), 0, 7) +
-                                8 * std::clamp(int(xy.y() / camera.height * 8), 0, 7));
-          const double angle = std::acos(std::clamp(camera.Ray(xy).z(), -1., 1.));
-          ++angles[im.camera][std::clamp(int(angle * 180 / Pi / 20), 0, 3)];
-        }
-      }
-      for (uint32_t id = 0; id < m.images.size(); ++id)
-        if (m.images[id].registered) {
-          if (observations[id] < 32 || cells[id].size() < 8)
-            throw std::runtime_error("Stable calibration lacks image coverage: " +
+        // The usable subset must meet the same calibration limits. Remove
+        // unsupported exposures and all their observations, then check again.
+        for (uint32_t id : missing.images) {
+          if (id == m.gauge_image || id == m.scale_image)
+            throw std::runtime_error("Calibration cannot retain its reference images: " +
                                      scene.images[id].name);
-          if (root(id) != root(m.gauge_image))
-            throw std::runtime_error("Stable calibration track graph is disconnected");
+          m.images[id].registered = false;
+          Log("Omit from final calibration: " + scene.images[id].name +
+              " (insufficient reliable track coverage)");
         }
-      for (uint32_t cid = 0; cid < angles.size(); ++cid) {
-        const auto& bins = angles[cid];
-        const bool used = std::any_of(m.images.begin(), m.images.end(), [&](const auto& image) {
-          return image.registered && image.camera == cid;
-        });
-        if (used && std::count_if(bins.begin(), bins.end(), [](size_t n) { return n >= 100; }) < 3)
-          throw std::runtime_error(
-              "Stable calibration needs at least three supported angle bands per lens");
+        for (auto& point : m.points)
+          point.track.erase(
+              std::remove_if(point.track.begin(), point.track.end(),
+                             [&](const auto& o) { return !m.images[o.image].registered; }),
+              point.track.end());
+        filter();
+        save_checkpoint();
+        continue;
       }
-      calibration_selection.push_back(
-          {{"points", selected.size()},
-           {"observations", std::accumulate(observations.begin(), observations.end(), size_t(0))},
-           {"minimum_track_length", 3},
-           {"minimum_angle_degrees", 1},
-           {"maximum_mean_error_px", 2},
-           {"observations_by_angle", angles}});
+      support["optimization_tracks"] = stable_calibration ? "stable" : "all";
+      support["used"] = true;
+      calibration_selection.push_back(std::move(support));
+      if (!stable_calibration)
+        selected.clear();
+      optimization.push_back(
+          Optimize(m, scene.cameras, "principal", workers, iterations, {}, {}, {}, selected));
+      break;
     }
-    optimization.push_back(
-        Optimize(m, scene.cameras, "principal", workers, iterations, {}, {}, {}, selected));
   };
   calibrate(150);
   for (int round = 0; round < 3; ++round) {
@@ -1010,11 +1070,19 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
               {"color_seconds", Seconds(color_started)}}},
             {"completion", completion},
             {"unassigned_completion", unassigned_completion},
+            {"pre_calibration_completion", calibration_completion},
             {"calibration_tracks", stable_calibration ? "stable" : "all"},
             {"calibration_selection", calibration_selection},
             {"optimization", optimization}};
   if (m.Registered() == m.images.size())
     fs::remove(work / "cache/unregistered.json");
+  else {
+    Json missing = Json::array();
+    for (uint32_t id = 0; id < m.images.size(); ++id)
+      if (!m.images[id].registered)
+        missing.push_back(id);
+    WriteJson(work / "cache/unregistered.json", missing);
+  }
   return m;
 }
 }  // namespace geosun

@@ -135,7 +135,7 @@ __global__ void Classify(const float2* sum, const float* weights, uchar2* classe
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count)
     return;
-  const float reciprocal = 1.f / fmaxf(weights[i], 1e-8f);
+  const float reciprocal = weights[i] > 0 ? 1.f / weights[i] : 0;
   classes[i] = make_uchar2(__fmul_rn(sum[i].x, reciprocal) > .90 ? 255 : 0,
                            __fmul_rn(sum[i].y, reciprocal) > .55 ? 255 : 0);
 }
@@ -158,16 +158,18 @@ __global__ void Morphology(const uchar2* input, uchar2* output, int width, int h
   }
   output[i] = make_uchar2(sky, person);
 }
-__global__ void Composite(const uchar2* classes, const uint8_t* valid, uint8_t* output, int width,
-                          int height, int small_width, int small_height, double sx, double sy) {
+__global__ void Composite(const uchar2* classes, const uint8_t* valid, const float* weights,
+                          uint8_t* output, int width, int height, int small_width, int small_height,
+                          double sx, double sy) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= width * height)
     return;
   const int x = i % width, y = i / width;
   const int xx = min(__double2int_rd(x * sx), small_width - 1),
             yy = min(__double2int_rd(y * sy), small_height - 1);
-  const auto value = classes[yy * small_width + xx];
-  output[i] = valid[i] ? (value.y ? 0 : value.x ? 128 : 255) : 0;
+  const int cell = yy * small_width + xx;
+  const auto value = classes[cell];
+  output[i] = valid[i] && weights[cell] > 0 ? (value.y ? 0 : value.x ? 128 : 255) : 0;
 }
 }  // namespace
 struct ImagePreprocessor::Implementation {
@@ -303,8 +305,9 @@ cv::Mat MaskFusion::Finish() {
   CudaCheck(cudaGetLastError());
   Composite<<<(p.width * p.height + 255) / 256, 256, 0, p.stream>>>(
       static_cast<const uchar2*>(p.morphed.data), static_cast<const uint8_t*>(p.valid.data),
-      static_cast<uint8_t*>(p.output.data), p.width, p.height, p.small_width, p.small_height,
-      double(p.small_width) / p.width, double(p.small_height) / p.height);
+      static_cast<const float*>(p.weight.data), static_cast<uint8_t*>(p.output.data), p.width,
+      p.height, p.small_width, p.small_height, double(p.small_width) / p.width,
+      double(p.small_height) / p.height);
   CudaCheck(cudaGetLastError());
   CudaCheck(cudaMemcpyAsync(p.host.data, p.output.data, p.output.bytes, cudaMemcpyDeviceToHost,
                             p.stream));

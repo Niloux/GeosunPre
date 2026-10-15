@@ -514,7 +514,55 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   Json graph;
   const auto refined_tracks = RefineObservationGraph(scene, model, normals, workers, graph);
   auto precise = model;
-  std::set<uint64_t> training, validation, photo_training;
+  constexpr size_t minimum_validation_observations = 16, minimum_validation_cells = 4;
+  std::set<uint64_t> training, validation, photo_training, photo_validation;
+  std::vector<std::vector<uint64_t>> candidates(model.images.size());
+  std::vector<size_t> validation_counts(model.images.size());
+  std::vector<std::set<int>> validation_cells(model.images.size()),
+      training_cells(model.images.size());
+  auto cell = [&](const Observation& o) {
+    const auto& camera = model.cameras[model.images[o.image].camera];
+    const auto& xy = model.images[o.image].pixels[o.feature];
+    return std::clamp(int(xy.x() / camera.width * 8), 0, 7) +
+           8 * std::clamp(int(xy.y() / camera.height * 8), 0, 7);
+  };
+  auto validation_track = [&](uint64_t id) -> const std::vector<Observation>& {
+    return refined_tracks[id].size() >= 3 ? refined_tracks[id] : model.points[id].track;
+  };
+  auto reserve = [&](uint64_t id) {
+    if (!validation.insert(id).second)
+      return;
+    for (const auto& o : validation_track(id)) {
+      ++validation_counts[o.image];
+      validation_cells[o.image].insert(cell(o));
+    }
+  };
+  for (uint64_t id = 0; id < model.points.size(); ++id) {
+    const auto& point = model.points[id];
+    if (point.track.size() < 3 || point.error > 2)
+      continue;
+    for (const auto& o : validation_track(id))
+      candidates[o.image].push_back(id);
+    if (id % 5 == 0)
+      reserve(id);
+  }
+  // Keep whole tracks out of the camera solve. Ordinary geometric tracks cover
+  // images where the stricter photometric graph could not refine enough patches.
+  for (uint32_t image = 0; image < model.images.size(); ++image)
+    if (model.images[image].registered)
+      for (uint64_t id : candidates[image]) {
+        if (validation_counts[image] >= minimum_validation_observations &&
+            validation_cells[image].size() >= minimum_validation_cells)
+          break;
+        if (validation.count(id))
+          continue;
+        for (const auto& o : validation_track(id))
+          if (o.image == image && (validation_counts[image] < minimum_validation_observations ||
+                                   !validation_cells[image].count(cell(o)))) {
+            reserve(id);
+            break;
+          }
+      }
   std::vector<size_t> coverage(model.images.size());
   std::vector<std::vector<uint8_t>> precise_observations(model.images.size());
   for (uint32_t image = 0; image < model.images.size(); ++image)
@@ -525,49 +573,104 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
       point.track.clear();
       continue;
     }
-    if (id % 5 == 0) {
-      if (refined_tracks[id].size() >= 3) {
-        point.track = refined_tracks[id];
-        validation.insert(id);
-      }
+    if (validation.count(id)) {
+      point.track = validation_track(id);
+      if (refined_tracks[id].size() >= 3)
+        photo_validation.insert(id);
     } else {
       training.insert(id);
       if (refined_tracks[id].size() >= 3)
         photo_training.insert(id);
       for (const auto& o : refined_tracks[id])
         precise_observations[o.image][o.feature] = 1;
-      for (const auto& o : point.track)
+      for (const auto& o : point.track) {
         ++coverage[o.image];
+        training_cells[o.image].insert(cell(o));
+      }
     }
   }
   precise.RebuildReferences();
   auto& report = refined.report;
-  report = {{"method", "cycle-consistent original-image graph with subpixel exposure-aware refinement"},
-                 {"refinement_version", 4}, {"accepted", false},
-                 {"limits", {{"las_support_fraction", limits.support_fraction},
-                             {"las_median_m", limits.median_m}, {"las_p90_m", limits.p90_m}}},
-                 {"pixel_shift_px", graph.at("pixel_shift_px")},
-                 {"training_tracks", training.size()}, {"validation_tracks", validation.size()},
-                 {"photo_training_tracks", photo_training.size()}, {"graph", graph},
-                 {"validation_point_ids", validation}, {"holdout_rule", "all point IDs divisible by five excluded from camera optimization"},
-                 {"training_observations_per_image", coverage}, {"surface_constraints", planes.size()}};
-  if (training.size() < 200 || validation.size() < 50) {
-    report["reason"] = "insufficient unambiguous multi-view photometric tracks";
-    report["failed_checks"] = {"photometric_support"};
-    report["structure_filter"] = {{"used", false}, {"reason", "photometric support insufficient"}};
+  Json image_coverage = Json::array(), insufficient = Json::array();
+  for (uint32_t image = 0; image < model.images.size(); ++image)
+    if (model.images[image].registered) {
+      const bool enough = validation_counts[image] >= minimum_validation_observations &&
+                          validation_cells[image].size() >= minimum_validation_cells &&
+                          coverage[image] >= 16 && training_cells[image].size() >= 4;
+      image_coverage.push_back({{"image_index", image},
+                                {"name", scene.images[image].name},
+                                {"validation_observations", validation_counts[image]},
+                                {"validation_cells", validation_cells[image].size()},
+                                {"training_observations", coverage[image]},
+                                {"training_cells", training_cells[image].size()},
+                                {"passed", enough}});
+      if (!enough)
+        insufficient.push_back(image);
+    }
+  report = {
+      {"method", "cycle-consistent original-image graph with subpixel exposure-aware refinement"},
+      {"refinement_version", 6},
+      {"accepted", false},
+      {"optimization_reference",
+       {{"coarse_observations", "accepted source projections"},
+        {"surface_constraints", "normal displacement from accepted source points"},
+        {"reprojection_loss", "shared Huber 2 px"}}},
+      {"limits",
+       {{"las_support_fraction", limits.support_fraction},
+        {"las_median_m", limits.median_m},
+        {"las_p90_m", limits.p90_m}}},
+      {"pixel_shift_px", graph.at("pixel_shift_px")},
+      {"training_tracks", training.size()},
+      {"validation_tracks", validation.size()},
+      {"photo_training_tracks", photo_training.size()},
+      {"photo_validation_tracks", photo_validation.size()},
+      {"geometric_validation_tracks", validation.size() - photo_validation.size()},
+      {"graph", graph},
+      {"validation_point_ids", validation},
+      {"holdout_rule",
+       "whole tracks with IDs divisible by five plus deterministic image-coverage supplements "
+       "excluded from camera optimization"},
+      {"validation_coverage",
+       {{"passed", insufficient.empty()},
+        {"per_image", image_coverage},
+        {"insufficient_images", insufficient},
+        {"grid_columns", 8},
+        {"grid_rows", 8},
+        {"minimum_validation_observations", minimum_validation_observations},
+        {"minimum_validation_cells", minimum_validation_cells},
+        {"minimum_training_observations", 16},
+        {"minimum_training_cells", 4}}},
+      {"training_observations_per_image", coverage},
+      {"surface_constraints", planes.size()}};
+  if (training.size() < 200 || photo_validation.size() < 50 || !insufficient.empty()) {
+    report["reason"] = insufficient.empty()
+                           ? "insufficient unambiguous multi-view photometric tracks"
+                           : "insufficient training or held-out image coverage";
+    report["failed_checks"] = {insufficient.empty() ? "photometric_support"
+                                                    : "validation_coverage"};
+    report["structure_filter"] = {{"used", false}, {"reason", "refinement support insufficient"}};
     report["seconds"] = Seconds(started);
     return refined;
   }
   const auto validation_before = PointErrors(precise, validation);
+  const auto photo_validation_before = PointErrors(precise, photo_validation, false);
   std::vector<PlaneConstraint> training_planes;
   for (const auto& plane : planes)
-    if (training.count(plane.point))
+    if (training.count(plane.point)) {
       training_planes.push_back(plane);
+      // Alignment already accepted the LAS fit. Preserve its normal offset
+      // during image refinement rather than pulling every point to zero error.
+      training_planes.back().center = source.points[plane.point].xyz;
+    }
   report["validation_before_px"] = validation_before;
-  report["optimization"] = Optimize(precise, scene.cameras, "principal", workers, 150, {},
-                                     training_planes, NavigationPositions(scene), training, precise_observations);
+  report["photo_validation_before_px"] = photo_validation_before;
+  report["optimization"] =
+      Optimize(precise, scene.cameras, "principal", workers, 150, {}, training_planes,
+               NavigationPositions(scene), training, precise_observations, &source);
   const auto validation_after = PointErrors(precise, validation);
+  const auto photo_validation_after = PointErrors(precise, photo_validation, false);
   report["validation_after_px"] = validation_after;
+  report["photo_validation_after_px"] = photo_validation_after;
   Json unvalidated = Json::array(), image_names = Json::object();
   for (uint32_t image = 0; image < model.images.size(); ++image)
     if (model.images[image].registered) {
@@ -577,11 +680,40 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
         unvalidated.push_back(image);
     }
   report["image_names"] = std::move(image_names);
-  report["validation_coverage"] = {
-      {"registered_images", model.Registered()},
-      {"images_with_holdout", validation_after.at("per_image").size()},
-      {"images_without_holdout", unvalidated},
-      {"scope", "global acceptance does not certify images or cells without held-out observations"}};
+  auto& validation_coverage = report["validation_coverage"];
+  validation_coverage["registered_images"] = model.Registered();
+  validation_coverage["images_with_holdout"] = validation_after.at("per_image").size();
+  validation_coverage["images_without_holdout"] = unvalidated;
+  validation_coverage["scope"] =
+      "internal retriangulated consistency, not independent metric accuracy";
+  Json degraded_images = Json::array(), degraded_cells = Json::array();
+  auto stable_errors = [](const Json& before, const Json& after) {
+    return after.at("median").get<double>() <= before.at("median").get<double>() * 1.1 + .1 &&
+           after.at("p90").get<double>() <= before.at("p90").get<double>() * 1.1 + .1;
+  };
+  for (const auto& [image, before] : validation_before.at("per_image").items()) {
+    const auto& after = validation_after.at("per_image").at(image);
+    if (!stable_errors(before, after))
+      degraded_images.push_back({{"image_index", std::stoul(image)},
+                                 {"before_median", before.at("median")},
+                                 {"after_median", after.at("median")},
+                                 {"before_p90", before.at("p90")},
+                                 {"after_p90", after.at("p90")}});
+    for (const auto& [cell_id, samples] : before.at("cells").items())
+      if (samples.at("count").get<size_t>() >= 8 &&
+          !stable_errors(samples, after.at("cells").at(cell_id)))
+        degraded_cells.push_back({{"image_index", std::stoul(image)},
+                                  {"cell", std::stoul(cell_id)},
+                                  {"samples", samples.at("count")},
+                                  {"before_median", samples.at("median")},
+                                  {"after_median", after.at("cells").at(cell_id).at("median")},
+                                  {"before_p90", samples.at("p90")},
+                                  {"after_p90", after.at("cells").at(cell_id).at("p90")}});
+  }
+  report["degraded_validation_images"] = degraded_images;
+  report["degraded_validation_cells"] = degraded_cells;
+  report["validation_error_limits"] = {
+      {"relative_increase", 1.1}, {"absolute_increase_px", .1}, {"minimum_cell_samples", 8}};
   report["training_error_px"] = PointErrors(precise, training, false);
   const auto plane_before = PlaneErrors(source, planes);
   model.cameras = precise.cameras;
@@ -617,16 +749,21 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   const bool surface_fit = planes.empty() ||
       report.at("plane_after_m").at("p90").get<double>() <=
           plane_before.at("p90").get<double>() * 1.25 + .01;
-  report["checks"] = {{"visual_acceptance", quality.at("passed")},
-                       {"held_out_improvement", validation_after.at("median").get<double>() <
-                                                  validation_before.at("median").get<double>() &&
-                                                validation_after.at("p90").get<double>() <
-                                                  validation_before.at("p90").get<double>()},
-                       {"full_reprojection", quality.at("reprojection_px").at("p90").is_number() &&
-                                                quality.at("reprojection_px").at("p90").get<double>() <=
-                                                previous_p90 * 1.1 + .1},
-                       {"surface_fit", surface_fit},
-                       {"registered_images_preserved", model.Registered() == source.Registered()}};
+  report["checks"] = {
+      {"visual_acceptance", quality.at("passed")},
+      {"held_out_improvement", photo_validation_after.at("median").get<double>() <
+                                       photo_validation_before.at("median").get<double>() &&
+                                   photo_validation_after.at("p90").get<double>() <
+                                       photo_validation_before.at("p90").get<double>()},
+      {"validation_coverage", insufficient.empty() && unvalidated.empty()},
+      {"held_out_reprojection", stable_errors(validation_before, validation_after)},
+      {"per_image_validation", degraded_images.empty()},
+      {"per_cell_validation", degraded_cells.empty()},
+      {"full_reprojection",
+       quality.at("reprojection_px").at("p90").is_number() &&
+           quality.at("reprojection_px").at("p90").get<double>() <= previous_p90 * 1.1 + .1},
+      {"surface_fit", surface_fit},
+      {"registered_images_preserved", model.Registered() == source.Registered()}};
   report["failed_checks"] = FailedChecks(report.at("checks"));
   refined.accepted = report.at("failed_checks").empty();
   report["accepted"] = refined.accepted;
@@ -634,7 +771,7 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   report["reason"] = refined.accepted ? "accepted" : "photometric candidate failed acceptance";
   if (refined.accepted && planes.size() >= 200) {
     Reconstruction cleaned = model;
-    auto filtering = FilterRefinementStructure(scene, cleaned, limits);
+    auto filtering = FilterRefinementStructure(scene, cleaned, limits, workers);
     const auto cleaned_quality = cleaned.Quality(scene, limits.median_px, limits.p90_px);
     filtering["coverage"] = StructureCoverage(model, cleaned, planes);
     std::vector<PlaneConstraint> retained_planes;
@@ -728,12 +865,15 @@ void RefinePhotometric(const Arguments& args) {
   WriteJson(output / "cache/refinement.json", refinement.report);
   WriteJson(output / "scene.json", scene.ToJson());
   WriteJson(output / "result.json", result);
+  const std::array<cv::Mat, 2> domains{MaskDomain(scene.cameras[0]), MaskDomain(scene.cameras[1])};
   for (const auto& image : scene.images) {
     if (!selected.images[image.id].registered)
       continue;
     const auto mask = MaskPath(output, image.id);
     fs::create_directories(mask.parent_path());
-    fs::copy_file(MaskPath(source, image.id), mask);
+    auto pixels = ReadImage(MaskPath(source, image.id), cv::IMREAD_GRAYSCALE);
+    pixels.setTo(0, domains[image.camera] == 0);
+    WriteImage(mask, pixels);
   }
   ExportBundle(scene, selected, output, output / "colmap", true, .05, result);
   Log("Photometric refinement " + refinement.report.at("reason").get<std::string>());

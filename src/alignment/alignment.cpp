@@ -426,6 +426,84 @@ double FixedCameraPositionSigma(const Reconstruction& model, const ModelPoint& p
   const auto eigen = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(information).eigenvalues().eval();
   return std::max(.5, point.error) / std::sqrt(std::max(eigen[0], 1e-18));
 }
+std::vector<double> LasSupportDistances(const Scene& scene, const Reconstruction& model,
+                                        const LasHeader& header, double maximum, int workers,
+                                        Json& report) {
+  const auto started = Clock::now();
+  const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
+  Json sampling;
+  Surface sample;
+  sample.points = SampleLas(scene.las, header, sampling);
+  for (auto& point : sample.points)
+    point -= origin;
+  sample.Index();
+  std::vector<double> distances(model.points.size(), INFINITY);
+  std::vector<uint64_t> unresolved;
+  for (uint64_t id = 0; id < model.points.size(); ++id) {
+    if (model.points[id].track.empty())
+      continue;
+    const Eigen::Vector3d local = model.points[id].xyz - origin;
+    size_t nearest;
+    double squared;
+    sample.tree->knnSearch(local.data(), 1, &nearest, &squared);
+    distances[id] = std::sqrt(squared);
+    if (distances[id] > maximum)
+      unresolved.push_back(id);
+  }
+  const size_t rechecked = unresolved.size();
+  // A missing neighbour in the bounded sample is not evidence of missing LAS
+  // support. Recheck only those points against every valid record, one chunk
+  // at a time, before removing them. No plane assumption is made here.
+  if (!unresolved.empty()) {
+    sample.tree.reset();
+    sample.points.clear();
+    ScanLas(scene.las, header, [&](uint64_t, const std::vector<LasPoint>& records) {
+      if (unresolved.empty())
+        return;
+      Surface chunk;
+      Eigen::Vector3d lower = Eigen::Vector3d::Constant(INFINITY), upper = -lower;
+      chunk.points.reserve(records.size());
+      for (const auto& record : records)
+        if (KeepLasPoint(record)) {
+          const Eigen::Vector3d xyz = LasCoordinates(header, record) - origin;
+          chunk.points.push_back(xyz);
+          lower = lower.cwiseMin(xyz);
+          upper = upper.cwiseMax(xyz);
+        }
+      if (chunk.points.empty())
+        return;
+      std::vector<uint64_t> nearby;
+      for (uint64_t id : unresolved) {
+        const Eigen::Vector3d xyz = model.points[id].xyz - origin;
+        if ((xyz.array() >= lower.array() - maximum).all() &&
+            (xyz.array() <= upper.array() + maximum).all())
+          nearby.push_back(id);
+      }
+      if (nearby.empty())
+        return;
+      chunk.Index();
+      Parallel(nearby.size(), workers, [&](size_t index) {
+        const uint64_t id = nearby[index];
+        const Eigen::Vector3d xyz = model.points[id].xyz - origin;
+        size_t nearest;
+        double squared;
+        chunk.tree->knnSearch(xyz.data(), 1, &nearest, &squared);
+        distances[id] = std::min(distances[id], std::sqrt(squared));
+      });
+      unresolved.erase(std::remove_if(unresolved.begin(), unresolved.end(),
+                                      [&](uint64_t id) { return distances[id] <= maximum; }),
+                       unresolved.end());
+    });
+  }
+  report = {{"sample", sampling},
+            {"rechecked_against_full_las", rechecked},
+            {"rescued_from_sample_gaps", rechecked - unresolved.size()},
+            {"unsupported_after_full_scan", unresolved.size()},
+            {"distance_scope",
+             "distance to a searched valid LAS record; upper bound on full-cloud nearest distance"},
+            {"seconds", Seconds(started)}};
+  return distances;
+}
 }  // namespace
 std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstruction& model,
                                             int workers) {
@@ -453,7 +531,7 @@ std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstr
   return planes;
 }
 Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
-                               const AlignmentLimits& limits) {
+                               const AlignmentLimits& limits, int workers) {
   // Camera refinement requires >=3 views; reliable two-view points can still
   // seed 3DGS when parallax, depth precision and LAS support pass.
   constexpr size_t minimum_track_length = 2;
@@ -462,18 +540,10 @@ Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
   const double max_error = std::min(3., limits.p90_px),
                max_sigma = std::max(.5 * limits.median_m, 3 * header.scale.maxCoeff()),
                max_distance = std::max(limits.median_m, 3 * header.scale.maxCoeff());
-  const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
-  Json sampling;
-  Surface target;
-  target.points = SampleLas(scene.las, header, sampling);
-  for (auto& p : target.points)
-    p -= origin;
-  target.Index();
   size_t before = 0, short_tracks = 0, uncertain = 0, unsupported = 0, retained = 0;
   for (const auto& p : model.points)
     before += !p.track.empty();
   model.Filter(max_error, minimum_parallax_degrees);
-  std::vector<double> distances, uncertainty;
   for (auto& point : model.points) {
     if (point.track.empty())
       continue;
@@ -488,18 +558,21 @@ Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
       ++uncertain;
       continue;
     }
-    const Eigen::Vector3d local = point.xyz - origin;
-    size_t nearest;
-    double squared;
-    target.tree->knnSearch(local.data(), 1, &nearest, &squared);
-    if (squared > max_distance * max_distance) {
+  }
+  Json support;
+  auto support_distances =
+      LasSupportDistances(scene, model, header, max_distance, workers, support);
+  Json support_passes = Json::array({support});
+  for (uint64_t id = 0; id < model.points.size(); ++id) {
+    auto& point = model.points[id];
+    if (point.track.empty())
+      continue;
+    if (support_distances[id] > max_distance) {
       point.track.clear();
       ++unsupported;
       continue;
     }
     ++retained;
-    distances.push_back(std::sqrt(squared));
-    uncertainty.push_back(sigma);
   }
   const size_t initially_retained = retained;
   Json removed_images = Json::array();
@@ -541,37 +614,45 @@ Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
     }
     model.Filter(max_error, minimum_parallax_degrees);
   }
-  distances.clear();
-  uncertainty.clear();
+  std::vector<double> distances, uncertainty;
   retained = 0;
-  for (auto& point : model.points) {
+  if (!removed_images.empty()) {
+    support_distances = LasSupportDistances(scene, model, header, max_distance, workers, support);
+    support_passes.push_back(support);
+  }
+  for (uint64_t id = 0; id < model.points.size(); ++id) {
+    auto& point = model.points[id];
     if (point.track.empty())
       continue;
     const double sigma = FixedCameraPositionSigma(model, point);
-    const Eigen::Vector3d local = point.xyz - origin;
-    size_t nearest;
-    double squared;
-    target.tree->knnSearch(local.data(), 1, &nearest, &squared);
     if (point.track.size() < minimum_track_length || sigma > max_sigma ||
-        squared > max_distance * max_distance) {
+        support_distances[id] > max_distance) {
       point.track.clear();
       continue;
     }
     ++retained;
-    distances.push_back(std::sqrt(squared));
+    distances.push_back(support_distances[id]);
     uncertainty.push_back(sigma);
   }
   model.RebuildReferences();
-  return {{"points_before", before}, {"points_after", retained},
-          {"removed_reprojection_or_parallax", before - initially_retained - short_tracks - uncertain - unsupported},
-          {"removed_short_tracks", short_tracks}, {"removed_uncertain_depth", uncertain},
-          {"removed_las_unsupported", unsupported}, {"removed_with_weak_images", initially_retained - retained},
-          {"removed_images", removed_images}, {"nearest_las_m", Statistics(distances)},
+  return {{"points_before", before},
+          {"points_after", retained},
+          {"removed_reprojection_or_parallax",
+           before - initially_retained - short_tracks - uncertain - unsupported},
+          {"removed_short_tracks", short_tracks},
+          {"removed_uncertain_depth", uncertain},
+          {"removed_las_unsupported", unsupported},
+          {"removed_with_weak_images", initially_retained - retained},
+          {"removed_images", removed_images},
+          {"nearest_las_m", Statistics(distances)},
+          {"las_support_passes", support_passes},
           {"fixed_camera_position_sigma_proxy_m", Statistics(uncertainty)},
-          {"limits", {{"minimum_track_length", minimum_track_length},
-                      {"minimum_parallax_degrees", minimum_parallax_degrees},
-                      {"maximum_reprojection_px", max_error}, {"maximum_sigma_proxy_m", max_sigma},
-                      {"maximum_nearest_las_m", max_distance}}}};
+          {"limits",
+           {{"minimum_track_length", minimum_track_length},
+            {"minimum_parallax_degrees", minimum_parallax_degrees},
+            {"maximum_reprojection_px", max_error},
+            {"maximum_sigma_proxy_m", max_sigma},
+            {"maximum_nearest_las_m", max_distance}}}};
 }
 Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits) {
   const auto header = ReadLasHeader(scene.las);
