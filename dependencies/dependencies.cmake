@@ -24,7 +24,7 @@ FetchContent_Declare(ceres URL https://codeload.github.com/ceres-solver/ceres-so
 FetchContent_MakeAvailable(ceres)
 include("${CMAKE_CURRENT_LIST_DIR}/ceres-schur.cmake")
 if(MSVC)
-  target_compile_options(ceres PRIVATE /utf-8 /MP8)
+  target_compile_options(ceres PRIVATE /utf-8)
 endif()
 FetchContent_Declare(json URL https://codeload.github.com/nlohmann/json/tar.gz/refs/tags/v3.12.0
   URL_HASH SHA512=6CC1E86261F8FAC21CC17A33DA3B6B3C3CD5C116755651642AF3C9E99BB3538FD42C1BD50397A77C8FB6821BC62D90E6B91BCDDE77A78F58F2416C62FC53B97D)

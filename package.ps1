@@ -16,8 +16,8 @@ if (Test-Path -LiteralPath $pending) { throw 'Unfinished package exists. Choose 
 New-Item -ItemType Directory -Path $pending | Out-Null
 $published = $destination
 $destination = $pending
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build\bin\Release\geosunpre.exe') -Destination $destination
-Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'build\bin\Release') -Filter '*.dll' | Copy-Item -Destination $destination
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build\ninja\bin\geosunpre.exe') -Destination $destination
+Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'build\ninja\bin') -Filter '*.dll' | Copy-Item -Destination $destination
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs\deployment.md') -Destination (Join-Path $destination 'README.md')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs') -Destination $destination -Recurse
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'dependencies\licenses') -Destination $destination -Recurse

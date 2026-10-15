@@ -1,4 +1,5 @@
 #include "app/pipeline.h"
+#include "app/build_info.h"
 #include "io/colmap.h"
 #include "io/las.h"
 #include "frontend/inference.h"
@@ -46,8 +47,7 @@ int Main(const std::vector<std::string>& argv) {
                        .dump(2)
                 << '\n';
     } else if (args.command == "help" || args.command == "--help") {
-      std::cout << "GeosunPre " GEOSUN_VERSION
-                   " - native dual-fisheye/LAS reconstruction\n"
+      std::cout << "GeosunPre " << BuildVersion << " - native dual-fisheye/LAS reconstruction\n"
                    "  geosunpre run --input INPUT --work WORK [--models MODELS] [--config JSON]\n"
                    "  geosunpre run --work WORK [--stage "
                    "prepare|masks|features|matches|sfm|align|refine|export]\n"

@@ -1,9 +1,10 @@
 {
   "version": 5,
   "configurePresets": [{
-    "name": "windows", "generator": "Visual Studio 17 2022", "architecture": "x64",
-    "binaryDir": "${sourceDir}/build",
-    "cacheVariables": {"CMAKE_POLICY_VERSION_MINIMUM": "3.5", "CMAKE_CUDA_ARCHITECTURES": "native"}
+    "name": "windows", "generator": "Ninja",
+    "binaryDir": "${sourceDir}/build/ninja",
+    "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "CMAKE_C_COMPILER": "cl", "CMAKE_CXX_COMPILER": "cl",
+      "CMAKE_POLICY_VERSION_MINIMUM": "3.5", "CMAKE_CUDA_ARCHITECTURES": "native"}
   }],
-  "buildPresets": [{"name": "release", "configurePreset": "windows", "configuration": "Release", "jobs": 8}]
+  "buildPresets": [{"name": "release", "configurePreset": "windows", "jobs": 8}]
 }

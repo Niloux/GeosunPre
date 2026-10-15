@@ -4,7 +4,7 @@
 
 ## 开始使用
 
-在 Windows x64 上安装 Visual Studio 2022 C++ 桌面工具链、Windows SDK、CUDA Toolkit 12.8、CMake 3.24 以上，然后在项目根目录执行：
+在 Windows x64 上安装 Visual Studio 2022 C++ 桌面工具链及 CMake 工具、Windows SDK、CUDA Toolkit 12.8、CMake 3.24 以上，然后在项目根目录的普通 PowerShell 中执行：
 
 ```powershell
 .\build.ps1
@@ -16,11 +16,13 @@
 
 | 步骤 | 默认行为 |
 | --- | --- |
-| `build.ps1` | 编译 Release 程序到 `build/bin/Release/geosunpre.exe`，自动应用 Ceres Schur 回代修复 |
+| `build.ps1` | 使用 Ninja 编译 Release 程序到 `build/ninja/bin/geosunpre.exe`，自动应用 Ceres Schur 回代修复 |
 | `prepare-models.ps1` | 为 GPU 0 准备 `models/`，匹配器默认 FP16，检测器支持动态宽高 |
 | `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准、原图精修及 COLMAP/PLY 导出 |
 
-首次构建下载固定依赖到 `build/_deps/`；首次准备模型下载转换工具和固定权重到 `.cache/model-prepare/`，需要联网及数 GB 下载空间。此后复用缓存。模型准备使用独立 Python 环境，运行程序与独立运行包使用 C++/CUDA/TensorRT。
+构建统一使用单配置 Ninja Release。脚本自动加载 x64 MSVC 环境，优先使用 PATH 中的 Ninja，否则使用 Visual Studio 自带的 Ninja。首次构建下载固定依赖到 `build/ninja/_deps/` 并编译，此后复用缓存。日常构建只编译变化影响到的文件，CMake 文件变化由 Ninja 自动重新配置；修改 preset 后自动重新配置，也可用 `build.ps1 -Configure` 显式重新配置，`-Jobs` 控制并行数（默认 8）。构建版本与时间单独生成，不会使全部源码因时间变化而重编。
+
+首次准备模型下载转换工具和固定权重到 `.cache/model-prepare/`，需要联网及数 GB 下载空间。此后复用缓存。模型准备使用独立 Python 环境，运行程序与独立运行包使用 C++/CUDA/TensorRT。
 
 ## 日常运行
 
@@ -65,7 +67,7 @@ SfM 默认不自动补匹配；首次停滞时，对已注册部分完成优化�
 
 最终所选模型在 `cache/refined.bin`，精修前模型在 `cache/aligned.bin`。独立精修的新交付在新目录的 `colmap/`；原始输入、工作目录及已有训练结果保持原样。独立精修目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 11，旧版工作目录继续保留；使用默认新流程时另建工作目录。
 
-`run.ps1` 固定启动 `build/bin/Release/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
+`run.ps1` 固定启动 `build/ninja/bin/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
 
 ## 模型与工作目录
 

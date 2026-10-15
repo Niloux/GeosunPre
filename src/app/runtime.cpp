@@ -1,4 +1,5 @@
 #include "app/runtime.h"
+#include "app/build_info.h"
 #include <iostream>
 
 #include <algorithm>
@@ -49,9 +50,9 @@ fs::path DefaultModels() {
   return ExecutablePath().parent_path() / "models";
 }
 Json BuildInfo() {
-  return {{"version", GEOSUN_VERSION},
-          {"revision", GEOSUN_REVISION},
-          {"built_utc", GEOSUN_BUILD_TIME},
+  return {{"version", std::string(BuildVersion)},
+          {"revision", std::string(BuildRevision)},
+          {"built_utc", std::string(BuildTime)},
           {"pipeline_version", PipelineVersion},
           {"executable", ExecutablePath().u8string()}};
 }
