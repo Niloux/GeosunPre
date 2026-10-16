@@ -255,11 +255,14 @@ Reconstruction ReadColmap(const fs::path& path, Scene& scene) {
 }
 }  // namespace
 void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::path& work,
-                  const fs::path& output, bool include_ply, double voxel, const Json& report) {
-  const Json request = {{"scene_file", FileMetadata(work / "scene.json")},
-                        {"model_file", FileMetadata(SelectedModelPath(work, report))},
-                        {"include_ply", include_ply},
-                        {"voxel", voxel}};
+                  const fs::path& output, bool include_ply, double voxel, const Json& report,
+                  const SupervisionOptions& options) {
+  Json request = {{"scene_file", FileMetadata(work / "scene.json")},
+                  {"model_file", FileMetadata(SelectedModelPath(work, report))},
+                  {"include_ply", include_ply},
+                  {"voxel", voxel}};
+  if (options.enabled)
+    request["supervision"] = SupervisionRequest(scene, model, work, options);
   if (fs::exists(output)) {
     if (!fs::is_regular_file(output / "manifest.json") ||
         ReadJson(output / "manifest.json").at("request") != request)
@@ -296,6 +299,11 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
   Json initialization = nullptr;
   if (include_ply)
     initialization = ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);
+  Json supervision = nullptr;
+  if (options.enabled) {
+    supervision = ExportLasSupervision(scene, model, work, pending, options);
+    WriteJson(pending / "supervision.json", supervision);
+  }
   const auto registration = model.Registration(scene);
   auto quality = report.at("quality");
   quality["registration"] = registration;
@@ -305,12 +313,15 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
   Json sizes = Json::object();
   for (const auto* file : {"cameras.bin", "images.bin", "points3D.bin", "rigs.bin", "frames.bin"})
     sizes[file] = fs::file_size(pending / "sparse/0" / file);
-  WriteJson(pending / "manifest.json", {{"version", 1},
-                                        {"request", request},
-                                        {"registration", registration},
-                                        {"images", photos},
-                                        {"model_files", sizes},
-                                        {"initialization", initialization}});
+  Json manifest = {{"version", 1},
+                   {"request", request},
+                   {"registration", registration},
+                   {"images", photos},
+                   {"model_files", sizes},
+                   {"initialization", initialization}};
+  if (options.enabled)
+    manifest["supervision"] = supervision;
+  WriteJson(pending / "manifest.json", manifest);
   CheckBundle(pending);
   fs::rename(pending, output);
 }
@@ -345,6 +356,12 @@ Json CheckBundle(const fs::path& output) {
   }
   if (!manifest.at("initialization").is_null())
     VerifyInitializationPly(sparse / "points3D.ply", manifest.at("initialization").at("points"));
+  if (manifest.contains("supervision")) {
+    if (ReadJson(output / "supervision.json") != manifest.at("supervision") ||
+        manifest.at("supervision").at("request") != manifest.at("request").at("supervision"))
+      throw std::runtime_error("LAS supervision manifest differs");
+    CheckLasSupervision(output, model, manifest.at("images"), manifest.at("supervision"));
+  }
   const auto saved = ReadJson(output / "quality.json");
   const auto registration = manifest.value("registration", model.Registration(scene));
   if (manifest.contains("registration") &&
@@ -358,10 +375,17 @@ Json CheckBundle(const fs::path& output) {
       model.Quality(scene, saved.at("limits").at("median_px"), saved.at("limits").at("p90_px"));
   if (!saved.at("passed").get<bool>() || !quality.at("passed").get<bool>())
     throw std::runtime_error("Bundle geometry failed acceptance");
-  return {{"passed", true},
+  Json checked = {{"passed", true},
           {"registration", registration},
           {"images", model.Registered()},
           {"points", quality.at("points")},
           {"observations", quality.at("observations")}};
+  if (manifest.contains("supervision")) {
+    const auto& supervision = manifest.at("supervision");
+    checked["supervision"] = {{"images", supervision.at("images").size()},
+                               {"depth_pixels", supervision.at("depth_pixels")},
+                               {"normal_pixels", supervision.at("normal_pixels")}};
+  }
+  return checked;
 }
 }  // namespace geosun

@@ -875,7 +875,7 @@ void RefinePhotometric(const Arguments& args) {
     pixels.setTo(0, domains[image.camera] == 0);
     WriteImage(mask, pixels);
   }
-  ExportBundle(scene, selected, output, output / "colmap", true, .05, result);
+  ExportBundle(scene, selected, output, output / "colmap", true, .05, result, {});
   Log("Photometric refinement " + refinement.report.at("reason").get<std::string>());
   std::cout << Json({{"work", output.u8string()}, {"accepted", refinement.accepted},
                      {"reason", refinement.report.at("reason")}}).dump(2) << '\n';

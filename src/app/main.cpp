@@ -53,6 +53,8 @@ int Main(const std::vector<std::string>& argv) {
                    "prepare|masks|features|matches|sfm|align|refine|export]\n"
                    "  geosunpre prepare --input INPUT --work WORK\n"
                    "  geosunpre export --work WORK [--output DIR] [--no-ply] [--ply-voxel METRES]\n"
+                   "    [--las-supervision] [--supervision-max-size PIXELS] [--supervision-boundary PIXELS]\n"
+                   "    [--supervision-mask-dir DIR]\n"
                    "  geosunpre refine --work WORK --output NEW_WORK [--workers N]\n"
                    "  geosunpre check --output DIR\n"
                    "  geosunpre info\n"

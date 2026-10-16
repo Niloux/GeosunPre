@@ -36,6 +36,24 @@
 
 默认交付 `WORK/colmap/`，包含原图、掩码、鱼眼 COLMAP 模型和 5 cm LAS 初始化 PLY。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长。完整结构见[输出约定](docs/output.md)。
 
+可选 `--las-supervision` 从原始有效 LAS 给已注册照片生成 Spirula 可读取的深度和法向图。已有工作目录可以直接导出到新目录，无需重跑重建：
+
+```powershell
+.\run.ps1 export --work "work/场景" --output "work/场景-supervised" --las-supervision
+```
+
+默认最长边 1600 px，深度为沿视线距离的 16 位毫米 PNG，法向使用 OpenCV 相机坐标并朝向相机。`--supervision-max-size` 调整最长边（128–4096），`--supervision-boundary` 设置屏蔽边界宽度（默认 6 个深度图像素，1–32）。只有静态区域内、具有可靠局部几何且非掠视角的像素参与监督；无效深度为 0，无效法向为黑色，原照片及 RGB 掩码保持不变。
+
+几何过滤不识别玻璃材质。可用 `--supervision-mask-dir DIR` 追加仅影响几何的排除掩码：按 `DIR/{L,R}/**.JPG.png` 保存原图尺寸灰度 PNG，仅 255 保留；未提供文件的照片沿用原静态区域。不同排除掩码使用新交付目录。
+
+Spirula 直接读取交付包的 `depths/`、`normals/`。训练时显式设置 `input_depth_is_ray_depth=true` 并开启相应监督权重；现有深度相关性损失约束形状，不是绝对米制深度拟合。`supervision.json` 记录每图有效像素、生成参数及文件身份，`check` 会回读监督图。
+
+在 Spirula 目录中可从较小权重开始试训，并与关闭监督的相同设置对照评估：
+
+```powershell
+.\build_vulkan\spirula.exe train 3dgs --data "交付目录" --primitive 3dgut --mask-mode segment_and_ignore --input-depth-is-ray-depth 1 --depth-supervision-weight 0.01 --normal-supervision-weight 0.002 --use-bilateral-grid-for-geometry 0
+```
+
 阶段为 `prepare → masks → features → matches → sfm → align → refine → export`。`run --work WORK` 复用已完成阶段并恢复检查点；`run --work WORK --stage 阶段` 单独执行指定阶段，须先完成前置阶段。`prepare` 检查真实输入、相机和导航转换，不加载模型。
 
 | 阶段 | 主要工作 | 主要产物 |

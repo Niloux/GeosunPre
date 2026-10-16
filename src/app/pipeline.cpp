@@ -109,7 +109,9 @@ void Verify(const fs::path& work, const Json& files) {
 }  // namespace
 void Run(const Arguments& args) {
   args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
-                 "--no-ply", "--ply-voxel"});
+                 "--no-ply", "--ply-voxel", "--las-supervision", "--supervision-max-size",
+                 "--supervision-boundary", "--supervision-mask-dir"});
+  const auto supervision = ParseSupervisionOptions(args);
   const auto work = args.Get("--work").empty()
                         ? fs::absolute(fs::path("work") / args.Path("--input").filename())
                         : args.Path("--work");
@@ -198,7 +200,7 @@ void Run(const Arguments& args) {
         if (stage == "export") {
           const auto result = ReadJson(work / "result.json");
           ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, ply, voxel,
-                       result);
+                       result, supervision);
         }
         Log("Reused " + stage);
         continue;
@@ -304,7 +306,8 @@ void Run(const Arguments& args) {
                     work / "cache/refinement.json", work / "result.json"};
       } else {
         const auto result = ReadJson(work / "result.json");
-        ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, ply, voxel, result);
+        ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, ply, voxel, result,
+                     supervision);
         products = {output / "manifest.json"};
       }
       state["stages"][stage] = {{"seconds", Seconds(begin)}, {"files", Inventory(work, products)}};
@@ -330,7 +333,9 @@ void Run(const Arguments& args) {
             << '\n';
 }
 void Export(const Arguments& args) {
-  args.Validate({"--work", "--output", "--no-ply", "--ply-voxel"});
+  args.Validate({"--work", "--output", "--no-ply", "--ply-voxel", "--las-supervision",
+                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir"});
+  const auto supervision = ParseSupervisionOptions(args);
   const auto work = args.Path("--work");
   Lock lock(work);
   if (fs::exists(work / "state.json")) {
@@ -348,7 +353,7 @@ void Export(const Arguments& args) {
   if (Contains(scene.input, output) || Contains(output, scene.input))
     throw std::runtime_error("Output must be separate from input");
   ExportBundle(scene, model, work, output, args.Get("--no-ply") != "true",
-               args.Number("--ply-voxel", .05), result);
+               args.Number("--ply-voxel", .05), result, supervision);
   std::cout << CheckBundle(output).dump() << '\n';
 }
 }  // namespace geosun
