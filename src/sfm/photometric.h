@@ -8,8 +8,5 @@ struct PhotometricRefinement {
   bool accepted = false;
 };
 PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction& source,
-                                      int workers, const AlignmentLimits& limits);
-Json RefinementResult(const Scene& scene, const Reconstruction& selected, const Json& original,
-                      const Json& refinement);
-void RefinePhotometric(const Arguments& args);
+                                        int workers, const AlignmentLimits& limits);
 }  // namespace geosun

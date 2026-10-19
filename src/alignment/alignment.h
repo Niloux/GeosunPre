@@ -8,8 +8,8 @@ struct AlignmentLimits {
   double median_px = 2, p90_px = 4;
 };
 Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits);
-std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstruction& model,
-                                            int workers);
-Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
-                               const AlignmentLimits& limits, int workers);
+std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Reconstruction& model,
+                                                 int workers);
+Json FilterSparseStructure(const Scene& scene, Reconstruction& model, const AlignmentLimits& limits,
+                           int workers);
 }  // namespace geosun

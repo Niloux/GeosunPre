@@ -1,9 +1,6 @@
 #include "sfm/photometric.h"
 #include "sfm/optimization.h"
 #include "alignment/alignment.h"
-#include "io/cache.h"
-#include "io/colmap.h"
-#include "frontend/frontend.h"
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <Eigen/Eigenvalues>
@@ -18,22 +15,6 @@
 namespace geosun {
 namespace {
 constexpr int Radius = 12, Search = 6;
-bool Contains(const fs::path& parent, const fs::path& child) {
-  const auto p = fs::absolute(parent).lexically_normal(), c = fs::absolute(child).lexically_normal();
-  auto a = p.begin(), b = c.begin();
-  for (; a != p.end(); ++a, ++b) {
-    if (b == c.end())
-      return false;
-#ifdef _WIN32
-    if (_wcsicmp(a->c_str(), b->c_str()))
-      return false;
-#else
-    if (*a != *b)
-      return false;
-#endif
-  }
-  return true;
-}
 template <class Function>
 void Parallel(size_t count, int workers, Function function) {
   std::atomic<size_t> next{0};
@@ -52,13 +33,13 @@ void Parallel(size_t count, int workers, Function function) {
 }
 // Coordinates use the project's half-pixel convention. Sample the original
 // grayscale image in double precision, without quantizing the warp to 1/32 px.
-cv::Mat Sample(const cv::Mat& image, const Eigen::Vector2d& center,
-               const Eigen::Matrix2d& affine, int radius) {
+cv::Mat Sample(const cv::Mat& image, const Eigen::Vector2d& center, const Eigen::Matrix2d& affine,
+               int radius) {
   cv::Mat patch(2 * radius + 1, 2 * radius + 1, CV_32FC1);
   for (int y = -radius; y <= radius; ++y)
     for (int x = -radius; x <= radius; ++x) {
-      const Eigen::Vector2d p = center + affine * Eigen::Vector2d(x, y) -
-                                Eigen::Vector2d::Constant(.5);
+      const Eigen::Vector2d p =
+          center + affine * Eigen::Vector2d(x, y) - Eigen::Vector2d::Constant(.5);
       const int ix = int(std::floor(p.x())), iy = int(std::floor(p.y()));
       if (ix < 0 || iy < 0 || ix + 1 >= image.cols || iy + 1 >= image.rows)
         return {};
@@ -90,7 +71,8 @@ bool Textured(const cv::Mat& patch) {
                               (patch.at<float>(y + 1, x) - patch.at<float>(y - 1, x)) / 2);
       gradients.noalias() += g * g.transpose();
     }
-  const auto values = Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(gradients).eigenvalues().eval();
+  const auto values =
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(gradients).eigenvalues().eval();
   return values[0] / ((patch.rows - 2) * (patch.cols - 2)) > 6 && values[0] > .02 * values[1];
 }
 bool Warp(const Reconstruction& model, const Eigen::Vector3d& xyz, const Observation& a,
@@ -108,9 +90,9 @@ bool Warp(const Reconstruction& model, const Eigen::Vector3d& xyz, const Observa
   Eigen::Matrix<double, 3, 2> basis;
   basis << u, v;
   const Eigen::Matrix2d ja = model.cameras[ia.camera].ProjectionJacobian(ia.pose.Apply(xyz)) *
-                            ia.pose.Rotation().toRotationMatrix() * basis,
+                             ia.pose.Rotation().toRotationMatrix() * basis,
                         jb = model.cameras[ib.camera].ProjectionJacobian(ib.pose.Apply(xyz)) *
-                            ib.pose.Rotation().toRotationMatrix() * basis;
+                             ib.pose.Rotation().toRotationMatrix() * basis;
   if (std::abs(ja.determinant()) < 1e-6)
     return false;
   affine = jb * ja.inverse();
@@ -119,7 +101,7 @@ bool Warp(const Reconstruction& model, const Eigen::Vector3d& xyz, const Observa
          scales[0] < 2.2 * scales[1];
 }
 bool MatchPatch(const cv::Mat& raw_reference, const cv::Mat& image, const Eigen::Vector2d& pixel,
-           const Eigen::Matrix2d& affine, Eigen::Vector2d& refined) {
+                const Eigen::Matrix2d& affine, Eigen::Vector2d& refined) {
   cv::Mat reference;
   cv::GaussianBlur(raw_reference, reference, cv::Size(5, 5), .7);
   const auto search = SmoothedSample(image, pixel, affine, Radius + Search);
@@ -171,7 +153,7 @@ bool MatchPatch(const cv::Mat& raw_reference, const cv::Mat& image, const Eigen:
         const double source = reference.at<float>(y, x);
         const double residual = target.at<float>(y, x) - gain * source - offset;
         const Eigen::Vector2d gradient((right.at<float>(y, x) - left.at<float>(y, x)) / 2,
-                                        (down.at<float>(y, x) - up.at<float>(y, x)) / 2);
+                                       (down.at<float>(y, x) - up.at<float>(y, x)) / 2);
         Eigen::Vector4d j;
         j << gradient.dot(affine.col(0)), gradient.dot(affine.col(1)), -source, -1;
         const double weight = std::min(1., 12 / std::max(std::abs(residual), 1e-9));
@@ -283,9 +265,8 @@ std::vector<std::vector<Observation>> RefineObservationGraph(
       continue;
     std::vector<uint32_t> sequence(point.track.size());
     std::iota(sequence.begin(), sequence.end(), 0);
-    std::sort(sequence.begin(), sequence.end(), [&](uint32_t a, uint32_t b) {
-      return point.track[a].image < point.track[b].image;
-    });
+    std::sort(sequence.begin(), sequence.end(),
+              [&](uint32_t a, uint32_t b) { return point.track[a].image < point.track[b].image; });
     // Consecutive views plus the preceding second view create local triangles.
     // Long tracks can propagate accurate correspondences without a distant,
     // fixed reference patch or loading all original images into memory.
@@ -301,8 +282,8 @@ std::vector<std::vector<Observation>> RefineObservationGraph(
   GrayCache cache(scene);
   auto checkpoint = Clock::now();
   size_t completed = 0, accepted_edges = 0, sparse_pairs = 0;
-  const size_t active_pairs = std::count_if(pairs.begin(), pairs.end(),
-                                            [](const auto& pair) { return pair.second.size() >= 8; });
+  const size_t active_pairs = std::count_if(
+      pairs.begin(), pairs.end(), [](const auto& pair) { return pair.second.size() >= 8; });
   std::vector<double> round_trips;
   for (const auto& [key, indices] : pairs) {
     if (indices.size() < 8) {
@@ -340,8 +321,8 @@ std::vector<std::vector<Observation>> RefineObservationGraph(
       }
     ++completed;
     if (Seconds(checkpoint) > 25) {
-      Log("Photometric view pairs " + std::to_string(completed) + "/" + std::to_string(active_pairs) +
-          ", accepted edges " + std::to_string(accepted_edges));
+      Log("Photometric view pairs " + std::to_string(completed) + "/" +
+          std::to_string(active_pairs) + ", accepted edges " + std::to_string(accepted_edges));
       checkpoint = Clock::now();
     }
   }
@@ -372,8 +353,8 @@ std::vector<std::vector<Observation>> RefineObservationGraph(
     }
     for (uint32_t node = 0; node < count; ++node)
       ++component_size[root(node)];
-    const uint32_t largest = uint32_t(std::max_element(component_size.begin(), component_size.end()) -
-                                      component_size.begin());
+    const uint32_t largest = uint32_t(
+        std::max_element(component_size.begin(), component_size.end()) - component_size.begin());
     const size_t size = component_size[largest];
     if (size < 3)
       return;
@@ -411,9 +392,11 @@ std::vector<std::vector<Observation>> RefineObservationGraph(
       const auto& edge = edges[edge_id];
       if (edge.accepted && positions[edge.a] >= 0 && positions[edge.b] >= 0)
         residuals.push_back((shift.segment<2>(2 * positions[edge.b]) -
-                             edge.affine * shift.segment<2>(2 * positions[edge.a]) - edge.shift).norm());
+                             edge.affine * shift.segment<2>(2 * positions[edge.a]) - edge.shift)
+                                .norm());
     }
-    if (Quantile(residuals, .9) > .4 || *std::max_element(residuals.begin(), residuals.end()) > .9) {
+    if (Quantile(residuals, .9) > .4 ||
+        *std::max_element(residuals.begin(), residuals.end()) > .9) {
       rejected_cycles[id] = 1;
       return;
     }
@@ -438,15 +421,23 @@ std::vector<std::vector<Observation>> RefineObservationGraph(
     shifts.insert(shifts.end(), changes[id].begin(), changes[id].end());
     cycles.insert(cycles.end(), cycle_errors[id].begin(), cycle_errors[id].end());
   }
-  report = {{"candidate_edges", edges.size()}, {"accepted_edges", accepted_edges},
-            {"matching", {{"image_sigma_px", .7}, {"minimum_ncc", .94},
-                           {"maximum_round_trip_px", .35}, {"maximum_cycle_p90_px", .4},
-                           {"minimum_shared_tracks", 8}}},
-            {"view_pairs", completed}, {"skipped_sparse_pairs", sparse_pairs},
+  report = {{"candidate_edges", edges.size()},
+            {"accepted_edges", accepted_edges},
+            {"matching",
+             {{"image_sigma_px", .7},
+              {"minimum_ncc", .94},
+              {"maximum_round_trip_px", .35},
+              {"maximum_cycle_p90_px", .4},
+              {"minimum_shared_tracks", 8}}},
+            {"view_pairs", completed},
+            {"skipped_sparse_pairs", sparse_pairs},
             {"refined_tracks", tracks},
-            {"refined_observations", observations}, {"pixel_shift_px", Statistics(shifts)},
-            {"round_trip_px", Statistics(round_trips)}, {"cycle_residual_px", Statistics(cycles)},
-            {"cycle_rejected_tracks", std::accumulate(rejected_cycles.begin(), rejected_cycles.end(), size_t(0))}};
+            {"refined_observations", observations},
+            {"pixel_shift_px", Statistics(shifts)},
+            {"round_trip_px", Statistics(round_trips)},
+            {"cycle_residual_px", Statistics(cycles)},
+            {"cycle_rejected_tracks",
+             std::accumulate(rejected_cycles.begin(), rejected_cycles.end(), size_t(0))}};
   return refined_tracks;
 }
 Json FailedChecks(const Json& checks) {
@@ -456,48 +447,9 @@ Json FailedChecks(const Json& checks) {
       failed.push_back(name);
   return failed;
 }
-Json StructureCoverage(const Reconstruction& before, const Reconstruction& after,
-                       const std::vector<PlaneConstraint>& planes) {
-  std::array<size_t, 2> previous{}, next{};
-  for (size_t id = 0; id < before.images.size(); ++id) {
-    previous[before.images[id].camera] += before.images[id].registered;
-    next[after.images[id].camera] += after.images[id].registered;
-  }
-  size_t retained = 0;
-  for (const auto& plane : planes)
-    retained += after.points[plane.point].track.size() >= 3;
-  std::vector<uint32_t> parent(after.images.size());
-  std::iota(parent.begin(), parent.end(), 0);
-  auto root = [&](uint32_t id) {
-    while (parent[id] != id) {
-      parent[id] = parent[parent[id]];
-      id = parent[id];
-    }
-    return id;
-  };
-  for (const auto& point : after.points)
-    for (size_t i = 1; i < point.track.size(); ++i)
-      parent[root(point.track[i].image)] = root(point.track[0].image);
-  std::set<uint32_t> components;
-  for (uint32_t id = 0; id < after.images.size(); ++id)
-    if (after.images[id].registered)
-      components.insert(root(id));
-  const bool camera_coverage = next[0] >= .98 * previous[0] && next[1] >= .98 * previous[1];
-  return {{"checks", {{"registered_image_retention", after.Registered() >= .99 * before.Registered()},
-                       {"per_camera_image_retention", camera_coverage},
-                       {"image_graph_connected", components.size() == 1},
-                       {"las_supported_track_retention", retained >= .9 * planes.size()}}},
-          {"registered_images_before", before.Registered()},
-          {"registered_images_after", after.Registered()},
-          {"camera_images_before", previous}, {"camera_images_after", next},
-          {"las_supported_tracks_before", planes.size()},
-          {"las_supported_tracks_after", retained},
-          {"limits", {{"minimum_image_retention", .99}, {"minimum_per_camera_retention", .98},
-                      {"minimum_las_supported_track_retention", .9}}}};
-}
 }  // namespace
 PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction& source,
-                                      int workers, const AlignmentLimits& limits) {
+                                        int workers, const AlignmentLimits& limits) {
   PhotometricRefinement refined;
   refined.candidate = source;
   auto& model = refined.candidate;
@@ -507,7 +459,7 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   const auto started = Clock::now();
   Log("Original-resolution photometric refinement: " + std::to_string(model.Registered()) +
       " images");
-  const auto planes = RefinementPlanes(scene, model, workers);
+  const auto planes = LasPlaneConstraints(scene, model, workers);
   std::vector<Eigen::Vector3d> normals(model.points.size(), Eigen::Vector3d::Zero());
   for (const auto& plane : planes)
     normals[plane.point] = plane.normal;
@@ -609,7 +561,7 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
     }
   report = {
       {"method", "cycle-consistent original-image graph with subpixel exposure-aware refinement"},
-      {"refinement_version", 6},
+      {"refinement_version", 7},
       {"accepted", false},
       {"optimization_reference",
        {{"coarse_observations", "accepted source projections"},
@@ -648,7 +600,6 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
                            : "insufficient training or held-out image coverage";
     report["failed_checks"] = {insufficient.empty() ? "photometric_support"
                                                     : "validation_coverage"};
-    report["structure_filter"] = {{"used", false}, {"reason", "refinement support insufficient"}};
     report["seconds"] = Seconds(started);
     return refined;
   }
@@ -737,7 +688,8 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
       for (const auto& o : point.track) {
         const auto& image = model.images[o.image];
         point.error += (model.cameras[image.camera].Project(image.pose.Apply(point.xyz)) -
-                        image.pixels[o.feature]).norm();
+                        image.pixels[o.feature])
+                           .norm();
       }
       point.error /= point.track.size();
     }
@@ -746,9 +698,8 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   model.Filter();
   auto quality = model.Quality(scene, limits.median_px, limits.p90_px);
   const double previous_p90 = before_quality.at("reprojection_px").at("p90");
-  const bool surface_fit = planes.empty() ||
-      report.at("plane_after_m").at("p90").get<double>() <=
-          plane_before.at("p90").get<double>() * 1.25 + .01;
+  const bool surface_fit = planes.empty() || report.at("plane_after_m").at("p90").get<double>() <=
+                                                 plane_before.at("p90").get<double>() * 1.25 + .01;
   report["checks"] = {
       {"visual_acceptance", quality.at("passed")},
       {"held_out_improvement", photo_validation_after.at("median").get<double>() <
@@ -769,115 +720,8 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   report["accepted"] = refined.accepted;
   report["optimization_quality"] = quality;
   report["reason"] = refined.accepted ? "accepted" : "photometric candidate failed acceptance";
-  if (refined.accepted && planes.size() >= 200) {
-    Reconstruction cleaned = model;
-    auto filtering = FilterRefinementStructure(scene, cleaned, limits, workers);
-    const auto cleaned_quality = cleaned.Quality(scene, limits.median_px, limits.p90_px);
-    filtering["coverage"] = StructureCoverage(model, cleaned, planes);
-    std::vector<PlaneConstraint> retained_planes;
-    for (const auto& plane : planes)
-      if (!cleaned.points[plane.point].track.empty())
-        retained_planes.push_back(plane);
-    filtering["plane_before_m"] = PlaneErrors(model, retained_planes);
-    filtering["plane_after_m"] = PlaneErrors(cleaned, retained_planes);
-    auto checks = filtering.at("coverage").at("checks");
-    checks["visual_acceptance"] = cleaned_quality.at("passed");
-    checks["full_reprojection"] = cleaned_quality.at("reprojection_px").at("p90").is_number() &&
-        cleaned_quality.at("reprojection_px").at("p90").get<double>() <=
-            quality.at("reprojection_px").at("p90").get<double>() * 1.05 + .05;
-    checks["surface_fit"] = !retained_planes.empty() &&
-        filtering.at("plane_after_m").at("p90").get<double>() <=
-            filtering.at("plane_before_m").at("p90").get<double>() * 1.25 + .01;
-    filtering["checks"] = checks;
-    filtering["failed_checks"] = FailedChecks(checks);
-    const bool used = filtering.at("failed_checks").empty();
-    filtering["used"] = used;
-    filtering["reason"] = used ? "accepted" : "pruning candidate failed coverage or geometry acceptance";
-    filtering["candidate_quality"] = cleaned_quality;
-    report["structure_filter"] = std::move(filtering);
-    if (used) {
-      model = std::move(cleaned);
-      quality = cleaned_quality;
-    }
-  } else {
-    report["structure_filter"] = {{"used", false},
-        {"reason", refined.accepted ? "insufficient reliable LAS support for pruning" :
-                                     "photometric candidate rejected"}};
-  }
   report["candidate_quality"] = quality;
   report["seconds"] = Seconds(started);
   return refined;
-}
-Json RefinementResult(const Scene& scene, const Reconstruction& selected, const Json& original,
-                      const Json& refinement) {
-  std::vector<double> navigation_errors;
-  const auto navigation = NavigationPositions(scene);
-  for (uint32_t image = 0; image < selected.images.size(); ++image)
-    if (selected.images[image].registered)
-      navigation_errors.push_back((selected.images[image].pose.Center() - navigation[image]).norm());
-  Json result = original;
-  result["quality"] = selected.Quality(scene, original.at("quality").at("limits").at("median_px"),
-                                     original.at("quality").at("limits").at("p90_px"));
-  result["refinement"] = refinement;
-  result["selected_model"] = "refined";
-  result["navigation_error_m"] = Statistics(navigation_errors);
-  result["build"] = BuildInfo();
-  return result;
-}
-void RefinePhotometric(const Arguments& args) {
-  args.Validate({"--work", "--output", "--workers"});
-  const auto source = args.Path("--work"), output = args.Path("--output");
-  const int workers = args.Integer("--workers", 4);
-  if (workers < 1 || workers > 32)
-    throw std::runtime_error("workers must be 1-32");
-  if (fs::exists(output))
-    throw std::runtime_error("Refinement output already exists; choose a new work directory");
-  const auto scene = Scene::FromJson(ReadJson(source / "scene.json"));
-  if (Contains(source, output) || Contains(scene.input, output))
-    throw std::runtime_error("Refinement output must be outside source work and input");
-  if (ReadScene(scene.input, scene.las).ToJson() != scene.ToJson())
-    throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
-  const auto original = ReadJson(source / "result.json");
-  const auto model = ReadModel(SelectedModelPath(source, original));
-  AlignmentLimits limits;
-  if (original.contains("alignment")) {
-    const auto& saved = original.at("alignment").at("limits");
-    limits.support_fraction = saved.at("support_fraction");
-    limits.median_m = saved.at("median_m");
-    limits.p90_m = saved.at("p90_m");
-  } else if (original.at("refinement").contains("limits")) {
-    const auto& saved = original.at("refinement").at("limits");
-    limits.support_fraction = saved.at("las_support_fraction");
-    limits.median_m = saved.at("las_median_m");
-    limits.p90_m = saved.at("las_p90_m");
-  }
-  limits.median_px = original.at("quality").at("limits").at("median_px");
-  limits.p90_px = original.at("quality").at("limits").at("p90_px");
-  fs::create_directories(output / "cache");
-  auto refinement = RefinePhotometric(scene, model, workers, limits);
-  refinement.report["source_work"] = source.u8string();
-  const auto& selected = refinement.accepted ? refinement.candidate : model;
-  const auto result = RefinementResult(scene, selected, original, refinement.report);
-  WriteModel(output / "cache/aligned.bin", model);
-  WriteJson(output / "cache/alignment.json", original);
-  WriteModel(output / "cache/refinement_candidate.bin", refinement.candidate);
-  WriteModel(output / "cache/refined.bin", selected);
-  WriteJson(output / "cache/refinement.json", refinement.report);
-  WriteJson(output / "scene.json", scene.ToJson());
-  WriteJson(output / "result.json", result);
-  const std::array<cv::Mat, 2> domains{MaskDomain(scene.cameras[0]), MaskDomain(scene.cameras[1])};
-  for (const auto& image : scene.images) {
-    if (!selected.images[image.id].registered)
-      continue;
-    const auto mask = MaskPath(output, image.id);
-    fs::create_directories(mask.parent_path());
-    auto pixels = ReadImage(MaskPath(source, image.id), cv::IMREAD_GRAYSCALE);
-    pixels.setTo(0, domains[image.camera] == 0);
-    WriteImage(mask, pixels);
-  }
-  ExportBundle(scene, selected, output, output / "colmap", true, .05, result, {});
-  Log("Photometric refinement " + refinement.report.at("reason").get<std::string>());
-  std::cout << Json({{"work", output.u8string()}, {"accepted", refinement.accepted},
-                     {"reason", refinement.report.at("reason")}}).dump(2) << '\n';
 }
 }  // namespace geosun

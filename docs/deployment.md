@@ -18,6 +18,8 @@ Windows x64，需与模型包匹配的 NVIDIA GPU 和驱动。无需安装 Pytho
 
 输入、配置或模型改变时使用新工作目录，保留已有成果。默认交付原图、掩码、鱼眼 COLMAP 模型和 5 cm LAS 初始化 PLY；下游需支持 OPENCV_FISHEYE。`--no-ply` 省略 PLY，`--ply-voxel 0.1` 生成 10 cm 初始化。
 
-`run` 默认在 LAS 对齐后执行原图精修，再导出通过验收的所选模型，不需要单独运行精修命令。初始匹配包含导航回访候选；SfM 默认不在停滞后额外补匹配，而是处理已注册部分，`sfm_repair_rounds` 可设为 `0`、`1` 或 `2`。相机优化及稀疏点清理分别验收，未采用原因见 `cache/refinement.json`。实现标记为 14；更新主点初值及匹配流程后须另建目录完整重建，独立 `refine` 使用原几何基准做增量优化并屏蔽旧掩码的无覆盖像素，但不重跑语义模型、特征和 SfM。
+`run` 默认在 LAS 对齐后独立清理稀疏点，再导出通过验收的所选模型。原图精修默认关闭，首次运行加 `--refine` 或配置 `"refine": true` 在清理前启用，续跑沿用已冻结的选择。精修未启用或候选未通过时，仍对对齐模型清理；未采用原因分别见 `cache/refinement.json` 与 `cache/cleanup.json`。
+
+初始匹配包含导航回访候选；SfM 默认不在停滞后额外补匹配，而是处理已注册部分，`sfm_repair_rounds` 可设为 `0`、`1` 或 `2`。实现标记为 15，新流程须使用新工作目录；旧成果仍可 `export`，也可通过 `refine --work OLD --output NEW` 或 `cleanup --work OLD --output NEW` 写入新目录。独立 `refine` 仅执行原图精修，独立 `cleanup` 仅清理稀疏结构；复制旧掩码时均屏蔽无覆盖像素，不重跑语义模型、特征和 SfM。
 
 换 GPU 时需重新准备相应模型，程序的 CUDA 编译目标也须支持该 GPU。完整输入、模型、输出和缓存约定见 `docs/`。

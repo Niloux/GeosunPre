@@ -7,7 +7,9 @@
 #include "frontend/inference.h"
 #include "sfm/reconstruction.h"
 #include "sfm/photometric.h"
+#include "sfm/structure.h"
 #include "alignment/alignment.h"
+#include <opencv2/imgcodecs.hpp>
 #include <set>
 #include <iostream>
 #ifdef _WIN32
@@ -53,14 +55,9 @@ class Lock {
   }
 };
 Json Settings(const fs::path& file) {
-  Json result = {{"workers", 4},
-                 {"sfm_repair_rounds", 0},
-                 {"quality_median_px", 2.},
-                 {"quality_p90_px", 4.},
-                 {"las_support_fraction", .25},
-                 {"las_median_m", .1},
-                 {"las_p90_m", .3},
-                 {"calibration_tracks", "all"}};
+  Json result = {{"workers", 4},         {"sfm_repair_rounds", 0},      {"quality_median_px", 2.},
+                 {"quality_p90_px", 4.}, {"las_support_fraction", .25}, {"las_median_m", .1},
+                 {"las_p90_m", .3},      {"calibration_tracks", "all"}, {"refine", false}};
   if (!file.empty()) {
     const auto configured = ReadJson(file);
     if (!configured.is_object())
@@ -74,11 +71,14 @@ Json Settings(const fs::path& file) {
   if (!result.at("workers").is_number_integer() || result.at("workers").get<int>() < 1 ||
       result.at("workers").get<int>() > 32)
     throw std::runtime_error("workers must be 1-32");
-  if (!result.at("sfm_repair_rounds").is_number_integer() ||
-      result.at("sfm_repair_rounds") < 0 || result.at("sfm_repair_rounds") > 2)
+  if (!result.at("sfm_repair_rounds").is_number_integer() || result.at("sfm_repair_rounds") < 0 ||
+      result.at("sfm_repair_rounds") > 2)
     throw std::runtime_error("sfm_repair_rounds must be an integer from 0 to 2");
+  if (!result.at("refine").is_boolean())
+    throw std::runtime_error("refine must be a boolean");
   for (const auto& [key, value] : result.items())
     if (key != "workers" && key != "calibration_tracks" && key != "sfm_repair_rounds" &&
+        key != "refine" &&
         (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() <= 0))
       throw std::runtime_error("Expected positive numeric setting: " + key);
   if (result.at("calibration_tracks") != "all" && result.at("calibration_tracks") != "stable")
@@ -106,11 +106,27 @@ void Verify(const fs::path& work, const Json& files) {
     if (FileMetadata(work / fs::u8path(name)) != metadata)
       throw std::runtime_error("Completed stage artifact changed: " + name);
 }
+Json PostprocessResult(const Scene& scene, const Reconstruction& selected, const Json& original,
+                       const std::string& selected_model) {
+  std::vector<double> navigation_errors;
+  const auto navigation = NavigationPositions(scene);
+  for (uint32_t image = 0; image < selected.images.size(); ++image)
+    if (selected.images[image].registered)
+      navigation_errors.push_back(
+          (selected.images[image].pose.Center() - navigation[image]).norm());
+  Json result = original;
+  result["quality"] = selected.Quality(scene, original.at("quality").at("limits").at("median_px"),
+                                       original.at("quality").at("limits").at("p90_px"));
+  result["selected_model"] = selected_model;
+  result["navigation_error_m"] = Statistics(navigation_errors);
+  result["build"] = BuildInfo();
+  return result;
+}
 }  // namespace
 void Run(const Arguments& args) {
   args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
                  "--no-ply", "--ply-voxel", "--las-supervision", "--supervision-max-size",
-                 "--supervision-boundary", "--supervision-mask-dir"});
+                 "--supervision-boundary", "--supervision-mask-dir", "--refine"});
   const auto supervision = ParseSupervisionOptions(args);
   const auto work = args.Get("--work").empty()
                         ? fs::absolute(fs::path("work") / args.Path("--input").filename())
@@ -127,9 +143,11 @@ void Run(const Arguments& args) {
                                                  : args.Path("--input");
   if (Contains(input, work) || Contains(work, input))
     throw std::runtime_error("Input and work directories must be separate");
-  const auto settings = args.Get("--config").empty()
-                            ? (state.empty() ? Settings({}) : state.at("settings"))
-                            : Settings(args.Path("--config"));
+  auto settings = args.Get("--config").empty()
+                      ? (state.empty() ? Settings({}) : state.at("settings"))
+                      : Settings(args.Path("--config"));
+  if (args.Get("--refine") == "true")
+    settings["refine"] = true;
   const auto las =
       args.Get("--las").empty()
           ? (state.empty() ? fs::path()
@@ -154,8 +172,13 @@ void Run(const Arguments& args) {
                                       : DefaultModels())
           : args.Path("--models");
   const auto requested = args.Get("--stage", args.command == "prepare" ? "prepare" : "all");
-  const std::vector<std::string> stages = {"prepare", "masks", "features", "matches",
-                                           "sfm",     "align", "refine", "export"};
+  std::vector<std::string> stages = {"prepare", "masks", "features", "matches", "sfm", "align"};
+  if (settings.at("refine").get<bool>())
+    stages.push_back("refine");
+  else if (requested == "refine")
+    throw std::runtime_error("Refinement is disabled; enable --refine in a new work directory");
+  stages.push_back("cleanup");
+  stages.push_back("export");
   if (requested != "all" && std::find(stages.begin(), stages.end(), requested) == stages.end())
     throw std::runtime_error("Unknown stage: " + requested);
   const auto output = args.Get("--output").empty() ? work / "colmap" : args.Path("--output");
@@ -169,6 +192,9 @@ void Run(const Arguments& args) {
   WriteJson(state_path, state);
   const auto started = Clock::now();
   const int workers = settings.at("workers");
+  const AlignmentLimits limits{settings.at("las_support_fraction"), settings.at("las_median_m"),
+                               settings.at("las_p90_m"), settings.at("quality_median_px"),
+                               settings.at("quality_p90_px")};
   try {
     for (const auto& stage : stages) {
       if (requested != "all" && stage != requested)
@@ -177,7 +203,7 @@ void Run(const Arguments& args) {
         const size_t index = std::find(stages.begin(), stages.end(), stage) - stages.begin();
         if (!state.at("stages").contains(stages[index - 1]))
           throw std::runtime_error("Run prerequisite stage: " + stages[index - 1]);
-        if (stage == "refine" || stage == "export")
+        if (stage == "refine" || stage == "cleanup" || stage == "export")
           Verify(work, state.at("stages").at(stages[index - 1]).at("files"));
         if (stage == "masks" || stage == "features" || stage == "matches") {
           Json identity = {{"manifest", FileMetadata(root / "manifest.json")}};
@@ -230,8 +256,9 @@ void Run(const Arguments& args) {
         for (int repair = completed_repairs;; ++repair) {
           std::set<uint32_t> deficient;
           try {
-            model = Reconstruct(scene, work, workers, report,
-                                settings.at("calibration_tracks") == "stable", repair >= max_repairs);
+            model =
+                Reconstruct(scene, work, workers, report,
+                            settings.at("calibration_tracks") == "stable", repair >= max_repairs);
             quality = model.Quality(scene, settings.at("quality_median_px"),
                                     settings.at("quality_p90_px"));
             if (quality.at("passed").get<bool>())
@@ -267,14 +294,11 @@ void Run(const Arguments& args) {
         state["registration"] = quality.at("registration");
         if (model.Registered() != model.images.size())
           Log("Partial reconstruction accepted: " + std::to_string(model.Registered()) + "/" +
-              std::to_string(model.images.size()) + "; see quality.registration for missing images");
+              std::to_string(model.images.size()) +
+              "; see quality.registration for missing images");
         products = {work / "cache/visual.bin", work / "cache/sfm.json"};
       } else if (stage == "align") {
         auto model = ReadModel(work / "cache/visual.bin");
-        const AlignmentLimits limits{settings.at("las_support_fraction"),
-                                     settings.at("las_median_m"), settings.at("las_p90_m"),
-                                     settings.at("quality_median_px"),
-                                     settings.at("quality_p90_px")};
         auto result = Align(scene, model, workers, limits);
         result["sfm"] = ReadJson(work / "cache/sfm.json");
         for (const auto& name : {"masks", "features", "matches"})
@@ -289,25 +313,43 @@ void Run(const Arguments& args) {
       } else if (stage == "refine") {
         const auto model = ReadModel(work / "cache/aligned.bin");
         const auto original = ReadJson(work / "cache/alignment.json");
-        const AlignmentLimits limits{settings.at("las_support_fraction"),
-                                     settings.at("las_median_m"), settings.at("las_p90_m"),
-                                     settings.at("quality_median_px"), settings.at("quality_p90_px")};
         auto refinement = RefinePhotometric(scene, model, workers, limits);
+        refinement.report["enabled"] = true;
         const auto& selected = refinement.accepted ? refinement.candidate : model;
-        const auto result = RefinementResult(scene, selected, original, refinement.report);
+        auto result = PostprocessResult(scene, selected, original, "refined");
+        result["refinement"] = refinement.report;
         WriteModel(work / "cache/refinement_candidate.bin", refinement.candidate);
         WriteModel(work / "cache/refined.bin", selected);
         WriteJson(work / "cache/refinement.json", refinement.report);
+        WriteJson(work / "cache/refinement_result.json", result);
+        Log("Photometric refinement " + refinement.report.at("reason").get<std::string>());
+        products = {work / "cache/refinement_candidate.bin", work / "cache/refined.bin",
+                    work / "cache/refinement.json", work / "cache/refinement_result.json"};
+      } else if (stage == "cleanup") {
+        const bool photo = settings.at("refine");
+        auto original =
+            ReadJson(work / (photo ? "cache/refinement_result.json" : "cache/alignment.json"));
+        if (!photo)
+          original["refinement"] = {
+              {"enabled", false}, {"accepted", false}, {"reason", "disabled by configuration"}};
+        const auto model = ReadModel(SelectedModelPath(work, original));
+        auto cleanup = CleanSparseStructure(scene, model, workers, limits);
+        cleanup.report["source_model"] = original.value("selected_model", std::string("aligned"));
+        const auto& selected = cleanup.accepted ? cleanup.candidate : model;
+        auto result = PostprocessResult(scene, selected, original, "cleaned");
+        result["cleanup"] = cleanup.report;
+        WriteModel(work / "cache/cleanup_candidate.bin", cleanup.candidate);
+        WriteModel(work / "cache/cleaned.bin", selected);
+        WriteJson(work / "cache/cleanup.json", cleanup.report);
         WriteJson(work / "result.json", result);
         state["registration"] = result.at("quality").at("registration");
-        Log("Photometric refinement " + refinement.report.at("reason").get<std::string>() +
-            "; pruning " + refinement.report.at("structure_filter").at("reason").get<std::string>());
-        products = {work / "cache/refinement_candidate.bin", work / "cache/refined.bin",
-                    work / "cache/refinement.json", work / "result.json"};
+        Log("Sparse structure cleanup " + cleanup.report.at("reason").get<std::string>());
+        products = {work / "cache/cleanup_candidate.bin", work / "cache/cleaned.bin",
+                    work / "cache/cleanup.json", work / "result.json"};
       } else {
         const auto result = ReadJson(work / "result.json");
-        ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, ply, voxel, result,
-                     supervision);
+        ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, ply, voxel,
+                     result, supervision);
         products = {output / "manifest.json"};
       }
       state["stages"][stage] = {{"seconds", Seconds(begin)}, {"files", Inventory(work, products)}};
@@ -341,9 +383,9 @@ void Export(const Arguments& args) {
   if (fs::exists(work / "state.json")) {
     const auto state = ReadJson(work / "state.json");
     if (state.value("pipeline_version", 0) == PipelineVersion) {
-      if (!state.at("stages").contains("refine"))
-        throw std::runtime_error("Run prerequisite stage: refine");
-      Verify(work, state.at("stages").at("refine").at("files"));
+      if (!state.at("stages").contains("cleanup"))
+        throw std::runtime_error("Run prerequisite stage: cleanup");
+      Verify(work, state.at("stages").at("cleanup").at("files"));
     }
   }
   const auto scene = Scene::FromJson(ReadJson(work / "scene.json"));
@@ -355,5 +397,85 @@ void Export(const Arguments& args) {
   ExportBundle(scene, model, work, output, args.Get("--no-ply") != "true",
                args.Number("--ply-voxel", .05), result, supervision);
   std::cout << CheckBundle(output).dump() << '\n';
+}
+void Postprocess(const Arguments& args) {
+  args.Validate({"--work", "--output", "--workers"});
+  const bool photo = args.command == "refine";
+  const auto source = args.Path("--work"), output = args.Path("--output");
+  const int workers = args.Integer("--workers", 4);
+  if (workers > 32)
+    throw std::runtime_error("workers must be 1-32");
+  if (fs::exists(output))
+    throw std::runtime_error("Postprocessing output already exists; choose a new work directory");
+  const auto scene = Scene::FromJson(ReadJson(source / "scene.json"));
+  if (Contains(source, output) || Contains(scene.input, output))
+    throw std::runtime_error("Postprocessing output must be outside source work and input");
+  if (ReadScene(scene.input, scene.las).ToJson() != scene.ToJson())
+    throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
+  const auto original = ReadJson(source / "result.json");
+  const auto model = ReadModel(SelectedModelPath(source, original));
+  AlignmentLimits limits;
+  if (original.contains("alignment")) {
+    const auto& saved = original.at("alignment").at("limits");
+    limits.support_fraction = saved.at("support_fraction");
+    limits.median_m = saved.at("median_m");
+    limits.p90_m = saved.at("p90_m");
+  } else if (original.contains("refinement") && original.at("refinement").contains("limits")) {
+    const auto& saved = original.at("refinement").at("limits");
+    limits.support_fraction = saved.at("las_support_fraction");
+    limits.median_m = saved.at("las_median_m");
+    limits.p90_m = saved.at("las_p90_m");
+  }
+  limits.median_px = original.at("quality").at("limits").at("median_px");
+  limits.p90_px = original.at("quality").at("limits").at("p90_px");
+  fs::create_directories(output / "cache");
+  Reconstruction selected;
+  Json report;
+  const std::string selected_name = photo ? "refined" : "cleaned";
+  const std::string report_name = photo ? "refinement" : "cleanup";
+  bool accepted;
+  if (photo) {
+    auto refinement = RefinePhotometric(scene, model, workers, limits);
+    accepted = refinement.accepted;
+    report = std::move(refinement.report);
+    report["enabled"] = true;
+    selected = accepted ? refinement.candidate : model;
+    WriteModel(output / "cache/refinement_candidate.bin", refinement.candidate);
+  } else {
+    auto cleanup = CleanSparseStructure(scene, model, workers, limits);
+    accepted = cleanup.accepted;
+    report = std::move(cleanup.report);
+    report["source_model"] = original.value("selected_model", std::string("aligned"));
+    selected = accepted ? cleanup.candidate : model;
+    WriteModel(output / "cache/cleanup_candidate.bin", cleanup.candidate);
+  }
+  report["source_work"] = source.u8string();
+  auto result = PostprocessResult(scene, selected, original, selected_name);
+  if (photo)
+    result.erase("cleanup");
+  result[report_name] = report;
+  WriteModel(output / "cache/aligned.bin", model);
+  WriteJson(output / "cache/alignment.json", original);
+  WriteModel(output / "cache" / (selected_name + ".bin"), selected);
+  WriteJson(output / "cache" / (report_name + ".json"), report);
+  WriteJson(output / "scene.json", scene.ToJson());
+  WriteJson(output / "result.json", result);
+  const std::array<cv::Mat, 2> domains{MaskDomain(scene.cameras[0]), MaskDomain(scene.cameras[1])};
+  for (const auto& image : scene.images) {
+    if (!selected.images[image.id].registered)
+      continue;
+    const auto mask = MaskPath(output, image.id);
+    fs::create_directories(mask.parent_path());
+    auto pixels = ReadImage(MaskPath(source, image.id), cv::IMREAD_GRAYSCALE);
+    pixels.setTo(0, domains[image.camera] == 0);
+    WriteImage(mask, pixels);
+  }
+  ExportBundle(scene, selected, output, output / "colmap", true, .05, result, {});
+  Log(args.command + ": " + report.at("reason").get<std::string>());
+  std::cout << Json({{"work", output.u8string()},
+                     {"accepted", accepted},
+                     {"reason", report.at("reason")}})
+                   .dump(2)
+            << '\n';
 }
 }  // namespace geosun

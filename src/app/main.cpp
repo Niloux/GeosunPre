@@ -4,7 +4,6 @@
 #include "io/las.h"
 #include "frontend/inference.h"
 #include "frontend/frontend.h"
-#include "sfm/photometric.h"
 #include <opencv2/core.hpp>
 #include <iostream>
 
@@ -18,8 +17,8 @@ int Main(const std::vector<std::string>& argv) {
       Run(args);
     } else if (args.command == "export")
       Export(args);
-    else if (args.command == "refine")
-      RefinePhotometric(args);
+    else if (args.command == "refine" || args.command == "cleanup")
+      Postprocess(args);
     else if (args.command == "check") {
       args.Validate({"--output", "--work"});
       std::cout << CheckBundle(args.Get("--output").empty() ? args.Path("--work") / "colmap"
@@ -47,15 +46,20 @@ int Main(const std::vector<std::string>& argv) {
                        .dump(2)
                 << '\n';
     } else if (args.command == "help" || args.command == "--help") {
-      std::cout << "GeosunPre " << BuildVersion << " - native dual-fisheye/LAS reconstruction\n"
-                   "  geosunpre run --input INPUT --work WORK [--models MODELS] [--config JSON]\n"
+      std::cout << "GeosunPre " << BuildVersion
+                << " - native dual-fisheye/LAS reconstruction\n"
+                   "  geosunpre run --input INPUT --work WORK [--models MODELS] [--config JSON] "
+                   "[--refine]\n"
                    "  geosunpre run --work WORK [--stage "
-                   "prepare|masks|features|matches|sfm|align|refine|export]\n"
-                   "  geosunpre prepare --input INPUT --work WORK\n"
+                   "prepare|masks|features|matches|sfm|align|refine|cleanup|export]\n"
+                   "    refine is disabled by default; enable with --refine or config refine=true\n"
+                   "  geosunpre prepare --input INPUT --work WORK [--refine]\n"
                    "  geosunpre export --work WORK [--output DIR] [--no-ply] [--ply-voxel METRES]\n"
-                   "    [--las-supervision] [--supervision-max-size PIXELS] [--supervision-boundary PIXELS]\n"
+                   "    [--las-supervision] [--supervision-max-size PIXELS] "
+                   "[--supervision-boundary PIXELS]\n"
                    "    [--supervision-mask-dir DIR]\n"
                    "  geosunpre refine --work WORK --output NEW_WORK [--workers N]\n"
+                   "  geosunpre cleanup --work WORK --output NEW_WORK [--workers N]\n"
                    "  geosunpre check --output DIR\n"
                    "  geosunpre info\n"
                    "  geosunpre check-models --image FILE [--models MODELS]\n"

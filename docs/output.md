@@ -40,7 +40,9 @@ quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 
 
 工作目录 `result.json` 的 joint 保存联合优化候选的完整质量、点位移统计、逐图退化明细、各项接受条件及 failed_checks；候选被拒绝时保留所选原模型，验收阈值不因诊断而放宽。
 
-默认在 LAS 对齐后精修，再导出最终所选模型。`result.json` 的 alignment、joint、sfm 是各阶段原报告；refinement 保存精修的留出误差、同组 LAS 平面误差、优化验收和独立清理验收，quality 与 navigation_error_m 更新为最终模型统计。相机候选未通过时导出对齐模型；清理候选未通过时导出未强力清理的精修模型，未采用原因明确记录。允许清理最多 1% 的已注册照片，且每镜头至少保留 98%、可靠 LAS 支撑轨迹至少保留 90%；最终照片名单以交付 registration 为准。
+默认在 LAS 对齐后独立清理稀疏点，再导出最终所选模型；原图精修默认关闭，`--refine` 或配置 `"refine": true` 在清理前启用。`result.json` 的 alignment、joint、sfm 是各阶段原报告；refinement 保存精修的启用状态、留出误差、同组 LAS 平面误差及相机优化验收，cleanup 单独保存稀疏点清理与验收。关闭精修时 refinement.enabled=false，且不生成精修缓存。quality 与 navigation_error_m 更新为最终模型统计。
+
+精修未启用或相机候选未通过时，对对齐模型执行清理；清理候选未通过时保留清理前的模型，未采用原因明确记录。允许清理最多 1% 的已注册照片，且每镜头至少保留 98%、可靠 LAS 支撑轨迹至少保留 90%；最终照片名单以交付 registration 为准。清理不改变相机内参和位姿，也不改变 LAS 初始化 PLY。独立 `refine` 只执行相机精修，独立 `cleanup` 只执行清理，两者均写入新工作目录。
 
 同级 `.pending` 中完成写入及回读后重命名发布。同一请求的完整包可复用，不同请求拒绝覆盖。`check --output` 只依赖交付包，检查结构、引用、尺寸、PLY 和几何拟合，不代表独立精度或渲染效果。
 

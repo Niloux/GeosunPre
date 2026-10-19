@@ -1,6 +1,6 @@
 # GeosunPre
 
-原生 C++17/CUDA 双鱼眼与 LAS 重建程序。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、原图精修和 COLMAP/PLY 导出。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
+原生 C++17/CUDA 双鱼眼与 LAS 重建程序。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、稀疏点清理和 COLMAP/PLY 导出，可选原图精修。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
 
 ## 开始使用
 
@@ -18,7 +18,7 @@
 | --- | --- |
 | `build.ps1` | 使用 Ninja 编译 Release 程序到 `build/ninja/bin/geosunpre.exe`，自动应用 Ceres Schur 回代修复 |
 | `prepare-models.ps1` | 为 GPU 0 准备 `models/`，匹配器默认 FP16，检测器支持动态宽高 |
-| `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准、原图精修及 COLMAP/PLY 导出 |
+| `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准、独立稀疏点清理及 COLMAP/PLY 导出；原图精修默认关闭 |
 
 构建统一使用单配置 Ninja Release。脚本自动加载 x64 MSVC 环境，优先使用 PATH 中的 Ninja，否则使用 Visual Studio 自带的 Ninja。首次构建下载固定依赖到 `build/ninja/_deps/` 并编译，此后复用缓存。日常构建只编译变化影响到的文件，CMake 文件变化由 Ninja 自动重新配置；修改 preset 后自动重新配置，也可用 `build.ps1 -Configure` 显式重新配置，`-Jobs` 控制并行数（默认 8）。构建版本与时间单独生成，不会使全部源码因时间变化而重编。
 
@@ -54,7 +54,9 @@ Spirula 直接读取交付包的 `depths/`、`normals/`。训练时显式设置 
 .\build_vulkan\spirula.exe train 3dgs --data "交付目录" --primitive 3dgut --mask-mode segment_and_ignore --input-depth-is-ray-depth 1 --depth-supervision-weight 0.01 --normal-supervision-weight 0.002 --use-bilateral-grid-for-geometry 0
 ```
 
-阶段为 `prepare → masks → features → matches → sfm → align → refine → export`。`run --work WORK` 复用已完成阶段并恢复检查点；`run --work WORK --stage 阶段` 单独执行指定阶段，须先完成前置阶段。`prepare` 检查真实输入、相机和导航转换，不加载模型。
+默认阶段为 `prepare → masks → features → matches → sfm → align → cleanup → export`。首次运行加 `--refine`，或在配置中设置 `"refine": true`，会在 `align` 与 `cleanup` 之间增加原图精修；默认 `false`。该选择随配置冻结，续跑自动沿用，改变选择须使用新工作目录。
+
+`run --work WORK` 复用已完成阶段并恢复检查点；`run --work WORK --stage 阶段` 单独执行指定阶段，须先完成前置阶段。`--stage refine` 只用于已启用精修的工作目录。`prepare` 检查真实输入、相机和导航转换，不加载模型。
 
 | 阶段 | 主要工作 | 主要产物 |
 | --- | --- | --- |
@@ -64,7 +66,8 @@ Spirula 直接读取交付包的 `depths/`、`normals/`。训练时显式设置 
 | `matches` 图像匹配 | 合并时间近邻、导航回访及外观检索候选，执行 LoMa 匹配，缓存对应关系；鱼眼几何验证在下一阶段执行 | `cache/pairs.json`、`cache/matches/` |
 | `sfm` 视觉重建 | 鱼眼几何验证、建立轨迹、增量注册相机和三角化；BA 联合优化位姿、点和共享内参，补全轨迹，最后固定相机恢复未分配观测形成的有效点，并做几何验收 | `cache/visual.bin`、`cache/sfm.json` |
 | `align` LAS 配准 | 导航位置提供尺度及初始坐标对齐，多尺度点到平面优化细化七参数相似变换；可靠表面支持时尝试联合约束相机与点，验收后采用 | `cache/aligned.bin`、`cache/alignment.json` |
-| `refine` 原图精修 | 原始分辨率图块匹配及闭环检查，联合优化相机、共享内参和可靠轨迹；留出观测验证后再单独验收点云清理，保留可靠双视图初始化点 | `cache/refined.bin`、`cache/refinement.json`、`result.json` |
+| `refine` 可选原图精修 | 原始分辨率图块匹配及闭环检查，联合优化相机、共享内参和可靠轨迹；通过留出观测验证后采用，否则保留对齐模型 | `cache/refined.bin`、`cache/refinement.json`、`cache/refinement_result.json` |
+| `cleanup` 稀疏点清理 | 对上一步所选模型独立清理、验收；精修关闭或候选被拒绝时仍正常执行，保留可靠双视图初始化点 | `cache/cleaned.bin`、`cache/cleanup.json`、`result.json` |
 | `export` 交付 | 导出所选模型、已注册原图和掩码、鱼眼 COLMAP 稀疏模型及可选 LAS PLY；在临时目录回读校验通过后发布 | `colmap/` |
 
 导航回访候选取 5 m 内、曝光时间相隔超过 10 s 的最近 20 幅照片，用于补充重复经过同一区域时的跨时段连接。它属于默认初始匹配，与停滞后的可选补匹配轮数不同。CameraPos 只提供位置；视觉姿态由 SfM 求解，不使用输入四元数，也不施加场景专用的固定角度补偿。
@@ -73,10 +76,21 @@ SfM 默认不自动补匹配；首次停滞时，对已注册部分完成优化�
 
 默认配置见 [configs/default.json](configs/default.json)，可通过 `--config` 指定。内参标定默认使用全部有效轨迹（`calibration_tracks=all`），随后锁定内参补全轨迹并精调。标定选项及坐标约定见[输入文档](docs/input.md)。
 
-原图精修默认在 LAS 对齐后自动执行，不需要另跑命令。它保留对齐模型，分别验收相机优化和稀疏点清理；相机候选未通过时使用原模型，清理候选未通过时使用精修后未清理的模型。未采用原因保存在 `cache/refinement.json`，读图、求解或文件错误仍明确报错。可以用独立命令升级已有工作目录，或在新目录继续精修：
+原图精修默认关闭。开启后保留对齐模型，相机候选未通过时使用原模型，原因保存在 `cache/refinement.json`。后续 `cleanup` 总是独立执行；清理候选未通过时保留清理前的模型，原因保存在 `cache/cleanup.json`。读图、求解或文件错误仍明确报错。
+
+cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深度不稳定或缺少有效 LAS 支撑的点；它不执行原图图块匹配、不优化相机。可靠 LAS 平面支撑不足时保留输入模型，并在清理报告中记录原因。
+
+新场景需要原图精修时，在首次运行启用：
+
+```powershell
+.\run.ps1 run --input "D:/数据/场景" --work "work/场景-精修" --refine
+```
+
+已有工作目录可用独立命令处理，结果及新交付写入新目录。独立 `refine` 仅精修相机与点，独立 `cleanup` 仅清理稀疏结构；两者均不重跑前端和 SfM：
 
 ```powershell
 .\run.ps1 refine --work "work/场景" --output "work/场景-精修" --workers 8
+.\run.ps1 cleanup --work "work/场景" --output "work/场景-清理" --workers 8
 ```
 
 精修在原始分辨率上对齐邻近视图的图块，使用鱼眼投影和可靠 LAS 平面处理图块变形，以亚像素位置和亮度参数联合精调，并检查双向往返与轨迹闭环一致性。匹配图块做轻度抗噪处理，交付图像仍保留原图。
@@ -85,9 +99,9 @@ SfM 默认不自动补匹配；首次停滞时，对已注册部分完成优化�
 
 点编号满足 `%5 == 0` 的轨迹固定留出，并按逐图覆盖补充整条轨迹，不参加相机优化。成功精修的留出轨迹须同时改善误差中位数和 P90；全部留出轨迹、每幅照片及有足够样本的格子还须通过退化检查。另外检查完整模型的几何质量、照片支撑及同一组 LAS 平面残差。留出误差反映内部一致性，不能代替独立精度检查；误差验收始终使用实际观测和绝对 LAS 平面距离，强力删点不会用于帮助相机候选通过验收。
 
-稀疏点清理作为单独候选：至少两次观测、视差至少 1.5°，单观测误差不超过 `min(3 px, quality_p90_px)`。距离和点位不确定度门限按 `las_median_m` 及 LAS 量化精度计算，默认分别为 10 cm 和 5 cm；该不确定度是固定相机的局部估计，不代表独立精度。清理后支撑不足的照片会从候选移除，但只有总照片保留至少 99%、每个镜头保留至少 98%、原可靠 LAS 支撑轨迹保留至少 90%，且图像图仍连通、剩余照片达到 32 个观测和 8 个覆盖格子、几何质量通过，才采用清理。否则保留相机精修结果，不强行删点。
+稀疏点清理作为单独候选：至少两次观测、视差至少 1.5°，单观测误差不超过 `min(3 px, quality_p90_px)`。距离和点位不确定度门限按 `las_median_m` 及 LAS 量化精度计算，默认分别为 10 cm 和 5 cm；该不确定度是固定相机的局部估计，不代表独立精度。清理后支撑不足的照片会从候选移除，但只有总照片保留至少 99%、每个镜头保留至少 98%、原可靠 LAS 支撑轨迹保留至少 90%，且图像图仍连通、剩余照片达到 32 个观测和 8 个覆盖格子、几何质量通过，才采用清理。否则保留清理前的模型，不强行删点。清理不修改相机参数，也不改变由原始 LAS 导出的初始化 PLY。
 
-最终所选模型在 `cache/refined.bin`，精修前模型在 `cache/aligned.bin`。独立精修的新交付在新目录的 `colmap/`；原始输入、工作目录及已有训练结果保持原样。独立精修目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 14，旧版工作目录继续保留；使用默认新流程时另建工作目录。
+默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`；开启精修时还保留 `cache/refined.bin`。独立处理的新交付在新目录的 `colmap/`；独立 `refine` 的所选模型为 `refined.bin`，独立 `cleanup` 为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 15，旧版工作目录、交付及训练结果保持原样，仍可独立导出或处理；新流程使用新工作目录。
 
 `run.ps1` 固定启动 `build/ninja/bin/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
 

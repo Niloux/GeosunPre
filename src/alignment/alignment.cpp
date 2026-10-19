@@ -423,7 +423,8 @@ double FixedCameraPositionSigma(const Reconstruction& model, const ModelPoint& p
         image.pose.Rotation().toRotationMatrix();
     information.noalias() += j.transpose() * j;
   }
-  const auto eigen = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(information).eigenvalues().eval();
+  const auto eigen =
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(information).eigenvalues().eval();
   return std::max(.5, point.error) / std::sqrt(std::max(eigen[0], 1e-18));
 }
 std::vector<double> LasSupportDistances(const Scene& scene, const Reconstruction& model,
@@ -505,8 +506,8 @@ std::vector<double> LasSupportDistances(const Scene& scene, const Reconstruction
   return distances;
 }
 }  // namespace
-std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstruction& model,
-                                            int workers) {
+std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Reconstruction& model,
+                                                 int workers) {
   const auto header = ReadLasHeader(scene.las);
   const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
   Json sampling;
@@ -530,8 +531,8 @@ std::vector<PlaneConstraint> RefinementPlanes(const Scene& scene, const Reconstr
   }
   return planes;
 }
-Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
-                               const AlignmentLimits& limits, int workers) {
+Json FilterSparseStructure(const Scene& scene, Reconstruction& model, const AlignmentLimits& limits,
+                           int workers) {
   // Camera refinement requires >=3 views; reliable two-view points can still
   // seed 3DGS when parallax, depth precision and LAS support pass.
   constexpr size_t minimum_track_length = 2;
@@ -596,17 +597,20 @@ Json FilterRefinementStructure(const Scene& scene, Reconstruction& model,
       if (count < 32 || cells.size() < 8) {
         image.registered = false;
         changed = true;
-        removed_images.push_back({{"image_index", id}, {"name", scene.images[id].name},
-                                  {"observations", count}, {"occupied_cells", cells.size()}});
+        removed_images.push_back({{"image_index", id},
+                                  {"name", scene.images[id].name},
+                                  {"observations", count},
+                                  {"occupied_cells", cells.size()}});
       }
     }
     if (!changed)
       break;
     for (auto& point : model.points) {
       const size_t before_track = point.track.size();
-      point.track.erase(std::remove_if(point.track.begin(), point.track.end(),
-                                       [&](const auto& o) { return !model.images[o.image].registered; }),
-                        point.track.end());
+      point.track.erase(
+          std::remove_if(point.track.begin(), point.track.end(),
+                         [&](const auto& o) { return !model.images[o.image].registered; }),
+          point.track.end());
       if (point.track.size() < minimum_track_length)
         point.track.clear();
       else if (point.track.size() != before_track)

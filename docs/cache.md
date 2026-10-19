@@ -6,7 +6,7 @@
 
 scene.json 保存曝光、初始相机和输入元数据。state.json 版本 1，保存冻结场景、配置、模型元数据和阶段产物元数据。文件变化时拒绝复用；输入、配置或模型改变时使用新 work。
 
-state.json 的 pipeline_version=14 标识当前实现，恢复时须与程序的实现标记一致；不匹配时使用新目录。状态与结果保存本次执行的构建版本、时间和 EXE 路径。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，最终 result.json 同时包含此报告。unassigned_completion 记录最终标定后固定相机、对匹配连通分量内未分配观测重新三角化的新增点数和观测数；不重复占用已有特征。timing 细分缓存读取、轨迹构建、候选选择、位姿注册、三角化、过滤、检查点和着色耗时。导航误差按最终所选模型计算。
+state.json 的 pipeline_version=15 标识当前实现，恢复时须与程序的实现标记一致；不匹配时使用新目录。旧工作目录仍可独立 `export`、`refine` 或 `cleanup`，原结果不迁移、不改写。状态与结果保存本次执行的构建版本、时间和 EXE 路径。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，最终 result.json 同时包含此报告。unassigned_completion 记录最终标定后固定相机、对匹配连通分量内未分配观测重新三角化的新增点数和观测数；不重复占用已有特征。timing 细分缓存读取、轨迹构建、候选选择、位姿注册、三角化、过滤、检查点和着色耗时。导航误差按最终所选模型计算。
 
 cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用数量、读图或缓存读取、预处理、输入等待、写入和推理耗时，最终 result.json 的 frontend 字段包含这些报告。匹配报告还保存配对总数、每图连接数及定向补边的图像编号。GPU 推理由 CUDA 事件测量；累计工作时间可以重叠，不能简单相加为总耗时。恢复运行的报告仅计本次计算，补匹配记录在 matches 报告的 repairs 数组，续跑沿用已完成的轮数。
 
@@ -20,17 +20,23 @@ cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用
 
 `cache/incremental.bin` 使用同一重建格式，保存 SfM 的部分注册结果，每次局部优化后原子更新。补匹配及中断恢复会重新验证匹配几何、重建候选关联，保留已有位姿、三维点和观测身份；该文件不作为视觉验收或导出依据。
 
-默认首次停滞就对已注册部分完成最终优化和验收；显式启用补匹配时，在轮数用完后处理已注册部分。通过后写入 visual.bin 并继续配准、精修、导出。所有重建缓存保留全部输入索引及 registered 标记，未注册图像不出现在点轨迹中。cache/unregistered.json 保留 SfM 阶段未注册的原输入索引；全部注册后删除。state.registration 保存最终所选模型的注册统计，sfm 报告的 quality.registration 保存精修前的统计。status=completed 表示交付完成，是否全注册看最终 registration.complete。
+默认首次停滞就对已注册部分完成最终优化和验收；显式启用补匹配时，在轮数用完后处理已注册部分。通过后写入 visual.bin 并继续配准、可选精修、独立清理和导出。所有重建缓存保留全部输入索引及 registered 标记，未注册图像不出现在点轨迹中。cache/unregistered.json 保留 SfM 阶段未注册的原输入索引；全部注册后删除。state.registration 保存最终所选模型的注册统计，sfm 报告的 quality.registration 保存后处理前的统计。status=completed 表示交付完成，是否全注册看最终 registration.complete。
 
-默认阶段为 `prepare → masks → features → matches → sfm → align → refine → export`。align 产物为 `cache/aligned.bin` 和 `cache/alignment.json`，精修不改写它们。refine 使用同一重建格式写入 `cache/refinement_candidate.bin` 和 `cache/refined.bin`：前者用于诊断候选，后者始终为最终所选模型，即使精修候选未通过也保存原模型。`cache/refinement.json` 分别记录相机优化及强力清理的验收、采用结果和原因；`result.json` 保留原阶段报告，并更新最终 quality、导航误差和 refinement。`selected_model=refined` 指定导出及独立精修读取 refined.bin；未声明该字段的旧结果仍读取 aligned.bin。
+默认阶段为 `prepare → masks → features → matches → sfm → align → cleanup → export`。配置 `refine` 默认为 false，首次运行 `--refine` 等价于设为 true，选择随配置冻结；启用后在 align 与 cleanup 之间增加 refine 阶段。align 产物为 `cache/aligned.bin` 和 `cache/alignment.json`，后续处理不改写它们。
 
-refine 完成后才提交阶段状态，所有产物纳入文件元数据校验；中断时重跑该阶段，不将未完成候选视为成果。续跑会复用已完成精修。默认导出和独立 `export` 都使用 result.json 指定的模型，其元数据也用于交付包的请求身份。
+启用 refine 时，写入 `cache/refinement_candidate.bin`、`cache/refined.bin`、`cache/refinement.json` 和中间结果 `cache/refinement_result.json`。refined.bin 保存相机精修后选中的模型，候选未通过时保存对齐模型；该阶段不执行强力清理、不写最终 result.json。关闭时不生成这些缓存，最终报告记录 refinement.enabled=false。
+
+cleanup 阶段默认对上一步所选模型独立清理与验收，写入 `cache/cleanup_candidate.bin`、`cache/cleaned.bin`、`cache/cleanup.json` 和最终 `result.json`。可靠 LAS 平面支撑少于 200 条时不采用清理；清理候选未通过时同样保留清理前模型，cleaned.bin 保存所选结果，cleanup.used=false 及 reason 记录原因。清理只处理稀疏点及轨迹，相机内参和位姿保持不变。最终报告分别保存 refinement 和 cleanup；cleanup.source_model 记录输入缓存为 aligned 或 refined，quality 与导航误差按最终所选模型计算。
+
+`selected_model=cleaned` 指定读取 cleaned.bin，`refined` 指定 refined.bin，`aligned` 或未声明字段时读取 aligned.bin；旧结果的选择不变。独立 `refine` 只执行相机精修、选择 refined.bin，独立 `cleanup` 只清理稀疏结构、选择 cleaned.bin；均读取来源的所选模型并写入新目录，保留来源目录。
+
+各阶段完成后才提交状态，产物纳入文件元数据校验；中断时重跑该阶段，不将未完成候选视为成果。清理不会改写精修的中间产物，续跑可分别复用。新流程在 cleanup 完成后才允许导出；默认导出和独立 `export` 都使用 result.json 指定的模型，其元数据也用于交付包的请求身份。
 
 精修误差统计的 `per_image` 按内部图像编号列出样本数、中位数和 P90，`cells` 再按原图 16×12 网格统计，格子编号为 `row*16+column`（从 0 开始）。`image_names` 将内部编号映射到图像文件名；它不等同于导出 COLMAP 的 image_id。`validation_coverage.images_without_holdout` 明确列出没有留出观测的已注册图像。全局验收通过不表示这些照片或未覆盖区域已通过独立校验；此报告中的留出误差是重三角化后的重投影误差，不能代替指定表面的原图投影叠加检查。
 
 `pre_calibration_completion` 记录每次末尾标定支撑检查前的轨迹补全，新增点参与随后的 BA。标定两档的 `calibration_selection` 均记录可靠轨迹的逐图观测数、8×8 覆盖格子和角度带计数。支撑不足的检查也保留报告：`used=false`、`insufficient_images` 列出对应曝光；可用子集收尾排除这些曝光后重新检查，最终 `unregistered.json` 和交付 registration 包含全部省略曝光。
 
-原图精修 `refinement_version=6` 的 `validation_coverage` 记录逐图训练及留出覆盖、限值和不足名单；覆盖不足时不运行相机优化。`optimization_reference` 说明增量优化的原投影与法向位移基准，`optimization.reference_observations` 记录使用原投影的训练观测数；优化代价包含这些先验，不能直接作为实际观测误差。
+原图精修 `refinement_version=7` 的 `validation_coverage` 记录逐图训练及留出覆盖、限值和不足名单；覆盖不足时不运行相机优化。精修报告不再内嵌 structure_filter，清理报告位于独立的 cleanup。`optimization_reference` 说明增量优化的原投影与法向位移基准，`optimization.reference_observations` 记录使用原投影的训练观测数；优化代价包含这些先验，不能直接作为实际观测误差。
 
 `training_error_px`、`validation_before_px/after_px` 均使用实际像素；后者包含全部留出轨迹，`photo_validation_before_px/after_px` 单独统计成功光度精修的留出轨迹，用于改善门限。逐图及有至少 8 个样本的格子退化名单另存样本数和前后中位数、P90。
 

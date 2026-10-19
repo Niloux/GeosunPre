@@ -15,7 +15,7 @@ set(GEOSUN_SOURCES
   src/io/scene.cpp src/io/cache.cpp src/io/las.cpp src/io/colmap.cpp
   src/geometry/camera.cpp src/geometry/model.cpp src/geometry/supervision.cu
   src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/preprocessing.cu src/frontend/frontend.cpp
-  src/sfm/reconstruction.cpp src/sfm/optimization.cpp src/sfm/photometric.cpp
+  src/sfm/reconstruction.cpp src/sfm/optimization.cpp src/sfm/photometric.cpp src/sfm/structure.cpp
   src/alignment/alignment.cpp)
 # Keep changing build metadata out of the application's compile definitions.
 file(GLOB_RECURSE GEOSUN_BUILD_INPUTS CONFIGURE_DEPENDS
