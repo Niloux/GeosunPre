@@ -127,7 +127,7 @@ void Run(const Arguments& args) {
   args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
                  "--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--refine"});
+                 "--supervision-cache-mb", "--refine"});
   const auto supervision = ParseSupervisionOptions(args);
   const auto work = args.Get("--work").empty()
                         ? fs::absolute(fs::path("work") / args.Path("--input").filename())
@@ -378,7 +378,7 @@ void Run(const Arguments& args) {
 void Export(const Arguments& args) {
   args.Validate({"--work", "--output", "--no-ply", "--ply-voxel", "--las-supervision",
                  "--no-las-supervision", "--supervision-max-size", "--supervision-boundary",
-                 "--supervision-mask-dir"});
+                 "--supervision-mask-dir", "--supervision-cache-mb"});
   const auto supervision = ParseSupervisionOptions(args);
   const auto work = args.Path("--work");
   Lock lock(work);
@@ -402,7 +402,8 @@ void Export(const Arguments& args) {
 }
 void Postprocess(const Arguments& args) {
   args.Validate({"--work", "--output", "--workers", "--las-supervision", "--no-las-supervision",
-                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir"});
+                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
+                 "--supervision-cache-mb"});
   const auto supervision = ParseSupervisionOptions(args);
   const bool photo = args.command == "refine";
   const auto source = args.Path("--work"), output = args.Path("--output");

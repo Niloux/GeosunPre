@@ -7,6 +7,7 @@
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <numeric>
 
 namespace geosun {
@@ -14,6 +15,34 @@ namespace {
 constexpr int Version = 1;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 constexpr size_t DepthBudget = 256 * 1024 * 1024;
+constexpr size_t PointChunk = 500000;
+struct Stream {
+  cudaStream_t value = nullptr;
+  Stream() { CudaCheck(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking)); }
+  ~Stream() {
+    cudaStreamSynchronize(value);
+    cudaStreamDestroy(value);
+  }
+};
+struct Event {
+  cudaEvent_t value = nullptr;
+  Event() { CudaCheck(cudaEventCreateWithFlags(&value, cudaEventDisableTiming)); }
+  ~Event() { cudaEventDestroy(value); }
+};
+struct PinnedPoints {
+  int3* data = nullptr;
+  PinnedPoints() {
+    CudaCheck(cudaMallocHost(reinterpret_cast<void**>(&data), PointChunk * sizeof(int3)));
+  }
+  ~PinnedPoints() { cudaFreeHost(data); }
+};
+struct PointTransfer {
+  PinnedPoints host;
+  DeviceBuffer device;
+  Event copied, consumed;
+  bool used = false;
+  explicit PointTransfer(bool streaming) : device(streaming ? PointChunk * sizeof(int3) : 0) {}
+};
 struct Projection {
   double rotation[9], translation[3], params[8], scales[3];
 };
@@ -43,6 +72,136 @@ __global__ void ProjectLas(const int3* points, int count, const Projection* came
     atomicMin(reinterpret_cast<unsigned*>(maps + pixel), __float_as_uint(float(distance)));
   }
 }
+class LasPointCache {
+  std::unique_ptr<DeviceBuffer> resident_;
+  std::array<std::unique_ptr<PointTransfer>, 2> transfers_;
+  // Drain both streams before releasing any buffers, including constructor failure.
+  Stream compute_, upload_;
+  fs::path file_;
+  uint64_t count_ = 0, excluded_ = 0, uploaded_bytes_ = 0;
+  size_t budget_ = 0, batches_ = 0;
+  double prepare_seconds_ = 0;
+
+ public:
+  LasPointCache(const fs::path& las, const LasHeader& header, const fs::path& output,
+                int cache_mb) {
+    const auto started = Clock::now();
+    size_t free, total;
+    CudaCheck(cudaMemGetInfo(&free, &total));
+    budget_ = std::min(size_t(cache_mb) * 1024 * 1024, free / 4);
+    const size_t maximum_bytes = size_t(header.count) * sizeof(int3);
+    std::ofstream packed;
+    if (maximum_bytes <= budget_)
+      resident_ = std::make_unique<DeviceBuffer>(maximum_bytes);
+    else {
+      file_ = output / "las-coordinates.cache";
+      packed.open(file_, std::ios::binary);
+      if (!packed)
+        throw std::runtime_error("Cannot create LAS coordinate cache");
+    }
+    for (auto& slot : transfers_)
+      slot = std::make_unique<PointTransfer>(!resident_);
+    size_t index = 0;
+    ScanLas(las, header, [&](uint64_t, const std::vector<LasPoint>& chunk) {
+      auto& slot = *transfers_[index++ % transfers_.size()];
+      if (slot.used)
+        CudaCheck(cudaEventSynchronize(slot.copied.value));
+      size_t kept = 0;
+      for (const auto& point : chunk) {
+        if (KeepLasPoint(point))
+          slot.host.data[kept++] = make_int3(point.raw[0], point.raw[1], point.raw[2]);
+        else
+          ++excluded_;
+      }
+      const size_t bytes = kept * sizeof(int3);
+      if (resident_ && bytes) {
+        auto* destination = static_cast<int3*>(resident_->data) + count_;
+        CudaCheck(cudaMemcpyAsync(destination, slot.host.data, bytes, cudaMemcpyHostToDevice,
+                                  upload_.value));
+        CudaCheck(cudaEventRecord(slot.copied.value, upload_.value));
+        slot.used = true;
+        uploaded_bytes_ += bytes;
+      } else if (!resident_) {
+        packed.write(reinterpret_cast<const char*>(slot.host.data), std::streamsize(bytes));
+        if (!packed)
+          throw std::runtime_error("Cannot write LAS coordinate cache");
+      }
+      count_ += kept;
+    });
+    CudaCheck(cudaStreamSynchronize(upload_.value));
+    if (resident_) {
+      for (auto& slot : transfers_)
+        slot.reset();
+    } else {
+      packed.close();
+      if (!packed)
+        throw std::runtime_error("Incomplete LAS coordinate cache write");
+    }
+    prepare_seconds_ = Seconds(started);
+    Log("LAS coordinates: " + std::to_string(count_) + " points, " +
+        (resident_ ? "GPU cache" : "compact file with double-buffered upload"));
+  }
+  cudaStream_t StreamHandle() const { return compute_.value; }
+  uint64_t Count() const { return count_; }
+  uint64_t Excluded() const { return excluded_; }
+  void Project(const Projection* cameras, float* maps, int width, int height, size_t images) {
+    std::ifstream packed;
+    if (!resident_) {
+      packed.open(file_, std::ios::binary);
+      if (!packed)
+        throw std::runtime_error("Cannot read LAS coordinate cache");
+    }
+    size_t index = 0;
+    for (uint64_t first = 0; first < count_; first += PointChunk) {
+      const size_t count = size_t(std::min<uint64_t>(PointChunk, count_ - first));
+      const int3* points;
+      PointTransfer* transfer = nullptr;
+      if (resident_)
+        points = static_cast<const int3*>(resident_->data) + first;
+      else {
+        transfer = transfers_[index++ % transfers_.size()].get();
+        if (transfer->used)
+          CudaCheck(cudaEventSynchronize(transfer->copied.value));
+        const size_t bytes = count * sizeof(int3);
+        if (!packed.read(reinterpret_cast<char*>(transfer->host.data), std::streamsize(bytes)))
+          throw std::runtime_error("Truncated LAS coordinate cache");
+        if (transfer->used)
+          CudaCheck(cudaStreamWaitEvent(upload_.value, transfer->consumed.value, 0));
+        CudaCheck(cudaMemcpyAsync(transfer->device.data, transfer->host.data, bytes,
+                                  cudaMemcpyHostToDevice, upload_.value));
+        CudaCheck(cudaEventRecord(transfer->copied.value, upload_.value));
+        CudaCheck(cudaStreamWaitEvent(compute_.value, transfer->copied.value, 0));
+        points = static_cast<const int3*>(transfer->device.data);
+        uploaded_bytes_ += bytes;
+      }
+      ProjectLas<<<dim3(unsigned((count + 255) / 256), unsigned(images)), 256, 0, compute_.value>>>(
+          points, int(count), cameras, maps, width, height);
+      CudaCheck(cudaGetLastError());
+      if (transfer) {
+        CudaCheck(cudaEventRecord(transfer->consumed.value, compute_.value));
+        transfer->used = true;
+      }
+    }
+    ++batches_;
+  }
+  void Finish() {
+    CudaCheck(cudaStreamSynchronize(compute_.value));
+    CudaCheck(cudaStreamSynchronize(upload_.value));
+    if (!file_.empty())
+      fs::remove(file_);
+  }
+  Json Profile() const {
+    return {{"storage", resident_ ? "gpu" : "file"},
+            {"las_scans", 1},
+            {"budget_bytes", budget_},
+            {"coordinate_bytes", count_ * sizeof(int3)},
+            {"gpu_cache_bytes", resident_ ? resident_->bytes : 0},
+            {"transfer_buffer_bytes", resident_ ? 0 : 2 * PointChunk * sizeof(int3)},
+            {"host_to_device_bytes", uploaded_bytes_},
+            {"projection_batches", batches_},
+            {"prepare_seconds", prepare_seconds_}};
+  }
+};
 __device__ float At(const float* depth, int x, int y, int w, int h) {
   if (x < 0 || y < 0 || x >= w || y >= h)
     return 0;
@@ -261,13 +420,16 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   options.enabled = args.Get("--no-las-supervision") != "true";
   options.max_size = args.Integer("--supervision-max-size", 1600);
   options.boundary = args.Integer("--supervision-boundary", 6);
+  options.cache_mb = args.Integer("--supervision-cache-mb", 1024);
   if (!args.Get("--supervision-mask-dir").empty())
     options.mask_dir = args.Path("--supervision-mask-dir");
   if (options.max_size < 128 || options.max_size > 4096 || options.boundary > 32)
     throw std::runtime_error("Supervision max size must be 128-4096 and boundary 1-32 pixels");
+  if (options.cache_mb > 4096)
+    throw std::runtime_error("Supervision cache budget must be 1-4096 MiB");
   if (!options.enabled &&
       (args.values.count("--supervision-max-size") || args.values.count("--supervision-boundary") ||
-       !options.mask_dir.empty()))
+       args.values.count("--supervision-cache-mb") || !options.mask_dir.empty()))
     throw std::runtime_error("Supervision options cannot be used with --no-las-supervision");
   if (!options.mask_dir.empty() && !fs::is_directory(options.mask_dir))
     throw std::runtime_error("Geometry exclusion mask directory does not exist");
@@ -298,10 +460,9 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   const auto header = ReadLasHeader(scene.las);
   const auto request = SupervisionRequest(scene, model, work, options);
   std::vector<Json> rows(model.images.size());
-  DeviceBuffer points(500000 * sizeof(int3));
-  std::vector<int3> raw;
-  raw.reserve(500000);
-  uint64_t accepted = 0, rejected = 0, depth_pixels = 0, normal_pixels = 0;
+  LasPointCache points(scene.las, header, output, options.cache_mb);
+  const auto stream = points.StreamHandle();
+  uint64_t depth_pixels = 0, normal_pixels = 0;
   size_t done = 0;
   for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
     std::vector<uint32_t> images;
@@ -326,7 +487,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     DeviceBuffer maps(batch * size * sizeof(float)), cameras(batch * sizeof(Projection)),
         rays(size * sizeof(double3)), clean(size * sizeof(float)), filled(size * sizeof(float)),
         mask(size), edge(size), dilated(size), millimetres(size * sizeof(uint16_t)), normals(size * sizeof(uchar3));
-    CudaCheck(cudaMemcpy(rays.data, ray_host.data(), rays.bytes, cudaMemcpyHostToDevice));
+    CudaCheck(
+        cudaMemcpyAsync(rays.data, ray_host.data(), rays.bytes, cudaMemcpyHostToDevice, stream));
     for (size_t first = 0; first < images.size(); first += batch) {
       const size_t count = std::min(batch, images.size() - first);
       std::vector<Projection> projection(count);
@@ -343,54 +505,43 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         }
         std::copy(camera.params.begin(), camera.params.end(), p.params);
       }
-      CudaCheck(cudaMemcpy(cameras.data, projection.data(), count * sizeof(Projection), cudaMemcpyHostToDevice));
-      CudaCheck(cudaMemset(maps.data, 0x7f, count * size * sizeof(float)));
-      uint64_t kept = 0, skipped = 0;
-      ScanLas(scene.las, header, [&](uint64_t, const std::vector<LasPoint>& chunk) {
-        raw.clear();
-        for (const auto& p : chunk) {
-          if (KeepLasPoint(p))
-            raw.push_back(make_int3(p.raw[0], p.raw[1], p.raw[2]));
-          else
-            ++skipped;
-        }
-        kept += raw.size();
-        if (raw.empty())
-          return;
-        CudaCheck(cudaMemcpy(points.data, raw.data(), raw.size() * sizeof(int3), cudaMemcpyHostToDevice));
-        ProjectLas<<<dim3(unsigned((raw.size() + 255) / 256), unsigned(count)), 256>>>(
-            static_cast<const int3*>(points.data), int(raw.size()), static_cast<const Projection*>(cameras.data),
-            static_cast<float*>(maps.data), w, h);
-        CudaCheck(cudaGetLastError());
-        CudaCheck(cudaDeviceSynchronize());
-      });
-      accepted = kept;
-      rejected = skipped;
+      CudaCheck(cudaMemcpyAsync(cameras.data, projection.data(), count * sizeof(Projection),
+                                cudaMemcpyHostToDevice, stream));
+      CudaCheck(cudaMemsetAsync(maps.data, 0x7f, count * size * sizeof(float), stream));
+      points.Project(static_cast<const Projection*>(cameras.data), static_cast<float*>(maps.data),
+                     w, h, count);
       for (size_t j = 0; j < count; ++j) {
         const uint32_t id = images[first + j];
         const auto static_mask = StaticMask(scene, work, id, camera, options);
-        CudaCheck(cudaMemcpy(mask.data, static_mask.data, size, cudaMemcpyHostToDevice));
+        CudaCheck(
+            cudaMemcpyAsync(mask.data, static_mask.data, size, cudaMemcpyHostToDevice, stream));
         const auto* raw_depth = static_cast<float*>(maps.data) + j * size;
         auto* filtered = static_cast<float*>(clean.data);
         auto* scratch = static_cast<float*>(filled.data);
         const auto* keep = static_cast<const uint8_t*>(mask.data);
-        Cull<<<blocks, 256>>>(raw_depth, filtered, keep, w, h);
+        Cull<<<blocks, 256, 0, stream>>>(raw_depth, filtered, keep, w, h);
         for (int pass = 0; pass < 2; ++pass) {
-          Fill<<<blocks, 256>>>(filtered, scratch, keep, w, h);
+          Fill<<<blocks, 256, 0, stream>>>(filtered, scratch, keep, w, h);
           std::swap(filtered, scratch);
         }
-        Edges<<<blocks, 256>>>(filtered, keep, static_cast<uint8_t*>(edge.data), w, h);
-        Dilate<<<blocks, 256>>>(static_cast<const uint8_t*>(edge.data), static_cast<uint8_t*>(dilated.data),
-                                 w, h, options.boundary, true);
-        Dilate<<<blocks, 256>>>(static_cast<const uint8_t*>(dilated.data), static_cast<uint8_t*>(edge.data),
-                                 w, h, options.boundary, false);
-        Encode<<<blocks, 256>>>(filtered, static_cast<const double3*>(rays.data), static_cast<const uint8_t*>(edge.data),
-                                 static_cast<uint16_t*>(millimetres.data), static_cast<uchar3*>(normals.data),
-                                 w, h, camera.params[0]);
+        Edges<<<blocks, 256, 0, stream>>>(filtered, keep, static_cast<uint8_t*>(edge.data), w, h);
+        Dilate<<<blocks, 256, 0, stream>>>(static_cast<const uint8_t*>(edge.data),
+                                           static_cast<uint8_t*>(dilated.data), w, h,
+                                           options.boundary, true);
+        Dilate<<<blocks, 256, 0, stream>>>(static_cast<const uint8_t*>(dilated.data),
+                                           static_cast<uint8_t*>(edge.data), w, h, options.boundary,
+                                           false);
+        Encode<<<blocks, 256, 0, stream>>>(
+            filtered, static_cast<const double3*>(rays.data),
+            static_cast<const uint8_t*>(edge.data), static_cast<uint16_t*>(millimetres.data),
+            static_cast<uchar3*>(normals.data), w, h, camera.params[0]);
         CudaCheck(cudaGetLastError());
         cv::Mat depth(h, w, CV_16UC1), normal(h, w, CV_8UC3);
-        CudaCheck(cudaMemcpy(depth.data, millimetres.data, millimetres.bytes, cudaMemcpyDeviceToHost));
-        CudaCheck(cudaMemcpy(normal.data, normals.data, normals.bytes, cudaMemcpyDeviceToHost));
+        CudaCheck(cudaMemcpyAsync(depth.data, millimetres.data, millimetres.bytes,
+                                  cudaMemcpyDeviceToHost, stream));
+        CudaCheck(cudaMemcpyAsync(normal.data, normals.data, normals.bytes, cudaMemcpyDeviceToHost,
+                                  stream));
+        CudaCheck(cudaStreamSynchronize(stream));
         const auto valid = Counts(depth, normal);
         depth_pixels += valid.first;
         normal_pixels += valid.second;
@@ -417,14 +568,28 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
       images.push_back(row);
   if (request != SupervisionRequest(scene, model, work, options))
     throw std::runtime_error("LAS or geometry exclusion masks changed during supervision export");
-  return {{"version", Version}, {"request", request}, {"source", "valid original LAS records"},
-          {"accepted_records", accepted}, {"excluded_records", rejected}, {"depth_format", "uint16_png_mm"},
-          {"depth_type", "ray_distance"}, {"invalid_depth", 0}, {"normal_format", "rgb8_png"},
-          {"normal_frame", "opencv_camera_facing_camera"}, {"normal_encoding", "round(127.5 * (n + 1))"},
-          {"invalid_normal_rgb", {0, 0, 0}}, {"minimum_abs_normal_dot_ray", MinIncidence},
-          {"surface_radius_m", .04}, {"normal_angle_limit_degrees", 10},
-          {"fine_plane_limit_m", .01}, {"coarse_plane_limit_m", .015},
-          {"depth_pixels", depth_pixels}, {"normal_pixels", normal_pixels}, {"images", images},
+  points.Finish();
+  return {{"version", Version},
+          {"request", request},
+          {"source", "valid original LAS records"},
+          {"accepted_records", points.Count()},
+          {"excluded_records", points.Excluded()},
+          {"point_cache", points.Profile()},
+          {"depth_format", "uint16_png_mm"},
+          {"depth_type", "ray_distance"},
+          {"invalid_depth", 0},
+          {"normal_format", "rgb8_png"},
+          {"normal_frame", "opencv_camera_facing_camera"},
+          {"normal_encoding", "round(127.5 * (n + 1))"},
+          {"invalid_normal_rgb", {0, 0, 0}},
+          {"minimum_abs_normal_dot_ray", MinIncidence},
+          {"surface_radius_m", .04},
+          {"normal_angle_limit_degrees", 10},
+          {"fine_plane_limit_m", .01},
+          {"coarse_plane_limit_m", .015},
+          {"depth_pixels", depth_pixels},
+          {"normal_pixels", normal_pixels},
+          {"images", images},
           {"seconds", Seconds(started)}};
 }
 void CheckLasSupervision(const fs::path& output, const Reconstruction& model,

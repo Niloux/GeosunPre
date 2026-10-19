@@ -5,6 +5,7 @@ namespace geosun {
 struct SupervisionOptions {
   bool enabled = true;
   int max_size = 1600, boundary = 6;
+  int cache_mb = 1024;
   fs::path mask_dir;
 };
 SupervisionOptions ParseSupervisionOptions(const Arguments& args);
