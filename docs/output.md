@@ -4,14 +4,14 @@
 OUTPUT/
   images/{L,R}/**.JPG
   masks/{L,R}/**.JPG.png
-  depths/{L,R}/**.JPG.png       # --las-supervision
-  normals/{L,R}/**.JPG.png      # --las-supervision
+  depths/{L,R}/**.JPG.png       # 默认生成，--no-las-supervision 省略
+  normals/{L,R}/**.JPG.png      # 默认生成，--no-las-supervision 省略
   sparse/0/{cameras,images,points3D,rigs,frames}.bin
   sparse/0/points3D.ply
   manifest.json
   quality.json
   initialization.json
-  supervision.json            # --las-supervision
+  supervision.json            # 默认生成，--no-las-supervision 省略
 ```
 
 COLMAP 小端二进制，`OPENCV_FISHEYE` 模型编号 5、8 个参数。相机 ID 1、2；每幅图像独立 frame，使用镜头对应的一传感器 rig。内部索引从 0 开始；仅导出已注册照片，按原输入顺序将图像/frame ID 连续重编号为 1 到注册数量，轨迹中的图像引用同步转换，内部缓存编号保持不变。
@@ -24,11 +24,11 @@ points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重
 
 掩码为原图尺寸单通道 PNG：静态 255、天空 128、人物及有效域外 0。SfM 只提取 255 区域；有效域按初始标定冻结。五视图融合无覆盖的格子对应原图像素也为 0，独立精修复制旧掩码时同步屏蔽这些像素。
 
-可选 LAS 监督使用最终所选相机和原始有效 LAS，以 50 万记录分块、GPU 有界批次逐点投影，几何计算为双精度；不读取初始化 PLY。监督图默认最长边 1600，不放大原图，相机内参按输出尺寸缩放。深度是沿视线距离，uint16 毫米，0 表示无效，0.05 m 以下及 65.535 m 以上留空。法向是 OpenCV 相机坐标下朝向相机的单位向量，RGB 为 `round(127.5*(n+1))`，黑色无效。Spirula 需显式设置 `input_depth_is_ray_depth=true`；图像仍保留原始鱼眼畸变。
+LAS 深度和法向监督默认在导出阶段生成，`run`、独立 `export`、`refine`、`cleanup` 均可用 `--no-las-supervision` 关闭。监督使用最终所选相机和原始有效 LAS，以 50 万记录分块、GPU 有界批次逐点投影，几何计算为双精度；不读取初始化 PLY。监督图默认最长边 1600，不放大原图，相机内参按输出尺寸缩放。深度是沿视线距离，uint16 毫米，0 表示无效，0.05 m 以下及 65.535 m 以上留空。法向是 OpenCV 相机坐标下朝向相机的单位向量，RGB 为 `round(127.5*(n+1))`，黑色无效。Spirula 需显式设置 `input_depth_is_ray_depth=true`；图像仍保留原始鱼眼畸变。
 
 先剔除近处表面空隙中漏出的远点，再以充分且深度一致的邻居补小孔。深度断层、语义边界默认留出 6 个监督图像素；局部三维面残差不超过 1 cm、法向与视线夹角余弦绝对值至少 0.3 时保留深度。法向另需两种邻域尺度相差不超过 10°、粗尺度面残差不超过 1.5 cm。缺测允许单图完全为空，但整包必须有有效深度和法向。以上是几何一致性筛选，不证明真实可见性或自动识别玻璃；`--supervision-mask-dir` 可按原图身份追加仅影响几何的排除掩码，原 RGB 掩码不因 LAS 缺测而改变。
 
-启用时 manifest 的 request.supervision 记录算法版本、LAS、静态及额外排除掩码身份和导出参数；supervision 字段与 `supervision.json` 相同，保存按已注册照片原顺序排列的尺寸、文件字节数及有效像素数量。`check` 逐图回读，核对类型、尺寸、身份、有效数量、法向单位长度及其深度支撑。旧包可以没有这些字段。
+manifest 的 request.supervision 记录算法版本、LAS、静态及额外排除掩码身份和导出参数；supervision 字段与 `supervision.json` 相同，保存按已注册照片原顺序排列的尺寸、文件字节数及有效像素数量。`check` 逐图回读，核对类型、尺寸、身份、有效数量、法向单位长度及其深度支撑。关闭监督时不生成这些字段和文件，旧包仍可回读。
 
 manifest 协议版本 1，保存请求、已注册图像身份、文件大小、初始化参数。图像条目的 image_index 是原输入的 0 起始索引。quality 保存所选模型拟合验收和限值。省略 PLY 时不生成 initialization.json，清单中的 initialization 为 null。
 

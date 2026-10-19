@@ -3,7 +3,7 @@
 
 namespace geosun {
 struct SupervisionOptions {
-  bool enabled = false;
+  bool enabled = true;
   int max_size = 1600, boundary = 6;
   fs::path mask_dir;
 };

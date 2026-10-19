@@ -256,16 +256,19 @@ std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal
 }  // namespace
 SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   SupervisionOptions options;
-  options.enabled = args.Get("--las-supervision") == "true";
+  if (args.values.count("--las-supervision") && args.values.count("--no-las-supervision"))
+    throw std::runtime_error("--las-supervision conflicts with --no-las-supervision");
+  options.enabled = args.Get("--no-las-supervision") != "true";
   options.max_size = args.Integer("--supervision-max-size", 1600);
   options.boundary = args.Integer("--supervision-boundary", 6);
   if (!args.Get("--supervision-mask-dir").empty())
     options.mask_dir = args.Path("--supervision-mask-dir");
   if (options.max_size < 128 || options.max_size > 4096 || options.boundary > 32)
     throw std::runtime_error("Supervision max size must be 128-4096 and boundary 1-32 pixels");
-  if (!options.enabled && (args.values.count("--supervision-max-size") ||
-                           args.values.count("--supervision-boundary") || !options.mask_dir.empty()))
-    throw std::runtime_error("Supervision options require --las-supervision");
+  if (!options.enabled &&
+      (args.values.count("--supervision-max-size") || args.values.count("--supervision-boundary") ||
+       !options.mask_dir.empty()))
+    throw std::runtime_error("Supervision options cannot be used with --no-las-supervision");
   if (!options.mask_dir.empty() && !fs::is_directory(options.mask_dir))
     throw std::runtime_error("Geometry exclusion mask directory does not exist");
   return options;

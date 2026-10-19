@@ -46,24 +46,29 @@ int Main(const std::vector<std::string>& argv) {
                        .dump(2)
                 << '\n';
     } else if (args.command == "help" || args.command == "--help") {
-      std::cout << "GeosunPre " << BuildVersion
-                << " - native dual-fisheye/LAS reconstruction\n"
-                   "  geosunpre run --input INPUT --work WORK [--models MODELS] [--config JSON] "
-                   "[--refine]\n"
-                   "  geosunpre run --work WORK [--stage "
-                   "prepare|masks|features|matches|sfm|align|refine|cleanup|export]\n"
-                   "    refine is disabled by default; enable with --refine or config refine=true\n"
-                   "  geosunpre prepare --input INPUT --work WORK [--refine]\n"
-                   "  geosunpre export --work WORK [--output DIR] [--no-ply] [--ply-voxel METRES]\n"
-                   "    [--las-supervision] [--supervision-max-size PIXELS] "
-                   "[--supervision-boundary PIXELS]\n"
-                   "    [--supervision-mask-dir DIR]\n"
-                   "  geosunpre refine --work WORK --output NEW_WORK [--workers N]\n"
-                   "  geosunpre cleanup --work WORK --output NEW_WORK [--workers N]\n"
-                   "  geosunpre check --output DIR\n"
-                   "  geosunpre info\n"
-                   "  geosunpre check-models --image FILE [--models MODELS]\n"
-                   "  geosunpre las-ply --las FILE --output FILE [--voxel METRES]\n";
+      std::cout
+          << "GeosunPre " << BuildVersion
+          << " - native dual-fisheye/LAS reconstruction\n"
+             "  geosunpre run --input INPUT --work WORK [--models MODELS] [--config JSON] "
+             "[--refine] [--no-las-supervision]\n"
+             "  geosunpre run --work WORK [--stage "
+             "prepare|masks|features|matches|sfm|align|refine|cleanup|export]\n"
+             "    refine is disabled by default; enable with --refine or config refine=true\n"
+             "  geosunpre prepare --input INPUT --work WORK [--refine]\n"
+             "  geosunpre export --work WORK [--output DIR] [--no-ply] [--ply-voxel METRES] "
+             "[--no-las-supervision]\n"
+             "  geosunpre refine --work WORK --output NEW_WORK [--workers N] "
+             "[--no-las-supervision]\n"
+             "  geosunpre cleanup --work WORK --output NEW_WORK [--workers N] "
+             "[--no-las-supervision]\n"
+             "    LAS depth/normal supervision is enabled for run/export/refine/cleanup\n"
+             "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS] "
+             "[--supervision-mask-dir DIR]\n"
+             "    --las-supervision explicitly enables it; conflicts with --no-las-supervision\n"
+             "  geosunpre check --output DIR\n"
+             "  geosunpre info\n"
+             "  geosunpre check-models --image FILE [--models MODELS]\n"
+             "  geosunpre las-ply --las FILE --output FILE [--voxel METRES]\n";
     } else
       throw std::runtime_error("Unknown command: " + args.command);
     return 0;

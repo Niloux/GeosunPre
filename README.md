@@ -1,6 +1,6 @@
 # GeosunPre
 
-原生 C++17/CUDA 双鱼眼与 LAS 重建程序。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、稀疏点清理和 COLMAP/PLY 导出，可选原图精修。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
+原生 C++17/CUDA 双鱼眼与 LAS 重建程序。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、稀疏点清理、COLMAP/PLY 及 LAS 深度和法向监督导出，可选原图精修。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
 
 ## 开始使用
 
@@ -18,7 +18,7 @@
 | --- | --- |
 | `build.ps1` | 使用 Ninja 编译 Release 程序到 `build/ninja/bin/geosunpre.exe`，自动应用 Ceres Schur 回代修复 |
 | `prepare-models.ps1` | 为 GPU 0 准备 `models/`，匹配器默认 FP16，检测器支持动态宽高 |
-| `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准、独立稀疏点清理及 COLMAP/PLY 导出；原图精修默认关闭 |
+| `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准、独立稀疏点清理及 COLMAP/PLY、LAS 深度和法向监督导出；原图精修默认关闭 |
 
 构建统一使用单配置 Ninja Release。脚本自动加载 x64 MSVC 环境，优先使用 PATH 中的 Ninja，否则使用 Visual Studio 自带的 Ninja。首次构建下载固定依赖到 `build/ninja/_deps/` 并编译，此后复用缓存。日常构建只编译变化影响到的文件，CMake 文件变化由 Ninja 自动重新配置；修改 preset 后自动重新配置，也可用 `build.ps1 -Configure` 显式重新配置，`-Jobs` 控制并行数（默认 8）。构建版本与时间单独生成，不会使全部源码因时间变化而重编。
 
@@ -34,13 +34,15 @@
 .\run.ps1 info
 ```
 
-默认交付 `WORK/colmap/`，包含原图、掩码、鱼眼 COLMAP 模型和 5 cm LAS 初始化 PLY。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长。完整结构见[输出约定](docs/output.md)。
+默认交付 `WORK/colmap/`，包含原图、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及 LAS 深度和法向监督图。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。完整结构见[输出约定](docs/output.md)。
 
-可选 `--las-supervision` 从原始有效 LAS 给已注册照片生成 Spirula 可读取的深度和法向图。已有工作目录可以直接导出到新目录，无需重跑重建：
+`run` 的导出阶段及独立 `export`、`refine`、`cleanup` 默认从原始有效 LAS 给已注册照片生成 Spirula 可读取的深度和法向图。已有工作目录可以直接导出到新目录，无需重跑重建：
 
 ```powershell
-.\run.ps1 export --work "work/场景" --output "work/场景-supervised" --las-supervision
+.\run.ps1 export --work "work/场景" --output "work/场景-supervised"
 ```
+
+旧的 `--las-supervision` 显式开启参数仍可使用，与 `--no-las-supervision` 互斥。旧交付包保持原样；给旧结果补监督或改变导出选项时使用新交付目录。续跑已有无监督交付时，可指定新 `--output`，或加 `--no-las-supervision` 复用原包。
 
 默认最长边 1600 px，深度为沿视线距离的 16 位毫米 PNG，法向使用 OpenCV 相机坐标并朝向相机。`--supervision-max-size` 调整最长边（128–4096），`--supervision-boundary` 设置屏蔽边界宽度（默认 6 个深度图像素，1–32）。只有静态区域内、具有可靠局部几何且非掠视角的像素参与监督；无效深度为 0，无效法向为黑色，原照片及 RGB 掩码保持不变。
 
@@ -68,7 +70,7 @@ Spirula 直接读取交付包的 `depths/`、`normals/`。训练时显式设置 
 | `align` LAS 配准 | 导航位置提供尺度及初始坐标对齐，多尺度点到平面优化细化七参数相似变换；可靠表面支持时尝试联合约束相机与点，验收后采用 | `cache/aligned.bin`、`cache/alignment.json` |
 | `refine` 可选原图精修 | 原始分辨率图块匹配及闭环检查，联合优化相机、共享内参和可靠轨迹；通过留出观测验证后采用，否则保留对齐模型 | `cache/refined.bin`、`cache/refinement.json`、`cache/refinement_result.json` |
 | `cleanup` 稀疏点清理 | 对上一步所选模型独立清理、验收；精修关闭或候选被拒绝时仍正常执行，保留可靠双视图初始化点 | `cache/cleaned.bin`、`cache/cleanup.json`、`result.json` |
-| `export` 交付 | 导出所选模型、已注册原图和掩码、鱼眼 COLMAP 稀疏模型及可选 LAS PLY；在临时目录回读校验通过后发布 | `colmap/` |
+| `export` 交付 | 导出所选模型、已注册原图和掩码、鱼眼 COLMAP 稀疏模型，默认附带 LAS PLY、深度及法向监督；在临时目录回读校验通过后发布 | `colmap/` |
 
 导航回访候选取 5 m 内、曝光时间相隔超过 10 s 的最近 20 幅照片，用于补充重复经过同一区域时的跨时段连接。它属于默认初始匹配，与停滞后的可选补匹配轮数不同。CameraPos 只提供位置；视觉姿态由 SfM 求解，不使用输入四元数，也不施加场景专用的固定角度补偿。
 

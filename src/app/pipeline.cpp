@@ -125,8 +125,9 @@ Json PostprocessResult(const Scene& scene, const Reconstruction& selected, const
 }  // namespace
 void Run(const Arguments& args) {
   args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
-                 "--no-ply", "--ply-voxel", "--las-supervision", "--supervision-max-size",
-                 "--supervision-boundary", "--supervision-mask-dir", "--refine"});
+                 "--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
+                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
+                 "--refine"});
   const auto supervision = ParseSupervisionOptions(args);
   const auto work = args.Get("--work").empty()
                         ? fs::absolute(fs::path("work") / args.Path("--input").filename())
@@ -376,7 +377,8 @@ void Run(const Arguments& args) {
 }
 void Export(const Arguments& args) {
   args.Validate({"--work", "--output", "--no-ply", "--ply-voxel", "--las-supervision",
-                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir"});
+                 "--no-las-supervision", "--supervision-max-size", "--supervision-boundary",
+                 "--supervision-mask-dir"});
   const auto supervision = ParseSupervisionOptions(args);
   const auto work = args.Path("--work");
   Lock lock(work);
@@ -399,7 +401,9 @@ void Export(const Arguments& args) {
   std::cout << CheckBundle(output).dump() << '\n';
 }
 void Postprocess(const Arguments& args) {
-  args.Validate({"--work", "--output", "--workers"});
+  args.Validate({"--work", "--output", "--workers", "--las-supervision", "--no-las-supervision",
+                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir"});
+  const auto supervision = ParseSupervisionOptions(args);
   const bool photo = args.command == "refine";
   const auto source = args.Path("--work"), output = args.Path("--output");
   const int workers = args.Integer("--workers", 4);
@@ -470,7 +474,7 @@ void Postprocess(const Arguments& args) {
     pixels.setTo(0, domains[image.camera] == 0);
     WriteImage(mask, pixels);
   }
-  ExportBundle(scene, selected, output, output / "colmap", true, .05, result, {});
+  ExportBundle(scene, selected, output, output / "colmap", true, .05, result, supervision);
   Log(args.command + ": " + report.at("reason").get<std::string>());
   std::cout << Json({{"work", output.u8string()},
                      {"accepted", accepted},

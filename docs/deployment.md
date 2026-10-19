@@ -16,7 +16,7 @@ Windows x64，需与模型包匹配的 NVIDIA GPU 和驱动。无需安装 Pytho
 
 `info` 显示程序路径、构建版本、GPU 和默认模型目录。`check-models` 使用指定的真实照片执行四个模型，照片仅用于本次检查，不会写入模型或运行包。version=2 模型包的检测器支持动态宽高，检查报告包含实际检测输入尺寸；换场景分辨率或宽高比无需重建模型。
 
-输入、配置或模型改变时使用新工作目录，保留已有成果。默认交付原图、掩码、鱼眼 COLMAP 模型和 5 cm LAS 初始化 PLY；下游需支持 OPENCV_FISHEYE。`--no-ply` 省略 PLY，`--ply-voxel 0.1` 生成 10 cm 初始化。
+输入、配置或模型改变时使用新工作目录，保留已有成果。默认交付原图、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及 LAS 深度和法向监督图；下游需支持 OPENCV_FISHEYE。`--no-ply` 省略 PLY，`--ply-voxel 0.1` 生成 10 cm 初始化，`--no-las-supervision` 省略监督图。Spirula 使用这些沿视线的深度时须设置 `input_depth_is_ray_depth=true`。旧重建可直接 `export --work OLD --output NEW` 补监督，保留原交付包。
 
 `run` 默认在 LAS 对齐后独立清理稀疏点，再导出通过验收的所选模型。原图精修默认关闭，首次运行加 `--refine` 或配置 `"refine": true` 在清理前启用，续跑沿用已冻结的选择。精修未启用或候选未通过时，仍对对齐模型清理；未采用原因分别见 `cache/refinement.json` 与 `cache/cleanup.json`。
 
