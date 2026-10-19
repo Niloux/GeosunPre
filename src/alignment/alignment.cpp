@@ -658,7 +658,10 @@ Json FilterSparseStructure(const Scene& scene, Reconstruction& model, const Alig
             {"maximum_sigma_proxy_m", max_sigma},
             {"maximum_nearest_las_m", max_distance}}}};
 }
-Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits) {
+Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits,
+           int ba_workers) {
+  if (!ba_workers)
+    ba_workers = workers;
   const auto header = ReadLasHeader(scene.las);
   Json sampling;
   const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
@@ -771,7 +774,7 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
   else {
     Reconstruction candidate = model;
     const auto solve =
-        Optimize(candidate, scene.cameras, "fixed", workers, 100, {}, constraints, navigation);
+        Optimize(candidate, scene.cameras, "fixed", ba_workers, 100, {}, constraints, navigation);
     const auto quality = candidate.Quality(scene, limits.median_px, limits.p90_px);
     Points candidate_points;
     std::vector<double> displacement;

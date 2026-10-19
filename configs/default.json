@@ -1,5 +1,6 @@
 {
   "workers": 4,
+  "ba_workers": 8,
   "sfm_repair_rounds": 0,
   "calibration_tracks": "all",
   "refine": false,

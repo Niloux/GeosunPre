@@ -729,7 +729,9 @@ std::set<uint64_t> CalibrationTracks(const Scene& scene, const Reconstruction& m
   return selected;
 }
 Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report,
-                           bool stable_calibration, bool allow_partial) {
+                           bool stable_calibration, bool allow_partial, int ba_workers) {
+  if (!ba_workers)
+    ba_workers = workers;
   const auto started = Clock::now();
   Reconstruction m;
   const auto checkpoint = work / "cache/incremental.bin";
@@ -1020,7 +1022,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       if (!stable_calibration)
         selected.clear();
       optimization.push_back(
-          Optimize(m, scene.cameras, "principal", workers, iterations, {}, {}, {}, selected));
+          Optimize(m, scene.cameras, "principal", ba_workers, iterations, {}, {}, {}, selected));
       break;
     }
   };
@@ -1037,11 +1039,11 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     if (round == 2 || (changed <= std::max<size_t>(1, size_t(before * .0005)) &&
                        optimization.back().at("converged").get<bool>()))
       break;
-    optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 100));
+    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 100));
   }
   calibrate(200);
   if (stable_calibration)
-    optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 200));
+    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 200));
   filter();
   const auto unassigned_completion = CompleteUnassignedTracks(m, graph);
   const auto color_started = Clock::now();

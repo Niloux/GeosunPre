@@ -282,6 +282,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
       }
       ordering->AddElementToGroup(p.xyz.data(), 0);
     }
+  const double observation_build_seconds = Seconds(started);
   if (used_images.size() < 2)
     throw std::runtime_error("Insufficient BA observations");
   for (uint32_t id : used_images) {
@@ -360,8 +361,33 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   for (const auto& c : m.cameras)
     c.Radius();
   Log(summary.BriefReport());
+  const double elapsed = Seconds(started);
+  int linear_iterations = 0, maximum_linear_iterations = 0, linear_limit_hits = 0;
+  Json iteration_profile = Json::array();
+  for (const auto& iteration : summary.iterations) {
+    linear_iterations += iteration.linear_solver_iterations;
+    maximum_linear_iterations =
+        std::max(maximum_linear_iterations, iteration.linear_solver_iterations);
+    linear_limit_hits += iteration.linear_solver_iterations >= options.max_linear_solver_iterations;
+    iteration_profile.push_back({{"iteration", iteration.iteration},
+                                 {"seconds", iteration.iteration_time_in_seconds},
+                                 {"step_solver_seconds", iteration.step_solver_time_in_seconds},
+                                 {"linear_iterations", iteration.linear_solver_iterations},
+                                 {"cost", iteration.cost},
+                                 {"cost_change", iteration.cost_change},
+                                 {"gradient_max_norm", iteration.gradient_max_norm},
+                                 {"trust_region_radius", iteration.trust_region_radius},
+                                 {"valid", iteration.step_is_valid},
+                                 {"accepted", iteration.step_is_successful}});
+  }
+  if (elapsed >= 5)
+    Log("BA timing: build " + std::to_string(build_seconds) + " s, linear " +
+        std::to_string(summary.linear_solver_time_in_seconds) + " s, Jacobian " +
+        std::to_string(summary.jacobian_evaluation_time_in_seconds) + " s, residual " +
+        std::to_string(summary.residual_evaluation_time_in_seconds) + " s, linear iterations " +
+        std::to_string(linear_iterations));
   return {{"stage", stage},
-          {"seconds", Seconds(started)},
+          {"seconds", elapsed},
           {"iterations", summary.iterations.size()},
           {"initial_cost", summary.initial_cost},
           {"final_cost", summary.final_cost},
@@ -376,6 +402,28 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"build_seconds", build_seconds},
           {"linear_solver_seconds", summary.linear_solver_time_in_seconds},
           {"jacobian_seconds", summary.jacobian_evaluation_time_in_seconds},
+          {"timing",
+           {{"observation_build_seconds", observation_build_seconds},
+            {"parameter_build_seconds", build_seconds - observation_build_seconds},
+            {"ceres_seconds", summary.total_time_in_seconds},
+            {"preprocessor_seconds", summary.preprocessor_time_in_seconds},
+            {"minimizer_seconds", summary.minimizer_time_in_seconds},
+            {"postprocessor_seconds", summary.postprocessor_time_in_seconds},
+            {"residual_seconds", summary.residual_evaluation_time_in_seconds}}},
+          {"threads", summary.num_threads_used},
+          {"preconditioner", ceres::PreconditionerTypeToString(summary.preconditioner_type_used)},
+          {"termination", ceres::TerminationTypeToString(summary.termination_type)},
+          {"termination_message", summary.message},
+          {"successful_steps", summary.num_successful_steps},
+          {"unsuccessful_steps", summary.num_unsuccessful_steps},
+          {"residual_evaluations", summary.num_residual_evaluations},
+          {"jacobian_evaluations", summary.num_jacobian_evaluations},
+          {"linear_solves", summary.num_linear_solves},
+          {"linear_iterations", linear_iterations},
+          {"maximum_linear_iterations", maximum_linear_iterations},
+          {"linear_iteration_limit_hits", linear_limit_hits},
+          {"function_tolerance", options.function_tolerance},
+          {"iteration_profile", iteration_profile},
           {"converged", summary.termination_type == ceres::CONVERGENCE}};
 }
 }  // namespace geosun

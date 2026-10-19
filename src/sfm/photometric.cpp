@@ -449,7 +449,10 @@ Json FailedChecks(const Json& checks) {
 }
 }  // namespace
 PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction& source,
-                                        int workers, const AlignmentLimits& limits) {
+                                        int workers, const AlignmentLimits& limits,
+                                        int ba_workers) {
+  if (!ba_workers)
+    ba_workers = workers;
   PhotometricRefinement refined;
   refined.candidate = source;
   auto& model = refined.candidate;
@@ -616,7 +619,7 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   report["validation_before_px"] = validation_before;
   report["photo_validation_before_px"] = photo_validation_before;
   report["optimization"] =
-      Optimize(precise, scene.cameras, "principal", workers, 150, {}, training_planes,
+      Optimize(precise, scene.cameras, "principal", ba_workers, 150, {}, training_planes,
                NavigationPositions(scene), training, precise_observations, &source);
   const auto validation_after = PointErrors(precise, validation);
   const auto photo_validation_after = PointErrors(precise, photo_validation, false);

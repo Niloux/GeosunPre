@@ -57,7 +57,8 @@ class Lock {
 Json Settings(const fs::path& file) {
   Json result = {{"workers", 4},         {"sfm_repair_rounds", 0},      {"quality_median_px", 2.},
                  {"quality_p90_px", 4.}, {"las_support_fraction", .25}, {"las_median_m", .1},
-                 {"las_p90_m", .3},      {"calibration_tracks", "all"}, {"refine", false}};
+                 {"las_p90_m", .3},      {"calibration_tracks", "all"}, {"refine", false},
+                 {"ba_workers", 8}};
   if (!file.empty()) {
     const auto configured = ReadJson(file);
     if (!configured.is_object())
@@ -68,9 +69,10 @@ Json Settings(const fs::path& file) {
       result[key] = value;
     }
   }
-  if (!result.at("workers").is_number_integer() || result.at("workers").get<int>() < 1 ||
-      result.at("workers").get<int>() > 32)
-    throw std::runtime_error("workers must be 1-32");
+  for (const auto* key : {"workers", "ba_workers"})
+    if (!result.at(key).is_number_integer() || result.at(key).get<int>() < 1 ||
+        result.at(key).get<int>() > 32)
+      throw std::runtime_error(std::string(key) + " must be 1-32");
   if (!result.at("sfm_repair_rounds").is_number_integer() || result.at("sfm_repair_rounds") < 0 ||
       result.at("sfm_repair_rounds") > 2)
     throw std::runtime_error("sfm_repair_rounds must be an integer from 0 to 2");
@@ -193,6 +195,7 @@ void Run(const Arguments& args) {
   WriteJson(state_path, state);
   const auto started = Clock::now();
   const int workers = settings.at("workers");
+  const int ba_workers = settings.at("ba_workers");
   const AlignmentLimits limits{settings.at("las_support_fraction"), settings.at("las_median_m"),
                                settings.at("las_p90_m"), settings.at("quality_median_px"),
                                settings.at("quality_p90_px")};
@@ -257,9 +260,9 @@ void Run(const Arguments& args) {
         for (int repair = completed_repairs;; ++repair) {
           std::set<uint32_t> deficient;
           try {
-            model =
-                Reconstruct(scene, work, workers, report,
-                            settings.at("calibration_tracks") == "stable", repair >= max_repairs);
+            model = Reconstruct(scene, work, workers, report,
+                                settings.at("calibration_tracks") == "stable",
+                                repair >= max_repairs, ba_workers);
             quality = model.Quality(scene, settings.at("quality_median_px"),
                                     settings.at("quality_p90_px"));
             if (quality.at("passed").get<bool>())
@@ -300,7 +303,7 @@ void Run(const Arguments& args) {
         products = {work / "cache/visual.bin", work / "cache/sfm.json"};
       } else if (stage == "align") {
         auto model = ReadModel(work / "cache/visual.bin");
-        auto result = Align(scene, model, workers, limits);
+        auto result = Align(scene, model, workers, limits, ba_workers);
         result["sfm"] = ReadJson(work / "cache/sfm.json");
         for (const auto& name : {"masks", "features", "matches"})
           result["frontend"][name] =
@@ -314,7 +317,7 @@ void Run(const Arguments& args) {
       } else if (stage == "refine") {
         const auto model = ReadModel(work / "cache/aligned.bin");
         const auto original = ReadJson(work / "cache/alignment.json");
-        auto refinement = RefinePhotometric(scene, model, workers, limits);
+        auto refinement = RefinePhotometric(scene, model, workers, limits, ba_workers);
         refinement.report["enabled"] = true;
         const auto& selected = refinement.accepted ? refinement.candidate : model;
         auto result = PostprocessResult(scene, selected, original, "refined");

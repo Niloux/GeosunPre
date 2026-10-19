@@ -18,5 +18,6 @@ class CalibrationCoverageIncomplete : public std::runtime_error {
 };
 std::set<uint64_t> CalibrationTracks(const Scene& scene, const Reconstruction& model, Json& report);
 Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers, Json& report,
-                           bool stable_calibration = false, bool allow_partial = false);
+                           bool stable_calibration = false, bool allow_partial = false,
+                           int ba_workers = 0);
 }  // namespace geosun
