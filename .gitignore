@@ -8,3 +8,5 @@
 /.codegraph/
 /.vs/
 *.user
+/packages/
+/models-ampere-plus/

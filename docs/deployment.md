@@ -1,6 +1,6 @@
 # GeosunPre 独立运行包
 
-Windows x64，需与模型包匹配的 NVIDIA GPU 和驱动。无需安装 Python、CUDA Toolkit、Visual Studio 或联网。
+Windows x64，需算力 ≥ 8.0 的 NVIDIA GPU（RTX 30/40/50、RTX A 系列等），建议驱动 R570 及以上（开发机验证驱动 610.88）。`package.json` 记录版本、提交、引擎级别和全部文件 SHA256。无需安装 Python、CUDA Toolkit、Visual Studio 或联网。
 
 运行包由项目的 `build.ps1` 编译程序，再由 `package.ps1` 收集程序、模型、运行库和文档。默认准备流程生成 FP16 匹配引擎，并保留关键层的 FP32 计算。将整个运行包复制到目标机器，在包目录打开 PowerShell：
 
@@ -22,4 +22,4 @@ Windows x64，需与模型包匹配的 NVIDIA GPU 和驱动。无需安装 Pytho
 
 初始匹配包含导航回访候选；SfM 默认不在停滞后额外补匹配，而是处理已注册部分，`sfm_repair_rounds` 可设为 `0`、`1` 或 `2`。实现标记为 16，新流程须使用新工作目录；旧成果仍可 `export`，也可通过 `refine --work OLD --output NEW` 或 `cleanup --work OLD --output NEW` 写入新目录。独立 `refine` 仅执行原图精修，独立 `cleanup` 仅清理稀疏结构；复制旧掩码时均屏蔽无覆盖像素，不重跑语义模型、特征和 SfM。
 
-换 GPU 时需重新准备相应模型，程序的 CUDA 编译目标也须支持该 GPU。完整输入、模型、输出和缓存约定见 `docs/`。
+`ampere_plus` 模型包可直接在上述 GPU 间迁移；算力低于 8.0 时程序明确拒绝加载。使用 `none` 级别的专用模型包时，GPU 型号须与构建 GPU 一致。完整输入、输出和缓存约定见 `docs/`。

@@ -4,7 +4,7 @@
     "name": "windows", "generator": "Ninja",
     "binaryDir": "${sourceDir}/build/ninja",
     "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "CMAKE_C_COMPILER": "cl", "CMAKE_CXX_COMPILER": "cl",
-      "CMAKE_POLICY_VERSION_MINIMUM": "3.5", "CMAKE_CUDA_ARCHITECTURES": "native"}
+      "CMAKE_POLICY_VERSION_MINIMUM": "3.5", "CMAKE_CUDA_ARCHITECTURES": "80;86-real;89-real;120-real"}
   }],
   "buildPresets": [{"name": "release", "configurePreset": "windows", "jobs": 8}]
 }

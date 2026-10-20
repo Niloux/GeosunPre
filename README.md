@@ -132,15 +132,16 @@ models/
 
 ## 打包部署
 
-完成模型准备后，编译并打包：
+交付包面向任意算力 ≥ 8.0 的 NVIDIA GPU：程序编译 sm_80/86/89/120 机器码及 compute_80 PTX，模型使用 `ampere_plus` 引擎。先准备通用模型，提交源码后编译并打包：
 
 ```powershell
+.\prepare-models.ps1 -Models models-ampere-plus -OnnxFrom packages/onnx-bundle-v1 -HardwareCompatibility ampere_plus
 .\build.ps1
 .\package.ps1
 ```
 
-`package.ps1` 将本次编译的程序、`models/` 中的引擎、运行库和文档复制到 `dist/`，并用真实照片执行四模型检查，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。打包只携带运行资源。
+`package.ps1` 默认读取 `models-ampere-plus/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 及同名 `.zip`、`.zip.sha256`。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行四模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
 
-将整个 `dist/` 目录复制到模型所对应 GPU 的 Windows 机器，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
+将 zip 复制到目标 Windows 机器解压，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
 
 构建依赖使用固定版本；Ceres 使用轻量日志和 Eigen 稀疏求解，OpenCV 只构建图像处理所需模块。Ceres 回代补丁由 CMake 自动应用，清空 `build/` 后重新构建同样生效。

@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
+# Match ampere_plus engines: SASS for Ampere/Ada/Blackwell, compute_80 PTX for other GPUs >= 8.0.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "Target CUDA architectures")
+  set(CMAKE_CUDA_ARCHITECTURES "80;86-real;89-real;120-real" CACHE STRING "Target CUDA architectures")
 endif()
 project(GeosunPre VERSION 1.1.0 LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)

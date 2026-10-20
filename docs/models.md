@@ -10,7 +10,7 @@
 .\prepare-models.ps1
 ```
 
-默认向 `models/` 准备四个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32。`run.ps1` 和 `package.ps1` 默认使用这个目录。
+默认向 `models/` 准备四个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32。`run.ps1` 默认使用这个目录；交付打包默认使用 `models-ampere-plus/`，见 README。
 
 首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。同 GPU 上更换照片分辨率、横竖方向或宽高比不需要重建模型。更换 GPU、模型协议或精度时需指定新的输出目录。
 
@@ -49,8 +49,8 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 权重→ONNX 与 GPU 无关，只需在开发机做一次；ONNX→引擎随 GPU 变化。将前者冻结为发布包，其他机器构建引擎时不再下载权重、LoMa 源码或 SegFormer：
 
 ```powershell
-.\prepare-models.ps1 -OnnxBundle dist/onnx-bundle-v1
-.\prepare-models.ps1 -Models models/other-gpu -OnnxFrom dist/onnx-bundle-v1
+.\prepare-models.ps1 -OnnxBundle packages/onnx-bundle-v1
+.\prepare-models.ps1 -Models models/other-gpu -OnnxFrom packages/onnx-bundle-v1
 ```
 
 `-OnnxBundle` 总是从固定权重重新导出，不接受 `-Models`、`-OnnxFrom`、`-MatcherPrecision`；输出目录已存在时报错。包内含 `onnx/` 四个单文件 ONNX、`references/` 导出时的 PyTorch 输入输出、`images/` 两张验证照片及 `onnx-bundle.json`（version=1、来源版本、检测器范围、max_features 与全部文件 SHA256）。导出同样经 `.pending` 目录校验后发布。
