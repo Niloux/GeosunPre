@@ -209,7 +209,9 @@ void Run(const Arguments& args) {
           throw std::runtime_error("Run prerequisite stage: " + stages[index - 1]);
         if (stage == "refine" || stage == "cleanup" || stage == "export")
           Verify(work, state.at("stages").at(stages[index - 1]).at("files"));
-        if (stage == "masks" || stage == "features" || stage == "matches") {
+        // SfM repair rounds run the matcher again with the recorded models.
+        if (stage == "masks" || stage == "features" || stage == "matches" ||
+            (stage == "sfm" && settings.at("sfm_repair_rounds").get<int>() > 0)) {
           Json identity = {{"manifest", FileMetadata(root / "manifest.json")}};
           const auto manifest = ReadJson(root / "manifest.json");
           for (const auto& [key, value] : manifest.at("models").items())
@@ -406,18 +408,30 @@ void Export(const Arguments& args) {
 void Postprocess(const Arguments& args) {
   args.Validate({"--work", "--output", "--workers", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb"});
+                 "--supervision-cache-mb", "--no-ply", "--ply-voxel"});
   const auto supervision = ParseSupervisionOptions(args);
   const bool photo = args.command == "refine";
-  const auto source = args.Path("--work"), output = args.Path("--output");
+  const auto source = args.Path("--work"), final_output = args.Path("--output");
   const int workers = args.Integer("--workers", 4);
   if (workers > 32)
     throw std::runtime_error("workers must be 1-32");
-  if (fs::exists(output))
+  const bool ply = args.Get("--no-ply") != "true";
+  const double voxel = args.Number("--ply-voxel", .05);
+  if (fs::exists(final_output))
     throw std::runtime_error("Postprocessing output already exists; choose a new work directory");
+  Lock lock(source);
   const auto scene = Scene::FromJson(ReadJson(source / "scene.json"));
-  if (Contains(source, output) || Contains(scene.input, output))
+  if (Contains(source, final_output) || Contains(scene.input, final_output))
     throw std::runtime_error("Postprocessing output must be outside source work and input");
+  // Build the whole work directory beside its destination and publish it only when complete.
+  auto output = final_output;
+  output += ".pending";
+  if (fs::exists(output)) {
+    auto archived = output;
+    archived += ".interrupted-" +
+                std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+    fs::rename(output, archived);
+  }
   if (ReadScene(scene.input, scene.las).ToJson() != scene.ToJson())
     throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
   const auto original = ReadJson(source / "result.json");
@@ -478,9 +492,10 @@ void Postprocess(const Arguments& args) {
     pixels.setTo(0, domains[image.camera] == 0);
     WriteImage(mask, pixels);
   }
-  ExportBundle(scene, selected, output, output / "colmap", true, .05, result, supervision);
+  ExportBundle(scene, selected, output, output / "colmap", ply, voxel, result, supervision);
+  fs::rename(output, final_output);
   Log(args.command + ": " + report.at("reason").get<std::string>());
-  std::cout << Json({{"work", output.u8string()},
+  std::cout << Json({{"work", final_output.u8string()},
                      {"accepted", accepted},
                      {"reason", report.at("reason")}})
                    .dump(2)

@@ -316,8 +316,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         throw std::runtime_error("Unknown calibration stage: " + stage);
       if (!fixed.empty())
         problem.SetManifold(params, new ceres::SubsetManifold(8, fixed));
-      const std::array<double, 8> delta = {
-          initial[cid].params[0] * .1, initial[cid].params[1] * .1, 50, 50, .05, .02, .01, .005};
+      const auto delta = initial[cid].CalibrationBounds();
       for (int i = 0; i < 8; ++i) {
         problem.SetParameterLowerBound(params, i, initial[cid].params[i] - delta[i]);
         problem.SetParameterUpperBound(params, i, initial[cid].params[i] + delta[i]);

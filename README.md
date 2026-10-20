@@ -92,7 +92,7 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 .\run.ps1 run --input "D:/数据/场景" --work "work/场景-精修" --refine
 ```
 
-已有工作目录可用独立命令处理，结果及新交付写入新目录。独立 `refine` 仅精修相机与点，独立 `cleanup` 仅清理稀疏结构；两者均不重跑前端和 SfM：
+已有工作目录可用独立命令处理，结果及新交付写入新目录。独立 `refine` 仅精修相机与点，独立 `cleanup` 仅清理稀疏结构；两者均不重跑前端和 SfM。新目录先在同级 `.pending` 中完整生成后再发布，处理期间锁定来源目录；`--no-ply`、`--ply-voxel` 与 `export` 含义相同：
 
 ```powershell
 .\run.ps1 refine --work "work/场景" --output "work/场景-精修" --workers 8

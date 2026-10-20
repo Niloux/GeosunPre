@@ -282,6 +282,11 @@ Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel) {
   fs::create_directories(output.parent_path());
   const auto source = FileMetadata(las);
   const auto h = ReadLasHeader(las);
+  // PLY stores float32 XYZ. Keep its rounding within 1 mm of the input LAS coordinates.
+  constexpr double float32_limit_m = 16777.216;
+  if (std::max(h.lower.cwiseAbs().maxCoeff(), h.upper.cwiseAbs().maxCoeff()) > float32_limit_m)
+    throw std::runtime_error("LAS coordinates exceed 16777 m; float32 PLY would lose millimetre "
+                             "precision. Use local LAS coordinates");
   auto workspace = output;
   workspace += ".voxel-work";
   if (fs::exists(workspace))

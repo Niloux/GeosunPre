@@ -104,6 +104,9 @@ Eigen::Vector3d Camera::Ray(const Eigen::Vector2d& pixel) const {
   }
   return {x * std::sin(t) / r, y * std::sin(t) / r, std::cos(t)};
 }
+std::array<double, 8> Camera::CalibrationBounds() const {
+  return {params[0] * .1, params[1] * .1, 50, 50, .05, .02, .01, .005};
+}
 Eigen::Quaterniond Pose::Rotation() const {
   return Eigen::Quaterniond(params[3], params[0], params[1], params[2]);
 }

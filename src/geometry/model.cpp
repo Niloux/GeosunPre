@@ -164,7 +164,7 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
         {"principal_shift_px",
          {cameras[cid].params[2] - base[2], cameras[cid].params[3] - base[3]}},
         {"reprojection_by_angle", bins}};
-    const std::array<double, 8> bounds = {base[0] * .1, base[1] * .1, 50, 50, .05, .02, .01, .005};
+    const auto bounds = scene.cameras[cid].CalibrationBounds();
     for (int j = 0; j < 8; ++j)
       if (std::abs(cameras[cid].params[j] - base[j]) >= bounds[j] * (1 - 1e-4))
         failures.push_back("Camera parameter reached calibration bound: " + cameras[cid].label +

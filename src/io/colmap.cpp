@@ -270,6 +270,12 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
     CheckBundle(output);
     return;
   }
+  // Delivery copies the original files, so they must still be the ones reconstructed.
+  for (const auto& e : scene.images)
+    if (model.images[e.id].registered && FileMetadata(e.source) != e.source_file)
+      throw std::runtime_error("Source image changed since reconstruction: " + e.name);
+  if (include_ply && FileMetadata(scene.las) != scene.sources.at("las"))
+    throw std::runtime_error("LAS changed since reconstruction; choose a new work directory");
   auto pending = output;
   pending += ".pending";
   if (fs::exists(pending)) {
@@ -287,6 +293,8 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
     const auto destination = pending / "images" / fs::u8path(e.name);
     fs::create_directories(destination.parent_path());
     fs::copy_file(e.source, destination);
+    if (fs::file_size(destination) != e.source_file.at("size_bytes").get<uint64_t>())
+      throw std::runtime_error("Source image changed while copying: " + e.name);
     const auto mask = pending / "masks" / fs::u8path(e.name + ".png");
     fs::create_directories(mask.parent_path());
     fs::copy_file(MaskPath(work, e.id), mask);

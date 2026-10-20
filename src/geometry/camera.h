@@ -18,6 +18,8 @@ struct Camera {
   Eigen::Vector2d Project(const Eigen::Vector3d& xyz) const;
   Eigen::Matrix<double, 2, 3> ProjectionJacobian(const Eigen::Vector3d& xyz) const;
   Eigen::Vector3d Ray(const Eigen::Vector2d& pixel) const;
+  // Largest change from the initial calibration allowed in BA and checked by acceptance.
+  std::array<double, 8> CalibrationBounds() const;
 };
 struct Pose {
   // World-to-camera rotation in Eigen order x,y,z,w, followed by translation.
