@@ -51,7 +51,7 @@ void Reconstruction::RebuildReferences() {
   }
 }
 void Reconstruction::Filter(double threshold, double min_angle) {
-  const double cosine = std::cos(min_angle * 3.14159265358979323846 / 180);
+  const double cosine = std::cos(min_angle * Pi / 180);
   for (auto& p : points) {
     std::vector<Observation> track;
     std::vector<Eigen::Vector3d> directions;
@@ -129,10 +129,9 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
         const auto& xy = image.pixels[k];
         const double angle =
             std::acos(std::clamp(scene.cameras[image.camera].Ray(xy).z(), -1., 1.));
-        const int bin = std::clamp(int(angle * 180 / 3.14159265358979323846 / 20), 0, 3);
+        const int bin = std::clamp(int(angle * 180 / Pi / 20), 0, 3);
         by_angle[image.camera][bin].push_back(r);
-        cells.insert(std::clamp(int(xy.x() / c.width * 8), 0, 7) +
-                     8 * std::clamp(int(xy.y() / c.height * 8), 0, 7));
+        cells.insert(c.CoverageCell(xy));
       }
     rows.push_back({{"image_index", id},
                     {"name", scene.images[id].name},
@@ -140,7 +139,7 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
                     {"observations", e.size()},
                     {"occupied_cells", cells.size()},
                     {"reprojection_px", Statistics(e)}});
-    if (e.size() < 32 || cells.size() < 8)
+    if (e.size() < MinimumImageObservations || cells.size() < MinimumImageCells)
       failures.push_back("Insufficient image coverage: " + scene.images[id].name);
     if (!e.empty() && Quantile(e, .9) > 2 * p90_limit)
       failures.push_back("Image reprojection error exceeds limit: " + scene.images[id].name);

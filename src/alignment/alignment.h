@@ -11,6 +11,10 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
            int ba_workers = 0);
 std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Reconstruction& model,
                                                  int workers);
+// Absolute point-to-plane distances of the constrained points that still have tracks.
+Json PlaneErrors(const Reconstruction& model, const std::vector<PlaneConstraint>& planes);
+// Names of the boolean checks that failed.
+Json FailedChecks(const Json& checks);
 Json FilterSparseStructure(const Scene& scene, Reconstruction& model, const AlignmentLimits& limits,
                            int workers);
 }  // namespace geosun

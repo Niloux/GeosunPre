@@ -78,7 +78,7 @@ Spirula 直接读取交付包的 `depths/`、`normals/`。训练时显式设置 
 
 SfM 默认不自动补匹配；首次停滞时，对已注册部分完成优化、几何验收及 LAS 配准，通过后照常交付 COLMAP。配置 `sfm_repair_rounds` 可设为 `0`（默认）、`1` 或 `2`，表示停滞或照片支撑不足时最多补匹配的轮数，用完后处理已注册部分。交付仅包含已注册照片及其掩码，`manifest.json` 和 `quality.json` 的 `registration` 保存注册数量与未注册照片名单；`complete=false` 表示部分注册。验收不通过仍明确报错。
 
-默认配置见 [configs/default.json](configs/default.json)，可通过 `--config` 指定。内参标定默认使用全部有效轨迹（`calibration_tracks=all`），随后锁定内参补全轨迹并精调。标定选项及坐标约定见[输入文档](docs/input.md)。
+默认配置唯一来源是 [configs/default.json](configs/default.json)，构建时编译进程序，独立运行包无需携带。`--config` 文件只需列出要修改的键，其余沿用默认值；未知键报错。内参标定默认使用全部有效轨迹（`calibration_tracks=all`），随后锁定内参补全轨迹并精调。标定选项及坐标约定见[输入文档](docs/input.md)。
 
 `workers` 默认 4，控制前端及增量注册阶段 BA 的并行数；SfM 几何验证逐对独立且结果与线程数无关，使用全部硬件线程（不少于 `workers`，最多 32），实际线程数记录在 `cache/sfm.json` 的 `geometry_threads`；`ba_workers` 默认 8，单独控制注册结束后的标定与全局精调、LAS 联合优化和已启用的原图精修 BA，两者均可设为 1–32。求解器、双精度残差、收敛精度和验收门限保持原有设置；独立 `refine` 的 `--workers` 仍控制其 BA。`cache/sfm.json` 的每次优化记录包含构建、预处理、残差、导数、线性求解耗时及逐轮迭代信息。
 

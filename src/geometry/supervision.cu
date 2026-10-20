@@ -16,6 +16,8 @@ namespace geosun {
 namespace {
 constexpr int Version = 1;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
+// Half of FieldOfViewDegrees in radians, kept as the published constant.
+constexpr double MaxTheta = 1.396263401595464;
 constexpr size_t DepthBudget = 256 * 1024 * 1024;
 constexpr size_t PointChunk = 500000;
 // Mask decoding, PNG encoding and read-back run beside the GPU with this many images in flight.
@@ -64,7 +66,7 @@ __global__ void ProjectLas(const int3* points, int count, const Projection* came
   if (pz <= 0)
     return;
   const double r = hypot(px, py), theta = atan2(r, pz), distance = sqrt(r * r + pz * pz);
-  if (theta > 1.396263401595464 || distance < .05 || distance > MaxDepth)
+  if (theta > MaxTheta || distance < .05 || distance > MaxDepth)
     return;
   const double tt = theta * theta;
   const auto* p = c.params;

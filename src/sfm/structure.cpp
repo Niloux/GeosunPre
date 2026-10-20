@@ -4,13 +4,6 @@
 
 namespace geosun {
 namespace {
-Json PlaneErrors(const Reconstruction& model, const std::vector<PlaneConstraint>& planes) {
-  std::vector<double> errors;
-  for (const auto& plane : planes)
-    if (!model.points[plane.point].track.empty())
-      errors.push_back(std::abs((model.points[plane.point].xyz - plane.center).dot(plane.normal)));
-  return Statistics(errors);
-}
 Json StructureCoverage(const Reconstruction& before, const Reconstruction& after,
                        const std::vector<PlaneConstraint>& planes) {
   std::array<size_t, 2> previous{}, next{};
@@ -91,10 +84,7 @@ StructureCleanup CleanSparseStructure(const Scene& scene, const Reconstruction& 
                           report.at("plane_after_m").at("p90").get<double>() <=
                               report.at("plane_before_m").at("p90").get<double>() * 1.25 + .01;
   report["checks"] = checks;
-  report["failed_checks"] = Json::array();
-  for (const auto& [name, passed] : checks.items())
-    if (!passed.get<bool>())
-      report["failed_checks"].push_back(name);
+  report["failed_checks"] = FailedChecks(checks);
   cleanup.accepted = report.at("failed_checks").empty();
   report["used"] = cleanup.accepted;
   report["reason"] =

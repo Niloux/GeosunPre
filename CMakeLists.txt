@@ -42,7 +42,17 @@ add_custom_command(OUTPUT "${GEOSUN_BUILD_INFO}"
     "-DOUTPUT=${GEOSUN_BUILD_INFO}" "-DVERSION=${PROJECT_VERSION}"
     -P "${CMAKE_SOURCE_DIR}/cmake/build-info.cmake"
   DEPENDS ${GEOSUN_BUILD_INPUTS} VERBATIM)
-add_executable(geosunpre ${GEOSUN_SOURCES} "${GEOSUN_BUILD_INFO}")
+# configs/default.json is the only copy of the default settings; editing it reconfigures.
+set(GEOSUN_DEFAULTS "${CMAKE_SOURCE_DIR}/configs/default.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GEOSUN_DEFAULTS}")
+file(READ "${GEOSUN_DEFAULTS}" GEOSUN_DEFAULT_SETTINGS)
+file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/generated/default_settings.cpp" CONTENT [=[
+namespace geosun {
+extern const char DefaultSettings[] = R"json(@GEOSUN_DEFAULT_SETTINGS@)json";
+}  // namespace geosun
+]=] @ONLY)
+add_executable(geosunpre ${GEOSUN_SOURCES} "${GEOSUN_BUILD_INFO}"
+  "${CMAKE_BINARY_DIR}/generated/default_settings.cpp")
 target_include_directories(geosunpre PRIVATE src ${tensorrt_SOURCE_DIR}/include ${OpenCV_INCLUDE_DIRS})
 target_include_directories(geosunpre SYSTEM PRIVATE ${opencv_BINARY_DIR} ${CMAKE_BINARY_DIR}
   ${opencv_SOURCE_DIR}/modules/core/include ${opencv_SOURCE_DIR}/modules/imgproc/include

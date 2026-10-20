@@ -46,7 +46,6 @@ struct Fusion {
 };
 Fusion VirtualViews(const Camera& camera) {
   constexpr int w = 900, h = 1200;
-  constexpr double Pi = 3.14159265358979323846;
   const double focal = 512 / (2 * std::tan(50 * Pi / 180)), cosine = std::cos(80 * Pi / 180);
   Fusion out;
   out.weight = cv::Mat::zeros(h, w, CV_32FC1);

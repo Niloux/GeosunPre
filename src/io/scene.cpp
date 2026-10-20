@@ -9,7 +9,6 @@
 #include <Eigen/Eigenvalues>
 namespace geosun {
 namespace {
-constexpr double pi = 3.14159265358979323846;
 double Cubic(double x) {
   x = std::abs(x);
   if (x < 1)

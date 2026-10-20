@@ -24,7 +24,7 @@ double Camera::Radius(double fov) const {
   if (width <= 0 || height <= 0 || params[0] <= 0 || params[1] <= 0 ||
       !std::all_of(params.begin(), params.end(), [](double x) { return std::isfinite(x); }))
     throw std::runtime_error(label + ": invalid camera calibration");
-  const double limit = fov * 3.14159265358979323846 / 360;
+  const double limit = fov * Pi / 360;
   for (int j = 0; j < 256; ++j) {
     const double t = limit * j / 255, t2 = t * t;
     double derivative = 1, power = t2;
@@ -106,6 +106,10 @@ Eigen::Vector3d Camera::Ray(const Eigen::Vector2d& pixel) const {
 }
 std::array<double, 8> Camera::CalibrationBounds() const {
   return {params[0] * .1, params[1] * .1, 50, 50, .05, .02, .01, .005};
+}
+int Camera::CoverageCell(const Eigen::Vector2d& pixel) const {
+  return std::clamp(int(pixel.x() / width * 8), 0, 7) +
+         8 * std::clamp(int(pixel.y() / height * 8), 0, 7);
 }
 Eigen::Quaterniond Pose::Rotation() const {
   return Eigen::Quaterniond(params[3], params[0], params[1], params[2]);

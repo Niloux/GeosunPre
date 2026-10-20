@@ -10,7 +10,6 @@
 #include <random>
 namespace geosun {
 namespace {
-constexpr double Pi = 3.14159265358979323846;
 using Tile = std::array<int64_t, 3>;
 using Points = std::vector<Eigen::Vector3d>;
 struct Cloud {
@@ -52,23 +51,6 @@ void Surface::Index() {
   tree = std::make_unique<Tree>(3, cloud, nanoflann::KDTreeSingleIndexAdaptorParams(10));
   tree->buildIndex();
 }
-template <typename Function>
-void Parallel(size_t size, int workers, Function function) {
-  std::atomic<size_t> next{0};
-  std::vector<std::future<void>> jobs;
-  for (int i = 0; i < workers; ++i)
-    jobs.push_back(std::async(std::launch::async, [&] {
-      for (;;) {
-        const size_t start = next.fetch_add(1024);
-        if (start >= size)
-          break;
-        for (size_t j = start; j < std::min(size, start + 1024); ++j)
-          function(j);
-      }
-    }));
-  for (auto& job : jobs)
-    job.get();
-}
 std::unique_ptr<Surface> Surfaces(const Points& points, double voxel, int workers) {
   struct Record {
     Tile key;
@@ -103,7 +85,7 @@ std::unique_ptr<Surface> Surfaces(const Points& points, double voxel, int worker
   surface->noise.resize(size);
   surface->valid.resize(size);
   const size_t k = std::min<size_t>(20, size);
-  Parallel(size, workers, [&](size_t i) {
+  ParallelFor(size, workers, 1024, [&](size_t i) {
     std::array<size_t, 20> ids{};
     std::array<double, 20> squared{};
     surface->tree->knnSearch(surface->points[i].data(), k, ids.data(), squared.data());
@@ -134,7 +116,7 @@ std::unique_ptr<Surface> CoherentSurfaces(const Points& points, double voxel, in
   auto fine = Surfaces(points, voxel, workers);
   auto coarse = Surfaces(points, 2 * voxel, workers);
   fine->coherent.resize(fine->points.size());
-  Parallel(fine->points.size(), workers, [&](size_t i) {
+  ParallelFor(fine->points.size(), workers, 1024, [&](size_t i) {
     size_t id;
     double squared;
     coarse->tree->knnSearch(fine->points[i].data(), 1, &id, &squared);
@@ -483,7 +465,7 @@ std::vector<double> LasSupportDistances(const Scene& scene, const Reconstruction
       if (nearby.empty())
         return;
       chunk.Index();
-      Parallel(nearby.size(), workers, [&](size_t index) {
+      ParallelFor(nearby.size(), workers, 1024, [&](size_t index) {
         const uint64_t id = nearby[index];
         const Eigen::Vector3d xyz = model.points[id].xyz - origin;
         size_t nearest;
@@ -506,6 +488,20 @@ std::vector<double> LasSupportDistances(const Scene& scene, const Reconstruction
   return distances;
 }
 }  // namespace
+Json PlaneErrors(const Reconstruction& model, const std::vector<PlaneConstraint>& planes) {
+  std::vector<double> errors;
+  for (const auto& plane : planes)
+    if (!model.points[plane.point].track.empty())
+      errors.push_back(std::abs((model.points[plane.point].xyz - plane.center).dot(plane.normal)));
+  return Statistics(errors);
+}
+Json FailedChecks(const Json& checks) {
+  Json failed = Json::array();
+  for (const auto& [name, passed] : checks.items())
+    if (!passed.get<bool>())
+      failed.push_back(name);
+  return failed;
+}
 std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Reconstruction& model,
                                                  int workers) {
   const auto header = ReadLasHeader(scene.las);
@@ -590,11 +586,9 @@ Json FilterSparseStructure(const Scene& scene, Reconstruction& model, const Alig
       for (size_t feature = 0; feature < image.points.size(); ++feature)
         if (image.points[feature] != NoPoint) {
           ++count;
-          const auto& pixel = image.pixels[feature];
-          cells.insert(std::clamp(int(pixel.x() / camera.width * 8), 0, 7) +
-                       8 * std::clamp(int(pixel.y() / camera.height * 8), 0, 7));
+          cells.insert(camera.CoverageCell(image.pixels[feature]));
         }
-      if (count < 32 || cells.size() < 8) {
+      if (count < MinimumImageObservations || cells.size() < MinimumImageCells) {
         image.registered = false;
         changed = true;
         removed_images.push_back({{"image_index", id},
@@ -811,10 +805,7 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
                          {"per_image_reprojection", image_stable},
                          {"point_displacement", Quantile(displacement, .9) <= .1},
                          {"plane_improvement", improved}};
-    Json failed_checks = Json::array();
-    for (const auto& [name, passed] : checks.items())
-      if (!passed.get<bool>())
-        failed_checks.push_back(name);
+    const auto failed_checks = FailedChecks(checks);
     const bool accepted = failed_checks.empty();
     joint["used"] = accepted;
     joint["reason"] =

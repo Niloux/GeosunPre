@@ -15,22 +15,6 @@
 namespace geosun {
 namespace {
 constexpr int Radius = 12, Search = 6;
-template <class Function>
-void Parallel(size_t count, int workers, Function function) {
-  std::atomic<size_t> next{0};
-  std::vector<std::future<void>> jobs;
-  for (int i = 0; i < workers; ++i)
-    jobs.push_back(std::async(std::launch::async, [&] {
-      for (;;) {
-        const auto id = next.fetch_add(1);
-        if (id >= count)
-          break;
-        function(id);
-      }
-    }));
-  for (auto& job : jobs)
-    job.get();
-}
 // Coordinates use the project's half-pixel convention. Sample the original
 // grayscale image in double precision, without quantizing the warp to 1/32 px.
 cv::Mat Sample(const cv::Mat& image, const Eigen::Vector2d& center, const Eigen::Matrix2d& affine,
@@ -214,13 +198,6 @@ Json PointErrors(Reconstruction& model, const std::set<uint64_t>& ids, bool refi
   }
   return result;
 }
-Json PlaneErrors(const Reconstruction& model, const std::vector<PlaneConstraint>& planes) {
-  std::vector<double> errors;
-  for (const auto& plane : planes)
-    if (!model.points[plane.point].track.empty())
-      errors.push_back(std::abs((model.points[plane.point].xyz - plane.center).dot(plane.normal)));
-  return Statistics(errors);
-}
 class GrayCache {
   const Scene& scene;
   std::map<uint32_t, cv::Mat> images;
@@ -291,7 +268,7 @@ std::vector<std::vector<Observation>> RefineObservationGraph(
       continue;
     }
     const auto source = cache.Get(key.first), target = cache.Get(key.second);
-    Parallel(indices.size(), workers, [&](size_t index) {
+    ParallelFor(indices.size(), workers, 1, [&](size_t index) {
       auto& edge = edges[indices[index]];
       const auto& point = model.points[edge.point];
       const auto& a = point.track[edge.a];
@@ -329,7 +306,7 @@ std::vector<std::vector<Observation>> RefineObservationGraph(
   std::vector<std::vector<Observation>> refined_tracks(model.points.size());
   std::vector<std::vector<double>> changes(model.points.size()), cycle_errors(model.points.size());
   std::vector<uint8_t> rejected_cycles(model.points.size());
-  Parallel(model.points.size(), workers, [&](size_t id) {
+  ParallelFor(model.points.size(), workers, 1, [&](size_t id) {
     const auto& point = model.points[id];
     if (by_point[id].empty())
       return;
@@ -440,13 +417,6 @@ std::vector<std::vector<Observation>> RefineObservationGraph(
              std::accumulate(rejected_cycles.begin(), rejected_cycles.end(), size_t(0))}};
   return refined_tracks;
 }
-Json FailedChecks(const Json& checks) {
-  Json failed = Json::array();
-  for (const auto& [name, passed] : checks.items())
-    if (!passed.get<bool>())
-      failed.push_back(name);
-  return failed;
-}
 }  // namespace
 PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction& source,
                                         int workers, const AlignmentLimits& limits,
@@ -478,8 +448,7 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   auto cell = [&](const Observation& o) {
     const auto& camera = model.cameras[model.images[o.image].camera];
     const auto& xy = model.images[o.image].pixels[o.feature];
-    return std::clamp(int(xy.x() / camera.width * 8), 0, 7) +
-           8 * std::clamp(int(xy.y() / camera.height * 8), 0, 7);
+    return camera.CoverageCell(xy);
   };
   auto validation_track = [&](uint64_t id) -> const std::vector<Observation>& {
     return refined_tracks[id].size() >= 3 ? refined_tracks[id] : model.points[id].track;
@@ -675,7 +644,7 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
     model.images[image].pose = precise.images[image].pose;
   // Keep the jointly optimized points and their LAS constraints. Held-out
   // points are independently refit; their observations never optimize cameras.
-  Parallel(model.points.size(), workers, [&](size_t id) {
+  ParallelFor(model.points.size(), workers, 1, [&](size_t id) {
     auto& point = model.points[id];
     if (training.count(id) || validation.count(id))
       point.xyz = precise.points[id].xyz;

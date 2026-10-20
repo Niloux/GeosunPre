@@ -17,6 +17,8 @@
 #endif
 
 namespace geosun {
+// Compiled from configs/default.json.
+extern const char DefaultSettings[];
 namespace {
 bool Contains(const fs::path& parent, const fs::path& child) {
   const auto p = fs::weakly_canonical(parent), c = fs::weakly_canonical(child);
@@ -55,10 +57,7 @@ class Lock {
   }
 };
 Json Settings(const fs::path& file) {
-  Json result = {{"workers", 4},         {"sfm_repair_rounds", 0},      {"quality_median_px", 2.},
-                 {"quality_p90_px", 4.}, {"las_support_fraction", .25}, {"las_median_m", .1},
-                 {"las_p90_m", .3},      {"calibration_tracks", "all"}, {"refine", false},
-                 {"ba_workers", 8}};
+  Json result = Json::parse(DefaultSettings);
   if (!file.empty()) {
     const auto configured = ReadJson(file);
     if (!configured.is_object())
@@ -90,6 +89,21 @@ Json Settings(const fs::path& file) {
       result.at("las_median_m").get<double>() > result.at("las_p90_m").get<double>())
     throw std::runtime_error("Invalid quality limit ordering");
   return result;
+}
+AlignmentLimits Limits(const Json& settings) {
+  return {settings.at("las_support_fraction"), settings.at("las_median_m"),
+          settings.at("las_p90_m"), settings.at("quality_median_px"),
+          settings.at("quality_p90_px")};
+}
+// Delivery options shared by run, export, refine and cleanup.
+struct Delivery {
+  bool ply;
+  double voxel;
+  SupervisionOptions supervision;
+};
+Delivery ParseDelivery(const Arguments& args) {
+  return {args.Get("--no-ply") != "true", args.Number("--ply-voxel", .05),
+          ParseSupervisionOptions(args)};
 }
 Json Inventory(const fs::path& work, const std::vector<fs::path>& products) {
   Json result = Json::object();
@@ -124,57 +138,171 @@ Json PostprocessResult(const Scene& scene, const Reconstruction& selected, const
   result["build"] = BuildInfo();
   return result;
 }
-}  // namespace
-void Run(const Arguments& args) {
-  args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
-                 "--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
-                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--refine"});
-  const auto supervision = ParseSupervisionOptions(args);
-  const auto work = args.Get("--work").empty()
-                        ? fs::absolute(fs::path("work") / args.Path("--input").filename())
-                        : args.Path("--work");
-  fs::create_directories(work);
-  Lock lock(work);
-  const auto state_path = work / "state.json";
-  Json state = fs::exists(state_path) ? ReadJson(state_path) : Json::object();
-  if (!state.empty() && state.at("version") != 1)
-    throw std::runtime_error("Unsupported work format; choose a new work directory");
-  if (!state.empty() && state.value("pipeline_version", 0) != PipelineVersion)
-    throw std::runtime_error("Reconstruction implementation changed; choose a new work directory");
-  const auto input = args.Get("--input").empty() ? fs::u8path(state.at("input").get<std::string>())
-                                                 : args.Path("--input");
-  if (Contains(input, work) || Contains(work, input))
-    throw std::runtime_error("Input and work directories must be separate");
-  auto settings = args.Get("--config").empty()
-                      ? (state.empty() ? Settings({}) : state.at("settings"))
-                      : Settings(args.Path("--config"));
-  if (args.Get("--refine") == "true")
-    settings["refine"] = true;
-  const auto las =
-      args.Get("--las").empty()
-          ? (state.empty() ? fs::path()
-                           : fs::u8path(state.at("scene").at("las").get<std::string>()))
-          : args.Path("--las");
-  const Scene scene = ReadScene(input, las);
-  ReadLasHeader(scene.las);
-  const auto prepared = scene.ToJson();
-  if (state.empty()) {
-    state = {{"version", 1},
-             {"pipeline_version", PipelineVersion},
-             {"input", scene.input.u8string()},
-             {"settings", settings},
-             {"scene", prepared},
-             {"stages", Json::object()}};
-    WriteJson(work / "scene.json", prepared);
-  } else if (state.at("scene") != prepared || state.at("settings") != settings)
-    throw std::runtime_error("Inputs/settings changed; choose a new work directory");
-  const auto root =
-      args.Get("--models").empty()
-          ? (state.contains("models") ? fs::u8path(state.at("models").get<std::string>())
-                                      : DefaultModels())
-          : args.Path("--models");
-  const auto requested = args.Get("--stage", args.command == "prepare" ? "prepare" : "all");
+// state.json of a work directory. It is saved after every change so an interruption keeps the
+// completed stages.
+struct WorkState {
+  fs::path path;
+  Json value;
+  void Save() const { WriteJson(path, value); }
+};
+// Bind the work directory to one model package; a different package needs a new work directory.
+void RecordModels(WorkState& state, const fs::path& root) {
+  Json identity = {{"manifest", FileMetadata(root / "manifest.json")}};
+  const auto manifest = ReadJson(root / "manifest.json");
+  for (const auto& [key, value] : manifest.at("models").items())
+    identity[key] = FileMetadata(root / "engines" / (key + ".engine"));
+  if (state.value.contains("model_identity") && state.value.at("model_identity") != identity)
+    throw std::runtime_error("Models changed; choose a new work directory");
+  state.value["model_identity"] = identity;
+  state.value["models"] = root.u8string();
+  state.Save();
+}
+void ExportSelected(const Scene& scene, const fs::path& work, const fs::path& output,
+                    const Delivery& delivery) {
+  const auto result = ReadJson(work / "result.json");
+  ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, delivery.ply,
+               delivery.voxel, result, delivery.supervision);
+}
+std::vector<fs::path> ReconstructVisual(const Scene& scene, const fs::path& work,
+                                        const fs::path& root, const Json& settings,
+                                        WorkState& state) {
+  Json report;
+  Json quality;
+  Reconstruction model;
+  const auto profile_path = work / "cache/matches_profile.json";
+  const int completed_repairs =
+      int(ReadJson(profile_path).value("repairs", Json::array()).size());
+  const int max_repairs = settings.at("sfm_repair_rounds");
+  for (int repair = completed_repairs;; ++repair) {
+    std::set<uint32_t> deficient;
+    try {
+      model = Reconstruct(scene, work, settings.at("workers"), report,
+                          settings.at("calibration_tracks") == "stable", repair >= max_repairs,
+                          settings.at("ba_workers"));
+      quality =
+          model.Quality(scene, settings.at("quality_median_px"), settings.at("quality_p90_px"));
+      if (quality.at("passed").get<bool>())
+        break;
+      for (uint32_t id = 0; id < model.images.size(); ++id) {
+        if (!model.images[id].registered)
+          continue;
+        const auto& row = quality.at("images")[id];
+        if (row.at("observations").get<size_t>() < MinimumImageObservations ||
+            row.at("occupied_cells").get<size_t>() < MinimumImageCells)
+          deficient.insert(id);
+      }
+      if (deficient.empty() || repair >= max_repairs)
+        throw std::runtime_error("Visual acceptance rejected: " + quality.at("failures").dump());
+      WriteModel(work / "cache/incremental.bin", model);
+    } catch (const RegistrationIncomplete& missing) {
+      if (repair >= max_repairs)
+        throw;
+      deficient.insert(missing.images.begin(), missing.images.end());
+    }
+    Log("Repair matching support for " + std::to_string(deficient.size()) + " images");
+    auto profile = ReadJson(profile_path);
+    profile["repairs"].push_back(MakeMatches(scene, work, root, deficient));
+    WriteJson(profile_path, profile);
+    state.value["stages"]["matches"]["files"] =
+        Inventory(work, {work / "cache/matches", work / "cache/pairs.json", profile_path});
+    state.Save();
+  }
+  WriteModel(work / "cache/visual.bin", model);
+  report["quality"] = quality;
+  WriteJson(work / "cache/sfm.json", report);
+  state.value["registration"] = quality.at("registration");
+  if (model.Registered() != model.images.size())
+    Log("Partial reconstruction accepted: " + std::to_string(model.Registered()) + "/" +
+        std::to_string(model.images.size()) + "; see quality.registration for missing images");
+  return {work / "cache/visual.bin", work / "cache/sfm.json"};
+}
+std::vector<fs::path> AlignVisual(const Scene& scene, const fs::path& work, const Json& settings) {
+  auto model = ReadModel(work / "cache/visual.bin");
+  auto result =
+      Align(scene, model, settings.at("workers"), Limits(settings), settings.at("ba_workers"));
+  result["sfm"] = ReadJson(work / "cache/sfm.json");
+  for (const auto& name : {"masks", "features", "matches"})
+    result["frontend"][name] = ReadJson(work / "cache" / (std::string(name) + "_profile.json"));
+  result["runtime"] = "C++/CUDA/TensorRT";
+  result["build"] = BuildInfo();
+  result["input"] = scene.input.u8string();
+  WriteModel(work / "cache/aligned.bin", model);
+  WriteJson(work / "cache/alignment.json", result);
+  return {work / "cache/aligned.bin", work / "cache/alignment.json"};
+}
+std::vector<fs::path> RefineAligned(const Scene& scene, const fs::path& work,
+                                    const Json& settings) {
+  const auto model = ReadModel(work / "cache/aligned.bin");
+  const auto original = ReadJson(work / "cache/alignment.json");
+  auto refinement = RefinePhotometric(scene, model, settings.at("workers"), Limits(settings),
+                                      settings.at("ba_workers"));
+  refinement.report["enabled"] = true;
+  const auto& selected = refinement.accepted ? refinement.candidate : model;
+  auto result = PostprocessResult(scene, selected, original, "refined");
+  result["refinement"] = refinement.report;
+  WriteModel(work / "cache/refinement_candidate.bin", refinement.candidate);
+  WriteModel(work / "cache/refined.bin", selected);
+  WriteJson(work / "cache/refinement.json", refinement.report);
+  WriteJson(work / "cache/refinement_result.json", result);
+  Log("Photometric refinement " + refinement.report.at("reason").get<std::string>());
+  return {work / "cache/refinement_candidate.bin", work / "cache/refined.bin",
+          work / "cache/refinement.json", work / "cache/refinement_result.json"};
+}
+std::vector<fs::path> CleanSelected(const Scene& scene, const fs::path& work, const Json& settings,
+                                    WorkState& state) {
+  const bool photo = settings.at("refine");
+  auto original =
+      ReadJson(work / (photo ? "cache/refinement_result.json" : "cache/alignment.json"));
+  if (!photo)
+    original["refinement"] = {
+        {"enabled", false}, {"accepted", false}, {"reason", "disabled by configuration"}};
+  const auto model = ReadModel(SelectedModelPath(work, original));
+  auto cleanup = CleanSparseStructure(scene, model, settings.at("workers"), Limits(settings));
+  cleanup.report["source_model"] = original.value("selected_model", std::string("aligned"));
+  const auto& selected = cleanup.accepted ? cleanup.candidate : model;
+  auto result = PostprocessResult(scene, selected, original, "cleaned");
+  result["cleanup"] = cleanup.report;
+  WriteModel(work / "cache/cleanup_candidate.bin", cleanup.candidate);
+  WriteModel(work / "cache/cleaned.bin", selected);
+  WriteJson(work / "cache/cleanup.json", cleanup.report);
+  WriteJson(work / "result.json", result);
+  state.value["registration"] = result.at("quality").at("registration");
+  Log("Sparse structure cleanup " + cleanup.report.at("reason").get<std::string>());
+  return {work / "cache/cleanup_candidate.bin", work / "cache/cleaned.bin",
+          work / "cache/cleanup.json", work / "result.json"};
+}
+// Runs one stage and returns the files that make up its result.
+std::vector<fs::path> RunStage(const std::string& stage, const Scene& scene, const fs::path& work,
+                               const fs::path& root, const Json& settings, const fs::path& output,
+                               const Delivery& delivery, WorkState& state) {
+  if (stage == "prepare") {
+    NavigationPositions(scene);
+    return {work / "scene.json"};
+  }
+  if (stage == "masks") {
+    WriteJson(work / "cache/masks_profile.json", MakeMasks(scene, work, root));
+    return {work / "cache/masks", work / "cache/masks_profile.json"};
+  }
+  if (stage == "features") {
+    WriteJson(work / "cache/features_profile.json", MakeFeatures(scene, work, root));
+    return {work / "cache/features", work / "cache/features_profile.json"};
+  }
+  if (stage == "matches") {
+    WriteJson(work / "cache/matches_profile.json", MakeMatches(scene, work, root));
+    return {work / "cache/matches", work / "cache/pairs.json", work / "cache/matches_profile.json"};
+  }
+  if (stage == "sfm")
+    return ReconstructVisual(scene, work, root, settings, state);
+  if (stage == "align")
+    return AlignVisual(scene, work, settings);
+  if (stage == "refine")
+    return RefineAligned(scene, work, settings);
+  if (stage == "cleanup")
+    return CleanSelected(scene, work, settings, state);
+  ExportSelected(scene, work, output, delivery);
+  return {output / "manifest.json"};
+}
+std::vector<std::string> Stages(const Json& settings, const std::string& requested) {
   std::vector<std::string> stages = {"prepare", "masks", "features", "matches", "sfm", "align"};
   if (settings.at("refine").get<bool>())
     stages.push_back("refine");
@@ -184,198 +312,117 @@ void Run(const Arguments& args) {
   stages.push_back("export");
   if (requested != "all" && std::find(stages.begin(), stages.end(), requested) == stages.end())
     throw std::runtime_error("Unknown stage: " + requested);
+  return stages;
+}
+}  // namespace
+void Run(const Arguments& args) {
+  args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
+                 "--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
+                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
+                 "--supervision-cache-mb", "--refine"});
+  const auto delivery = ParseDelivery(args);
+  const auto work = args.Get("--work").empty()
+                        ? fs::absolute(fs::path("work") / args.Path("--input").filename())
+                        : args.Path("--work");
+  fs::create_directories(work);
+  Lock lock(work);
+  WorkState state{work / "state.json", Json::object()};
+  if (fs::exists(state.path))
+    state.value = ReadJson(state.path);
+  if (!state.value.empty() && state.value.at("version") != 1)
+    throw std::runtime_error("Unsupported work format; choose a new work directory");
+  if (!state.value.empty() && state.value.value("pipeline_version", 0) != PipelineVersion)
+    throw std::runtime_error("Reconstruction implementation changed; choose a new work directory");
+  const auto input = args.Get("--input").empty()
+                         ? fs::u8path(state.value.at("input").get<std::string>())
+                         : args.Path("--input");
+  if (Contains(input, work) || Contains(work, input))
+    throw std::runtime_error("Input and work directories must be separate");
+  auto settings = args.Get("--config").empty()
+                      ? (state.value.empty() ? Settings({}) : state.value.at("settings"))
+                      : Settings(args.Path("--config"));
+  if (args.Get("--refine") == "true")
+    settings["refine"] = true;
+  const auto las = args.Get("--las").empty()
+                       ? (state.value.empty()
+                              ? fs::path()
+                              : fs::u8path(state.value.at("scene").at("las").get<std::string>()))
+                       : args.Path("--las");
+  const Scene scene = ReadScene(input, las);
+  ReadLasHeader(scene.las);
+  const auto prepared = scene.ToJson();
+  if (state.value.empty()) {
+    state.value = {{"version", 1},
+                   {"pipeline_version", PipelineVersion},
+                   {"input", scene.input.u8string()},
+                   {"settings", settings},
+                   {"scene", prepared},
+                   {"stages", Json::object()}};
+    WriteJson(work / "scene.json", prepared);
+  } else if (state.value.at("scene") != prepared || state.value.at("settings") != settings)
+    throw std::runtime_error("Inputs/settings changed; choose a new work directory");
+  const auto root = args.Get("--models").empty()
+                        ? (state.value.contains("models")
+                               ? fs::u8path(state.value.at("models").get<std::string>())
+                               : DefaultModels())
+                        : args.Path("--models");
+  const auto requested = args.Get("--stage", args.command == "prepare" ? "prepare" : "all");
+  const auto stages = Stages(settings, requested);
   const auto output = args.Get("--output").empty() ? work / "colmap" : args.Path("--output");
   if (Contains(input, output) || Contains(output, input))
     throw std::runtime_error("Output must be separate from input");
-  const bool ply = args.Get("--no-ply") != "true";
-  const double voxel = args.Number("--ply-voxel", .05);
-  state["status"] = "running";
-  state["build"] = BuildInfo();
-  state["error"] = nullptr;
-  WriteJson(state_path, state);
+  state.value["status"] = "running";
+  state.value["build"] = BuildInfo();
+  state.value["error"] = nullptr;
+  state.Save();
   const auto started = Clock::now();
-  const int workers = settings.at("workers");
-  const int ba_workers = settings.at("ba_workers");
-  const AlignmentLimits limits{settings.at("las_support_fraction"), settings.at("las_median_m"),
-                               settings.at("las_p90_m"), settings.at("quality_median_px"),
-                               settings.at("quality_p90_px")};
   try {
     for (const auto& stage : stages) {
       if (requested != "all" && stage != requested)
         continue;
+      auto& completed = state.value.at("stages");
       if (stage != "prepare") {
-        const size_t index = std::find(stages.begin(), stages.end(), stage) - stages.begin();
-        if (!state.at("stages").contains(stages[index - 1]))
-          throw std::runtime_error("Run prerequisite stage: " + stages[index - 1]);
+        const auto& previous = *(std::find(stages.begin(), stages.end(), stage) - 1);
+        if (!completed.contains(previous))
+          throw std::runtime_error("Run prerequisite stage: " + previous);
         if (stage == "refine" || stage == "cleanup" || stage == "export")
-          Verify(work, state.at("stages").at(stages[index - 1]).at("files"));
+          Verify(work, completed.at(previous).at("files"));
         // SfM repair rounds run the matcher again with the recorded models.
         if (stage == "masks" || stage == "features" || stage == "matches" ||
-            (stage == "sfm" && settings.at("sfm_repair_rounds").get<int>() > 0)) {
-          Json identity = {{"manifest", FileMetadata(root / "manifest.json")}};
-          const auto manifest = ReadJson(root / "manifest.json");
-          for (const auto& [key, value] : manifest.at("models").items())
-            identity[key] = FileMetadata(root / "engines" / (key + ".engine"));
-          if (state.contains("model_identity") && state.at("model_identity") != identity)
-            throw std::runtime_error("Models changed; choose a new work directory");
-          state["model_identity"] = identity;
-          state["models"] = root.u8string();
-          WriteJson(state_path, state);
-        }
+            (stage == "sfm" && settings.at("sfm_repair_rounds").get<int>() > 0))
+          RecordModels(state, root);
       }
       Log("Stage: " + stage);
-      state["active_stage"] = stage;
-      WriteJson(state_path, state);
+      state.value["active_stage"] = stage;
+      state.Save();
       const auto begin = Clock::now();
-      if (state.at("stages").contains(stage)) {
-        Verify(work, state.at("stages").at(stage).at("files"));
-        if (stage == "export") {
-          const auto result = ReadJson(work / "result.json");
-          ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, ply, voxel,
-                       result, supervision);
-        }
+      if (completed.contains(stage)) {
+        Verify(work, completed.at(stage).at("files"));
+        if (stage == "export")
+          ExportSelected(scene, work, output, delivery);
         Log("Reused " + stage);
         continue;
       }
-      std::vector<fs::path> products;
-      if (stage == "prepare") {
-        NavigationPositions(scene);
-        products = {work / "scene.json"};
-      } else if (stage == "masks") {
-        WriteJson(work / "cache/masks_profile.json", MakeMasks(scene, work, root));
-        products = {work / "cache/masks", work / "cache/masks_profile.json"};
-      } else if (stage == "features") {
-        WriteJson(work / "cache/features_profile.json", MakeFeatures(scene, work, root));
-        products = {work / "cache/features", work / "cache/features_profile.json"};
-      } else if (stage == "matches") {
-        WriteJson(work / "cache/matches_profile.json", MakeMatches(scene, work, root));
-        products = {work / "cache/matches", work / "cache/pairs.json",
-                    work / "cache/matches_profile.json"};
-      } else if (stage == "sfm") {
-        Json report;
-        Json quality;
-        Reconstruction model;
-        const auto profile_path = work / "cache/matches_profile.json";
-        const int completed_repairs =
-            int(ReadJson(profile_path).value("repairs", Json::array()).size());
-        const int max_repairs = settings.at("sfm_repair_rounds");
-        for (int repair = completed_repairs;; ++repair) {
-          std::set<uint32_t> deficient;
-          try {
-            model = Reconstruct(scene, work, workers, report,
-                                settings.at("calibration_tracks") == "stable",
-                                repair >= max_repairs, ba_workers);
-            quality = model.Quality(scene, settings.at("quality_median_px"),
-                                    settings.at("quality_p90_px"));
-            if (quality.at("passed").get<bool>())
-              break;
-            for (uint32_t id = 0; id < model.images.size(); ++id) {
-              if (!model.images[id].registered)
-                continue;
-              const auto& row = quality.at("images")[id];
-              if (row.at("observations").get<size_t>() < 32 ||
-                  row.at("occupied_cells").get<size_t>() < 8)
-                deficient.insert(id);
-            }
-            if (deficient.empty() || repair >= max_repairs)
-              throw std::runtime_error("Visual acceptance rejected: " +
-                                       quality.at("failures").dump());
-            WriteModel(work / "cache/incremental.bin", model);
-          } catch (const RegistrationIncomplete& missing) {
-            if (repair >= max_repairs)
-              throw;
-            deficient.insert(missing.images.begin(), missing.images.end());
-          }
-          Log("Repair matching support for " + std::to_string(deficient.size()) + " images");
-          auto profile = ReadJson(profile_path);
-          profile["repairs"].push_back(MakeMatches(scene, work, root, deficient));
-          WriteJson(profile_path, profile);
-          state["stages"]["matches"]["files"] =
-              Inventory(work, {work / "cache/matches", work / "cache/pairs.json", profile_path});
-          WriteJson(state_path, state);
-        }
-        WriteModel(work / "cache/visual.bin", model);
-        report["quality"] = quality;
-        WriteJson(work / "cache/sfm.json", report);
-        state["registration"] = quality.at("registration");
-        if (model.Registered() != model.images.size())
-          Log("Partial reconstruction accepted: " + std::to_string(model.Registered()) + "/" +
-              std::to_string(model.images.size()) +
-              "; see quality.registration for missing images");
-        products = {work / "cache/visual.bin", work / "cache/sfm.json"};
-      } else if (stage == "align") {
-        auto model = ReadModel(work / "cache/visual.bin");
-        auto result = Align(scene, model, workers, limits, ba_workers);
-        result["sfm"] = ReadJson(work / "cache/sfm.json");
-        for (const auto& name : {"masks", "features", "matches"})
-          result["frontend"][name] =
-              ReadJson(work / "cache" / (std::string(name) + "_profile.json"));
-        result["runtime"] = "C++/CUDA/TensorRT";
-        result["build"] = BuildInfo();
-        result["input"] = scene.input.u8string();
-        WriteModel(work / "cache/aligned.bin", model);
-        WriteJson(work / "cache/alignment.json", result);
-        products = {work / "cache/aligned.bin", work / "cache/alignment.json"};
-      } else if (stage == "refine") {
-        const auto model = ReadModel(work / "cache/aligned.bin");
-        const auto original = ReadJson(work / "cache/alignment.json");
-        auto refinement = RefinePhotometric(scene, model, workers, limits, ba_workers);
-        refinement.report["enabled"] = true;
-        const auto& selected = refinement.accepted ? refinement.candidate : model;
-        auto result = PostprocessResult(scene, selected, original, "refined");
-        result["refinement"] = refinement.report;
-        WriteModel(work / "cache/refinement_candidate.bin", refinement.candidate);
-        WriteModel(work / "cache/refined.bin", selected);
-        WriteJson(work / "cache/refinement.json", refinement.report);
-        WriteJson(work / "cache/refinement_result.json", result);
-        Log("Photometric refinement " + refinement.report.at("reason").get<std::string>());
-        products = {work / "cache/refinement_candidate.bin", work / "cache/refined.bin",
-                    work / "cache/refinement.json", work / "cache/refinement_result.json"};
-      } else if (stage == "cleanup") {
-        const bool photo = settings.at("refine");
-        auto original =
-            ReadJson(work / (photo ? "cache/refinement_result.json" : "cache/alignment.json"));
-        if (!photo)
-          original["refinement"] = {
-              {"enabled", false}, {"accepted", false}, {"reason", "disabled by configuration"}};
-        const auto model = ReadModel(SelectedModelPath(work, original));
-        auto cleanup = CleanSparseStructure(scene, model, workers, limits);
-        cleanup.report["source_model"] = original.value("selected_model", std::string("aligned"));
-        const auto& selected = cleanup.accepted ? cleanup.candidate : model;
-        auto result = PostprocessResult(scene, selected, original, "cleaned");
-        result["cleanup"] = cleanup.report;
-        WriteModel(work / "cache/cleanup_candidate.bin", cleanup.candidate);
-        WriteModel(work / "cache/cleaned.bin", selected);
-        WriteJson(work / "cache/cleanup.json", cleanup.report);
-        WriteJson(work / "result.json", result);
-        state["registration"] = result.at("quality").at("registration");
-        Log("Sparse structure cleanup " + cleanup.report.at("reason").get<std::string>());
-        products = {work / "cache/cleanup_candidate.bin", work / "cache/cleaned.bin",
-                    work / "cache/cleanup.json", work / "result.json"};
-      } else {
-        const auto result = ReadJson(work / "result.json");
-        ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, ply, voxel,
-                     result, supervision);
-        products = {output / "manifest.json"};
-      }
-      state["stages"][stage] = {{"seconds", Seconds(begin)}, {"files", Inventory(work, products)}};
-      WriteJson(state_path, state);
+      const auto products = RunStage(stage, scene, work, root, settings, output, delivery, state);
+      state.value["stages"][stage] = {{"seconds", Seconds(begin)},
+                                      {"files", Inventory(work, products)}};
+      state.Save();
       Log(stage + ": completed in " + std::to_string(Seconds(begin)) + " s");
     }
-    state["status"] = state.at("stages").contains("export") ? "completed" : "ready";
-    state["active_stage"] = nullptr;
-    state["last_invocation_seconds"] = Seconds(started);
-    state["resources"] = Resources();
-    WriteJson(state_path, state);
+    state.value["status"] = state.value.at("stages").contains("export") ? "completed" : "ready";
+    state.value["active_stage"] = nullptr;
+    state.value["last_invocation_seconds"] = Seconds(started);
+    state.value["resources"] = Resources();
+    state.Save();
   } catch (const std::exception& e) {
-    state["status"] = "failed";
-    state["error"] = e.what();
-    WriteJson(state_path, state);
+    state.value["status"] = "failed";
+    state.value["error"] = e.what();
+    state.Save();
     throw;
   }
   std::cout << Json({{"work", work.u8string()},
-                     {"status", state.at("status")},
-                     {"registration", state.value("registration", Json(nullptr))},
+                     {"status", state.value.at("status")},
+                     {"registration", state.value.value("registration", Json(nullptr))},
                      {"seconds", Seconds(started)}})
                    .dump()
             << '\n';
@@ -384,7 +431,7 @@ void Export(const Arguments& args) {
   args.Validate({"--work", "--output", "--no-ply", "--ply-voxel", "--las-supervision",
                  "--no-las-supervision", "--supervision-max-size", "--supervision-boundary",
                  "--supervision-mask-dir", "--supervision-cache-mb"});
-  const auto supervision = ParseSupervisionOptions(args);
+  const auto delivery = ParseDelivery(args);
   const auto work = args.Path("--work");
   Lock lock(work);
   if (fs::exists(work / "state.json")) {
@@ -396,27 +443,22 @@ void Export(const Arguments& args) {
     }
   }
   const auto scene = Scene::FromJson(ReadJson(work / "scene.json"));
-  const auto result = ReadJson(work / "result.json");
-  const auto model = ReadModel(SelectedModelPath(work, result));
   const auto output = args.Get("--output").empty() ? work / "colmap" : args.Path("--output");
   if (Contains(scene.input, output) || Contains(output, scene.input))
     throw std::runtime_error("Output must be separate from input");
-  ExportBundle(scene, model, work, output, args.Get("--no-ply") != "true",
-               args.Number("--ply-voxel", .05), result, supervision);
+  ExportSelected(scene, work, output, delivery);
   std::cout << CheckBundle(output).dump() << '\n';
 }
 void Postprocess(const Arguments& args) {
   args.Validate({"--work", "--output", "--workers", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
                  "--supervision-cache-mb", "--no-ply", "--ply-voxel"});
-  const auto supervision = ParseSupervisionOptions(args);
+  const auto delivery = ParseDelivery(args);
   const bool photo = args.command == "refine";
   const auto source = args.Path("--work"), final_output = args.Path("--output");
   const int workers = args.Integer("--workers", 4);
   if (workers > 32)
     throw std::runtime_error("workers must be 1-32");
-  const bool ply = args.Get("--no-ply") != "true";
-  const double voxel = args.Number("--ply-voxel", .05);
   if (fs::exists(final_output))
     throw std::runtime_error("Postprocessing output already exists; choose a new work directory");
   Lock lock(source);
@@ -492,7 +534,8 @@ void Postprocess(const Arguments& args) {
     pixels.setTo(0, domains[image.camera] == 0);
     WriteImage(mask, pixels);
   }
-  ExportBundle(scene, selected, output, output / "colmap", ply, voxel, result, supervision);
+  ExportBundle(scene, selected, output, output / "colmap", delivery.ply, delivery.voxel, result,
+               delivery.supervision);
   fs::rename(output, final_output);
   Log(args.command + ": " + report.at("reason").get<std::string>());
   std::cout << Json({{"work", final_output.u8string()},

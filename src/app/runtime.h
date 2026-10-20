@@ -1,6 +1,9 @@
 #pragma once
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <initializer_list>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -22,6 +25,25 @@ Json FileMetadata(const fs::path& path);
 Json Resources();
 void PublishFile(const fs::path& temporary, const fs::path& path);
 void Log(const std::string& message);
+// Calls function(i) for every i < count on workers threads, handing out chunk indices at a time.
+// A worker exception is rethrown once every worker has finished.
+template <class Function>
+void ParallelFor(size_t count, int workers, size_t chunk, Function function) {
+  std::atomic<size_t> next{0};
+  std::vector<std::future<void>> jobs;
+  for (int i = 0; i < workers; ++i)
+    jobs.push_back(std::async(std::launch::async, [&] {
+      for (;;) {
+        const size_t start = next.fetch_add(chunk);
+        if (start >= count)
+          break;
+        for (size_t j = start; j < std::min(count, start + chunk); ++j)
+          function(j);
+      }
+    }));
+  for (auto& job : jobs)
+    job.get();
+}
 struct Arguments {
   std::string command;
   std::map<std::string, std::string> values;

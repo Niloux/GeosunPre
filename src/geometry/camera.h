@@ -5,6 +5,11 @@
 #include "app/runtime.h"
 
 namespace geosun {
+constexpr double Pi = 3.14159265358979323846;
+// Valid fisheye domain shared by masks, features and supervision.
+constexpr double FieldOfViewDegrees = 160;
+// Per-image support required for registration, calibration and visual acceptance.
+constexpr size_t MinimumImageObservations = 32, MinimumImageCells = 8;
 struct Camera {
   std::string label;
   int width = 0, height = 0;
@@ -12,14 +17,16 @@ struct Camera {
   std::array<double, 2> principal_offset{};
   static Camera FromJson(const Json& value);
   Json ToJson() const;
-  double Radius(double fov = 160) const;
-  bool Valid(double x, double y, double fov = 160) const;
-  cv::Mat Mask(double fov = 160) const;
+  double Radius(double fov = FieldOfViewDegrees) const;
+  bool Valid(double x, double y, double fov = FieldOfViewDegrees) const;
+  cv::Mat Mask(double fov = FieldOfViewDegrees) const;
   Eigen::Vector2d Project(const Eigen::Vector3d& xyz) const;
   Eigen::Matrix<double, 2, 3> ProjectionJacobian(const Eigen::Vector3d& xyz) const;
   Eigen::Vector3d Ray(const Eigen::Vector2d& pixel) const;
   // Largest change from the initial calibration allowed in BA and checked by acceptance.
   std::array<double, 8> CalibrationBounds() const;
+  // Cell index in the 8x8 image grid counted against MinimumImageCells.
+  int CoverageCell(const Eigen::Vector2d& pixel) const;
 };
 struct Pose {
   // World-to-camera rotation in Eigen order x,y,z,w, followed by translation.

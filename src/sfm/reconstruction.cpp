@@ -14,7 +14,6 @@
 
 namespace geosun {
 namespace {
-constexpr double Pi = 3.14159265358979323846;
 Eigen::Matrix3d Matrix(const cv::Mat& input) {
   cv::Mat m;
   input.convertTo(m, CV_64F);
@@ -624,9 +623,9 @@ bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
     const auto v = selected.Apply({xyz[i].x, xyz[i].y, xyz[i].z});
     const auto& pixel = image.pixels[features[i]];
     if (v.z() > 0 && (cam.Project(v) - pixel).norm() <= 6)
-      cells.insert(int(pixel.x() / cam.width * 8) + 8 * int(pixel.y() / cam.height * 8));
+      cells.insert(cam.CoverageCell(pixel));
   }
-  if (maximum < 32 || cells.size() < 8)
+  if (maximum < MinimumImageObservations || cells.size() < MinimumImageCells)
     return false;
   image.pose = selected;
   image.registered = true;
@@ -678,8 +677,7 @@ std::set<uint64_t> CalibrationTracks(const Scene& scene, const Reconstruction& m
       const auto& camera = scene.cameras[im.camera];
       const auto& xy = im.pixels[o.feature];
       ++observations[o.image];
-      cells[o.image].insert(std::clamp(int(xy.x() / camera.width * 8), 0, 7) +
-                            8 * std::clamp(int(xy.y() / camera.height * 8), 0, 7));
+      cells[o.image].insert(camera.CoverageCell(xy));
       const double angle = std::acos(std::clamp(camera.Ray(xy).z(), -1., 1.));
       ++angles[im.camera][std::clamp(int(angle * 180 / Pi / 20), 0, 3)];
     }
@@ -692,7 +690,7 @@ std::set<uint64_t> CalibrationTracks(const Scene& scene, const Reconstruction& m
       per_image.push_back({{"image_index", id},
                            {"observations", observations[id]},
                            {"occupied_cells", cells[id].size()}});
-      if (observations[id] < 32 || cells[id].size() < 8)
+      if (observations[id] < MinimumImageObservations || cells[id].size() < MinimumImageCells)
         insufficient.push_back(id);
       connected = connected && root(id) == root(model.gauge_image);
     }
