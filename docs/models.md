@@ -44,6 +44,19 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 
 导出和 ONNX→TensorRT 编译是独立资源准备，由根目录 `prepare-models.ps1` 完成。引擎针对构建 GPU，更换 GPU 时重新构建，不默认承诺跨型号兼容。
 
+## ONNX 发布包
+
+权重→ONNX 与 GPU 无关，只需在开发机做一次；ONNX→引擎随 GPU 变化。将前者冻结为发布包，其他机器构建引擎时不再下载权重、LoMa 源码或 SegFormer：
+
+```powershell
+.\prepare-models.ps1 -OnnxBundle dist/onnx-bundle-v1
+.\prepare-models.ps1 -Models models/other-gpu -OnnxFrom dist/onnx-bundle-v1
+```
+
+`-OnnxBundle` 总是从固定权重重新导出，不接受 `-Models`、`-OnnxFrom`、`-MatcherPrecision`；输出目录已存在时报错。包内含 `onnx/` 四个单文件 ONNX、`references/` 导出时的 PyTorch 输入输出、`images/` 两张验证照片及 `onnx-bundle.json`（version=1、来源版本、检测器范围、max_features 与全部文件 SHA256）。导出同样经 `.pending` 目录校验后发布。
+
+`-OnnxFrom` 指向发布包时先校验清单与全部 SHA256，默认用包内照片验证，并用包内参考数据完成 PyTorch/TensorRT 逐模型比较，门限与首次导出相同。构建仍需项目内 Python、PyTorch 与 TensorRT 环境，但不需要原始权重。
+
 ## 自定义参数
 
 按目标设备或精度调整准备参数；升级旧固定尺寸模型包时使用新目录：

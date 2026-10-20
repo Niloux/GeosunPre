@@ -14,7 +14,7 @@ import torch
 import onnx
 import tensorrt as trt
 
-from resources import CACHE, loma_source, segmentation_source, sha256, torch_weights
+from resources import CACHE, LOMA_COMMIT, SEGMENTATION_REVISION, loma_source, segmentation_source, sha256, torch_weights
 from networks import Detector, Descriptor, Matcher, Segmentation, fix_descriptor_positions
 
 TRT_VERSION = '10.13.3.9'
@@ -29,6 +29,9 @@ CONTRACTS = {
     'matcher': (['ka', 'kb', 'da', 'db', 'mask_a', 'mask_b'], ['matches', 'confidence']),
     'segmentation': (['image'], ['probabilities']),
 }
+BUNDLE = 'onnx-bundle.json'
+REFERENCES = [f'{name}.npz' for name in CONTRACTS] + [
+    f'detector_{width}x{height}.npz' for width, height in DETECTOR_CHECK_SIZES]
 
 
 def write_json(path, value):
@@ -441,14 +444,68 @@ def verify_package(root, settings, shapes, images):
     verify(root, shapes, images)
 
 
+def read_bundle(root):
+    bundle = json.loads((root / BUNDLE).read_text(encoding='utf-8'))
+    if bundle.get('version') != 1 or bundle.get('detector_profile') != DETECTOR_PROFILE or bundle.get('max_features') != MAX_FEATURES:
+        raise RuntimeError(f'ONNX bundle version/profile differs from this preparation tool: {root}')
+    required = [f'onnx/{name}.onnx' for name in CONTRACTS] + [f'references/{name}' for name in REFERENCES] + bundle['images']
+    files = bundle['files']
+    if len(bundle['images']) != 2 or any(name not in files for name in required):
+        raise RuntimeError(f'ONNX bundle is incomplete: {root}')
+    for name, digest in files.items():
+        if sha256(root / name) != digest:
+            raise RuntimeError(f'ONNX bundle checksum differs: {root / name}')
+    return bundle
+
+
+def export_bundle(root, shapes, source, images):
+    """Export the GPU-independent ONNX graphs with PyTorch references and validation images."""
+    if root.exists():
+        raise RuntimeError(f'ONNX bundle output already exists: {root}. Choose a new -OnnxBundle directory.')
+    pending = root.with_name(root.name + '.pending')
+    if (pending / BUNDLE).is_file():
+        read_bundle(pending)
+        print(f'Reuse verified pending ONNX bundle: {pending}', flush=True)
+        return
+    recipe = ''.join(sha256(Path(__file__).with_name(name)) for name in ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt'))
+    settings = {'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest(), 'images': [sha256(path) for path in images]}
+    settings_path = pending / 'preparation.json'
+    if pending.is_dir() and any(pending.iterdir()) and (not settings_path.is_file() or json.loads(settings_path.read_text(encoding='utf-8')) != settings):
+        raise RuntimeError(f'Unfinished ONNX bundle has different settings: {pending}. Choose a new -OnnxBundle directory.')
+    for directory in ('onnx', 'references', 'images'):
+        (pending / directory).mkdir(parents=True, exist_ok=True)
+    write_json(settings_path, settings)
+    export_models(pending / 'onnx', shapes, source, images, pending / 'references')
+    missing = [name for name in REFERENCES if not (pending / 'references' / name).is_file()]
+    if missing:
+        raise RuntimeError(f'Unfinished ONNX bundle lacks PyTorch references {missing}. Choose a new -OnnxBundle directory.')
+    for name in CONTRACTS:
+        check_onnx(pending / 'onnx' / f'{name}.onnx', name, shapes[name])
+    names = []
+    for letter, path in zip('AB', images):
+        names.append(f'images/{letter}{path.suffix.lower()}')
+        shutil.copy2(path, pending / names[-1])
+    files = [f'onnx/{name}.onnx' for name in CONTRACTS] + [f'references/{name}' for name in REFERENCES] + names
+    write_json(pending / BUNDLE, {
+        'version': 1, 'recipe': settings['recipe'], 'loma_commit': LOMA_COMMIT,
+        'segmentation_revision': SEGMENTATION_REVISION, 'detector_profile': DETECTOR_PROFILE,
+        'max_features': MAX_FEATURES, 'images': names,
+        'files': {name: sha256(pending / name) for name in files}})
+    read_bundle(pending)
+    print(f'ONNX bundle verified: {pending}', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--models', type=Path, required=True)
+    parser.add_argument('--models', type=Path)
+    parser.add_argument('--bundle', type=Path, help='export a GPU-independent ONNX bundle instead of engines')
     parser.add_argument('--matcher-precision', choices=('fp32', 'tf32', 'fp16'), default='fp16',
                         help='matcher engine precision (default: %(default)s)')
     parser.add_argument('--onnx-from', type=Path)
     parser.add_argument('--images', type=Path, nargs=2)
     args = parser.parse_args()
+    if bool(args.models) == bool(args.bundle) or (args.bundle and args.onnx_from):
+        raise RuntimeError('Use either --models (optionally with --onnx-from) or --bundle')
     if trt.__version__ != TRT_VERSION:
         raise RuntimeError(f'Requires TensorRT {TRT_VERSION}, found {trt.__version__}')
     if not torch.cuda.is_available():
@@ -463,27 +520,38 @@ def main():
     torch.backends.cuda.enable_cudnn_sdp(False)
     torch.backends.cuda.enable_math_sdp(True)
     shapes = expected_shapes()
-    root = args.models.resolve()
     recipe = ''.join(sha256(Path(__file__).with_name(name)) for name in ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt'))
     settings = {'gpu': torch.cuda.get_device_name(0), 'tensorrt': TRT_VERSION,
                 'detector_profile': DETECTOR_PROFILE,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': 'fp32' if args.matcher_precision == 'fp16' else args.matcher_precision,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest()}
-    reuse_manifest = None
+    reuse_manifest = bundle = None
     if args.onnx_from:
         origin = args.onnx_from.resolve()
         if (origin / 'onnx').is_dir():
             origin = origin / 'onnx'
+        if (origin.parent / BUNDLE).is_file():
+            bundle = read_bundle(origin.parent)
         settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in CONTRACTS}
         if (origin.parent / 'manifest.json').is_file():
             reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
-    source = None if args.images else loma_source()
-    images = args.images or [source / 'assets' / f'0015_{letter}.jpg' for letter in ('A', 'B')]
+    # A bundle carries its own validation images; no upstream source download is needed.
+    source = None if args.images or bundle else loma_source()
+    if args.images:
+        images = args.images
+    elif bundle:
+        images = [origin.parent / name for name in bundle['images']]
+    else:
+        images = [source / 'assets' / f'0015_{letter}.jpg' for letter in ('A', 'B')]
     images = [path.resolve() for path in images]
     for path in images:
         if not path.is_file():
             raise FileNotFoundError(path)
+    if args.bundle:
+        export_bundle(args.bundle.resolve(), shapes, source, images)
+        return
+    root = args.models.resolve()
     if (root / 'manifest.json').is_file():
         verify_package(root, settings, shapes, images)
         print(f'Reuse complete model package: {root}', flush=True)
@@ -502,8 +570,11 @@ def main():
     if settings_path.is_file() and json.loads(settings_path.read_text(encoding='utf-8')) != settings:
         raise RuntimeError(f'Unfinished conversion has different settings: {pending}. Choose a new -Models directory.')
     write_json(settings_path, settings)
-    references = CACHE / 'references' / sha256(settings_path)
-    references.mkdir(parents=True, exist_ok=True)
+    if bundle:
+        references = origin.parent / 'references'
+    else:
+        references = CACHE / 'references' / sha256(settings_path)
+        references.mkdir(parents=True, exist_ok=True)
     for directory in ('onnx', 'engines', 'runtime'):
         (pending / directory).mkdir(exist_ok=True)
     copied = set()

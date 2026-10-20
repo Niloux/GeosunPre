@@ -3,10 +3,14 @@ param(
     [string]$Models = (Join-Path $PSScriptRoot 'models'),
     [ValidateSet('fp32', 'tf32', 'fp16')][string]$MatcherPrecision = 'fp16',
     [string]$OnnxFrom,
+    [string]$OnnxBundle,
     [string[]]$Images
 )
 $ErrorActionPreference = 'Stop'
 if ($Images -and $Images.Count -ne 2) { throw '-Images requires two real image paths.' }
+if ($OnnxBundle -and ($OnnxFrom -or $PSBoundParameters.ContainsKey('Models') -or $PSBoundParameters.ContainsKey('MatcherPrecision'))) {
+    throw '-OnnxBundle exports GPU-independent ONNX only; it cannot be combined with -Models, -OnnxFrom or -MatcherPrecision.'
+}
 
 function Invoke-Tool([string]$Program, [string[]]$Arguments) {
     & $Program @Arguments
@@ -51,9 +55,11 @@ try {
         Invoke-Tool $uvPath @('pip', 'install', '--python', $python, '-r', $requirements, '--extra-index-url', 'https://pypi.nvidia.com')
         Set-Content -LiteralPath $stamp -Value $identity -Encoding ASCII
     }
-    $modelRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Models).TrimEnd([char[]]'\/')
-    $arguments = @('-B', '-X', 'utf8', (Join-Path $PSScriptRoot 'tools\models\prepare.py'), '--models', $modelRoot,
-        '--matcher-precision', $MatcherPrecision)
+    $target = if ($OnnxBundle) { $OnnxBundle } else { $Models }
+    $modelRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($target).TrimEnd([char[]]'\/')
+    $arguments = @('-B', '-X', 'utf8', (Join-Path $PSScriptRoot 'tools\models\prepare.py'))
+    if ($OnnxBundle) { $arguments += @('--bundle', $modelRoot) }
+    else { $arguments += @('--models', $modelRoot, '--matcher-precision', $MatcherPrecision) }
     if ($OnnxFrom) { $arguments += @('--onnx-from', $OnnxFrom) }
     if ($Images) {
         $arguments += @('--images') + $Images
@@ -64,9 +70,9 @@ try {
         try {
             [IO.Directory]::Move($pending, $modelRoot)
         } catch [IO.IOException], [UnauthorizedAccessException] {
-            throw "Cannot publish models: $($_.Exception.Message) Verified files remain in '$pending'. Close programs using this directory and rerun prepare-models.ps1."
+            throw "Cannot publish: $($_.Exception.Message) Verified files remain in '$pending'. Close programs using this directory and rerun prepare-models.ps1."
         }
-        Write-Host "Models ready: $modelRoot"
+        Write-Host $(if ($OnnxBundle) { "ONNX bundle ready: $modelRoot" } else { "Models ready: $modelRoot" })
     }
 } finally {
     foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], 'Process') }
