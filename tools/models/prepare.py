@@ -30,6 +30,8 @@ CONTRACTS = {
     'segmentation': (['image'], ['probabilities']),
 }
 BUNDLE = 'onnx-bundle.json'
+# Hardware compatibility trades some tactics for one engine set on every Ampere+ GPU.
+HARDWARE_LEVELS = {'none': None, 'ampere_plus': (8, 0)}
 REFERENCES = [f'{name}.npz' for name in CONTRACTS] + [
     f'detector_{width}x{height}.npz' for width, height in DETECTOR_CHECK_SIZES]
 
@@ -218,7 +220,7 @@ def export_models(directory, shapes, source, images, references):
         torch.cuda.empty_cache()
 
 
-def build_engine(path, name, shapes, matcher_precision='fp16'):
+def build_engine(path, name, shapes, matcher_precision='fp16', hardware='none'):
     if path.is_file():
         print(f'Reuse engine: {name}', flush=True)
         return
@@ -256,6 +258,8 @@ def build_engine(path, name, shapes, matcher_precision='fp16'):
         if not scoring:
             raise RuntimeError('FP16 matcher ONNX is missing the final scoring projection')
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+    if hardware == 'ampere_plus':
+        config.hardware_compatibility_level = trt.HardwareCompatibilityLevel.AMPERE_PLUS
     if name == 'detector':
         profile = builder.create_optimization_profile()
         profile.set_shape('image', *[(1, 3, height, width)
@@ -427,10 +431,21 @@ def matcher_precisions(manifest):
     return precision, manifest.get('matcher_score_precision', precision)
 
 
+def hardware_level(manifest):
+    return manifest.get('hardware_compatibility', 'none')
+
+
+def same_target(manifest, settings):
+    """Engines from the same TensorRT version run on the build GPU model or any GPU of their level."""
+    if manifest.get('tensorrt') != settings['tensorrt'] or hardware_level(manifest) != settings['hardware_compatibility']:
+        return False
+    return settings['hardware_compatibility'] != 'none' or manifest.get('gpu') == settings['gpu']
+
+
 def verify_package(root, settings, shapes, images):
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
-    if manifest.get('version') != 2 or any(manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt', 'detector_profile')):
-        raise RuntimeError('Existing model GPU/version/profile differs. Choose a new -Models directory; use -OnnxFrom to upgrade a static package.')
+    if manifest.get('version') != 2 or not same_target(manifest, settings) or manifest.get('detector_profile') != settings['detector_profile']:
+        raise RuntimeError('Existing model GPU/hardware level/version/profile differs. Choose a new -Models directory; use -OnnxFrom to upgrade a static package.')
     if matcher_precisions(manifest) != matcher_precisions(settings):
         raise RuntimeError('Existing matcher calculation/scoring precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
     for name, (inputs, outputs) in CONTRACTS.items():
@@ -501,6 +516,8 @@ def main():
     parser.add_argument('--bundle', type=Path, help='export a GPU-independent ONNX bundle instead of engines')
     parser.add_argument('--matcher-precision', choices=('fp32', 'tf32', 'fp16'), default='fp16',
                         help='matcher engine precision (default: %(default)s)')
+    parser.add_argument('--hardware-compatibility', choices=tuple(HARDWARE_LEVELS), default='none',
+                        help='TensorRT engine hardware compatibility (default: %(default)s)')
     parser.add_argument('--onnx-from', type=Path)
     parser.add_argument('--images', type=Path, nargs=2)
     args = parser.parse_args()
@@ -511,6 +528,9 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError('A CUDA GPU is required for model preparation')
     torch.cuda.set_device(0)
+    minimum = HARDWARE_LEVELS[args.hardware_compatibility]
+    if minimum and torch.cuda.get_device_capability(0) < minimum:
+        raise RuntimeError(f'{args.hardware_compatibility} engines require a GPU with compute capability >= {minimum[0]}.{minimum[1]}')
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -523,6 +543,7 @@ def main():
     recipe = ''.join(sha256(Path(__file__).with_name(name)) for name in ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt'))
     settings = {'gpu': torch.cuda.get_device_name(0), 'tensorrt': TRT_VERSION,
                 'detector_profile': DETECTOR_PROFILE,
+                'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': 'fp32' if args.matcher_precision == 'fp16' else args.matcher_precision,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest()}
@@ -597,7 +618,7 @@ def main():
             copied.add(name)
     export_models(pending / 'onnx', shapes, source, images, references)
     # Reuse unchanged engines only from the complete package supplying these ONNX files.
-    if reuse_manifest and any(reuse_manifest.get(key) != settings[key] for key in ('gpu', 'tensorrt')):
+    if reuse_manifest and not same_target(reuse_manifest, settings):
         reuse_manifest = None
     for name in CONTRACTS:
         check_onnx(pending / 'onnx' / f'{name}.onnx', name, shapes[name])
@@ -609,7 +630,7 @@ def main():
             if spec['shapes'] != shapes[name] or sha256(candidate) != spec['sha256']:
                 raise RuntimeError(f'Source engine contract/checksum differs: {name}')
             shutil.copy2(candidate, destination)
-        build_engine(destination, name, shapes[name], args.matcher_precision)
+        build_engine(destination, name, shapes[name], args.matcher_precision, args.hardware_compatibility)
         gc.collect()
         torch.cuda.empty_cache()
     runtime = installed_runtime()
@@ -623,6 +644,7 @@ def main():
         compare_reference(pending, name, shapes, references)
     verify(pending, shapes, images)
     manifest = {'version': 2, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
+                'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': settings['matcher_score_precision'],
                 'detector_profile': DETECTOR_PROFILE, 'descriptor_size': [784, 784],

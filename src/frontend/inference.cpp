@@ -163,8 +163,16 @@ Models::Models(const fs::path& root) : impl_(std::make_unique<Implementation>())
   if ((version != 1 && version != 2) || impl_->manifest.at("tensorrt") != "10.13.3.9")
     throw std::runtime_error("Models require the pinned TensorRT 10.13.3.9 runtime");
   CudaCheck(cudaSetDevice(0));
-  if (impl_->manifest.at("gpu") != GpuInfo().at("name"))
+  const auto gpu = GpuInfo();
+  const auto hardware = impl_->manifest.value("hardware_compatibility", std::string("none"));
+  if (hardware == "ampere_plus") {
+    if (gpu.at("compute_capability").get<std::array<int, 2>>() < std::array<int, 2>{8, 0})
+      throw std::runtime_error("ampere_plus models require a GPU with compute capability >= 8.0");
+  } else if (hardware != "none") {
+    throw std::runtime_error("Unknown model hardware compatibility: " + hardware);
+  } else if (impl_->manifest.at("gpu") != gpu.at("name")) {
     throw std::runtime_error("Model GPU differs; prepare a new model package for this GPU");
+  }
   CudaCheck(cudaStreamCreate(&impl_->stream));
   using Create = void* (*)(void*, int32_t);
   Create create = nullptr;
