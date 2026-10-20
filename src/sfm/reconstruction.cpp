@@ -788,7 +788,11 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   std::exception_ptr error;
   std::mutex mutex;
   std::vector<std::thread> threads;
-  for (int worker = 0; worker < workers; ++worker)
+  // Each pair is verified independently with its own fixed seed, so the result does not depend
+  // on the thread count. Use the whole CPU for this stage.
+  const int geometry_workers =
+      std::clamp(int(std::thread::hardware_concurrency()), workers, 32);
+  for (int worker = 0; worker < geometry_workers; ++worker)
     threads.emplace_back([&] {
       try {
         for (;;) {
@@ -1061,6 +1065,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
             {"tracks", graph.tracks.size()},
             {"seconds", Seconds(started)},
             {"geometry_seconds", geometry_seconds},
+            {"geometry_threads", geometry_workers},
             {"timing",
              {{"cache_read_seconds", cache_read_seconds},
               {"track_build_seconds", graph_seconds},

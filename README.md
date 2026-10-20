@@ -80,7 +80,7 @@ SfM 默认不自动补匹配；首次停滞时，对已注册部分完成优化�
 
 默认配置见 [configs/default.json](configs/default.json)，可通过 `--config` 指定。内参标定默认使用全部有效轨迹（`calibration_tracks=all`），随后锁定内参补全轨迹并精调。标定选项及坐标约定见[输入文档](docs/input.md)。
 
-`workers` 默认 4，控制前端、几何验证及增量注册阶段 BA 的并行数；`ba_workers` 默认 8，单独控制注册结束后的标定与全局精调、LAS 联合优化和已启用的原图精修 BA，两者均可设为 1–32。求解器、双精度残差、收敛精度和验收门限保持原有设置；独立 `refine` 的 `--workers` 仍控制其 BA。`cache/sfm.json` 的每次优化记录包含构建、预处理、残差、导数、线性求解耗时及逐轮迭代信息。
+`workers` 默认 4，控制前端及增量注册阶段 BA 的并行数；SfM 几何验证逐对独立且结果与线程数无关，使用全部硬件线程（不少于 `workers`，最多 32），实际线程数记录在 `cache/sfm.json` 的 `geometry_threads`；`ba_workers` 默认 8，单独控制注册结束后的标定与全局精调、LAS 联合优化和已启用的原图精修 BA，两者均可设为 1–32。求解器、双精度残差、收敛精度和验收门限保持原有设置；独立 `refine` 的 `--workers` 仍控制其 BA。`cache/sfm.json` 的每次优化记录包含构建、预处理、残差、导数、线性求解耗时及逐轮迭代信息。
 
 原图精修默认关闭。开启后保留对齐模型，相机候选未通过时使用原模型，原因保存在 `cache/refinement.json`。后续 `cleanup` 总是独立执行；清理候选未通过时保留清理前的模型，原因保存在 `cache/cleanup.json`。读图、求解或文件错误仍明确报错。
 
