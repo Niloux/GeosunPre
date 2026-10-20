@@ -737,7 +737,8 @@ ShutterMotion DeliveryShutterFromJson(const Json& value, const Scene& scene,
     throw std::runtime_error("Rolling-shutter image count differs");
   for (uint32_t i = 0; i < model.images.size(); ++i) {
     const auto& row = images[i];
-    if (row.at("image_id") != i + 1 || row.at("name") != scene.images[i].name)
+    if (row.at("image_id") != i + 1 || row.at("name") != scene.images[i].name ||
+        (row.contains("camera_id") && row.at("camera_id") != model.images[i].camera + 1))
       throw std::runtime_error("Rolling-shutter image identity differs");
     const auto w = row.at("rotation_rad").get<std::array<double, 3>>();
     const auto v = row.at("velocity_m_s").get<std::array<double, 3>>();

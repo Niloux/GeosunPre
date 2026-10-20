@@ -63,7 +63,7 @@ quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 
 ```text
 readout_axis   "rows" 或 "columns"，两镜头共用
 cameras        [{camera_id, readout_s}]，readout_s 为整帧读出时间（秒），符号表示读出先后
-images         [{image_id, camera_id, name, rotation_rad[3], velocity_m_s[3], translation_m[3]}]，与 images.bin 的 ID 一致
+images         [{image_id, camera_id, name, rotation_rad[3], velocity_m_s[3], translation_m[3]}]，与 images.bin 的 ID 一致；读取时 camera_id 可省略，存在即须与 images.bin 相符
 ```
 
 读出比例 `s = (c - N/2)/N`，c 为像素沿读出轴的坐标（左上像素中心为 0.5），N 为该轴的图像尺寸。参考位姿为 images.bin 的 world-to-camera `R, t`（s = 0）。三维点 X 在读出比例 s 处的相机坐标为 `p(s) = (I + s[rotation_rad]×)(R X + t - s·translation_m)`，`translation_m = readout_s · velocity_m_s`；rotation_rad、velocity_m_s、translation_m 均在 OpenCV 参考相机坐标中，rotation_rad 与 translation_m 对应整帧读出。X 的像素 x 满足 `x = fisheye(p(s(x)))`，从 s = 0 起不动点迭代 3–4 次即收敛。该一阶模型在读出期间转动不超过约 3° 时足够精确。
