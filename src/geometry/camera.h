@@ -18,7 +18,6 @@ struct Camera {
   static Camera FromJson(const Json& value);
   Json ToJson() const;
   double Radius(double fov = FieldOfViewDegrees) const;
-  bool Valid(double x, double y, double fov = FieldOfViewDegrees) const;
   cv::Mat Mask(double fov = FieldOfViewDegrees) const;
   Eigen::Vector2d Project(const Eigen::Vector3d& xyz) const;
   Eigen::Matrix<double, 2, 3> ProjectionJacobian(const Eigen::Vector3d& xyz) const;

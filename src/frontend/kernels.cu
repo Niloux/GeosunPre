@@ -9,15 +9,6 @@
 
 namespace geosun {
 namespace {
-__global__ void Normalize(const uint8_t* image, float* out, int count, float3 mean,
-                          float3 deviation) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count)
-    return;
-  out[i] = (image[3 * i] / 255.f - mean.x) / deviation.x;
-  out[count + i] = (image[3 * i + 1] / 255.f - mean.y) / deviation.y;
-  out[2 * count + i] = (image[3 * i + 2] / 255.f - mean.z) / deviation.z;
-}
 struct Peak {
   uint32_t index;
   float value;
@@ -71,24 +62,6 @@ __global__ void Subpixel(const float* logits, const Peak* peaks, float* output, 
   output[3 * i + 2] = float(exp(double(peaks[i].value) - *highest) / *total);
 }
 }  // namespace
-Tensor ImageTensor(const cv::Mat& rgb, const std::array<float, 3>& mean,
-                   const std::array<float, 3>& deviation) {
-  if (rgb.type() != CV_8UC3 || !rgb.isContinuous())
-    throw std::runtime_error("Expected contiguous RGB8 image");
-  const size_t count = size_t(rgb.rows) * rgb.cols;
-  DeviceBuffer source(count * 3);
-  CudaCheck(cudaMemcpy(source.data, rgb.data, count * 3, cudaMemcpyHostToDevice));
-  Tensor t;
-  t.shape = {1, 3, rgb.rows, rgb.cols};
-  t.device = std::make_shared<DeviceBuffer>(count * 3 * sizeof(float));
-  Normalize<<<unsigned((count + 255) / 256), 256>>>(
-      static_cast<const uint8_t*>(source.data), static_cast<float*>(t.device->data), int(count),
-      make_float3(mean[0], mean[1], mean[2]),
-      make_float3(deviation[0], deviation[1], deviation[2]));
-  CudaCheck(cudaGetLastError());
-  CudaCheck(cudaDeviceSynchronize());
-  return t;
-}
 std::vector<std::array<float, 3>> DetectKeypoints(const Tensor& logits, int w, int h,
                                                   size_t maximum, cudaStream_t stream) {
   if (logits.Count() != size_t(w) * h)

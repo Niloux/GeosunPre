@@ -176,34 +176,6 @@ std::vector<ResizeCoefficients> ResizeWeights(int input, int output) {
   }
   return coefficients;
 }
-cv::Mat BicubicResize(const cv::Mat& image, int width, int height) {
-  if (image.type() != CV_8UC3)
-    throw std::runtime_error("Expected an 8-bit RGB image");
-  const auto horizontal = ResizeWeights(image.cols, width),
-             vertical = ResizeWeights(image.rows, height);
-  cv::Mat intermediate(image.rows, width, CV_8UC3), output(height, width, CV_8UC3);
-  for (int y = 0; y < image.rows; ++y)
-    for (int x = 0; x < width; ++x)
-      for (int c = 0; c < 3; ++c) {
-        int64_t sum = 1 << 21;
-        for (size_t j = 0; j < horizontal[x].values.size(); ++j)
-          sum += int64_t(image.at<cv::Vec3b>(y, horizontal[x].start + int(j))[c]) *
-                 horizontal[x].values[j];
-        intermediate.at<cv::Vec3b>(y, x)[c] =
-            static_cast<uint8_t>(std::clamp<int64_t>(sum >> 22, 0, 255));
-      }
-  for (int y = 0; y < height; ++y)
-    for (int x = 0; x < width; ++x)
-      for (int c = 0; c < 3; ++c) {
-        int64_t sum = 1 << 21;
-        for (size_t j = 0; j < vertical[y].values.size(); ++j)
-          sum += int64_t(intermediate.at<cv::Vec3b>(vertical[y].start + int(j), x)[c]) *
-                 vertical[y].values[j];
-        output.at<cv::Vec3b>(y, x)[c] =
-            static_cast<uint8_t>(std::clamp<int64_t>(sum >> 22, 0, 255));
-      }
-  return output;
-}
 
 Json Scene::ToJson() const {
   Json exposures = Json::array();

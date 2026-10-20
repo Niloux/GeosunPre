@@ -38,11 +38,6 @@ double Camera::Radius(double fov) const {
   const double t2 = limit * limit;
   return limit * (1 + t2 * (params[4] + t2 * (params[5] + t2 * (params[6] + t2 * params[7]))));
 }
-bool Camera::Valid(double x, double y, double fov) const {
-  const double dx = (x - params[2]) / params[0], dy = (y - params[3]) / params[1], r = Radius(fov);
-  return std::isfinite(x) && std::isfinite(y) && x >= 0 && y >= 0 && x < width && y < height &&
-         dx * dx + dy * dy <= r * r;
-}
 cv::Mat Camera::Mask(double fov) const {
   cv::Mat out(height, width, CV_8UC1);
   const double r = Radius(fov);

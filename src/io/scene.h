@@ -22,7 +22,6 @@ struct Scene {
 Scene ReadScene(const fs::path& input, const fs::path& las = {});
 cv::Mat ReadImage(const fs::path& path, int mode);
 void WriteImage(const fs::path& path, const cv::Mat& image);
-cv::Mat BicubicResize(const cv::Mat& image, int width, int height);
 struct ResizeCoefficients {
   int start;
   std::vector<int32_t> values;

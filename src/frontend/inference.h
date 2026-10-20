@@ -25,8 +25,6 @@ struct Tensor {
   static Tensor Float(std::vector<int64_t> shape, const float* data, size_t count);
   static Tensor Upload(std::vector<int64_t> shape, const float* data, size_t count);
 };
-Tensor ImageTensor(const cv::Mat& rgb, const std::array<float, 3>& mean = {0, 0, 0},
-                   const std::array<float, 3>& std = {1, 1, 1});
 std::vector<std::array<float, 3>> DetectKeypoints(const Tensor& logits, int width, int height,
                                                   size_t maximum, cudaStream_t stream = nullptr);
 class Models {
