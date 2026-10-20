@@ -468,6 +468,9 @@ void Postprocess(const Arguments& args) {
   // Build the whole work directory beside its destination and publish it only when complete.
   auto output = final_output;
   output += ".pending";
+  if (Contains(source, output) || Contains(output, source) || Contains(scene.input, output) ||
+      Contains(output, scene.input))
+    throw std::runtime_error("Postprocessing .pending directory overlaps source work or input");
   if (fs::exists(output)) {
     auto archived = output;
     archived += ".interrupted-" +
