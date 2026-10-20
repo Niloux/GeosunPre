@@ -8,6 +8,7 @@
 #include "sfm/reconstruction.h"
 #include "sfm/photometric.h"
 #include "sfm/structure.h"
+#include "sfm/shutter.h"
 #include "alignment/alignment.h"
 #include <opencv2/imgcodecs.hpp>
 #include <set>
@@ -75,11 +76,12 @@ Json Settings(const fs::path& file) {
   if (!result.at("sfm_repair_rounds").is_number_integer() || result.at("sfm_repair_rounds") < 0 ||
       result.at("sfm_repair_rounds") > 2)
     throw std::runtime_error("sfm_repair_rounds must be an integer from 0 to 2");
-  if (!result.at("refine").is_boolean())
-    throw std::runtime_error("refine must be a boolean");
+  for (const auto* key : {"refine", "rolling_shutter"})
+    if (!result.at(key).is_boolean())
+      throw std::runtime_error(std::string(key) + " must be a boolean");
   for (const auto& [key, value] : result.items())
     if (key != "workers" && key != "calibration_tracks" && key != "sfm_repair_rounds" &&
-        key != "refine" &&
+        key != "refine" && key != "rolling_shutter" &&
         (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() <= 0))
       throw std::runtime_error("Expected positive numeric setting: " + key);
   if (result.at("calibration_tracks") != "all" && result.at("calibration_tracks") != "stable")
@@ -100,10 +102,14 @@ struct Delivery {
   bool ply;
   double voxel;
   SupervisionOptions supervision;
+  std::string photos;
 };
 Delivery ParseDelivery(const Arguments& args) {
+  const auto photos = args.Get("--rolling-shutter-photos", "rectified");
+  if (photos != "rectified" && photos != "original")
+    throw std::runtime_error("--rolling-shutter-photos must be rectified or original");
   return {args.Get("--no-ply") != "true", args.Number("--ply-voxel", .05),
-          ParseSupervisionOptions(args)};
+          ParseSupervisionOptions(args), photos};
 }
 Json Inventory(const fs::path& work, const std::vector<fs::path>& products) {
   Json result = Json::object();
@@ -161,7 +167,7 @@ void ExportSelected(const Scene& scene, const fs::path& work, const fs::path& ou
                     const Delivery& delivery) {
   const auto result = ReadJson(work / "result.json");
   ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, delivery.ply,
-               delivery.voxel, result, delivery.supervision);
+               delivery.voxel, result, delivery.supervision, delivery.photos);
 }
 std::vector<fs::path> ReconstructVisual(const Scene& scene, const fs::path& work,
                                         const fs::path& root, const Json& settings,
@@ -248,14 +254,55 @@ std::vector<fs::path> RefineAligned(const Scene& scene, const fs::path& work,
   return {work / "cache/refinement_candidate.bin", work / "cache/refined.bin",
           work / "cache/refinement.json", work / "cache/refinement_result.json"};
 }
-std::vector<fs::path> CleanSelected(const Scene& scene, const fs::path& work, const Json& settings,
-                                    WorkState& state) {
+// Result of the camera stages before rolling-shutter correction: alignment or refinement.
+Json CameraResult(const fs::path& work, const Json& settings) {
   const bool photo = settings.at("refine");
   auto original =
       ReadJson(work / (photo ? "cache/refinement_result.json" : "cache/alignment.json"));
   if (!photo)
     original["refinement"] = {
         {"enabled", false}, {"accepted", false}, {"reason", "disabled by configuration"}};
+  return original;
+}
+std::vector<fs::path> CorrectShutter(const Scene& scene, const fs::path& work,
+                                     const Json& settings) {
+  const auto original = CameraResult(work, settings);
+  const auto model = ReadModel(SelectedModelPath(work, original));
+  auto correction = CorrectRollingShutter(scene, model, settings.at("workers"), Limits(settings),
+                                          settings.at("ba_workers"));
+  auto& report = correction.report;
+  report["enabled"] = true;
+  report["source_model"] = original.value("selected_model", std::string("aligned"));
+  // Rectification products from an interrupted attempt are rebuilt.
+  fs::remove_all(work / "cache/shutter");
+  std::vector<fs::path> products{work / "cache/shutter_candidate.bin", work / "cache/shutter.bin",
+                                 work / "cache/shutter.json", work / "cache/shutter_result.json"};
+  if (correction.accepted) {
+    report["rectification"] = PrepareRectification(scene, correction.candidate, correction.motion,
+                                                   work, work / "cache/shutter",
+                                                   settings.at("workers"));
+    products.push_back(work / "cache/shutter");
+  }
+  const auto& selected = correction.accepted ? correction.candidate : model;
+  auto result = PostprocessResult(scene, selected, original, "shutter");
+  result["shutter"] = report;
+  auto saved = report;
+  saved["motion"] = MotionToJson(correction.motion, correction.candidate);
+  WriteModel(work / "cache/shutter_candidate.bin", correction.candidate);
+  WriteModel(work / "cache/shutter.bin", selected);
+  WriteJson(work / "cache/shutter.json", saved);
+  WriteJson(work / "cache/shutter_result.json", result);
+  Log("Rolling-shutter correction " + report.at("reason").get<std::string>());
+  return products;
+}
+std::vector<fs::path> CleanSelected(const Scene& scene, const fs::path& work, const Json& settings,
+                                    WorkState& state) {
+  auto original = settings.at("rolling_shutter").get<bool>()
+                      ? ReadJson(work / "cache/shutter_result.json")
+                      : CameraResult(work, settings);
+  if (!original.contains("shutter"))
+    original["shutter"] = {{"enabled", false}, {"used", false},
+                           {"reason", "disabled by configuration"}};
   const auto model = ReadModel(SelectedModelPath(work, original));
   auto cleanup = CleanSparseStructure(scene, model, settings.at("workers"), Limits(settings));
   cleanup.report["source_model"] = original.value("selected_model", std::string("aligned"));
@@ -297,6 +344,8 @@ std::vector<fs::path> RunStage(const std::string& stage, const Scene& scene, con
     return AlignVisual(scene, work, settings);
   if (stage == "refine")
     return RefineAligned(scene, work, settings);
+  if (stage == "shutter")
+    return CorrectShutter(scene, work, settings);
   if (stage == "cleanup")
     return CleanSelected(scene, work, settings, state);
   ExportSelected(scene, work, output, delivery);
@@ -308,6 +357,10 @@ std::vector<std::string> Stages(const Json& settings, const std::string& request
     stages.push_back("refine");
   else if (requested == "refine")
     throw std::runtime_error("Refinement is disabled; enable --refine in a new work directory");
+  if (settings.at("rolling_shutter").get<bool>())
+    stages.push_back("shutter");
+  else if (requested == "shutter")
+    throw std::runtime_error("Rolling-shutter correction is disabled by configuration");
   stages.push_back("cleanup");
   stages.push_back("export");
   if (requested != "all" && std::find(stages.begin(), stages.end(), requested) == stages.end())
@@ -319,7 +372,7 @@ void Run(const Arguments& args) {
   args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
                  "--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--refine"});
+                 "--supervision-cache-mb", "--refine", "--rolling-shutter-photos"});
   const auto delivery = ParseDelivery(args);
   const auto work = args.Get("--work").empty()
                         ? fs::absolute(fs::path("work") / args.Path("--input").filename())
@@ -385,7 +438,7 @@ void Run(const Arguments& args) {
         const auto& previous = *(std::find(stages.begin(), stages.end(), stage) - 1);
         if (!completed.contains(previous))
           throw std::runtime_error("Run prerequisite stage: " + previous);
-        if (stage == "refine" || stage == "cleanup" || stage == "export")
+        if (stage == "refine" || stage == "shutter" || stage == "cleanup" || stage == "export")
           Verify(work, completed.at(previous).at("files"));
         // SfM repair rounds run the matcher again with the recorded models.
         if (stage == "masks" || stage == "features" || stage == "matches" ||
@@ -430,7 +483,7 @@ void Run(const Arguments& args) {
 void Export(const Arguments& args) {
   args.Validate({"--work", "--output", "--no-ply", "--ply-voxel", "--las-supervision",
                  "--no-las-supervision", "--supervision-max-size", "--supervision-boundary",
-                 "--supervision-mask-dir", "--supervision-cache-mb"});
+                 "--supervision-mask-dir", "--supervision-cache-mb", "--rolling-shutter-photos"});
   const auto delivery = ParseDelivery(args);
   const auto work = args.Path("--work");
   Lock lock(work);
@@ -452,7 +505,7 @@ void Export(const Arguments& args) {
 void Postprocess(const Arguments& args) {
   args.Validate({"--work", "--output", "--workers", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--no-ply", "--ply-voxel"});
+                 "--supervision-cache-mb", "--no-ply", "--ply-voxel", "--rolling-shutter-photos"});
   const auto delivery = ParseDelivery(args);
   const bool photo = args.command == "refine";
   const auto source = args.Path("--work"), final_output = args.Path("--output");
@@ -480,6 +533,12 @@ void Postprocess(const Arguments& args) {
   if (ReadScene(scene.input, scene.las).ToJson() != scene.ToJson())
     throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
   const auto original = ReadJson(source / "result.json");
+  const bool rectified =
+      original.contains("shutter") && original.at("shutter").value("used", false);
+  if (photo && rectified)
+    throw std::runtime_error(
+        "Photometric refinement needs the original photo geometry; the source model is "
+        "rolling-shutter corrected");
   const auto model = ReadModel(SelectedModelPath(source, original));
   AlignmentLimits limits;
   if (original.contains("alignment")) {
@@ -527,18 +586,30 @@ void Postprocess(const Arguments& args) {
   WriteJson(output / "cache" / (report_name + ".json"), report);
   WriteJson(output / "scene.json", scene.ToJson());
   WriteJson(output / "result.json", result);
-  const std::array<cv::Mat, 2> domains{MaskDomain(scene.cameras[0]), MaskDomain(scene.cameras[1])};
-  for (const auto& image : scene.images) {
-    if (!selected.images[image.id].registered)
-      continue;
-    const auto mask = MaskPath(output, image.id);
-    fs::create_directories(mask.parent_path());
-    auto pixels = ReadImage(MaskPath(source, image.id), cv::IMREAD_GRAYSCALE);
-    pixels.setTo(0, domains[image.camera] == 0);
-    WriteImage(mask, pixels);
+  // Rolling-shutter corrected models carry their rectified masks, range grids and motion, and
+  // keep the original masks for deliveries with original photos.
+  std::vector<fs::path> mask_sets{"cache/masks"};
+  if (rectified) {
+    mask_sets.push_back("cache/shutter/masks");
+    fs::create_directories(output / "cache/shutter");
+    fs::copy(source / "cache/shutter/ranges", output / "cache/shutter/ranges",
+             fs::copy_options::recursive);
+    fs::copy_file(source / "cache/shutter.json", output / "cache/shutter.json");
   }
+  const std::array<cv::Mat, 2> domains{MaskDomain(scene.cameras[0]), MaskDomain(scene.cameras[1])};
+  for (const auto& masks : mask_sets)
+    for (const auto& image : scene.images) {
+      if (!selected.images[image.id].registered)
+        continue;
+      const auto name = std::to_string(image.id) + ".png";
+      const auto mask = output / masks / name;
+      fs::create_directories(mask.parent_path());
+      auto pixels = ReadImage(source / masks / name, cv::IMREAD_GRAYSCALE);
+      pixels.setTo(0, domains[image.camera] == 0);
+      WriteImage(mask, pixels);
+    }
   ExportBundle(scene, selected, output, output / "colmap", delivery.ply, delivery.voxel, result,
-               delivery.supervision);
+               delivery.supervision, delivery.photos);
   fs::rename(output, final_output);
   Log(args.command + ": " + report.at("reason").get<std::string>());
   std::cout << Json({{"work", final_output.u8string()},

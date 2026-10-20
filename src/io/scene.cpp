@@ -366,12 +366,20 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las) {
                {"las", FileMetadata(s.las)}};
   return s;
 }
-std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene) {
-  struct Row {
-    int week;
-    double time;
-    Eigen::Vector3d point;
-  };
+namespace {
+struct NavigationRow {
+  int week;
+  double time;
+  Eigen::Vector3d point;
+};
+// Navigation rows and the fitted ECEF-to-LAS-frame conversion of their positions.
+struct Navigation {
+  std::vector<NavigationRow> rows;
+  Eigen::Vector3d center;
+  Similarity conversion;
+};
+Navigation ReadNavigation(const Scene& scene) {
+  using Row = NavigationRow;
   auto read = [](const fs::path& file) {
     std::ifstream stream(file);
     if (!stream)
@@ -426,12 +434,43 @@ std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene) {
   for (size_t i = 0; i < source.size(); ++i)
     if ((conversion.Apply(source[i]) - target[i]).norm() > .02)
       throw std::runtime_error("Navigation frame conversion error exceeds 2 cm");
-  std::vector<Eigen::Vector3d> positions;
-  for (const auto& image : scene.images) {
+  for (const auto& image : scene.images)
     if (image.week != a[0].week)
       throw std::runtime_error("Camera and navigation GPS week differ");
-    positions.push_back(conversion.Apply(image.navigation_raw - center));
-  }
+  return {a, center, conversion};
+}
+}  // namespace
+std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene) {
+  const auto navigation = ReadNavigation(scene);
+  std::vector<Eigen::Vector3d> positions;
+  for (const auto& image : scene.images)
+    positions.push_back(navigation.conversion.Apply(image.navigation_raw - navigation.center));
   return positions;
+}
+std::vector<Eigen::Vector3d> NavigationVelocities(const Scene& scene) {
+  constexpr double half_window = .05;
+  const auto navigation = ReadNavigation(scene);
+  const auto& rows = navigation.rows;
+  auto at = [&](double time) {
+    if (time < rows.front().time || time > rows.back().time)
+      throw std::runtime_error("Exposure time outside navigation trajectory");
+    const auto next = std::upper_bound(rows.begin(), rows.end(), time,
+                                       [](double t, const NavigationRow& r) { return t < r.time; });
+    if (next == rows.end())
+      return rows.back().point;
+    const auto& b = *next;
+    const auto& a = *(next - 1);
+    return Eigen::Vector3d(a.point + (b.point - a.point) * ((time - a.time) / (b.time - a.time)));
+  };
+  std::vector<Eigen::Vector3d> velocities;
+  for (const auto& image : scene.images) {
+    const double low = std::max(rows.front().time, image.pose_seconds - half_window),
+                 high = std::min(rows.back().time, image.pose_seconds + half_window);
+    if (high - low < half_window)
+      throw std::runtime_error("Navigation trajectory does not bracket exposure: " + image.name);
+    velocities.push_back(navigation.conversion.scale *
+                         (navigation.conversion.rotation * (at(high) - at(low))) / (high - low));
+  }
+  return velocities;
 }
 }  // namespace geosun

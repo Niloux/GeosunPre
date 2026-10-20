@@ -5,7 +5,8 @@
 namespace geosun {
 fs::path SelectedModelPath(const fs::path& work, const Json& result) {
   const auto selected = result.value("selected_model", std::string("aligned"));
-  if (selected != "aligned" && selected != "refined" && selected != "cleaned")
+  if (selected != "aligned" && selected != "refined" && selected != "shutter" &&
+      selected != "cleaned")
     throw std::runtime_error("Unknown selected reconstruction cache: " + selected);
   return work / "cache" / (selected + ".bin");
 }

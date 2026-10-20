@@ -18,5 +18,5 @@ Json Optimize(Reconstruction& model, const std::array<Camera, 2>& initial, const
               const std::vector<Eigen::Vector3d>& navigation = {},
               const std::set<uint64_t>& selected_points = {},
               const std::vector<std::vector<uint8_t>>& precise_observations = {},
-              const Reconstruction* reference = nullptr);
+              const Reconstruction* reference = nullptr, ShutterMotion* shutter = nullptr);
 }  // namespace geosun

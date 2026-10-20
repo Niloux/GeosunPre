@@ -6,7 +6,7 @@ LAS 深度和法向监督默认随最终模型导出，`--no-las-supervision` �
 
 scene.json 保存曝光、初始相机和输入元数据。state.json 版本 1，保存冻结场景、配置、模型元数据和阶段产物元数据。文件变化时拒绝复用；输入、配置或模型改变时使用新 work。
 
-state.json 的 pipeline_version=16 标识当前实现，恢复时须与程序的实现标记一致；不匹配时使用新目录。旧工作目录仍可独立 `export`、`refine` 或 `cleanup`，原结果不迁移、不改写。状态与结果保存本次执行的构建版本、时间和 EXE 路径。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，`geometry_threads` 为几何验证使用的线程数（不影响验证结果），最终 result.json 同时包含此报告。unassigned_completion 记录最终标定后固定相机、对匹配连通分量内未分配观测重新三角化的新增点数和观测数；不重复占用已有特征。timing 细分缓存读取、轨迹构建、候选选择、位姿注册、三角化、过滤、检查点和着色耗时。导航误差按最终所选模型计算。
+state.json 的 pipeline_version=17 标识当前实现，恢复时须与程序的实现标记一致；不匹配时使用新目录。旧工作目录仍可独立 `export`、`refine` 或 `cleanup`，原结果不迁移、不改写。状态与结果保存本次执行的构建版本、时间和 EXE 路径。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，`geometry_threads` 为几何验证使用的线程数（不影响验证结果），最终 result.json 同时包含此报告。unassigned_completion 记录最终标定后固定相机、对匹配连通分量内未分配观测重新三角化的新增点数和观测数；不重复占用已有特征。timing 细分缓存读取、轨迹构建、候选选择、位姿注册、三角化、过滤、检查点和着色耗时。导航误差按最终所选模型计算。
 
 配置中的 `ba_workers` 默认 8，控制注册结束后的标定与全局精调、LAS 联合优化和流水线原图精修的 BA 线程数；增量注册阶段 BA 及其他并行工作沿用 `workers`（默认 4）。每次 BA 保留既有 `build_seconds`、`linear_solver_seconds`、`jacobian_seconds`，新增 `timing` 中的观测建模、参数与先验建模、Ceres 预处理、迭代、后处理及纯残差计算耗时。`threads`、`preconditioner`、`termination`、评估次数、成功与失败步数、线性迭代总数、单轮最大值及触及迭代上限次数说明实际求解过程；`iteration_profile` 逐轮记录代价、梯度、信赖域、步求解耗时和接受状态。逐轮耗时与汇总耗时是同一过程的不同层级，不能将各层统计重复相加。线程数改变使用新工作目录；算法精度及质量门限不因线程数改变而放宽。
 
@@ -24,13 +24,15 @@ cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用
 
 默认首次停滞就对已注册部分完成最终优化和验收；显式启用补匹配时，在轮数用完后处理已注册部分。通过后写入 visual.bin 并继续配准、可选精修、独立清理和导出。所有重建缓存保留全部输入索引及 registered 标记，未注册图像不出现在点轨迹中。cache/unregistered.json 保留 SfM 阶段未注册的原输入索引；全部注册后删除。state.registration 保存最终所选模型的注册统计，sfm 报告的 quality.registration 保存后处理前的统计。status=completed 表示交付完成，是否全注册看最终 registration.complete。
 
-默认阶段为 `prepare → masks → features → matches → sfm → align → cleanup → export`。配置 `refine` 默认为 false，首次运行 `--refine` 等价于设为 true，选择随配置冻结；启用后在 align 与 cleanup 之间增加 refine 阶段。align 产物为 `cache/aligned.bin` 和 `cache/alignment.json`，后续处理不改写它们。
+默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。配置 `refine` 默认为 false，首次运行 `--refine` 等价于设为 true，选择随配置冻结；启用后在 align 与 shutter 之间增加 refine 阶段。align 产物为 `cache/aligned.bin` 和 `cache/alignment.json`，后续处理不改写它们。
 
 启用 refine 时，写入 `cache/refinement_candidate.bin`、`cache/refined.bin`、`cache/refinement.json` 和中间结果 `cache/refinement_result.json`。refined.bin 保存相机精修后选中的模型，候选未通过时保存对齐模型；该阶段不执行强力清理、不写最终 result.json。关闭时不生成这些缓存，最终报告记录 refinement.enabled=false。
 
-cleanup 阶段默认对上一步所选模型独立清理与验收，写入 `cache/cleanup_candidate.bin`、`cache/cleaned.bin`、`cache/cleanup.json` 和最终 `result.json`。可靠 LAS 平面支撑少于 200 条时不采用清理；清理候选未通过时同样保留清理前模型，cleaned.bin 保存所选结果，cleanup.used=false 及 reason 记录原因。清理只处理稀疏点及轨迹，相机内参和位姿保持不变。最终报告分别保存 refinement 和 cleanup；cleanup.source_model 记录输入缓存为 aligned 或 refined，quality 与导航误差按最终所选模型计算。
+配置 `rolling_shutter` 默认为 true，在 align（或已启用的 refine）与 cleanup 之间执行 shutter 阶段，写入 `cache/shutter_candidate.bin`、`cache/shutter.bin`、`cache/shutter.json` 和中间结果 `cache/shutter_result.json`。shutter_candidate.bin 是换算到参考位姿的候选，shutter.bin 保存所选模型：通过验收时为候选，否则为上一步模型。shutter.json 在报告之外保存 `motion`：`readout_axis`（rows 或 columns）、读出比例约定、相机点公式、两镜头 `readout_s`，以及每幅已注册照片的 `rotation_rad`（参考相机系、整帧读出）和 `velocity_m_s`（参考相机系）。通过验收时另写 `cache/shutter/ranges/索引.png`（每 8 像素一格的 LAS 射线距离，uint16 毫米，空洞已补齐）和 `cache/shutter/masks/索引.png`（校正后掩码）；导出据此重采样照片，监督读取校正后掩码。重跑该阶段时先删除 `cache/shutter/`。配置为 false 时不生成这些缓存，最终报告记录 shutter.enabled=false。
 
-`selected_model=cleaned` 指定读取 cleaned.bin，`refined` 指定 refined.bin，`aligned` 或未声明字段时读取 aligned.bin；旧结果的选择不变。独立 `refine` 只执行相机精修、选择 refined.bin，独立 `cleanup` 只清理稀疏结构、选择 cleaned.bin；均读取来源的所选模型并写入新目录，保留来源目录。
+cleanup 阶段默认对上一步所选模型独立清理与验收，写入 `cache/cleanup_candidate.bin`、`cache/cleaned.bin`、`cache/cleanup.json` 和最终 `result.json`。可靠 LAS 平面支撑少于 200 条时不采用清理；清理候选未通过时同样保留清理前模型，cleaned.bin 保存所选结果，cleanup.used=false 及 reason 记录原因。清理只处理稀疏点及轨迹，相机内参和位姿保持不变。最终报告分别保存 refinement 和 cleanup；cleanup.source_model 记录输入缓存为 aligned、refined 或 shutter，quality 与导航误差按最终所选模型计算。
+
+`selected_model=cleaned` 指定读取 cleaned.bin，`shutter` 指定 shutter.bin，`refined` 指定 refined.bin，`aligned` 或未声明字段时读取 aligned.bin；旧结果的选择不变。result.json 的 shutter.used=true 表示所选模型已换算到参考位姿，导出须重采样照片。独立 `refine` 只执行相机精修、选择 refined.bin，来源已卷帘校正时拒绝执行；独立 `cleanup` 只清理稀疏结构、选择 cleaned.bin，来源已卷帘校正时复制 shutter.json、距离网格与校正后掩码；均读取来源的所选模型并写入新目录，保留来源目录。
 
 各阶段完成后才提交状态，产物纳入文件元数据校验；中断时重跑该阶段，不将未完成候选视为成果。清理不会改写精修的中间产物，续跑可分别复用。新流程在 cleanup 完成后才允许导出；默认导出和独立 `export` 都使用 result.json 指定的模型，其元数据也用于交付包的请求身份。
 

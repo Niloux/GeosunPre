@@ -2,7 +2,11 @@
 #include "io/cache.h"
 #include "io/las.h"
 #include "frontend/frontend.h"
+#include "sfm/shutter.h"
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <deque>
+#include <fstream>
 #include <set>
 #include <unordered_map>
 
@@ -107,7 +111,10 @@ void WriteColmap(const fs::path& path, const Scene& scene, const Reconstruction&
   }
   points.Commit();
 }
-Reconstruction ReadColmap(const fs::path& path, Scene& scene) {
+// shutter is the delivery's rolling_shutter.json when its photos are the original rolling-shutter
+// images; point errors are then verified with that projection, returned in motion.
+Reconstruction ReadColmap(const fs::path& path, Scene& scene, const Json* shutter,
+                          ShutterMotion& motion) {
   Reconstruction m;
   BinaryReader cameras(path / "cameras.bin");
   if (cameras.Value<uint64_t>() != 2)
@@ -240,29 +247,52 @@ Reconstruction ReadColmap(const fs::path& path, Scene& scene) {
   for (size_t i = 0; i < m.images.size(); ++i)
     if (m.images[i].points != references[i].points)
       throw std::runtime_error("Track references are not reciprocal");
+  if (shutter)
+    motion = DeliveryShutterFromJson(*shutter, scene, m);
   for (const auto& point : m.points) {
     double error = 0;
-    for (const auto& observation : point.track) {
-      const auto& image = m.images[observation.image];
-      error += (m.cameras[image.camera].Project(image.pose.Apply(point.xyz)) -
-                image.pixels[observation.feature])
-                   .norm();
+    if (shutter)
+      error = ShutterPointError(m, motion, point);
+    else {
+      for (const auto& observation : point.track) {
+        const auto& image = m.images[observation.image];
+        error += (m.cameras[image.camera].Project(image.pose.Apply(point.xyz)) -
+                  image.pixels[observation.feature])
+                     .norm();
+      }
+      error /= point.track.size();
     }
-    if (std::abs(error / point.track.size() - point.error) > 1e-6)
+    if (std::abs(error - point.error) > 1e-6)
       throw std::runtime_error("COLMAP point error differs from its observations");
   }
   return m;
 }
 }  // namespace
-void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::path& work,
+void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
-                  const SupervisionOptions& options) {
+                  const SupervisionOptions& options, const std::string& photos_mode) {
+  if (photos_mode != "rectified" && photos_mode != "original")
+    throw std::runtime_error("Rolling-shutter photos must be rectified or original");
+  // A rolling-shutter corrected model describes photos at its reference poses. They are either
+  // resampled to those poses, or kept original with the readout motion beside the model.
+  const bool corrected = report.contains("shutter") && report.at("shutter").value("used", false);
+  const bool rectified = corrected && photos_mode == "rectified",
+             rolling = corrected && photos_mode == "original";
+  const auto masks = work / (rectified ? "cache/shutter/masks" : "cache/masks");
   Json request = {{"scene_file", FileMetadata(work / "scene.json")},
                   {"model_file", FileMetadata(SelectedModelPath(work, report))},
                   {"include_ply", include_ply},
                   {"voxel", voxel}};
+  if (rectified)
+    request["rolling_shutter"] = {{"motion_file", FileMetadata(work / "cache/shutter.json")},
+                                  {"photos", "rectified"},
+                                  {"photo_resampling", "lanczos4"},
+                                  {"jpeg_quality", 95}};
+  if (rolling)
+    request["rolling_shutter"] = {{"motion_file", FileMetadata(work / "cache/shutter.json")},
+                                  {"photos", "original"}};
   if (options.enabled)
-    request["supervision"] = SupervisionRequest(scene, model, work, options);
+    request["supervision"] = SupervisionRequest(scene, selected, masks, options, rolling);
   if (fs::exists(output)) {
     if (!fs::is_regular_file(output / "manifest.json") ||
         ReadJson(output / "manifest.json").at("request") != request)
@@ -272,7 +302,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
   }
   // Delivery copies the original files, so they must still be the ones reconstructed.
   for (const auto& e : scene.images)
-    if (model.images[e.id].registered && FileMetadata(e.source) != e.source_file)
+    if (selected.images[e.id].registered && FileMetadata(e.source) != e.source_file)
       throw std::runtime_error("Source image changed since reconstruction: " + e.name);
   if (include_ply && FileMetadata(scene.las) != scene.sources.at("las"))
     throw std::runtime_error("LAS changed since reconstruction; choose a new work directory");
@@ -285,35 +315,78 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
     fs::rename(pending, archived);
   }
   fs::create_directories(pending / "sparse/0");
+  ShutterMotion motion;
+  if (corrected)
+    motion =
+        MotionFromJson(ReadJson(work / "cache/shutter.json").at("motion"), selected.images.size());
+  const auto model = rolling ? OriginalPhotoObservations(selected, motion, 8) : selected;
   WriteColmap(pending / "sparse/0", scene, model);
   Json photos = Json::array();
+  std::deque<std::future<void>> rectifying;
   for (const auto& e : scene.images) {
     if (!model.images[e.id].registered)
       continue;
     const auto destination = pending / "images" / fs::u8path(e.name);
     fs::create_directories(destination.parent_path());
-    fs::copy_file(e.source, destination);
-    if (fs::file_size(destination) != e.source_file.at("size_bytes").get<uint64_t>())
-      throw std::runtime_error("Source image changed while copying: " + e.name);
+    if (rectified) {
+      if (rectifying.size() >= 6) {
+        rectifying.front().get();
+        rectifying.pop_front();
+      }
+      rectifying.push_back(std::async(std::launch::async, [&, exposure = &e, destination] {
+        const auto& e = *exposure;
+        std::ifstream stream(e.source, std::ios::binary);
+        std::vector<uint8_t> bytes(fs::file_size(e.source));
+        stream.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!stream || FileMetadata(e.source) != e.source_file)
+          throw std::runtime_error("Source image changed while rectifying: " + e.name);
+        const auto photo = cv::imdecode(bytes, cv::IMREAD_COLOR);
+        if (photo.empty())
+          throw std::runtime_error("Cannot decode image: " + e.name);
+        const auto range = ReadImage(
+            work / "cache/shutter/ranges" / (std::to_string(e.id) + ".png"), cv::IMREAD_UNCHANGED);
+        WriteRectifiedJpeg(bytes,
+                           RectifyRaster(photo, model.cameras[e.camera], motion, e.id, e.camera,
+                                         range, cv::INTER_LANCZOS4),
+                           destination);
+      }));
+    } else {
+      fs::copy_file(e.source, destination);
+      if (fs::file_size(destination) != e.source_file.at("size_bytes").get<uint64_t>())
+        throw std::runtime_error("Source image changed while copying: " + e.name);
+    }
     const auto mask = pending / "masks" / fs::u8path(e.name + ".png");
     fs::create_directories(mask.parent_path());
-    fs::copy_file(MaskPath(work, e.id), mask);
+    fs::copy_file(masks / (std::to_string(e.id) + ".png"), mask);
     photos.push_back({{"image_index", e.id},
                       {"name", e.name},
                       {"camera", e.camera},
-                      {"image_size", fs::file_size(destination)},
                       {"mask_size", fs::file_size(mask)}});
   }
+  while (!rectifying.empty()) {
+    rectifying.front().get();
+    rectifying.pop_front();
+  }
+  for (auto& photo : photos)
+    photo["image_size"] = fs::file_size(pending / "images" / fs::u8path(photo.at("name").get<std::string>()));
   Json initialization = nullptr;
   if (include_ply)
     initialization = ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);
   Json supervision = nullptr;
   if (options.enabled) {
-    supervision = ExportLasSupervision(scene, model, work, pending, options);
+    supervision =
+        ExportLasSupervision(scene, model, masks, pending, options, rolling ? &motion : nullptr);
     WriteJson(pending / "supervision.json", supervision);
   }
   const auto registration = model.Registration(scene);
   auto quality = report.at("quality");
+  if (rolling) {
+    // The delivered observations are original pixels; report their rolling-shutter fit.
+    const double median = quality.at("limits").at("median_px"),
+                 p90 = quality.at("limits").at("p90_px");
+    quality = model.Quality(scene, median, p90, &motion);
+    WriteJson(pending / "rolling_shutter.json", DeliveryShutterJson(scene, model, motion));
+  }
   quality["registration"] = registration;
   WriteJson(pending / "quality.json", quality);
   if (include_ply)
@@ -329,6 +402,9 @@ void ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
                    {"initialization", initialization}};
   if (options.enabled)
     manifest["supervision"] = supervision;
+  if (rolling)
+    manifest["rolling_shutter"] = {{"file", "rolling_shutter.json"},
+                                   {"size_bytes", fs::file_size(pending / "rolling_shutter.json")}};
   WriteJson(pending / "manifest.json", manifest);
   CheckBundle(pending);
   fs::rename(pending, output);
@@ -342,7 +418,21 @@ Json CheckBundle(const fs::path& output) {
     if (fs::file_size(sparse / fs::u8path(name)) != size.get<uint64_t>())
       throw std::runtime_error("Model file size differs");
   Scene scene;
-  const auto model = ReadColmap(sparse, scene);
+  const bool rolling = manifest.contains("rolling_shutter");
+  const auto& request = manifest.at("request");
+  if (rolling != (request.contains("rolling_shutter") &&
+                  request.at("rolling_shutter").value("photos", "") == "original") ||
+      rolling != fs::exists(output / "rolling_shutter.json"))
+    throw std::runtime_error("Rolling-shutter delivery files differ from the request");
+  Json shutter;
+  if (rolling) {
+    if (fs::file_size(output / "rolling_shutter.json") !=
+        manifest.at("rolling_shutter").at("size_bytes").get<uint64_t>())
+      throw std::runtime_error("Rolling-shutter file size differs");
+    shutter = ReadJson(output / "rolling_shutter.json");
+  }
+  ShutterMotion motion;
+  const auto model = ReadColmap(sparse, scene, rolling ? &shutter : nullptr, motion);
   if (manifest.at("images").size() != scene.images.size())
     throw std::runtime_error("Bundle exposure count differs");
   for (uint32_t i = 0; i < scene.images.size(); ++i) {
@@ -380,7 +470,8 @@ Json CheckBundle(const fs::path& output) {
        registration.at("complete") != registration.at("unregistered_images").empty()))
     throw std::runtime_error("Bundle registration summary differs");
   const auto quality =
-      model.Quality(scene, saved.at("limits").at("median_px"), saved.at("limits").at("p90_px"));
+      model.Quality(scene, saved.at("limits").at("median_px"), saved.at("limits").at("p90_px"),
+                    rolling ? &motion : nullptr);
   if (!saved.at("passed").get<bool>() || !quality.at("passed").get<bool>())
     throw std::runtime_error("Bundle geometry failed acceptance");
   Json checked = {{"passed", true},

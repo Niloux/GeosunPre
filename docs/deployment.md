@@ -18,8 +18,8 @@ Windows x64，需算力 ≥ 8.0 的 NVIDIA GPU（RTX 30/40/50、RTX A 系列等�
 
 输入、配置或模型改变时使用新工作目录，保留已有成果。默认交付原图、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及 LAS 深度和法向监督图；下游需支持 OPENCV_FISHEYE。`--no-ply` 省略 PLY，`--ply-voxel 0.1` 生成 10 cm 初始化，`--no-las-supervision` 省略监督图。Spirula 使用这些沿视线的深度时须设置 `input_depth_is_ray_depth=true`。旧重建可直接 `export --work OLD --output NEW` 补监督，保留原交付包。
 
-`run` 默认在 LAS 对齐后独立清理稀疏点，再导出通过验收的所选模型。原图精修默认关闭，首次运行加 `--refine` 或配置 `"refine": true` 在清理前启用，续跑沿用已冻结的选择。精修未启用或候选未通过时，仍对对齐模型清理；未采用原因分别见 `cache/refinement.json` 与 `cache/cleanup.json`。
+`run` 默认在 LAS 对齐后执行卷帘快门校正并独立清理稀疏点，再导出通过验收的所选模型；卷帘校正被采用时交付照片为校正到参考位姿的重采样 JPEG，未采用时为原图拷贝，原因见 `cache/shutter.json`。原图精修默认关闭，首次运行加 `--refine` 或配置 `"refine": true` 在卷帘校正前启用，续跑沿用已冻结的选择。精修未启用或候选未通过时，仍对上一步所选模型校正和清理；未采用原因分别见 `cache/refinement.json`、`cache/shutter.json` 与 `cache/cleanup.json`。
 
-初始匹配包含导航回访候选；SfM 默认不在停滞后额外补匹配，而是处理已注册部分，`sfm_repair_rounds` 可设为 `0`、`1` 或 `2`。实现标记为 16，新流程须使用新工作目录；旧成果仍可 `export`，也可通过 `refine --work OLD --output NEW` 或 `cleanup --work OLD --output NEW` 写入新目录。独立 `refine` 仅执行原图精修，独立 `cleanup` 仅清理稀疏结构；复制旧掩码时均屏蔽无覆盖像素，不重跑语义模型、特征和 SfM。
+初始匹配包含导航回访候选；SfM 默认不在停滞后额外补匹配，而是处理已注册部分，`sfm_repair_rounds` 可设为 `0`、`1` 或 `2`。实现标记为 17，新流程须使用新工作目录；旧成果仍可 `export`，也可通过 `refine --work OLD --output NEW` 或 `cleanup --work OLD --output NEW` 写入新目录。独立 `refine` 仅执行原图精修，独立 `cleanup` 仅清理稀疏结构；复制旧掩码时均屏蔽无覆盖像素，不重跑语义模型、特征和 SfM。
 
 `ampere_plus` 模型包可直接在上述 GPU 间迁移；算力低于 8.0 时程序明确拒绝加载。使用 `none` 级别的专用模型包时，GPU 型号须与构建 GPU 一致。完整输入、输出和缓存约定见 `docs/`。

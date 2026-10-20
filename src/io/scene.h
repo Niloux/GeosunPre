@@ -29,4 +29,6 @@ struct ResizeCoefficients {
 std::vector<ResizeCoefficients> ResizeWeights(int input, int output);
 Json ImageHeader(const fs::path& path);
 std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene);
+// Trajectory velocity in the LAS frame (m/s) at every exposure, from +-50 ms of navigation.
+std::vector<Eigen::Vector3d> NavigationVelocities(const Scene& scene);
 }  // namespace geosun

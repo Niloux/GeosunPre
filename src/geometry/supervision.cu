@@ -49,9 +49,19 @@ struct PointTransfer {
   bool used = false;
   explicit PointTransfer(bool streaming) : device(streaming ? PointChunk * sizeof(int3) : 0) {}
 };
+// motion holds the readout rotation and the readout translation (readout time times velocity)
+// of a rolling-shutter image, both in the reference camera frame; see ShutterMotion.
 struct Projection {
-  double rotation[9], translation[3], params[8], scales[3];
+  double rotation[9], translation[3], params[8], scales[3], motion[6];
+  int rolling, axis;
 };
+__device__ void FisheyePixel(double x, double y, double z, const double* p, double& u, double& v) {
+  const double r = hypot(x, y), theta = atan2(r, z), tt = theta * theta;
+  const double radial = theta * (1 + tt * (p[4] + tt * (p[5] + tt * (p[6] + tt * p[7])))),
+               scale = r > 1e-15 ? radial / r : 0;
+  u = p[0] * x * scale + p[2];
+  v = p[1] * y * scale + p[3];
+}
 __global__ void ProjectLas(const int3* points, int count, const Projection* cameras,
                             float* maps, int width, int height) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -60,11 +70,27 @@ __global__ void ProjectLas(const int3* points, int count, const Projection* came
   const auto& c = cameras[blockIdx.y];
   const auto raw = points[i];
   const double x = raw.x * c.scales[0], y = raw.y * c.scales[1], z = raw.z * c.scales[2];
-  const double px = c.rotation[0] * x + c.rotation[1] * y + c.rotation[2] * z + c.translation[0],
-               py = c.rotation[3] * x + c.rotation[4] * y + c.rotation[5] * z + c.translation[1],
-               pz = c.rotation[6] * x + c.rotation[7] * y + c.rotation[8] * z + c.translation[2];
+  double px = c.rotation[0] * x + c.rotation[1] * y + c.rotation[2] * z + c.translation[0],
+         py = c.rotation[3] * x + c.rotation[4] * y + c.rotation[5] * z + c.translation[1],
+         pz = c.rotation[6] * x + c.rotation[7] * y + c.rotation[8] * z + c.translation[2];
   if (pz <= 0)
     return;
+  if (c.rolling) {
+    // The pixel's readout line sets its camera; a few fixed-point steps settle the line.
+    const double qx = px, qy = py, qz = pz;
+    for (int k = 0; k < 3; ++k) {
+      double u, v;
+      FisheyePixel(px, py, pz, c.params, u, v);
+      const double s = c.axis ? (v - .5 * height) / height : (u - .5 * width) / width;
+      const double bx = qx - s * c.motion[3], by = qy - s * c.motion[4], bz = qz - s * c.motion[5];
+      const double wx = s * c.motion[0], wy = s * c.motion[1], wz = s * c.motion[2];
+      px = bx + wy * bz - wz * by;
+      py = by + wz * bx - wx * bz;
+      pz = bz + wx * by - wy * bx;
+      if (pz <= 0)
+        return;
+    }
+  }
   const double r = hypot(px, py), theta = atan2(r, pz), distance = sqrt(r * r + pz * pz);
   if (theta > MaxTheta || distance < .05 || distance > MaxDepth)
     return;
@@ -303,21 +329,52 @@ __device__ bool DepthSupported(const float* depth, int x, int y, int w, int h, d
     }
   return false;
 }
-__device__ bool SurfacePoint(const float* depth, const double3* rays, int x, int y, int w,
-                            int h, double distance, double3 center, double3& delta) {
+__device__ double3 ReadoutInverse(double3 w, double3 p) {
+  const double dot = Dot(w, p), den = 1 + Dot(w, w);
+  return make_double3((p.x - w.y * p.z + w.z * p.y + w.x * dot) / den,
+                      (p.y - w.z * p.x + w.x * p.z + w.y * dot) / den,
+                      (p.z - w.x * p.y + w.y * p.x + w.z * dot) / den);
+}
+// Same readout fraction as ShutterMotion::Fraction, for the pixel centre of map pixel (x, y).
+__device__ double ReadoutFraction(int x, int y, int w, int h, const Projection& c) {
+  return c.axis ? (y + .5) / h - .5 : (x + .5) / w - .5;
+}
+__device__ double3 ReferencePoint(double3 point, int x, int y, int w, int h, const Projection& c) {
+  if (!c.rolling)
+    return point;
+  const double s = ReadoutFraction(x, y, w, h, c);
+  auto p = ReadoutInverse(make_double3(s * c.motion[0], s * c.motion[1], s * c.motion[2]), point);
+  return make_double3(p.x + s * c.motion[3], p.y + s * c.motion[4], p.z + s * c.motion[5]);
+}
+__device__ double3 ReferenceRay(double3 ray, int x, int y, int w, int h, const Projection& c) {
+  if (!c.rolling)
+    return ray;
+  const double s = ReadoutFraction(x, y, w, h, c);
+  auto p = ReadoutInverse(make_double3(s * c.motion[0], s * c.motion[1], s * c.motion[2]), ray);
+  const double length = sqrt(Dot(p, p));
+  return make_double3(p.x / length, p.y / length, p.z / length);
+}
+__device__ bool SurfacePoint(const float* depth, const double3* rays, int x, int y, int w, int h,
+                             double distance, double3 center, double3& delta,
+                             const Projection& camera) {
   const float d = At(depth, x, y, w, h);
   if (!d || fabs(d - distance) > .02 * distance + .01)
     return false;
   const auto ray = rays[y * w + x];
   if (Dot(ray, ray) < .5)
     return false;
-  delta = Sub(make_double3(d * ray.x, d * ray.y, d * ray.z), center);
+  delta = Sub(ReferencePoint(make_double3(d * ray.x, d * ray.y, d * ray.z), x, y, w, h, camera),
+              center);
   return true;
 }
 __device__ bool Normal(const float* depth, const double3* rays, int x, int y, int w, int h,
-                       int radius, double distance, double3& normal, double tolerance) {
-  const auto ray = rays[y * w + x];
-  const double3 center = make_double3(distance * ray.x, distance * ray.y, distance * ray.z);
+                       int radius, double distance, double3& normal, double tolerance,
+                       const Projection& camera) {
+  const auto source_ray = rays[y * w + x];
+  const auto ray = ReferenceRay(source_ray, x, y, w, h, camera);
+  const double3 center = ReferencePoint(
+      make_double3(distance * source_ray.x, distance * source_ray.y, distance * source_ray.z), x, y,
+      w, h, camera);
   const double tangent_length = hypot(ray.x, ray.z);
   const double3 u = make_double3(ray.z / tangent_length, 0, -ray.x / tangent_length),
                 v = make_double3(ray.y * u.z, ray.z * u.x - ray.x * u.z, -ray.y * u.x);
@@ -328,8 +385,8 @@ __device__ bool Normal(const float* depth, const double3* rays, int x, int y, in
   for (int dy = -3; dy <= 3; ++dy)
     for (int dx = -3; dx <= 3; ++dx) {
       double3 delta;
-      if (!SurfacePoint(depth, rays, x + dx * radius / 3, y + dy * radius / 3,
-                        w, h, distance, center, delta))
+      if (!SurfacePoint(depth, rays, x + dx * radius / 3, y + dy * radius / 3, w, h, distance,
+                        center, delta, camera))
         continue;
       const double px = Dot(delta, u), py = Dot(delta, v), pz = Dot(delta, ray);
       sx += px;
@@ -365,15 +422,16 @@ __device__ bool Normal(const float* depth, const double3* rays, int x, int y, in
   for (int dy = -3; dy <= 3; ++dy)
     for (int dx = -3; dx <= 3; ++dx) {
       double3 delta;
-      if (SurfacePoint(depth, rays, x + dx * radius / 3, y + dy * radius / 3,
-                       w, h, distance, center, delta) &&
+      if (SurfacePoint(depth, rays, x + dx * radius / 3, y + dy * radius / 3, w, h, distance,
+                       center, delta, camera) &&
           fabs(Dot(normal, delta) + c / length) > tolerance)
         return false;
     }
   return true;
 }
 __global__ void Encode(const float* depth, const double3* rays, const uint8_t* edges,
-                         uint16_t* millimetres, uchar3* normals, int w, int h, double focal) {
+                       uint16_t* millimetres, uchar3* normals, int w, int h, double focal,
+                       Projection camera) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= w * h)
     return;
@@ -386,12 +444,19 @@ __global__ void Encode(const float* depth, const double3* rays, const uint8_t* e
   millimetres[i] = uint16_t(max(1, min(65535, int(d * 1000. + .5))));
   const int radius = max(3, min(24, int(focal * .04 / d + .5)));
   double3 normal, coarse;
-  if (!Normal(depth, rays, x, y, w, h, radius, d, normal, .01) ||
-      -Dot(normal, rays[i]) < MinIncidence)
+  if (!Normal(depth, rays, x, y, w, h, radius, d, normal, .01, camera) ||
+      -Dot(normal, ReferenceRay(rays[i], x, y, w, h, camera)) < MinIncidence)
     return;
-  if (!Normal(depth, rays, x, y, w, h, radius * 2, d, coarse, .015) ||
+  if (!Normal(depth, rays, x, y, w, h, radius * 2, d, coarse, .015, camera) ||
       Dot(normal, coarse) < .984807753012208)
     return;
+  if (camera.rolling) {
+    const double s = ReadoutFraction(x, y, w, h, camera);
+    normal = ReadoutInverse(
+        make_double3(-s * camera.motion[0], -s * camera.motion[1], -s * camera.motion[2]), normal);
+    const double length = sqrt(Dot(normal, normal));
+    normal = make_double3(normal.x / length, normal.y / length, normal.z / length);
+  }
   normals[i] = make_uchar3(uint8_t(127.5 + 127.5 * normal.z + .5),
                            uint8_t(127.5 + 127.5 * normal.y + .5),
                            uint8_t(127.5 + 127.5 * normal.x + .5));
@@ -409,9 +474,12 @@ Camera MapCamera(const Camera& source, int max_size) {
 fs::path ExtraMask(const SupervisionOptions& options, const std::string& name) {
   return options.mask_dir / fs::u8path(name + ".png");
 }
-cv::Mat StaticMask(const Scene& scene, const fs::path& work, uint32_t image,
-                    const Camera& camera, const SupervisionOptions& options) {
-  auto mask = ReadImage(MaskPath(work, image), cv::IMREAD_GRAYSCALE);
+fs::path StaticMaskPath(const fs::path& masks, uint32_t image) {
+  return masks / (std::to_string(image) + ".png");
+}
+cv::Mat StaticMask(const Scene& scene, const fs::path& masks, uint32_t image, const Camera& camera,
+                   const SupervisionOptions& options) {
+  auto mask = ReadImage(StaticMaskPath(masks, image), cv::IMREAD_GRAYSCALE);
   mask = mask == 255;
   if (!options.mask_dir.empty() && fs::exists(ExtraMask(options, scene.images[image].name))) {
     auto extra = ReadImage(ExtraMask(options, scene.images[image].name), cv::IMREAD_GRAYSCALE);
@@ -476,8 +544,8 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
     throw std::runtime_error("Geometry exclusion mask directory does not exist");
   return options;
 }
-Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const fs::path& work,
-                        const SupervisionOptions& options) {
+Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const fs::path& masks_dir,
+                        const SupervisionOptions& options, bool rolling) {
   if (!options.enabled)
     return nullptr;
   if (FileMetadata(scene.las) != scene.sources.at("las"))
@@ -486,20 +554,27 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
   for (const auto& image : scene.images) {
     if (!model.images[image.id].registered)
       continue;
-    static_masks[image.name] = FileMetadata(MaskPath(work, image.id));
+    static_masks[image.name] = FileMetadata(StaticMaskPath(masks_dir, image.id));
     if (!options.mask_dir.empty() && fs::exists(ExtraMask(options, image.name)))
       masks[image.name] = FileMetadata(ExtraMask(options, image.name));
   }
-  return {{"version", Version}, {"max_size", options.max_size}, {"boundary_pixels", options.boundary},
-          {"las_file", FileMetadata(scene.las)}, {"exclusion_mask_dir", options.mask_dir.u8string()},
-          {"static_masks", static_masks}, {"exclusion_masks", masks}};
+  Json request = {{"version", Version},
+                  {"max_size", options.max_size},
+                  {"boundary_pixels", options.boundary},
+                  {"las_file", FileMetadata(scene.las)},
+                  {"exclusion_mask_dir", options.mask_dir.u8string()},
+                  {"static_masks", static_masks},
+                  {"exclusion_masks", masks}};
+  if (rolling)
+    request["readout_normals_version"] = 1;
+  return request;
 }
 Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
-                          const fs::path& work, const fs::path& output,
-                          const SupervisionOptions& options) {
+                          const fs::path& masks_dir, const fs::path& output,
+                          const SupervisionOptions& options, const ShutterMotion* motion) {
   const auto started = Clock::now();
   const auto header = ReadLasHeader(scene.las);
-  const auto request = SupervisionRequest(scene, model, work, options);
+  const auto request = SupervisionRequest(scene, model, masks_dir, options, motion != nullptr);
   std::vector<Json> rows(model.images.size());
   LasPointCache points(scene.las, header, output, options.cache_mb);
   const auto stream = points.StreamHandle();
@@ -556,7 +631,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     auto request = [&] {
       for (; masks.size() < Lookahead && requested < images.size(); ++requested)
         masks.push_back(std::async(std::launch::async, [&, id = images[requested]] {
-          auto pixels = StaticMask(scene, work, id, camera, options);
+          auto pixels = StaticMask(scene, masks_dir, id, camera, options);
           const int count = cv::countNonZero(pixels);
           return LoadedMask{std::move(pixels), count};
         }));
@@ -577,6 +652,16 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
             p.rotation[r * 3 + c] = rotation(r, c);
         }
         std::copy(camera.params.begin(), camera.params.end(), p.params);
+        if (motion) {
+          const uint32_t id = images[first + j];
+          const Eigen::Vector3d moved = motion->readout[cid] * motion->velocity[id];
+          for (int k = 0; k < 3; ++k) {
+            p.motion[k] = motion->rotation[id][k];
+            p.motion[3 + k] = moved[k];
+          }
+          p.rolling = 1;
+          p.axis = motion->axis;
+        }
       }
       CudaCheck(cudaMemcpyAsync(cameras.data, projection.data(), count * sizeof(Projection),
                                 cudaMemcpyHostToDevice, stream));
@@ -609,7 +694,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         Encode<<<blocks, 256, 0, stream>>>(
             filtered, static_cast<const double3*>(rays.data),
             static_cast<const uint8_t*>(edge.data), static_cast<uint16_t*>(millimetres.data),
-            static_cast<uchar3*>(normals.data), w, h, camera.params[0]);
+            static_cast<uchar3*>(normals.data), w, h, camera.params[0], projection[j]);
         CudaCheck(cudaGetLastError());
         cv::Mat depth(h, w, CV_16UC1), normal(h, w, CV_8UC3);
         CudaCheck(cudaMemcpyAsync(depth.data, millimetres.data, millimetres.bytes,
@@ -645,12 +730,13 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   for (const auto& row : rows)
     if (!row.is_null())
       images.push_back(row);
-  if (request != SupervisionRequest(scene, model, work, options))
+  if (request != SupervisionRequest(scene, model, masks_dir, options, motion != nullptr))
     throw std::runtime_error("LAS or geometry exclusion masks changed during supervision export");
   points.Finish();
   return {{"version", Version},
           {"request", request},
           {"source", "valid original LAS records"},
+          {"projection", motion ? "rolling_shutter_readout_line" : "global_shutter"},
           {"accepted_records", points.Count()},
           {"excluded_records", points.Excluded()},
           {"point_cache", points.Profile()},
@@ -662,7 +748,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"normal_encoding", "round(127.5 * (n + 1))"},
           {"invalid_normal_rgb", {0, 0, 0}},
           {"depth_validity", "occlusion_boundary_and_local_depth_support"},
-          {"normal_estimator", "two_scale_tangent_plane_least_squares"},
+          {"normal_estimator", motion ? "readout_reference_two_scale_tangent_plane_least_squares"
+                                      : "two_scale_tangent_plane_least_squares"},
           {"normal_grid_size", 7},
           {"normal_minimum_samples", 8},
           {"minimum_abs_normal_dot_ray", MinIncidence},
@@ -674,6 +761,61 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"normal_pixels", normal_pixels},
           {"images", images},
           {"seconds", Seconds(started)}};
+}
+void LasRangeMaps(const Scene& scene, const Reconstruction& model, int max_size,
+                  const fs::path& scratch, const std::function<void(uint32_t, cv::Mat)>& use) {
+  const auto header = ReadLasHeader(scene.las);
+  LasPointCache points(scene.las, header, scratch, 1024);
+  const auto stream = points.StreamHandle();
+  for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
+    std::vector<uint32_t> images;
+    for (uint32_t i = 0; i < model.images.size(); ++i)
+      if (model.images[i].registered && model.images[i].camera == cid)
+        images.push_back(i);
+    if (images.empty())
+      continue;
+    const auto camera = MapCamera(model.cameras[cid], max_size);
+    const int w = camera.width, h = camera.height, size = w * h, blocks = (size + 255) / 256;
+    const size_t batch =
+        std::min<size_t>(64, std::max<size_t>(1, DepthBudget / (size * sizeof(float))));
+    DeviceBuffer maps(batch * size * sizeof(float)), cameras(batch * sizeof(Projection)),
+        clean(size * sizeof(float)), mask(size);
+    CudaCheck(cudaMemsetAsync(mask.data, 1, size, stream));
+    for (size_t first = 0; first < images.size(); first += batch) {
+      const size_t count = std::min(batch, images.size() - first);
+      std::vector<Projection> projection(count);
+      for (size_t j = 0; j < count; ++j) {
+        auto& p = projection[j];
+        const auto& pose = model.images[images[first + j]].pose;
+        const Eigen::Matrix3d rotation = pose.Rotation().toRotationMatrix();
+        const Eigen::Vector3d translation = rotation * header.origin + pose.Translation();
+        for (int r = 0; r < 3; ++r) {
+          p.translation[r] = translation[r];
+          p.scales[r] = header.scale[r];
+          for (int c = 0; c < 3; ++c)
+            p.rotation[r * 3 + c] = rotation(r, c);
+        }
+        std::copy(camera.params.begin(), camera.params.end(), p.params);
+      }
+      CudaCheck(cudaMemcpyAsync(cameras.data, projection.data(), count * sizeof(Projection),
+                                cudaMemcpyHostToDevice, stream));
+      CudaCheck(cudaMemsetAsync(maps.data, 0x7f, count * size * sizeof(float), stream));
+      points.Project(static_cast<const Projection*>(cameras.data), static_cast<float*>(maps.data),
+                     w, h, count);
+      for (size_t j = 0; j < count; ++j) {
+        Cull<<<blocks, 256, 0, stream>>>(static_cast<const float*>(maps.data) + j * size,
+                                         static_cast<float*>(clean.data),
+                                         static_cast<const uint8_t*>(mask.data), w, h);
+        CudaCheck(cudaGetLastError());
+        cv::Mat range(h, w, CV_32FC1);
+        CudaCheck(
+            cudaMemcpyAsync(range.data, clean.data, clean.bytes, cudaMemcpyDeviceToHost, stream));
+        CudaCheck(cudaStreamSynchronize(stream));
+        use(images[first + j], std::move(range));
+      }
+    }
+  }
+  points.Finish();
 }
 void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
                          const Json& photos, const Json& summary) {

@@ -12,11 +12,12 @@ OUTPUT/
   quality.json
   initialization.json
   supervision.json            # 默认生成，--no-las-supervision 省略
+  rolling_shutter.json        # 卷帘校正被采用且 --rolling-shutter-photos original 时生成
 ```
 
 COLMAP 小端二进制，`OPENCV_FISHEYE` 模型编号 5、8 个参数。相机 ID 1、2；每幅图像独立 frame，使用镜头对应的一传感器 rig。内部索引从 0 开始；仅导出已注册照片，按原输入顺序将图像/frame ID 连续重编号为 1 到注册数量，轨迹中的图像引用同步转换，内部缓存编号保持不变。
 
-位姿 world-to-camera，COLMAP 四元数顺序 `w x y z`。图像名相对于 images，保留原图、尺寸、畸变与全部特征编号。点轨迹与图像引用相互一致，无三维点的特征用 uint64 最大值。下游须支持原生鱼眼模型。
+位姿 world-to-camera，COLMAP 四元数顺序 `w x y z`。图像名相对于 images，保留原图名、尺寸、鱼眼畸变与全部特征编号。卷帘快门校正被采用时，位姿为读出中线时刻的参考位姿，照片按 `--rolling-shutter-photos` 交付，见下节；未采用或关闭时照片为原图拷贝，该选项不起作用。点轨迹与图像引用相互一致，无三维点的特征用 uint64 最大值。下游须支持原生鱼眼模型。
 
 points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重投影距离，单位像素；联合优化后重新计算，交付回读时验证。
 
@@ -32,7 +33,7 @@ LAS 深度和法向监督默认在导出阶段生成，`run`、独立 `export`�
 
 manifest 的 request.supervision 记录算法版本、LAS、静态及额外排除掩码身份和导出参数；当前监督算法版本为 2，版本 1 的旧交付仍可回读。supervision 字段与 `supervision.json` 相同，保存按已注册照片原顺序排列的尺寸、文件字节数及有效像素数量。`check` 逐图回读，核对类型、尺寸、身份、有效数量、法向单位长度及其深度支撑。关闭监督时不生成这些字段和文件，旧包仍可回读。
 
-manifest 协议版本 1，保存请求、已注册图像身份、文件大小、初始化参数。图像条目的 image_index 是原输入的 0 起始索引。quality 保存所选模型拟合验收和限值。省略 PLY 时不生成 initialization.json，清单中的 initialization 为 null。
+manifest 协议版本 1，保存请求、已注册图像身份、文件大小、初始化参数。卷帘校正被采用时 request 另含 `rolling_shutter`：`cache/shutter.json` 的文件身份、照片重采样核与 JPEG 质量，监督请求中的 static_masks 为校正后掩码。图像条目的 image_index 是原输入的 0 起始索引。quality 保存所选模型拟合验收和限值。省略 PLY 时不生成 initialization.json，清单中的 initialization 为 null。
 
 manifest 和 quality 的 registration 保存 complete、selected_images、registered_images，以及 unregistered_images 名单（image_index、name、0 起始 camera）。默认首次停滞就处理已注册部分；可配置 `sfm_repair_rounds=1` 或 `2`，在补匹配轮数用完后处理已注册部分。子集收尾还会排除末尾标定可靠支撑不足的曝光，其原始索引和支撑记录保存在 sfm.calibration_selection。只有通过支撑检查的已注册照片参与后续优化、几何验收及配准；原有验收门限不变。quality.images 保留全部输入的顺序与 registered 标记，未注册条目的观测数为 0、误差统计为空。quality.passed 表示已重建部分通过验收，不表示全部照片注册成功；check 同时返回 registration。旧版完整包可以没有 registration。
 
@@ -42,10 +43,29 @@ quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 
 
 工作目录 `result.json` 的 joint 保存联合优化候选的完整质量、点位移统计、逐图退化明细、各项接受条件及 failed_checks；候选被拒绝时保留所选原模型，验收阈值不因诊断而放宽。
 
-默认在 LAS 对齐后独立清理稀疏点，再导出最终所选模型；原图精修默认关闭，`--refine` 或配置 `"refine": true` 在清理前启用。`result.json` 的 alignment、joint、sfm 是各阶段原报告；refinement 保存精修的启用状态、留出误差、同组 LAS 平面误差及相机优化验收，cleanup 单独保存稀疏点清理与验收。关闭精修时 refinement.enabled=false，且不生成精修缓存。quality 与 navigation_error_m 更新为最终模型统计。
+默认在 LAS 对齐后执行卷帘快门校正和独立稀疏点清理，再导出最终所选模型；原图精修默认关闭，`--refine` 或配置 `"refine": true` 在卷帘校正前启用。`result.json` 的 alignment、joint、sfm 是各阶段原报告；refinement 保存精修的启用状态、留出误差、同组 LAS 平面误差及相机优化验收；shutter 保存读出时间、读出转动与平移统计、各镜头读出一致性、留出误差、同组 LAS 平面误差、观测换算位移、各项检查及 used；cleanup 单独保存稀疏点清理与验收。关闭精修时 refinement.enabled=false，且不生成精修缓存；配置 `"rolling_shutter": false` 时 shutter.enabled=false。quality 与 navigation_error_m 更新为最终模型统计。
 
 精修未启用或相机候选未通过时，对对齐模型执行清理；清理候选未通过时保留清理前的模型，未采用原因明确记录。允许清理最多 1% 的已注册照片，且每镜头至少保留 98%、可靠 LAS 支撑轨迹至少保留 90%；最终照片名单以交付 registration 为准。清理不改变相机内参和位姿，也不改变 LAS 初始化 PLY。独立 `refine` 只执行相机精修，独立 `cleanup` 只执行清理，两者均写入新工作目录。
 
 同级 `.pending` 中完成写入及回读后重命名发布。同一请求的完整包可复用，不同请求拒绝覆盖。`check --output` 只依赖交付包，检查结构、引用、尺寸、PLY 和几何拟合，不代表独立精度或渲染效果。
 
 格式依据：[COLMAP output format](https://colmap.github.io/format.html)。
+
+## 卷帘快门交付
+
+`run`、`export`、`cleanup` 的 `--rolling-shutter-photos` 取 `rectified`（默认）或 `original`，只对卷帘校正被采用的模型有效，两种交付使用不同输出目录。
+
+- `rectified`：images 为按参考位姿重采样的照片（Lanczos4 插值，JPEG 质量 95，保留原图 EXIF、XMP 等 APP 段），masks 为同一映射最近邻重采样并限制有效域的掩码，特征坐标同样换算到校正后照片，映射到原图之外的像素为黑色、掩码为 0。COLMAP 按全局快门读取即可，任何支持 `OPENCV_FISHEYE` 的下游可直接使用。
+- `original`：images、masks 为原图与原掩码拷贝，特征坐标为原图像素，位姿仍为参考位姿；`rolling_shutter.json` 给出每幅照片的读出运动。按全局快门读取时视图间仍有卷帘偏差，下游须使用该文件。points3D.bin 的 error、quality.json 与 `check` 均按卷帘投影计算；深度和法向监督按每个像素自身读出线的相机投影 LAS；法向的双尺度平面拟合先把各邻域点换算到参考相机，再按逆转置变换到本像素读出线的相机中表示（与参考相机相差不超过整帧读出转动）。supervision.json 的 projection 为 `rolling_shutter_readout_line`，normal_estimator 为 `readout_reference_two_scale_tangent_plane_least_squares`，监督请求另含 `readout_normals_version`，与校正照片交付的请求相互区分。
+
+`rolling_shutter.json`（version 1）是 `original` 交付的相机接口：
+
+```text
+readout_axis   "rows" 或 "columns"，两镜头共用
+cameras        [{camera_id, readout_s}]，readout_s 为整帧读出时间（秒），符号表示读出先后
+images         [{image_id, camera_id, name, rotation_rad[3], velocity_m_s[3], translation_m[3]}]，与 images.bin 的 ID 一致
+```
+
+读出比例 `s = (c - N/2)/N`，c 为像素沿读出轴的坐标（左上像素中心为 0.5），N 为该轴的图像尺寸。参考位姿为 images.bin 的 world-to-camera `R, t`（s = 0）。三维点 X 在读出比例 s 处的相机坐标为 `p(s) = (I + s[rotation_rad]×)(R X + t - s·translation_m)`，`translation_m = readout_s · velocity_m_s`；rotation_rad、velocity_m_s、translation_m 均在 OpenCV 参考相机坐标中，rotation_rad 与 translation_m 对应整帧读出。X 的像素 x 满足 `x = fisheye(p(s(x)))`，从 s = 0 起不动点迭代 3–4 次即收敛。该一阶模型在读出期间转动不超过约 3° 时足够精确。
+
+原图交付的法向拟合先将邻域三维点按各自读出时间变换到参考相机，再拟合平面并将法向变换到中心像素的读出相机。监督请求的 `readout_normals_version=1` 区分此几何约定；旧交付仍可回读，新导出使用新目录。

@@ -83,7 +83,8 @@ void Reconstruction::Filter(double threshold, double min_angle) {
   }
   RebuildReferences();
 }
-Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90_limit) const {
+Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90_limit,
+                             const ShutterMotion* motion) const {
   Json rows = Json::array(), failures = Json::array();
   std::vector<double> errors;
   std::array<std::vector<double>, 2> by_camera;
@@ -117,7 +118,9 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
     ++camera_images[image.camera];
     for (size_t k = 0; k < image.points.size(); ++k)
       if (image.points[k] != NoPoint) {
-        const auto xyz = image.pose.Apply(points.at(image.points[k]).xyz);
+        auto xyz = image.pose.Apply(points.at(image.points[k]).xyz);
+        if (motion)
+          xyz = motion->Apply(id, image.camera, motion->Fraction(c, image.pixels[k]), xyz);
         const double r = (c.Project(xyz) - image.pixels[k]).norm();
         if (!xyz.allFinite() || xyz.z() <= 0 || !std::isfinite(r)) {
           ++invalid;

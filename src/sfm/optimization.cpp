@@ -27,6 +27,25 @@ Eigen::Matrix<double, 3, 4> RotationJacobian(const Eigen::Quaterniond& unit,
   j -= 2 * rotated * unit.coeffs().transpose();
   return j / norm;
 }
+void CameraJacobian(const Camera& camera, const Eigen::Vector3d& v, double* jacobian) {
+  Eigen::Map<Eigen::Matrix<double, 2, 8, Eigen::RowMajor>> camera_j(jacobian);
+  camera_j.setZero();
+  const auto& cam = camera.params;
+  const double r = std::hypot(v.x(), v.y()), theta = std::atan2(r, v.z()), t2 = theta * theta;
+  const double d =
+      r < 1e-15 ? 1 / v.z()
+                : theta * (1 + t2 * (cam[4] + t2 * (cam[5] + t2 * (cam[6] + t2 * cam[7])))) / r;
+  camera_j(0, 0) = v.x() * d;
+  camera_j(1, 1) = v.y() * d;
+  camera_j(0, 2) = camera_j(1, 3) = 1;
+  double power = theta * t2;
+  for (int k = 4; k < 8; ++k) {
+    const double radial = r < 1e-15 ? 0 : power / r;
+    camera_j(0, k) = cam[0] * v.x() * radial;
+    camera_j(1, k) = cam[1] * v.y() * radial;
+    power *= t2;
+  }
+}
 struct Reprojection : ceres::SizedCostFunction<2, 7, 3, 8> {
   Eigen::Vector2d pixel;
   explicit Reprojection(const Eigen::Vector2d& measurement) : pixel(measurement) {}
@@ -55,24 +74,62 @@ struct Reprojection : ceres::SizedCostFunction<2, 7, 3, 8> {
       Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[1]);
       point_j = j * rotation.toRotationMatrix();
     }
-    if (jacobians[2]) {
-      Eigen::Map<Eigen::Matrix<double, 2, 8, Eigen::RowMajor>> camera_j(jacobians[2]);
-      camera_j.setZero();
-      const auto& cam = camera.params;
-      const double r = std::hypot(v.x(), v.y()), theta = std::atan2(r, v.z()), t2 = theta * theta;
-      const double d =
-          r < 1e-15 ? 1 / v.z()
-                    : theta * (1 + t2 * (cam[4] + t2 * (cam[5] + t2 * (cam[6] + t2 * cam[7])))) / r;
-      camera_j(0, 0) = v.x() * d;
-      camera_j(1, 1) = v.y() * d;
-      camera_j(0, 2) = camera_j(1, 3) = 1;
-      double power = theta * t2;
-      for (int k = 4; k < 8; ++k) {
-        const double radial = r < 1e-15 ? 0 : power / r;
-        camera_j(0, k) = cam[0] * v.x() * radial;
-        camera_j(1, k) = cam[1] * v.y() * radial;
-        power *= t2;
-      }
+    if (jacobians[2])
+      CameraJacobian(camera, v, jacobians[2]);
+    return true;
+  }
+};
+// Reprojection of an observation exposed at readout fraction s; see ShutterMotion. The extra
+// blocks are the image's readout rotation and its lens readout time.
+struct ShutterReprojection : ceres::SizedCostFunction<2, 7, 3, 8, 3, 1> {
+  Eigen::Vector2d pixel;
+  Eigen::Vector3d velocity;
+  double s;
+  ShutterReprojection(const Eigen::Vector2d& measurement, const Eigen::Vector3d& camera_velocity,
+                      double fraction)
+      : pixel(measurement), velocity(camera_velocity), s(fraction) {}
+  bool Evaluate(double const* const* parameters, double* residual,
+                double** jacobians) const override {
+    const auto* pose = parameters[0];
+    const Eigen::Map<const Eigen::Vector3d> point(parameters[1]), w(parameters[3]);
+    const double readout = parameters[4][0];
+    Eigen::Quaterniond rotation(pose[3], pose[0], pose[1], pose[2]);
+    const double norm = rotation.norm();
+    rotation.coeffs() /= norm;
+    const Eigen::Vector3d rotated = rotation * point;
+    const Eigen::Vector3d b =
+        rotated + Eigen::Map<const Eigen::Vector3d>(pose + 4) - s * readout * velocity;
+    const Eigen::Vector3d v = b + s * w.cross(b);
+    Camera camera;
+    std::copy_n(parameters[2], 8, camera.params.begin());
+    Eigen::Map<Eigen::Vector2d> output(residual);
+    output = camera.Project(v) - pixel;
+    if (!jacobians)
+      return true;
+    Eigen::Matrix3d a;
+    a << 1, -s * w.z(), s * w.y(), s * w.z(), 1, -s * w.x(), -s * w.y(), s * w.x(), 1;
+    const auto j = camera.ProjectionJacobian(v);
+    const Eigen::Matrix<double, 2, 3> ja = j * a;
+    if (jacobians[0]) {
+      Eigen::Map<Eigen::Matrix<double, 2, 7, Eigen::RowMajor>> pose_j(jacobians[0]);
+      pose_j.leftCols<4>() = ja * RotationJacobian(rotation, point, rotated, norm);
+      pose_j.rightCols<3>() = ja;
+    }
+    if (jacobians[1]) {
+      Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[1]);
+      point_j = ja * rotation.toRotationMatrix();
+    }
+    if (jacobians[2])
+      CameraJacobian(camera, v, jacobians[2]);
+    if (jacobians[3]) {
+      Eigen::Matrix3d cross;
+      cross << 0, -b.z(), b.y(), b.z(), 0, -b.x(), -b.y(), b.x(), 0;
+      Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> rotation_j(jacobians[3]);
+      rotation_j = -s * j * cross;
+    }
+    if (jacobians[4]) {
+      Eigen::Map<Eigen::Vector2d> readout_j(jacobians[4]);
+      readout_j = -s * ja * velocity;
     }
     return true;
   }
@@ -238,7 +295,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
               const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav,
               const std::set<uint64_t>& selected_points,
               const std::vector<std::vector<uint8_t>>& precise_observations,
-              const Reconstruction* reference) {
+              const Reconstruction* reference, ShutterMotion* shutter) {
   const auto started = Clock::now();
   ceres::Problem problem;
   auto ordering = std::make_shared<ceres::ParameterBlockOrdering>();
@@ -273,8 +330,15 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
               original.pose.Apply(reference->points[&p - m.points.data()].xyz));
           ++reference_count;
         }
-        problem.AddResidualBlock(new Reprojection(pixel), loss, image.pose.params.data(),
-                                 p.xyz.data(), m.cameras[image.camera].params.data());
+        if (shutter)
+          problem.AddResidualBlock(
+              new ShutterReprojection(pixel, shutter->velocity[o.image],
+                                      shutter->Fraction(m.cameras[image.camera], pixel)),
+              loss, image.pose.params.data(), p.xyz.data(), m.cameras[image.camera].params.data(),
+              shutter->rotation[o.image].data(), &shutter->readout[image.camera]);
+        else
+          problem.AddResidualBlock(new Reprojection(pixel), loss, image.pose.params.data(),
+                                   p.xyz.data(), m.cameras[image.camera].params.data());
         problem.AddResidualBlock(new Depth(.05 * depth, 1000 / depth), nullptr,
                                  image.pose.params.data(), p.xyz.data());
         used_images.insert(o.image);
@@ -321,6 +385,22 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         problem.SetParameterLowerBound(params, i, initial[cid].params[i] - delta[i]);
         problem.SetParameterUpperBound(params, i, initial[cid].params[i] + delta[i]);
       }
+    }
+  }
+  if (shutter) {
+    // At most ~3 degrees of rotation and 50 ms per readout; a solution at a bound is reported.
+    for (uint32_t id : used_images) {
+      auto* rotation = shutter->rotation[id].data();
+      ordering->AddElementToGroup(rotation, 1);
+      for (int i = 0; i < 3; ++i) {
+        problem.SetParameterLowerBound(rotation, i, -.05);
+        problem.SetParameterUpperBound(rotation, i, .05);
+      }
+    }
+    for (uint32_t cid : used_cameras) {
+      ordering->AddElementToGroup(&shutter->readout[cid], 1);
+      problem.SetParameterLowerBound(&shutter->readout[cid], 0, -.05);
+      problem.SetParameterUpperBound(&shutter->readout[cid], 0, .05);
     }
   }
   for (const auto& p : planes)
@@ -393,6 +473,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"images", used_images.size()},
           {"variable_images", variable_count},
           {"metric_constraints", metric},
+          {"rolling_shutter", shutter != nullptr},
           {"observations", observations},
           {"precise_observations", precise_count},
           {"reference_observations", reference_count},
