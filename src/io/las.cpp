@@ -86,25 +86,27 @@ void MergeBucket(const fs::path& bucket, const fs::path& workspace,
   // large.
   constexpr size_t limit = 2 * 1024 * 1024;
   std::ifstream input(bucket, std::ios::binary);
+  auto remaining = fs::file_size(bucket);
+  if (remaining % sizeof(Aggregate))
+    throw std::runtime_error("Truncated voxel partition");
+  remaining /= sizeof(Aggregate);
   std::vector<fs::path> runs;
-  for (;;) {
-    std::vector<Aggregate> records(limit);
-    input.read(reinterpret_cast<char*>(records.data()),
-               std::streamsize(records.size() * sizeof(Aggregate)));
-    const auto bytes = input.gcount();
-    if (bytes % sizeof(Aggregate))
-      throw std::runtime_error("Truncated voxel partition");
-    records.resize(size_t(bytes) / sizeof(Aggregate));
-    if (records.empty())
-      break;
+  while (remaining) {
+    std::vector<Aggregate> records(size_t(std::min<uintmax_t>(limit, remaining)));
+    if (!input.read(reinterpret_cast<char*>(records.data()),
+                    std::streamsize(records.size() * sizeof(Aggregate))))
+      throw std::runtime_error("Cannot read voxel partition");
+    remaining -= records.size();
+    // A partition that fits in one sort run is emitted directly.
+    if (runs.empty() && !remaining) {
+      for (const auto& value : Reduce(std::move(records)))
+        emit(value);
+      return;
+    }
     const auto path = workspace / fs::u8path(bucket.stem().u8string() + "-run-" +
                                              std::to_string(runs.size()) + ".bin");
     WriteRecords(path, Reduce(std::move(records)));
     runs.push_back(path);
-    if (input.eof())
-      break;
-    if (!input)
-      throw std::runtime_error("Cannot read voxel partition");
   }
   struct Item {
     Aggregate value;

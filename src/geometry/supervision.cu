@@ -7,7 +7,9 @@
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <fstream>
+#include <future>
 #include <numeric>
 
 namespace geosun {
@@ -16,6 +18,8 @@ constexpr int Version = 1;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 constexpr size_t DepthBudget = 256 * 1024 * 1024;
 constexpr size_t PointChunk = 500000;
+// Mask decoding, PNG encoding and read-back run beside the GPU with this many images in flight.
+constexpr size_t Lookahead = 6;
 struct Stream {
   cudaStream_t value = nullptr;
   Stream() { CudaCheck(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking)); }
@@ -392,24 +396,30 @@ cv::Mat StaticMask(const Scene& scene, const fs::path& work, uint32_t image,
   return mask;
 }
 std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal) {
+  static const auto squares = [] {
+    std::array<double, 256> values;
+    for (int v = 0; v < 256; ++v)
+      values[v] = std::pow(v / 127.5 - 1, 2);
+    return values;
+  }();
   uint64_t depths = 0, normals = 0;
-  for (int y = 0; y < depth.rows; ++y)
-    for (int x = 0; x < depth.cols; ++x) {
-      const bool has_depth = depth.at<uint16_t>(y, x) != 0;
-      const auto n = normal.at<cv::Vec3b>(y, x);
-      const bool has_normal = n != cv::Vec3b(0, 0, 0);
+  for (int y = 0; y < depth.rows; ++y) {
+    const auto* d = depth.ptr<uint16_t>(y);
+    const auto* n = normal.ptr<uint8_t>(y);
+    for (int x = 0; x < depth.cols; ++x, n += 3) {
+      const bool has_depth = d[x] != 0;
+      const bool has_normal = n[0] || n[1] || n[2];
       if (has_normal) {
         if (!has_depth)
           throw std::runtime_error("Normal has no corresponding valid LAS depth");
-        double norm = 0;
-        for (int j = 0; j < 3; ++j)
-          norm += std::pow(n[j] / 127.5 - 1, 2);
+        const double norm = squares[n[0]] + squares[n[1]] + squares[n[2]];
         if (std::abs(norm - 1) > .025)
           throw std::runtime_error("Nonunit encoded LAS normal");
       }
       depths += has_depth;
       normals += has_normal;
     }
+  }
   return {depths, normals};
 }
 }  // namespace
@@ -464,6 +474,26 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   const auto stream = points.StreamHandle();
   uint64_t depth_pixels = 0, normal_pixels = 0;
   size_t done = 0;
+  struct Written {
+    uint32_t id;
+    Json row;
+  };
+  std::deque<std::future<Written>> writes;
+  auto finish = [&] {
+    auto written = writes.front().get();
+    writes.pop_front();
+    depth_pixels += written.row.at("depth_pixels").get<uint64_t>();
+    normal_pixels += written.row.at("normal_pixels").get<uint64_t>();
+    rows[written.id] = std::move(written.row);
+    ++done;
+    if (done % 16 == 0 || done == model.Registered())
+      Log("LAS supervision: " + std::to_string(done) + "/" + std::to_string(model.Registered()) +
+          " images, " + std::to_string(Seconds(started)) + " s");
+  };
+  struct LoadedMask {
+    cv::Mat pixels;
+    int count;
+  };
   for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
     std::vector<uint32_t> images;
     for (uint32_t i = 0; i < model.images.size(); ++i)
@@ -489,7 +519,19 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         mask(size), edge(size), dilated(size), millimetres(size * sizeof(uint16_t)), normals(size * sizeof(uchar3));
     CudaCheck(
         cudaMemcpyAsync(rays.data, ray_host.data(), rays.bytes, cudaMemcpyHostToDevice, stream));
+    // Masks for the following images decode while the GPU projects the current batch.
+    std::deque<std::future<LoadedMask>> masks;
+    size_t requested = 0;
+    auto request = [&] {
+      for (; masks.size() < Lookahead && requested < images.size(); ++requested)
+        masks.push_back(std::async(std::launch::async, [&, id = images[requested]] {
+          auto pixels = StaticMask(scene, work, id, camera, options);
+          const int count = cv::countNonZero(pixels);
+          return LoadedMask{std::move(pixels), count};
+        }));
+    };
     for (size_t first = 0; first < images.size(); first += batch) {
+      request();
       const size_t count = std::min(batch, images.size() - first);
       std::vector<Projection> projection(count);
       for (size_t j = 0; j < count; ++j) {
@@ -512,9 +554,11 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                      w, h, count);
       for (size_t j = 0; j < count; ++j) {
         const uint32_t id = images[first + j];
-        const auto static_mask = StaticMask(scene, work, id, camera, options);
-        CudaCheck(
-            cudaMemcpyAsync(mask.data, static_mask.data, size, cudaMemcpyHostToDevice, stream));
+        const auto static_mask = masks.front().get();
+        masks.pop_front();
+        request();
+        CudaCheck(cudaMemcpyAsync(mask.data, static_mask.pixels.data, size, cudaMemcpyHostToDevice,
+                                  stream));
         const auto* raw_depth = static_cast<float*>(maps.data) + j * size;
         auto* filtered = static_cast<float*>(clean.data);
         auto* scratch = static_cast<float*>(filled.data);
@@ -542,24 +586,28 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         CudaCheck(cudaMemcpyAsync(normal.data, normals.data, normals.bytes, cudaMemcpyDeviceToHost,
                                   stream));
         CudaCheck(cudaStreamSynchronize(stream));
-        const auto valid = Counts(depth, normal);
-        depth_pixels += valid.first;
-        normal_pixels += valid.second;
-        const auto name = scene.images[id].name + ".png";
-        const auto dp = output / "depths" / fs::u8path(name), np = output / "normals" / fs::u8path(name);
-        WriteImage(dp, depth);
-        WriteImage(np, normal);
-        rows[id] = {{"image_index", id}, {"name", scene.images[id].name}, {"width", w}, {"height", h},
-                    {"depth_size", fs::file_size(dp)}, {"normal_size", fs::file_size(np)},
-                    {"static_pixels", cv::countNonZero(static_mask)},
-                    {"depth_pixels", valid.first}, {"normal_pixels", valid.second}};
-        ++done;
-        if (done % 16 == 0 || done == model.Registered())
-          Log("LAS supervision: " + std::to_string(done) + "/" + std::to_string(model.Registered()) +
-              " images, " + std::to_string(Seconds(started)) + " s");
+        const auto& name = scene.images[id].name;
+        const auto dp = output / "depths" / fs::u8path(name + ".png"),
+                   np = output / "normals" / fs::u8path(name + ".png");
+        fs::create_directories(dp.parent_path());
+        fs::create_directories(np.parent_path());
+        if (writes.size() >= Lookahead)
+          finish();
+        writes.push_back(std::async(std::launch::async, [=, static_pixels = static_mask.count] {
+          const auto valid = Counts(depth, normal);
+          WriteImage(dp, depth);
+          WriteImage(np, normal);
+          return Written{id,
+                         {{"image_index", id}, {"name", name}, {"width", w}, {"height", h},
+                          {"depth_size", fs::file_size(dp)}, {"normal_size", fs::file_size(np)},
+                          {"static_pixels", static_pixels}, {"depth_pixels", valid.first},
+                          {"normal_pixels", valid.second}}};
+        }));
       }
     }
   }
+  while (!writes.empty())
+    finish();
   if (!depth_pixels || !normal_pixels)
     throw std::runtime_error("LAS supervision has no reliable depth or normal pixels");
   Json images = Json::array();
@@ -600,6 +648,13 @@ void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
       summary.at("images").size() != photos.size())
     throw std::runtime_error("Unexpected LAS supervision contract");
   uint64_t depth_total = 0, normal_total = 0;
+  std::deque<std::future<std::pair<uint64_t, uint64_t>>> checks;
+  auto finish = [&] {
+    const auto counts = checks.front().get();
+    checks.pop_front();
+    depth_total += counts.first;
+    normal_total += counts.second;
+  };
   for (size_t i = 0; i < photos.size(); ++i) {
     const auto& image = photos[i];
     const auto& row = summary.at("images")[i];
@@ -612,18 +667,25 @@ void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
     if (fs::file_size(dp) != row.at("depth_size").get<uint64_t>() ||
         fs::file_size(np) != row.at("normal_size").get<uint64_t>())
       throw std::runtime_error("LAS supervision file size differs");
-    const auto depth = ReadImage(dp, cv::IMREAD_UNCHANGED), normal = ReadImage(np, cv::IMREAD_UNCHANGED);
-    if (depth.type() != CV_16UC1 || normal.type() != CV_8UC3 || depth.size() != normal.size() ||
-        depth.cols != camera.width || depth.rows != camera.height ||
-        row.at("width") != camera.width || row.at("height") != camera.height)
+    if (row.at("width") != camera.width || row.at("height") != camera.height)
       throw std::runtime_error("LAS supervision map dimensions or pixel types differ");
-    const auto counts = Counts(depth, normal);
-    if (counts.first != row.at("depth_pixels").get<uint64_t>() ||
-        counts.second != row.at("normal_pixels").get<uint64_t>())
-      throw std::runtime_error("LAS supervision valid pixel counts differ");
-    depth_total += counts.first;
-    normal_total += counts.second;
+    if (checks.size() >= Lookahead)
+      finish();
+    checks.push_back(std::async(std::launch::async, [=, depths = row.at("depth_pixels").get<uint64_t>(),
+                                                     normals = row.at("normal_pixels").get<uint64_t>()] {
+      const auto depth = ReadImage(dp, cv::IMREAD_UNCHANGED),
+                 normal = ReadImage(np, cv::IMREAD_UNCHANGED);
+      if (depth.type() != CV_16UC1 || normal.type() != CV_8UC3 || depth.size() != normal.size() ||
+          depth.cols != camera.width || depth.rows != camera.height)
+        throw std::runtime_error("LAS supervision map dimensions or pixel types differ");
+      const auto counts = Counts(depth, normal);
+      if (counts.first != depths || counts.second != normals)
+        throw std::runtime_error("LAS supervision valid pixel counts differ");
+      return counts;
+    }));
   }
+  while (!checks.empty())
+    finish();
   if (!depth_total || !normal_total || depth_total != summary.at("depth_pixels").get<uint64_t>() ||
       normal_total != summary.at("normal_pixels").get<uint64_t>())
     throw std::runtime_error("LAS supervision totals differ");
