@@ -14,7 +14,7 @@
 
 namespace geosun {
 namespace {
-constexpr int Version = 1;
+constexpr int Version = 2;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
 constexpr double MaxTheta = 1.396263401595464;
@@ -293,53 +293,83 @@ __device__ double3 Sub(double3 a, double3 b) {
   return make_double3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
 __device__ double Dot(double3 a, double3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-__device__ bool Point(const float* depth, const double3* rays, int x, int y, int w, int h,
-                        double3& point) {
-  const float center = At(depth, x, y, w, h);
-  if (!center)
-    return false;
-  point = make_double3(0, 0, 0);
+__device__ bool DepthSupported(const float* depth, int x, int y, int w, int h, double center) {
   int count = 0;
-  for (int dy = -1; dy <= 1; ++dy)
-    for (int dx = -1; dx <= 1; ++dx) {
-      const int xx = x + dx, yy = y + dy;
-      const float v = At(depth, xx, yy, w, h);
-      if (v > 0 && fabs(v - center) <= .02 * center + .01) {
-        const auto ray = rays[yy * w + xx];
-        point.x += v * ray.x;
-        point.y += v * ray.y;
-        point.z += v * ray.z;
-        ++count;
-      }
+  for (int dy = -2; dy <= 2; ++dy)
+    for (int dx = -2; dx <= 2; ++dx) {
+      const float v = At(depth, x + dx, y + dy, w, h);
+      if (v > 0 && fabs(v - center) <= .02 * center + .01 && ++count >= 4)
+        return true;
     }
-  if (count < 6)
+  return false;
+}
+__device__ bool SurfacePoint(const float* depth, const double3* rays, int x, int y, int w,
+                            int h, double distance, double3 center, double3& delta) {
+  const float d = At(depth, x, y, w, h);
+  if (!d || fabs(d - distance) > .02 * distance + .01)
     return false;
-  point.x /= count;
-  point.y /= count;
-  point.z /= count;
+  const auto ray = rays[y * w + x];
+  if (Dot(ray, ray) < .5)
+    return false;
+  delta = Sub(make_double3(d * ray.x, d * ray.y, d * ray.z), center);
   return true;
 }
 __device__ bool Normal(const float* depth, const double3* rays, int x, int y, int w, int h,
-                         int radius, double3 center, double3& normal, double tolerance) {
-  double3 p[4];
-  if (!Point(depth, rays, x - radius, y, w, h, p[0]) ||
-      !Point(depth, rays, x + radius, y, w, h, p[1]) ||
-      !Point(depth, rays, x, y - radius, w, h, p[2]) ||
-      !Point(depth, rays, x, y + radius, w, h, p[3]))
+                       int radius, double distance, double3& normal, double tolerance) {
+  const auto ray = rays[y * w + x];
+  const double3 center = make_double3(distance * ray.x, distance * ray.y, distance * ray.z);
+  const double tangent_length = hypot(ray.x, ray.z);
+  const double3 u = make_double3(ray.z / tangent_length, 0, -ray.x / tangent_length),
+                v = make_double3(ray.y * u.z, ray.z * u.x - ray.x * u.z, -ray.y * u.x);
+  // Fit ray displacement over the tangent plane. Missing samples are omitted rather than
+  // requiring complete 3x3 patches at four particular positions.
+  double sx = 0, sy = 0, sz = 0, sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0;
+  int count = 0;
+  for (int dy = -3; dy <= 3; ++dy)
+    for (int dx = -3; dx <= 3; ++dx) {
+      double3 delta;
+      if (!SurfacePoint(depth, rays, x + dx * radius / 3, y + dy * radius / 3,
+                        w, h, distance, center, delta))
+        continue;
+      const double px = Dot(delta, u), py = Dot(delta, v), pz = Dot(delta, ray);
+      sx += px;
+      sy += py;
+      sz += pz;
+      sxx += px * px;
+      sxy += px * py;
+      syy += py * py;
+      sxz += px * pz;
+      syz += py * pz;
+      ++count;
+    }
+  if (count < 8)
     return false;
-  const auto dx = Sub(p[1], p[0]), dy = Sub(p[2], p[3]);
-  normal = make_double3(dx.y * dy.z - dx.z * dy.y, dx.z * dy.x - dx.x * dy.z,
-                        dx.x * dy.y - dx.y * dy.x);
-  const double length = sqrt(Dot(normal, normal));
-  if (length < 1e-12)
+  sxx -= sx * sx / count;
+  sxy -= sx * sy / count;
+  syy -= sy * sy / count;
+  sxz -= sx * sz / count;
+  syz -= sy * sz / count;
+  const double trace = sxx + syy, det = sxx * syy - sxy * sxy;
+  // Reject line-like support, including scan stripes with no surface extent across them.
+  if (trace <= 1e-10 || det <= .02 * trace * trace)
     return false;
-  const double factor = (Dot(normal, center) > 0 ? -1. : 1.) / length;
-  normal.x *= factor;
-  normal.y *= factor;
-  normal.z *= factor;
-  for (int j = 0; j < 4; ++j)
-    if (fabs(Dot(normal, Sub(p[j], center))) > tolerance)
-      return false;
+  const double a = (sxz * syy - syz * sxy) / det,
+               b = (syz * sxx - sxz * sxy) / det,
+               c = (sz - a * sx - b * sy) / count,
+               length = sqrt(1 + a * a + b * b);
+  if (fabs(c) > tolerance * length)
+    return false;
+  normal = make_double3((a * u.x + b * v.x - ray.x) / length,
+                        (a * u.y + b * v.y - ray.y) / length,
+                        (a * u.z + b * v.z - ray.z) / length);
+  for (int dy = -3; dy <= 3; ++dy)
+    for (int dx = -3; dx <= 3; ++dx) {
+      double3 delta;
+      if (SurfacePoint(depth, rays, x + dx * radius / 3, y + dy * radius / 3,
+                       w, h, distance, center, delta) &&
+          fabs(Dot(normal, delta) + c / length) > tolerance)
+        return false;
+    }
   return true;
 }
 __global__ void Encode(const float* depth, const double3* rays, const uint8_t* edges,
@@ -351,16 +381,15 @@ __global__ void Encode(const float* depth, const double3* rays, const uint8_t* e
   normals[i] = make_uchar3(0, 0, 0);
   const int x = i % w, y = i / w;
   const float d = At(depth, x, y, w, h);
-  if (edges[i] || !d)
-    return;
-  const int radius = max(2, min(24, int(focal * .04 / d + .5)));
-  double3 center, normal, coarse;
-  if (!Point(depth, rays, x, y, w, h, center) ||
-      !Normal(depth, rays, x, y, w, h, radius, center, normal, .01) ||
-      -Dot(normal, rays[i]) < MinIncidence)
+  if (edges[i] || !d || Dot(rays[i], rays[i]) < .5 || !DepthSupported(depth, x, y, w, h, d))
     return;
   millimetres[i] = uint16_t(max(1, min(65535, int(d * 1000. + .5))));
-  if (!Normal(depth, rays, x, y, w, h, radius * 2, center, coarse, .015) ||
+  const int radius = max(3, min(24, int(focal * .04 / d + .5)));
+  double3 normal, coarse;
+  if (!Normal(depth, rays, x, y, w, h, radius, d, normal, .01) ||
+      -Dot(normal, rays[i]) < MinIncidence)
+    return;
+  if (!Normal(depth, rays, x, y, w, h, radius * 2, d, coarse, .015) ||
       Dot(normal, coarse) < .984807753012208)
     return;
   normals[i] = make_uchar3(uint8_t(127.5 + 127.5 * normal.z + .5),
@@ -632,6 +661,10 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"normal_frame", "opencv_camera_facing_camera"},
           {"normal_encoding", "round(127.5 * (n + 1))"},
           {"invalid_normal_rgb", {0, 0, 0}},
+          {"depth_validity", "occlusion_boundary_and_local_depth_support"},
+          {"normal_estimator", "two_scale_tangent_plane_least_squares"},
+          {"normal_grid_size", 7},
+          {"normal_minimum_samples", 8},
           {"minimum_abs_normal_dot_ray", MinIncidence},
           {"surface_radius_m", .04},
           {"normal_angle_limit_degrees", 10},
@@ -644,7 +677,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
 }
 void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
                          const Json& photos, const Json& summary) {
-  if (summary.at("version") != Version || summary.at("depth_type") != "ray_distance" ||
+  if ((summary.at("version") != 1 && summary.at("version") != Version) ||
+      summary.at("depth_type") != "ray_distance" ||
       summary.at("depth_format") != "uint16_png_mm" || summary.at("normal_format") != "rgb8_png" ||
       summary.at("normal_frame") != "opencv_camera_facing_camera" ||
       summary.at("images").size() != photos.size())
