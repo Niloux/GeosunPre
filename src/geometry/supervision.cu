@@ -762,61 +762,6 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"images", images},
           {"seconds", Seconds(started)}};
 }
-void LasRangeMaps(const Scene& scene, const Reconstruction& model, int max_size,
-                  const fs::path& scratch, const std::function<void(uint32_t, cv::Mat)>& use) {
-  const auto header = ReadLasHeader(scene.las);
-  LasPointCache points(scene.las, header, scratch, 1024);
-  const auto stream = points.StreamHandle();
-  for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
-    std::vector<uint32_t> images;
-    for (uint32_t i = 0; i < model.images.size(); ++i)
-      if (model.images[i].registered && model.images[i].camera == cid)
-        images.push_back(i);
-    if (images.empty())
-      continue;
-    const auto camera = MapCamera(model.cameras[cid], max_size);
-    const int w = camera.width, h = camera.height, size = w * h, blocks = (size + 255) / 256;
-    const size_t batch =
-        std::min<size_t>(64, std::max<size_t>(1, DepthBudget / (size * sizeof(float))));
-    DeviceBuffer maps(batch * size * sizeof(float)), cameras(batch * sizeof(Projection)),
-        clean(size * sizeof(float)), mask(size);
-    CudaCheck(cudaMemsetAsync(mask.data, 1, size, stream));
-    for (size_t first = 0; first < images.size(); first += batch) {
-      const size_t count = std::min(batch, images.size() - first);
-      std::vector<Projection> projection(count);
-      for (size_t j = 0; j < count; ++j) {
-        auto& p = projection[j];
-        const auto& pose = model.images[images[first + j]].pose;
-        const Eigen::Matrix3d rotation = pose.Rotation().toRotationMatrix();
-        const Eigen::Vector3d translation = rotation * header.origin + pose.Translation();
-        for (int r = 0; r < 3; ++r) {
-          p.translation[r] = translation[r];
-          p.scales[r] = header.scale[r];
-          for (int c = 0; c < 3; ++c)
-            p.rotation[r * 3 + c] = rotation(r, c);
-        }
-        std::copy(camera.params.begin(), camera.params.end(), p.params);
-      }
-      CudaCheck(cudaMemcpyAsync(cameras.data, projection.data(), count * sizeof(Projection),
-                                cudaMemcpyHostToDevice, stream));
-      CudaCheck(cudaMemsetAsync(maps.data, 0x7f, count * size * sizeof(float), stream));
-      points.Project(static_cast<const Projection*>(cameras.data), static_cast<float*>(maps.data),
-                     w, h, count);
-      for (size_t j = 0; j < count; ++j) {
-        Cull<<<blocks, 256, 0, stream>>>(static_cast<const float*>(maps.data) + j * size,
-                                         static_cast<float*>(clean.data),
-                                         static_cast<const uint8_t*>(mask.data), w, h);
-        CudaCheck(cudaGetLastError());
-        cv::Mat range(h, w, CV_32FC1);
-        CudaCheck(
-            cudaMemcpyAsync(range.data, clean.data, clean.bytes, cudaMemcpyDeviceToHost, stream));
-        CudaCheck(cudaStreamSynchronize(stream));
-        use(images[first + j], std::move(range));
-      }
-    }
-  }
-  points.Finish();
-}
 void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
                          const Json& photos, const Json& summary) {
   if ((summary.at("version") != 1 && summary.at("version") != Version) ||

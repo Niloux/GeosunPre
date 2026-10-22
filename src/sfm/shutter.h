@@ -19,18 +19,6 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
                                         int ba_workers);
 Json MotionToJson(const ShutterMotion& motion, const Reconstruction& model);
 ShutterMotion MotionFromJson(const Json& value, size_t images);
-// LAS range grids and rectified static masks of an accepted correction, written to
-// directory/ranges and directory/masks by image index.
-Json PrepareRectification(const Scene& scene, const Reconstruction& model,
-                          const ShutterMotion& motion, const fs::path& work,
-                          const fs::path& directory, int workers);
-// Resamples a raster recorded by the rolling shutter into the reference-pose image, using the
-// range grid written by PrepareRectification. Pixels with no source are 0.
-cv::Mat RectifyRaster(const cv::Mat& source, const Camera& camera, const ShutterMotion& motion,
-                      uint32_t image, uint32_t lens, const cv::Mat& range_mm, int interpolation);
-// Encodes a rectified photo as JPEG and keeps the original's EXIF, XMP and other APPn segments.
-void WriteRectifiedJpeg(const std::vector<uint8_t>& original, const cv::Mat& image,
-                        const fs::path& destination);
 // Maps the observations of a corrected model back into the original rolling-shutter photos and
 // sets each point error to its rolling-shutter reprojection.
 Reconstruction OriginalPhotoObservations(const Reconstruction& corrected,

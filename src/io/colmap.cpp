@@ -3,10 +3,6 @@
 #include "io/las.h"
 #include "frontend/frontend.h"
 #include "sfm/shutter.h"
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
-#include <deque>
-#include <fstream>
 #include <set>
 #include <unordered_map>
 
@@ -270,24 +266,15 @@ Reconstruction ReadColmap(const fs::path& path, Scene& scene, const Json* shutte
 }  // namespace
 void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
-                  const SupervisionOptions& options, const std::string& photos_mode) {
-  if (photos_mode != "rectified" && photos_mode != "original")
-    throw std::runtime_error("Rolling-shutter photos must be rectified or original");
-  // A rolling-shutter corrected model describes photos at its reference poses. They are either
-  // resampled to those poses, or kept original with the readout motion beside the model.
-  const bool corrected = report.contains("shutter") && report.at("shutter").value("used", false);
-  const bool rectified = corrected && photos_mode == "rectified",
-             rolling = corrected && photos_mode == "original";
-  const auto masks = work / (rectified ? "cache/shutter/masks" : "cache/masks");
+                  const SupervisionOptions& options) {
+  // A rolling-shutter corrected model describes photos at its reference poses; they are delivered
+  // original, with the readout motion beside the model.
+  const bool rolling = report.contains("shutter") && report.at("shutter").value("used", false);
+  const auto masks = work / "cache/masks";
   Json request = {{"scene_file", FileMetadata(work / "scene.json")},
                   {"model_file", FileMetadata(SelectedModelPath(work, report))},
                   {"include_ply", include_ply},
                   {"voxel", voxel}};
-  if (rectified)
-    request["rolling_shutter"] = {{"motion_file", FileMetadata(work / "cache/shutter.json")},
-                                  {"photos", "rectified"},
-                                  {"photo_resampling", "lanczos4"},
-                                  {"jpeg_quality", 95}};
   if (rolling)
     request["rolling_shutter"] = {{"motion_file", FileMetadata(work / "cache/shutter.json")},
                                   {"photos", "original"}};
@@ -316,59 +303,29 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   }
   fs::create_directories(pending / "sparse/0");
   ShutterMotion motion;
-  if (corrected)
+  if (rolling)
     motion =
         MotionFromJson(ReadJson(work / "cache/shutter.json").at("motion"), selected.images.size());
   const auto model = rolling ? OriginalPhotoObservations(selected, motion, 8) : selected;
   WriteColmap(pending / "sparse/0", scene, model);
   Json photos = Json::array();
-  std::deque<std::future<void>> rectifying;
   for (const auto& e : scene.images) {
     if (!model.images[e.id].registered)
       continue;
     const auto destination = pending / "images" / fs::u8path(e.name);
     fs::create_directories(destination.parent_path());
-    if (rectified) {
-      if (rectifying.size() >= 6) {
-        rectifying.front().get();
-        rectifying.pop_front();
-      }
-      rectifying.push_back(std::async(std::launch::async, [&, exposure = &e, destination] {
-        const auto& e = *exposure;
-        std::ifstream stream(e.source, std::ios::binary);
-        std::vector<uint8_t> bytes(fs::file_size(e.source));
-        stream.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
-        if (!stream || FileMetadata(e.source) != e.source_file)
-          throw std::runtime_error("Source image changed while rectifying: " + e.name);
-        const auto photo = cv::imdecode(bytes, cv::IMREAD_COLOR);
-        if (photo.empty())
-          throw std::runtime_error("Cannot decode image: " + e.name);
-        const auto range = ReadImage(
-            work / "cache/shutter/ranges" / (std::to_string(e.id) + ".png"), cv::IMREAD_UNCHANGED);
-        WriteRectifiedJpeg(bytes,
-                           RectifyRaster(photo, model.cameras[e.camera], motion, e.id, e.camera,
-                                         range, cv::INTER_LANCZOS4),
-                           destination);
-      }));
-    } else {
-      fs::copy_file(e.source, destination);
-      if (fs::file_size(destination) != e.source_file.at("size_bytes").get<uint64_t>())
-        throw std::runtime_error("Source image changed while copying: " + e.name);
-    }
+    fs::copy_file(e.source, destination);
+    if (fs::file_size(destination) != e.source_file.at("size_bytes").get<uint64_t>())
+      throw std::runtime_error("Source image changed while copying: " + e.name);
     const auto mask = pending / "masks" / fs::u8path(e.name + ".png");
     fs::create_directories(mask.parent_path());
     fs::copy_file(masks / (std::to_string(e.id) + ".png"), mask);
     photos.push_back({{"image_index", e.id},
                       {"name", e.name},
                       {"camera", e.camera},
-                      {"mask_size", fs::file_size(mask)}});
+                      {"mask_size", fs::file_size(mask)},
+                      {"image_size", fs::file_size(destination)}});
   }
-  while (!rectifying.empty()) {
-    rectifying.front().get();
-    rectifying.pop_front();
-  }
-  for (auto& photo : photos)
-    photo["image_size"] = fs::file_size(pending / "images" / fs::u8path(photo.at("name").get<std::string>()));
   Json initialization = nullptr;
   if (include_ply)
     initialization = ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);

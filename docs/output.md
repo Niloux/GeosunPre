@@ -12,12 +12,12 @@ OUTPUT/
   quality.json
   initialization.json
   supervision.json            # 默认生成，--no-las-supervision 省略
-  rolling_shutter.json        # 卷帘校正被采用且 --rolling-shutter-photos original 时生成
+  rolling_shutter.json        # 卷帘校正被采用时生成
 ```
 
 COLMAP 小端二进制，`OPENCV_FISHEYE` 模型编号 5、8 个参数。相机 ID 1、2；每幅图像独立 frame，使用镜头对应的一传感器 rig。内部索引从 0 开始；仅导出已注册照片，按原输入顺序将图像/frame ID 连续重编号为 1 到注册数量，轨迹中的图像引用同步转换，内部缓存编号保持不变。
 
-位姿 world-to-camera，COLMAP 四元数顺序 `w x y z`。图像名相对于 images，保留原图名、尺寸、鱼眼畸变与全部特征编号。卷帘快门校正被采用时，位姿为读出中线时刻的参考位姿，照片按 `--rolling-shutter-photos` 交付，见下节；未采用或关闭时照片为原图拷贝，该选项不起作用。点轨迹与图像引用相互一致，无三维点的特征用 uint64 最大值。下游须支持原生鱼眼模型。
+位姿 world-to-camera，COLMAP 四元数顺序 `w x y z`。图像名相对于 images，保留原图名、尺寸、鱼眼畸变与全部特征编号。照片和掩码始终为原图拷贝。卷帘快门校正被采用时，位姿为读出中线时刻的参考位姿，并附 `rolling_shutter.json`，见下节。点轨迹与图像引用相互一致，无三维点的特征用 uint64 最大值。下游须支持原生鱼眼模型。
 
 points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重投影距离，单位像素；联合优化后重新计算，交付回读时验证。
 
@@ -33,7 +33,7 @@ LAS 深度和法向监督默认在导出阶段生成，`run`、独立 `export`�
 
 manifest 的 request.supervision 记录算法版本、LAS、静态及额外排除掩码身份和导出参数；当前监督算法版本为 2，版本 1 的旧交付仍可回读。supervision 字段与 `supervision.json` 相同，保存按已注册照片原顺序排列的尺寸、文件字节数及有效像素数量。`check` 逐图回读，核对类型、尺寸、身份、有效数量、法向单位长度及其深度支撑。关闭监督时不生成这些字段和文件，旧包仍可回读。
 
-manifest 协议版本 1，保存请求、已注册图像身份、文件大小、初始化参数。卷帘校正被采用时 request 另含 `rolling_shutter`：`cache/shutter.json` 的文件身份、照片重采样核与 JPEG 质量，监督请求中的 static_masks 为校正后掩码。图像条目的 image_index 是原输入的 0 起始索引。quality 保存所选模型拟合验收和限值。省略 PLY 时不生成 initialization.json，清单中的 initialization 为 null。
+manifest 协议版本 1，保存请求、已注册图像身份、文件大小、初始化参数。卷帘校正被采用时 request 另含 `rolling_shutter`：`cache/shutter.json` 的文件身份与 `photos: "original"`。图像条目的 image_index 是原输入的 0 起始索引。quality 保存所选模型拟合验收和限值。省略 PLY 时不生成 initialization.json，清单中的 initialization 为 null。
 
 manifest 和 quality 的 registration 保存 complete、selected_images、registered_images，以及 unregistered_images 名单（image_index、name、0 起始 camera）。默认首次停滞就处理已注册部分；可配置 `sfm_repair_rounds=1` 或 `2`，在补匹配轮数用完后处理已注册部分。子集收尾还会排除末尾标定可靠支撑不足的曝光，其原始索引和支撑记录保存在 sfm.calibration_selection。只有通过支撑检查的已注册照片参与后续优化、几何验收及配准；原有验收门限不变。quality.images 保留全部输入的顺序与 registered 标记，未注册条目的观测数为 0、误差统计为空。quality.passed 表示已重建部分通过验收，不表示全部照片注册成功；check 同时返回 registration。旧版完整包可以没有 registration。
 
@@ -53,12 +53,9 @@ quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 
 
 ## 卷帘快门交付
 
-`run`、`export`、`cleanup` 的 `--rolling-shutter-photos` 取 `rectified`（默认）或 `original`，只对卷帘校正被采用的模型有效，两种交付使用不同输出目录。
+卷帘校正被采用的模型交付原图与原掩码拷贝，特征坐标为原图像素，位姿为参考位姿；`rolling_shutter.json` 给出每幅照片的读出运动。按全局快门读取时视图间仍有卷帘偏差，下游须使用该文件（spirula 的 `3dgut` 按卷帘相机训练）。照片不做重采样：读出平移的像素偏移随深度变化，按 LAS 距离重采样会在近处动态物体和 LAS 空洞处错位。旧版按参考位姿重采样照片的 `rectified` 交付不再生成，仍可 `check` 回读。points3D.bin 的 error、quality.json 与 `check` 均按卷帘投影计算；深度和法向监督按每个像素自身读出线的相机投影 LAS；法向的双尺度平面拟合先把各邻域点换算到参考相机，再按逆转置变换到本像素读出线的相机中表示（与参考相机相差不超过整帧读出转动）。supervision.json 的 projection 为 `rolling_shutter_readout_line`，normal_estimator 为 `readout_reference_two_scale_tangent_plane_least_squares`，监督请求另含 `readout_normals_version`。
 
-- `rectified`：images 为按参考位姿重采样的照片（Lanczos4 插值，JPEG 质量 95，保留原图 EXIF、XMP 等 APP 段），masks 为同一映射最近邻重采样并限制有效域的掩码，特征坐标同样换算到校正后照片，映射到原图之外的像素为黑色、掩码为 0。COLMAP 按全局快门读取即可，任何支持 `OPENCV_FISHEYE` 的下游可直接使用。
-- `original`：images、masks 为原图与原掩码拷贝，特征坐标为原图像素，位姿仍为参考位姿；`rolling_shutter.json` 给出每幅照片的读出运动。按全局快门读取时视图间仍有卷帘偏差，下游须使用该文件。points3D.bin 的 error、quality.json 与 `check` 均按卷帘投影计算；深度和法向监督按每个像素自身读出线的相机投影 LAS；法向的双尺度平面拟合先把各邻域点换算到参考相机，再按逆转置变换到本像素读出线的相机中表示（与参考相机相差不超过整帧读出转动）。supervision.json 的 projection 为 `rolling_shutter_readout_line`，normal_estimator 为 `readout_reference_two_scale_tangent_plane_least_squares`，监督请求另含 `readout_normals_version`，与校正照片交付的请求相互区分。
-
-`rolling_shutter.json`（version 1）是 `original` 交付的相机接口：
+`rolling_shutter.json`（version 1）是卷帘交付的相机接口：
 
 ```text
 readout_axis   "rows" 或 "columns"，两镜头共用

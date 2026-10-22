@@ -102,14 +102,10 @@ struct Delivery {
   bool ply;
   double voxel;
   SupervisionOptions supervision;
-  std::string photos;
 };
 Delivery ParseDelivery(const Arguments& args) {
-  const auto photos = args.Get("--rolling-shutter-photos", "rectified");
-  if (photos != "rectified" && photos != "original")
-    throw std::runtime_error("--rolling-shutter-photos must be rectified or original");
   return {args.Get("--no-ply") != "true", args.Number("--ply-voxel", .05),
-          ParseSupervisionOptions(args), photos};
+          ParseSupervisionOptions(args)};
 }
 Json Inventory(const fs::path& work, const std::vector<fs::path>& products) {
   Json result = Json::object();
@@ -167,7 +163,7 @@ void ExportSelected(const Scene& scene, const fs::path& work, const fs::path& ou
                     const Delivery& delivery) {
   const auto result = ReadJson(work / "result.json");
   ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, delivery.ply,
-               delivery.voxel, result, delivery.supervision, delivery.photos);
+               delivery.voxel, result, delivery.supervision);
 }
 std::vector<fs::path> ReconstructVisual(const Scene& scene, const fs::path& work,
                                         const fs::path& root, const Json& settings,
@@ -273,16 +269,8 @@ std::vector<fs::path> CorrectShutter(const Scene& scene, const fs::path& work,
   auto& report = correction.report;
   report["enabled"] = true;
   report["source_model"] = original.value("selected_model", std::string("aligned"));
-  // Rectification products from an interrupted attempt are rebuilt.
-  fs::remove_all(work / "cache/shutter");
   std::vector<fs::path> products{work / "cache/shutter_candidate.bin", work / "cache/shutter.bin",
                                  work / "cache/shutter.json", work / "cache/shutter_result.json"};
-  if (correction.accepted) {
-    report["rectification"] = PrepareRectification(scene, correction.candidate, correction.motion,
-                                                   work, work / "cache/shutter",
-                                                   settings.at("workers"));
-    products.push_back(work / "cache/shutter");
-  }
   const auto& selected = correction.accepted ? correction.candidate : model;
   auto result = PostprocessResult(scene, selected, original, "shutter");
   result["shutter"] = report;
@@ -372,7 +360,7 @@ void Run(const Arguments& args) {
   args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
                  "--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--refine", "--rolling-shutter-photos"});
+                 "--supervision-cache-mb", "--refine"});
   const auto delivery = ParseDelivery(args);
   const auto work = args.Get("--work").empty()
                         ? fs::absolute(fs::path("work") / args.Path("--input").filename())
@@ -483,7 +471,7 @@ void Run(const Arguments& args) {
 void Export(const Arguments& args) {
   args.Validate({"--work", "--output", "--no-ply", "--ply-voxel", "--las-supervision",
                  "--no-las-supervision", "--supervision-max-size", "--supervision-boundary",
-                 "--supervision-mask-dir", "--supervision-cache-mb", "--rolling-shutter-photos"});
+                 "--supervision-mask-dir", "--supervision-cache-mb"});
   const auto delivery = ParseDelivery(args);
   const auto work = args.Path("--work");
   Lock lock(work);
@@ -505,7 +493,7 @@ void Export(const Arguments& args) {
 void Postprocess(const Arguments& args) {
   args.Validate({"--work", "--output", "--workers", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--no-ply", "--ply-voxel", "--rolling-shutter-photos"});
+                 "--supervision-cache-mb", "--no-ply", "--ply-voxel"});
   const auto delivery = ParseDelivery(args);
   const bool photo = args.command == "refine";
   const auto source = args.Path("--work"), final_output = args.Path("--output");
@@ -533,9 +521,9 @@ void Postprocess(const Arguments& args) {
   if (ReadScene(scene.input, scene.las).ToJson() != scene.ToJson())
     throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
   const auto original = ReadJson(source / "result.json");
-  const bool rectified =
+  const bool corrected =
       original.contains("shutter") && original.at("shutter").value("used", false);
-  if (photo && rectified)
+  if (photo && corrected)
     throw std::runtime_error(
         "Photometric refinement needs the original photo geometry; the source model is "
         "rolling-shutter corrected");
@@ -586,30 +574,22 @@ void Postprocess(const Arguments& args) {
   WriteJson(output / "cache" / (report_name + ".json"), report);
   WriteJson(output / "scene.json", scene.ToJson());
   WriteJson(output / "result.json", result);
-  // Rolling-shutter corrected models carry their rectified masks, range grids and motion, and
-  // keep the original masks for deliveries with original photos.
-  std::vector<fs::path> mask_sets{"cache/masks"};
-  if (rectified) {
-    mask_sets.push_back("cache/shutter/masks");
-    fs::create_directories(output / "cache/shutter");
-    fs::copy(source / "cache/shutter/ranges", output / "cache/shutter/ranges",
-             fs::copy_options::recursive);
+  // Rolling-shutter corrected models carry their readout motion.
+  if (corrected)
     fs::copy_file(source / "cache/shutter.json", output / "cache/shutter.json");
-  }
   const std::array<cv::Mat, 2> domains{MaskDomain(scene.cameras[0]), MaskDomain(scene.cameras[1])};
-  for (const auto& masks : mask_sets)
-    for (const auto& image : scene.images) {
-      if (!selected.images[image.id].registered)
-        continue;
-      const auto name = std::to_string(image.id) + ".png";
-      const auto mask = output / masks / name;
-      fs::create_directories(mask.parent_path());
-      auto pixels = ReadImage(source / masks / name, cv::IMREAD_GRAYSCALE);
-      pixels.setTo(0, domains[image.camera] == 0);
-      WriteImage(mask, pixels);
-    }
+  for (const auto& image : scene.images) {
+    if (!selected.images[image.id].registered)
+      continue;
+    const auto name = std::to_string(image.id) + ".png";
+    const auto mask = output / "cache/masks" / name;
+    fs::create_directories(mask.parent_path());
+    auto pixels = ReadImage(source / "cache/masks" / name, cv::IMREAD_GRAYSCALE);
+    pixels.setTo(0, domains[image.camera] == 0);
+    WriteImage(mask, pixels);
+  }
   ExportBundle(scene, selected, output, output / "colmap", delivery.ply, delivery.voxel, result,
-               delivery.supervision, delivery.photos);
+               delivery.supervision);
   fs::rename(output, final_output);
   Log(args.command + ": " + report.at("reason").get<std::string>());
   std::cout << Json({{"work", final_output.u8string()},

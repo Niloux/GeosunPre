@@ -1,18 +1,11 @@
 #include "sfm/shutter.h"
 #include "frontend/frontend.h"
 #include "geometry/supervision.h"
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
-#include <deque>
-#include <fstream>
 #include <set>
 
 namespace geosun {
 namespace {
-// Rectification maps are solved on nodes this many pixels apart and interpolated between them;
-// the LAS range grid has one cell per node spacing.
-constexpr int GridStep = 8;
-constexpr double MinimumRange = .05, MaximumRange = 65.535;
+constexpr double MaximumRange = 65.535;
 constexpr double RotationBound = .05, ReadoutBound = .05;
 constexpr size_t MinimumImageHoldout = 16;
 constexpr double MinimumExplainedRotation = .1;
@@ -156,91 +149,6 @@ struct HoldoutErrors {
     images[image].push_back(error);
   }
 };
-// Push-pull fill of LAS range holes in inverse range, so missing surfaces take the nearby
-// geometry and regions without any record fall back to a distant range.
-cv::Mat FillRanges(const cv::Mat& range) {
-  std::vector<cv::Mat> value{cv::Mat::zeros(range.size(), CV_32FC1)},
-      weight{cv::Mat::zeros(range.size(), CV_32FC1)};
-  for (int y = 0; y < range.rows; ++y)
-    for (int x = 0; x < range.cols; ++x) {
-      const float r = range.at<float>(y, x);
-      if (r > 0 && std::isfinite(r)) {
-        value[0].at<float>(y, x) = 1.f / r;
-        weight[0].at<float>(y, x) = 1;
-      }
-    }
-  while (value.back().cols > 1 || value.back().rows > 1) {
-    const auto& v = value.back();
-    const auto& w = weight.back();
-    cv::Mat nv = cv::Mat::zeros((v.rows + 1) / 2, (v.cols + 1) / 2, CV_32FC1), nw = nv.clone();
-    for (int y = 0; y < nv.rows; ++y)
-      for (int x = 0; x < nv.cols; ++x) {
-        float sum = 0, total = 0;
-        for (int dy = 0; dy < 2; ++dy)
-          for (int dx = 0; dx < 2; ++dx) {
-            const int yy = 2 * y + dy, xx = 2 * x + dx;
-            if (yy < v.rows && xx < v.cols) {
-              sum += w.at<float>(yy, xx) * v.at<float>(yy, xx);
-              total += w.at<float>(yy, xx);
-            }
-          }
-        nv.at<float>(y, x) = total > 0 ? sum / total : 0;
-        nw.at<float>(y, x) = std::min(1.f, total);
-      }
-    value.push_back(nv);
-    weight.push_back(nw);
-  }
-  for (size_t level = value.size() - 1; level-- > 0;) {
-    cv::Mat up;
-    cv::resize(value[level + 1], up, value[level].size(), 0, 0, cv::INTER_LINEAR);
-    value[level] = weight[level].mul(value[level]) + (1 - weight[level]).mul(up);
-  }
-  cv::Mat millimetres(range.size(), CV_16UC1);
-  for (int y = 0; y < range.rows; ++y)
-    for (int x = 0; x < range.cols; ++x) {
-      const float inverse = value[0].at<float>(y, x);
-      const double r = inverse > 0 ? std::clamp(1. / inverse, MinimumRange, MaximumRange)
-                                   : MaximumRange;
-      millimetres.at<uint16_t>(y, x) = uint16_t(std::lround(r * 1000));
-    }
-  return millimetres;
-}
-double SampleRange(const cv::Mat& millimetres, double x, double y) {
-  x = std::clamp(x, 0., millimetres.cols - 1.);
-  y = std::clamp(y, 0., millimetres.rows - 1.);
-  const int x0 = std::min(int(x), millimetres.cols - 2 < 0 ? 0 : millimetres.cols - 2),
-            y0 = std::min(int(y), millimetres.rows - 2 < 0 ? 0 : millimetres.rows - 2);
-  const int x1 = std::min(x0 + 1, millimetres.cols - 1), y1 = std::min(y0 + 1, millimetres.rows - 1);
-  const double fx = x - x0, fy = y - y0;
-  auto at = [&](int yy, int xx) {
-    const uint16_t v = millimetres.at<uint16_t>(yy, xx);
-    return v ? v / 1000. : MaximumRange;
-  };
-  return (1 - fy) * ((1 - fx) * at(y0, x0) + fx * at(y0, x1)) +
-         fy * ((1 - fx) * at(y1, x0) + fx * at(y1, x1));
-}
-// Offset just past SOI and the leading APPn/COM segments; kept receives APP1-APP15 and COM.
-size_t MetadataEnd(const std::vector<uint8_t>& jpeg, std::vector<uint8_t>* kept) {
-  if (jpeg.size() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
-    throw std::runtime_error("Not a JPEG stream");
-  size_t at = 2;
-  while (at + 4 <= jpeg.size() && jpeg[at] == 0xFF) {
-    const uint8_t marker = jpeg[at + 1];
-    if (marker == 0xFF) {
-      ++at;
-      continue;
-    }
-    if ((marker < 0xE0 || marker > 0xEF) && marker != 0xFE)
-      break;
-    const size_t length = size_t(jpeg[at + 2]) << 8 | jpeg[at + 3];
-    if (length < 2 || at + 2 + length > jpeg.size())
-      throw std::runtime_error("Truncated JPEG metadata segment");
-    if (kept && marker != 0xE0)
-      kept->insert(kept->end(), jpeg.begin() + at, jpeg.begin() + at + 2 + length);
-    at += 2 + length;
-  }
-  return at;
-}
 }  // namespace
 Json MotionToJson(const ShutterMotion& motion, const Reconstruction& model) {
   Json images = Json::array();
@@ -526,115 +434,6 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   report["seconds"] = Seconds(started);
   return best;
 }
-Json PrepareRectification(const Scene& scene, const Reconstruction& model,
-                          const ShutterMotion& motion, const fs::path& work,
-                          const fs::path& directory, int workers) {
-  const auto started = Clock::now();
-  int size = 0;
-  for (const auto& camera : model.cameras)
-    size = std::max({size, camera.width, camera.height});
-  const int grid = (size + GridStep - 1) / GridStep;
-  fs::create_directories(directory / "ranges");
-  fs::create_directories(directory / "masks");
-  const std::array<cv::Mat, 2> domains{MaskDomain(scene.cameras[0]), MaskDomain(scene.cameras[1])};
-  std::vector<double> coverage;
-  std::deque<std::future<double>> jobs;
-  auto finish = [&] {
-    coverage.push_back(jobs.front().get());
-    jobs.pop_front();
-    if (coverage.size() % 64 == 0)
-      Log("Rolling-shutter rectification grids " + std::to_string(coverage.size()) + "/" +
-          std::to_string(model.Registered()));
-  };
-  LasRangeMaps(scene, model, grid, directory, [&](uint32_t id, cv::Mat range) {
-    if (jobs.size() >= size_t(std::max(1, workers)))
-      finish();
-    jobs.push_back(std::async(std::launch::async, [&, id, range = std::move(range)] {
-      const uint32_t lens = model.images[id].camera;
-      const auto& camera = model.cameras[lens];
-      const double radius = camera.Radius();
-      size_t inside = 0, measured = 0;
-      for (int y = 0; y < range.rows; ++y)
-        for (int x = 0; x < range.cols; ++x) {
-          const double dx = ((x + .5) * camera.width / range.cols - camera.params[2]) /
-                            camera.params[0],
-                       dy = ((y + .5) * camera.height / range.rows - camera.params[3]) /
-                            camera.params[1];
-          if (dx * dx + dy * dy <= radius * radius) {
-            ++inside;
-            measured += range.at<float>(y, x) > 0;
-          }
-        }
-      const auto millimetres = FillRanges(range);
-      WriteImage(directory / "ranges" / (std::to_string(id) + ".png"), millimetres);
-      auto mask = RectifyRaster(ReadImage(MaskPath(work, id), cv::IMREAD_GRAYSCALE), camera,
-                                motion, id, lens, millimetres, cv::INTER_NEAREST);
-      mask.setTo(0, domains[lens] == 0);
-      WriteImage(directory / "masks" / (std::to_string(id) + ".png"), mask);
-      return inside ? double(measured) / inside : 0.;
-    }));
-  });
-  while (!jobs.empty())
-    finish();
-  return {{"grid_step_px", GridStep},
-          {"range_grid_size", grid},
-          {"range_source", "nearest valid LAS record per grid cell, holes filled in inverse range"},
-          {"las_range_coverage", Statistics(coverage)},
-          {"images", coverage.size()},
-          {"seconds", Seconds(started)}};
-}
-cv::Mat RectifyRaster(const cv::Mat& source, const Camera& camera, const ShutterMotion& motion,
-                      uint32_t image, uint32_t lens, const cv::Mat& range_mm, int interpolation) {
-  if (source.cols != camera.width || source.rows != camera.height || range_mm.empty() ||
-      range_mm.type() != CV_16UC1)
-    throw std::runtime_error("Rolling-shutter rectification input differs from its camera");
-  const int w = camera.width, h = camera.height;
-  const int gw = (w + GridStep - 1) / GridStep + 1, gh = (h + GridStep - 1) / GridStep + 1;
-  const double sx = double(range_mm.cols) / w, sy = double(range_mm.rows) / h;
-  // Outside the valid fisheye domain the masks are 0; keep those pixels in place.
-  const double radius = camera.Radius() * 1.02;
-  cv::Mat nodes(gh, gw, CV_32FC2);
-  for (int j = 0; j < gh; ++j)
-    for (int i = 0; i < gw; ++i) {
-      const Eigen::Vector2d q(i * GridStep + .5, j * GridStep + .5);
-      const double dx = (q.x() - camera.params[2]) / camera.params[0],
-                   dy = (q.y() - camera.params[3]) / camera.params[1];
-      Eigen::Vector2d p = q;
-      if (dx * dx + dy * dy <= radius * radius) {
-        const Eigen::Vector3d reference =
-            SampleRange(range_mm, q.x() * sx - .5, q.y() * sy - .5) * camera.Ray(q);
-        for (int iteration = 0; iteration < 4; ++iteration)
-          p = camera.Project(
-              motion.Apply(image, lens, motion.Fraction(camera, p), reference));
-      }
-      nodes.at<cv::Vec2f>(j, i) = cv::Vec2f(float(p.x() - .5), float(p.y() - .5));
-    }
-  cv::Mat output(source.size(), source.type());
-  constexpr int strip = 256;
-  for (int y0 = 0; y0 < h; y0 += strip) {
-    const int rows = std::min(strip, h - y0);
-    cv::Mat map(rows, w, CV_32FC2);
-    for (int y = 0; y < rows; ++y) {
-      const double gy = double(y0 + y) / GridStep;
-      const int j = std::min(int(gy), gh - 2);
-      const float fy = float(gy - j);
-      auto* row = map.ptr<cv::Vec2f>(y);
-      const auto* top = nodes.ptr<cv::Vec2f>(j);
-      const auto* bottom = nodes.ptr<cv::Vec2f>(j + 1);
-      for (int x = 0; x < w; ++x) {
-        const double gx = double(x) / GridStep;
-        const int i = std::min(int(gx), gw - 2);
-        const float fx = float(gx - i);
-        row[x] = (1 - fy) * ((1 - fx) * top[i] + fx * top[i + 1]) +
-                 fy * ((1 - fx) * bottom[i] + fx * bottom[i + 1]);
-      }
-    }
-    cv::Mat destination = output.rowRange(y0, y0 + rows);
-    cv::remap(source, destination, map, cv::noArray(), interpolation, cv::BORDER_CONSTANT,
-              cv::Scalar::all(0));
-  }
-  return output;
-}
 double ShutterPointError(const Reconstruction& model, const ShutterMotion& motion,
                          const ModelPoint& point) {
   double error = 0;
@@ -750,21 +549,5 @@ ShutterMotion DeliveryShutterFromJson(const Json& value, const Scene& scene,
       throw std::runtime_error("Rolling-shutter translation differs from readout and velocity");
   }
   return motion;
-}
-void WriteRectifiedJpeg(const std::vector<uint8_t>& original, const cv::Mat& image,
-                        const fs::path& destination) {
-  std::vector<uint8_t> encoded, metadata;
-  if (!cv::imencode(".jpg", image, encoded, {cv::IMWRITE_JPEG_QUALITY, 95}))
-    throw std::runtime_error("Cannot encode rectified image");
-  MetadataEnd(original, &metadata);
-  const size_t body = MetadataEnd(encoded, nullptr);
-  std::ofstream stream(destination, std::ios::binary);
-  stream.write("\xFF\xD8", 2);
-  stream.write(reinterpret_cast<const char*>(metadata.data()), std::streamsize(metadata.size()));
-  stream.write(reinterpret_cast<const char*>(encoded.data() + body),
-               std::streamsize(encoded.size() - body));
-  stream.close();
-  if (!stream)
-    throw std::runtime_error("Cannot write rectified image: " + destination.u8string());
 }
 }  // namespace geosun
