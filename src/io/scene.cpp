@@ -297,42 +297,64 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las) {
     if (!positions.emplace(name, Position{week, sec, {x, y, z}}).second)
       throw std::runtime_error("Duplicate camera position: " + name);
   }
-  std::set<std::string> selected;
+  // Pose-bound JPEGs by file name; Image/L and Image/R hold only their own lens.
+  auto index = [&](const fs::path& folder, const std::string& lens) {
+    std::map<std::string, fs::path> files;
+    if (!fs::is_directory(folder))
+      return files;
+    for (const auto& row : fs::recursive_directory_iterator(folder)) {
+      if (!row.is_regular_file())
+        continue;
+      auto ext = row.path().extension().u8string();
+      std::transform(ext.begin(), ext.end(), ext.begin(),
+                     [](unsigned char c) { return char(std::tolower(c)); });
+      if (ext != ".jpg" && ext != ".jpeg")
+        continue;
+      const auto name = row.path().filename().u8string();
+      int frame;
+      std::string label;
+      TimeName(name, frame, label);
+      if ((label != "L" && label != "R") || !positions.count(name))
+        continue;
+      if (!lens.empty() && label != lens)
+        throw std::runtime_error("Image in wrong lens folder: " + row.path().u8string());
+      if (!files.emplace(name, row.path()).second)
+        throw std::runtime_error("Ambiguous exposure: " + name);
+    }
+    return files;
+  };
+  const auto originals = [&] {
+    auto files = index(input / "Image/L", "L");
+    files.merge(index(input / "Image/R", "R"));
+    return files;
+  }();
+  const auto enhanced = index(input / "Image/enhanced", "");
   std::set<std::pair<std::string, int>> frames;
-  for (const auto& row : fs::recursive_directory_iterator(input / "Image")) {
-    if (!row.is_regular_file())
-      continue;
-    auto ext = row.path().extension().u8string();
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c) { return char(std::tolower(c)); });
-    if (ext != ".jpg" && ext != ".jpeg")
-      continue;
-    const auto name = row.path().filename().u8string();
+  for (const auto& [name, position] : positions) {
     int frame;
     std::string label;
     const auto [week, seconds] = TimeName(name, frame, label);
-    if ((label != "L" && label != "R") || !positions.count(name))
+    if (label != "L" && label != "R")
       continue;
-    if (!selected.insert(name).second || !frames.emplace(label, frame).second)
+    // Enhanced photos take precedence; the delivered name keeps the lens folder layout.
+    const auto original = originals.find(name), better = enhanced.find(name);
+    if (original == originals.end() && better == enhanced.end())
+      throw std::runtime_error("Pose-bound image missing: " + name);
+    const auto path = better != enhanced.end() ? better->second : original->second;
+    const auto relative = original != originals.end()
+                              ? fs::relative(original->second, input / "Image").generic_u8string()
+                              : label + "/" + name;
+    if (!frames.emplace(label, frame).second)
       throw std::runtime_error("Ambiguous exposure: " + name);
-    const auto& position = positions.at(name);
     if (position.week != week)
       throw std::runtime_error("Image and CameraPos week differ");
     const uint32_t cid = label == "L" ? 0 : 1;
-    const auto header = ReadJpegMetadata(row.path());
+    const auto header = ReadJpegMetadata(path);
     const auto& c = s.cameras[cid];
     if (header.width != c.width || header.height != c.height || header.orientation != 1)
-      throw std::runtime_error("Unexpected JPEG size/orientation: " + name);
-    s.images.push_back({0, cid, fs::relative(row.path(), input / "Image").generic_u8string(),
-                        fs::absolute(row.path()), frame, week, seconds, position.seconds,
-                        position.center, FileMetadata(row.path())});
-  }
-  for (const auto& [name, p] : positions) {
-    int frame;
-    std::string label;
-    TimeName(name, frame, label);
-    if ((label == "L" || label == "R") && !selected.count(name))
-      throw std::runtime_error("Pose-bound image missing: " + name);
+      throw std::runtime_error("Unexpected JPEG size/orientation: " + path.u8string());
+    s.images.push_back({0, cid, relative, fs::absolute(path), frame, week, seconds,
+                        position.seconds, position.center, FileMetadata(path)});
   }
   if (s.images.size() < 3)
     throw std::runtime_error("Too few eligible L/R exposures");
@@ -342,20 +364,9 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las) {
   });
   for (uint32_t i = 0; i < s.images.size(); ++i)
     s.images[i].id = i;
-  s.las = chosen_las;
-  if (s.las.empty())
-    for (const auto& row : fs::directory_iterator(input / "ResultOut")) {
-      auto ext = row.path().extension().u8string();
-      std::transform(ext.begin(), ext.end(), ext.begin(),
-                     [](unsigned char c) { return char(std::tolower(c)); });
-      if (ext == ".las") {
-        if (!s.las.empty())
-          throw std::runtime_error("Multiple LAS inputs; select --las");
-        s.las = row.path();
-      }
-    }
-  if (s.las.empty())
-    throw std::runtime_error("Missing ResultOut/*.las");
+  s.las = chosen_las.empty() ? input / "ResultOut" / fs::u8path(stem + ".las") : chosen_las;
+  if (!fs::is_regular_file(s.las))
+    throw std::runtime_error("Missing LAS: " + s.las.u8string());
   s.las = fs::absolute(s.las);
   const auto nav = input / fs::u8path(stem + "_pos.txt"),
              enh = input / fs::u8path(stem + "_pos_ENH.txt");
