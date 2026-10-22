@@ -16,10 +16,11 @@ struct Scene {
   std::array<Camera, 2> cameras;
   std::vector<Exposure> images;
   Json sources;
+  bool enhanced = false;  // Image/enhanced copies replace same-name originals
   Json ToJson() const;
   static Scene FromJson(const Json& value);
 };
-Scene ReadScene(const fs::path& input, const fs::path& las = {});
+Scene ReadScene(const fs::path& input, const fs::path& las = {}, bool enhanced = false);
 cv::Mat ReadImage(const fs::path& path, int mode);
 void WriteImage(const fs::path& path, const cv::Mat& image);
 struct ResizeCoefficients {

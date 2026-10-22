@@ -5,6 +5,7 @@
   "calibration_tracks": "all",
   "refine": false,
   "rolling_shutter": true,
+  "enhanced_photos": false,
   "quality_median_px": 2.0,
   "quality_p90_px": 4.0,
   "las_support_fraction": 0.25,

@@ -76,12 +76,12 @@ Json Settings(const fs::path& file) {
   if (!result.at("sfm_repair_rounds").is_number_integer() || result.at("sfm_repair_rounds") < 0 ||
       result.at("sfm_repair_rounds") > 2)
     throw std::runtime_error("sfm_repair_rounds must be an integer from 0 to 2");
-  for (const auto* key : {"refine", "rolling_shutter"})
+  for (const auto* key : {"refine", "rolling_shutter", "enhanced_photos"})
     if (!result.at(key).is_boolean())
       throw std::runtime_error(std::string(key) + " must be a boolean");
   for (const auto& [key, value] : result.items())
     if (key != "workers" && key != "calibration_tracks" && key != "sfm_repair_rounds" &&
-        key != "refine" && key != "rolling_shutter" &&
+        key != "refine" && key != "rolling_shutter" && key != "enhanced_photos" &&
         (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() <= 0))
       throw std::runtime_error("Expected positive numeric setting: " + key);
   if (result.at("calibration_tracks") != "all" && result.at("calibration_tracks") != "stable")
@@ -389,7 +389,9 @@ void Run(const Arguments& args) {
                               ? fs::path()
                               : fs::u8path(state.value.at("scene").at("las").get<std::string>()))
                        : args.Path("--las");
-  const Scene scene = ReadScene(input, las);
+  // Work directories frozen before this setting existed read as original photos and
+  // fail the scene comparison below if they had used enhanced copies.
+  const Scene scene = ReadScene(input, las, settings.value("enhanced_photos", false));
   ReadLasHeader(scene.las);
   const auto prepared = scene.ToJson();
   if (state.value.empty()) {
@@ -518,7 +520,7 @@ void Postprocess(const Arguments& args) {
                 std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
     fs::rename(output, archived);
   }
-  if (ReadScene(scene.input, scene.las).ToJson() != scene.ToJson())
+  if (ReadScene(scene.input, scene.las, scene.enhanced).ToJson() != scene.ToJson())
     throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
   const auto original = ReadJson(source / "result.json");
   const bool corrected =

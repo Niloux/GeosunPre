@@ -58,7 +58,7 @@ Spirula 直接读取交付包的 `depths/`、`normals/`。训练时显式设置 
 .\build_vulkan\spirula.exe train 3dgs --data "交付目录" --primitive 3dgut --mask-mode segment_and_ignore --input-depth-is-ray-depth 1 --depth-supervision-weight 0.01 --normal-supervision-weight 0.002 --use-bilateral-grid-for-geometry 0
 ```
 
-默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。首次运行加 `--refine`，或在配置中设置 `"refine": true`，会在 `align` 与 `shutter` 之间增加原图精修；默认 `false`。配置 `"rolling_shutter": false` 去掉卷帘校正阶段，默认 `true`。这些选择随配置冻结，续跑自动沿用，改变选择须使用新工作目录。
+默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。首次运行加 `--refine`，或在配置中设置 `"refine": true`，会在 `align` 与 `shutter` 之间增加原图精修；默认 `false`。配置 `"rolling_shutter": false` 去掉卷帘校正阶段，默认 `true`。配置 `"enhanced_photos": true` 改用 `Image/enhanced` 照片，默认 `false` 只用原图。这些选择随配置冻结，续跑自动沿用，改变选择须使用新工作目录。
 
 `run --work WORK` 复用已完成阶段并恢复检查点；`run --work WORK --stage 阶段` 单独执行指定阶段，须先完成前置阶段。`--stage refine` 只用于已启用精修的工作目录。`prepare` 检查真实输入、相机和导航转换，不加载模型。
 

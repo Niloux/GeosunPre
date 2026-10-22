@@ -197,6 +197,7 @@ Json Scene::ToJson() const {
           {"las", las.u8string()},
           {"cameras", {cameras[0].ToJson(), cameras[1].ToJson()}},
           {"images", exposures},
+          {"photos", enhanced ? "enhanced" : "original"},
           {"sources", sources}};
 }
 Scene Scene::FromJson(const Json& v) {
@@ -207,6 +208,11 @@ Scene Scene::FromJson(const Json& v) {
   s.project = fs::u8path(v.at("project").get<std::string>());
   s.las = fs::u8path(v.at("las").get<std::string>());
   s.sources = v.at("sources");
+  // Scenes written before the choice existed always preferred enhanced copies.
+  const auto photos = v.value("photos", "enhanced");
+  if (photos != "enhanced" && photos != "original")
+    throw std::runtime_error("Unknown scene photos: " + photos);
+  s.enhanced = photos == "enhanced";
   for (int i = 0; i < 2; ++i)
     s.cameras[i] = Camera::FromJson(v.at("cameras")[i]);
   for (const auto& row : v.at("images")) {
@@ -218,9 +224,10 @@ Scene Scene::FromJson(const Json& v) {
   }
   return s;
 }
-Scene ReadScene(const fs::path& input, const fs::path& chosen_las) {
+Scene ReadScene(const fs::path& input, const fs::path& chosen_las, bool enhanced_photos) {
   Scene s;
   s.input = fs::weakly_canonical(input);
+  s.enhanced = enhanced_photos;
   for (const auto& row : fs::directory_iterator(input))
     if (row.path().extension() == ".pro") {
       if (!s.project.empty())
@@ -328,7 +335,8 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las) {
     files.merge(index(input / "Image/R", "R"));
     return files;
   }();
-  const auto enhanced = index(input / "Image/enhanced", "");
+  const auto enhanced = enhanced_photos ? index(input / "Image/enhanced", "")
+                                        : std::map<std::string, fs::path>{};
   std::set<std::pair<std::string, int>> frames;
   for (const auto& [name, position] : positions) {
     int frame;
@@ -336,7 +344,7 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las) {
     const auto [week, seconds] = TimeName(name, frame, label);
     if (label != "L" && label != "R")
       continue;
-    // Enhanced photos take precedence; the delivered name keeps the lens folder layout.
+    // Enabled enhanced photos take precedence; the delivered name keeps the lens folder layout.
     const auto original = originals.find(name), better = enhanced.find(name);
     if (original == originals.end() && better == enhanced.end())
       throw std::runtime_error("Pose-bound image missing: " + name);

@@ -56,6 +56,8 @@ int Main(const std::vector<std::string>& argv) {
              "    refine is disabled by default; enable with --refine or config refine=true\n"
              "    shutter (rolling-shutter correction) runs by default; config "
              "rolling_shutter=false removes it\n"
+             "    original Image/L and Image/R photos are used; config enhanced_photos=true "
+             "prefers Image/enhanced\n"
              "  geosunpre prepare --input INPUT --work WORK [--refine]\n"
              "  geosunpre export --work WORK [--output DIR] [--no-ply] [--ply-voxel METRES] "
              "[--no-las-supervision]\n"
