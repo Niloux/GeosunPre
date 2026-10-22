@@ -14,7 +14,7 @@
 
 namespace geosun {
 namespace {
-constexpr int Version = 2;
+constexpr int Version = 3;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
 constexpr double MaxTheta = 1.396263401595464;
@@ -355,21 +355,65 @@ __device__ double3 ReferenceRay(double3 ray, int x, int y, int w, int h, const P
   return make_double3(p.x / length, p.y / length, p.z / length);
 }
 __device__ bool SurfacePoint(const float* depth, const double3* rays, int x, int y, int w, int h,
-                             double distance, double3 center, double3& delta,
+                             double reach, double3 center, double3& delta,
                              const Projection& camera) {
   const float d = At(depth, x, y, w, h);
-  if (!d || fabs(d - distance) > .02 * distance + .01)
+  if (!d)
     return false;
   const auto ray = rays[y * w + x];
   if (Dot(ray, ray) < .5)
     return false;
   delta = Sub(ReferencePoint(make_double3(d * ray.x, d * ray.y, d * ray.z), x, y, w, h, camera),
               center);
+  return Dot(delta, delta) <= reach * reach;
+}
+// Least-squares ray displacement z = a x + b y + c over the selected tangent-plane samples.
+__device__ bool FitPlane(const double* px, const double* py, const double* pz, const bool* use,
+                         int count, double& a, double& b, double& c) {
+  double sx = 0, sy = 0, sz = 0, sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0;
+  int used = 0;
+  for (int i = 0; i < count; ++i) {
+    if (!use[i])
+      continue;
+    sx += px[i];
+    sy += py[i];
+    sz += pz[i];
+    sxx += px[i] * px[i];
+    sxy += px[i] * py[i];
+    syy += py[i] * py[i];
+    sxz += px[i] * pz[i];
+    syz += py[i] * pz[i];
+    ++used;
+  }
+  if (used < 8)
+    return false;
+  sxx -= sx * sx / used;
+  sxy -= sx * sy / used;
+  syy -= sy * sy / used;
+  sxz -= sx * sz / used;
+  syz -= sy * sz / used;
+  const double trace = sxx + syy, det = sxx * syy - sxy * sxy;
+  // Reject line-like support, including scan stripes with no surface extent across them.
+  if (trace <= 1e-10 || det <= .02 * trace * trace)
+    return false;
+  a = (sxz * syy - syz * sxy) / det;
+  b = (syz * sxx - sxz * sxy) / det;
+  c = (sz - a * sx - b * sy) / used;
   return true;
 }
+__device__ double Median(const double* values, int count) {
+  double sorted[49];
+  for (int i = 0; i < count; ++i) {
+    int j = i;
+    for (; j > 0 && sorted[j - 1] > values[i]; --j)
+      sorted[j] = sorted[j - 1];
+    sorted[j] = values[i];
+  }
+  return count % 2 ? sorted[count / 2] : .5 * (sorted[count / 2 - 1] + sorted[count / 2]);
+}
 __device__ bool Normal(const float* depth, const double3* rays, int x, int y, int w, int h,
-                       int radius, double distance, double3& normal, double tolerance,
-                       const Projection& camera) {
+                       int radius, double distance, double focal, double3& normal,
+                       double tolerance, const Projection& camera) {
   const auto source_ray = rays[y * w + x];
   const auto ray = ReferenceRay(source_ray, x, y, w, h, camera);
   const double3 center = ReferencePoint(
@@ -378,55 +422,58 @@ __device__ bool Normal(const float* depth, const double3* rays, int x, int y, in
   const double tangent_length = hypot(ray.x, ray.z);
   const double3 u = make_double3(ray.z / tangent_length, 0, -ray.x / tangent_length),
                 v = make_double3(ray.y * u.z, ray.z * u.x - ray.x * u.z, -ray.y * u.x);
-  // Fit ray displacement over the tangent plane. Missing samples are omitted rather than
-  // requiring complete 3x3 patches at four particular positions.
-  double sx = 0, sy = 0, sz = 0, sxx = 0, sxy = 0, syy = 0, sxz = 0, syz = 0;
+  // Samples come from a 3D ball holding the grid footprint on any surface within the
+  // incidence limit, so oblique planes keep their support; other surfaces are trimmed below.
+  const double band = 2 * tolerance,
+               reach = 1.4142135623730951 * radius * distance / (focal * MinIncidence) + band;
+  double px[49], py[49], pz[49], residual[49];
+  bool use[49];
   int count = 0;
   for (int dy = -3; dy <= 3; ++dy)
     for (int dx = -3; dx <= 3; ++dx) {
       double3 delta;
-      if (!SurfacePoint(depth, rays, x + dx * radius / 3, y + dy * radius / 3, w, h, distance,
+      if (!SurfacePoint(depth, rays, x + dx * radius / 3, y + dy * radius / 3, w, h, reach,
                         center, delta, camera))
         continue;
-      const double px = Dot(delta, u), py = Dot(delta, v), pz = Dot(delta, ray);
-      sx += px;
-      sy += py;
-      sz += pz;
-      sxx += px * px;
-      sxy += px * py;
-      syy += py * py;
-      sxz += px * pz;
-      syz += py * pz;
-      ++count;
+      px[count] = Dot(delta, u);
+      py[count] = Dot(delta, v);
+      pz[count] = Dot(delta, ray);
+      use[count++] = true;
     }
   if (count < 8)
     return false;
-  sxx -= sx * sx / count;
-  sxy -= sx * sy / count;
-  syy -= sy * sy / count;
-  sxz -= sx * sz / count;
-  syz -= sy * sz / count;
-  const double trace = sxx + syy, det = sxx * syy - sxy * sxy;
-  // Reject line-like support, including scan stripes with no surface extent across them.
-  if (trace <= 1e-10 || det <= .02 * trace * trace)
+  // Trim by 3 robust sigmas of the current fit, then settle on the fixed inlier band.
+  double a, b, c, length;
+  for (int pass = 0; pass < 4; ++pass) {
+    if (!FitPlane(px, py, pz, use, count, a, b, c))
+      return false;
+    length = sqrt(1 + a * a + b * b);
+    for (int i = 0; i < count; ++i)
+      residual[i] = fabs(pz[i] - a * px[i] - b * py[i] - c) / length;
+    const double limit = pass < 3 ? fmax(band, 3 * 1.4826 * Median(residual, count)) : band;
+    for (int i = 0; i < count; ++i)
+      use[i] = residual[i] <= limit;
+  }
+  if (!FitPlane(px, py, pz, use, count, a, b, c))
     return false;
-  const double a = (sxz * syy - syz * sxy) / det,
-               b = (syz * sxx - sxz * sxy) / det,
-               c = (sz - a * sx - b * sy) / count,
-               length = sqrt(1 + a * a + b * b);
-  if (fabs(c) > tolerance * length)
+  length = sqrt(1 + a * a + b * b);
+  // The centre sample lies at the tangent origin, so |c| / length is its plane distance.
+  if (fabs(c) > band * length)
+    return false;
+  double squares = 0;
+  int inliers = 0;
+  for (int i = 0; i < count; ++i) {
+    const double r = fabs(pz[i] - a * px[i] - b * py[i] - c) / length;
+    if (r <= band) {
+      squares += r * r;
+      ++inliers;
+    }
+  }
+  if (inliers < 8 || inliers < .6 * count || squares > tolerance * tolerance * inliers)
     return false;
   normal = make_double3((a * u.x + b * v.x - ray.x) / length,
                         (a * u.y + b * v.y - ray.y) / length,
                         (a * u.z + b * v.z - ray.z) / length);
-  for (int dy = -3; dy <= 3; ++dy)
-    for (int dx = -3; dx <= 3; ++dx) {
-      double3 delta;
-      if (SurfacePoint(depth, rays, x + dx * radius / 3, y + dy * radius / 3, w, h, distance,
-                       center, delta, camera) &&
-          fabs(Dot(normal, delta) + c / length) > tolerance)
-        return false;
-    }
   return true;
 }
 __global__ void Encode(const float* depth, const double3* rays, const uint8_t* edges,
@@ -444,10 +491,10 @@ __global__ void Encode(const float* depth, const double3* rays, const uint8_t* e
   millimetres[i] = uint16_t(max(1, min(65535, int(d * 1000. + .5))));
   const int radius = max(3, min(24, int(focal * .04 / d + .5)));
   double3 normal, coarse;
-  if (!Normal(depth, rays, x, y, w, h, radius, d, normal, .01, camera) ||
+  if (!Normal(depth, rays, x, y, w, h, radius, d, focal, normal, .01, camera) ||
       -Dot(normal, ReferenceRay(rays[i], x, y, w, h, camera)) < MinIncidence)
     return;
-  if (!Normal(depth, rays, x, y, w, h, radius * 2, d, coarse, .015, camera) ||
+  if (!Normal(depth, rays, x, y, w, h, radius * 2, d, focal, coarse, .015, camera) ||
       Dot(normal, coarse) < .984807753012208)
     return;
   if (camera.rolling) {
@@ -748,15 +795,20 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"normal_encoding", "round(127.5 * (n + 1))"},
           {"invalid_normal_rgb", {0, 0, 0}},
           {"depth_validity", "occlusion_boundary_and_local_depth_support"},
-          {"normal_estimator", motion ? "readout_reference_two_scale_tangent_plane_least_squares"
-                                      : "two_scale_tangent_plane_least_squares"},
+          {"normal_estimator", motion ? "readout_reference_two_scale_robust_tangent_plane"
+                                      : "two_scale_robust_tangent_plane"},
+          {"normal_neighbourhood", "3d_ball_of_grid_footprint_at_minimum_incidence"},
           {"normal_grid_size", 7},
           {"normal_minimum_samples", 8},
+          {"normal_minimum_inlier_fraction", .6},
+          {"normal_trim_robust_sigmas", 3},
           {"minimum_abs_normal_dot_ray", MinIncidence},
           {"surface_radius_m", .04},
           {"normal_angle_limit_degrees", 10},
-          {"fine_plane_limit_m", .01},
-          {"coarse_plane_limit_m", .015},
+          {"fine_plane_rms_limit_m", .01},
+          {"coarse_plane_rms_limit_m", .015},
+          {"fine_inlier_band_m", .02},
+          {"coarse_inlier_band_m", .03},
           {"depth_pixels", depth_pixels},
           {"normal_pixels", normal_pixels},
           {"images", images},
@@ -764,7 +816,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
 }
 void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
                          const Json& photos, const Json& summary) {
-  if ((summary.at("version") != 1 && summary.at("version") != Version) ||
+  if (summary.at("version") < 1 || summary.at("version") > Version ||
       summary.at("depth_type") != "ray_distance" ||
       summary.at("depth_format") != "uint16_png_mm" || summary.at("normal_format") != "rgb8_png" ||
       summary.at("normal_frame") != "opencv_camera_facing_camera" ||
