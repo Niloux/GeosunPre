@@ -14,7 +14,7 @@
 
 namespace geosun {
 namespace {
-constexpr int Version = 3;
+constexpr int Version = 4;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
 constexpr double MaxTheta = 1.396263401595464;
@@ -279,28 +279,31 @@ __global__ void Fill(const float* input, float* output, const uint8_t* mask, int
   if (mask[i] && !d && count >= 6 && hi - lo <= .02f * lo + .01f)
     output[i] = sum / count;
 }
+// Cull leaves no depth jump inside a 5x5 window, so occlusions are found on the supported
+// projection before culling: a background pixel a clear step behind a supported foreground
+// pixel seeds the margin. The step exceeds the depth ramp across two pixels of oblique
+// floors, ceilings and side walls, so those surfaces do not seed.
 __global__ void Edges(const float* depth, const uint8_t* mask, uint8_t* edges, int w, int h) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= w * h)
     return;
   const int x = i % w, y = i / w;
-  float lo = float(MaxDepth), hi = 0;
+  float near = float(MaxDepth);
   bool boundary = !mask[i];
-  for (int dy = -1; dy <= 1; ++dy)
-    for (int dx = -1; dx <= 1; ++dx) {
+  for (int dy = -2; dy <= 2; ++dy)
+    for (int dx = -2; dx <= 2; ++dx) {
       const int xx = x + dx, yy = y + dy;
+      const bool adjacent = abs(dx) <= 1 && abs(dy) <= 1;
       if (xx < 0 || yy < 0 || xx >= w || yy >= h) {
-        boundary = true;
+        boundary = boundary || adjacent;
         continue;
       }
-      boundary = boundary || !mask[yy * w + xx];
+      boundary = boundary || (adjacent && !mask[yy * w + xx]);
       const float v = At(depth, xx, yy, w, h);
-      if (v > 0) {
-        lo = fminf(lo, v);
-        hi = fmaxf(hi, v);
-      }
+      if (v > 0 && mask[yy * w + xx])
+        near = fminf(near, v);
     }
-  edges[i] = boundary || hi - lo > .025f * lo + .02f;
+  edges[i] = boundary || At(depth, x, y, w, h) > near * 1.1f + .05f;
 }
 __global__ void Dilate(const uint8_t* input, uint8_t* output, int w, int h, int radius,
                          bool horizontal) {
@@ -328,6 +331,16 @@ __device__ bool DepthSupported(const float* depth, int x, int y, int w, int h, d
         return true;
     }
   return false;
+}
+// Projected pixels without local depth support are dropped before culling, so an isolated
+// outlier neither culls the surface around it nor seeds a boundary margin.
+__global__ void Isolate(const float* input, float* output, int w, int h) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= w * h)
+    return;
+  const int x = i % w, y = i / w;
+  const float d = At(input, x, y, w, h);
+  output[i] = d && DepthSupported(input, x, y, w, h, d) ? d : 0;
 }
 __device__ double3 ReadoutInverse(double3 w, double3 p) {
   const double dot = Dot(w, p), den = 1 + Dot(w, w);
@@ -726,12 +739,13 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         auto* filtered = static_cast<float*>(clean.data);
         auto* scratch = static_cast<float*>(filled.data);
         const auto* keep = static_cast<const uint8_t*>(mask.data);
-        Cull<<<blocks, 256, 0, stream>>>(raw_depth, filtered, keep, w, h);
+        Isolate<<<blocks, 256, 0, stream>>>(raw_depth, scratch, w, h);
+        Cull<<<blocks, 256, 0, stream>>>(scratch, filtered, keep, w, h);
+        Edges<<<blocks, 256, 0, stream>>>(scratch, keep, static_cast<uint8_t*>(edge.data), w, h);
         for (int pass = 0; pass < 2; ++pass) {
           Fill<<<blocks, 256, 0, stream>>>(filtered, scratch, keep, w, h);
           std::swap(filtered, scratch);
         }
-        Edges<<<blocks, 256, 0, stream>>>(filtered, keep, static_cast<uint8_t*>(edge.data), w, h);
         Dilate<<<blocks, 256, 0, stream>>>(static_cast<const uint8_t*>(edge.data),
                                            static_cast<uint8_t*>(dilated.data), w, h,
                                            options.boundary, true);
@@ -794,7 +808,9 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"normal_frame", "opencv_camera_facing_camera"},
           {"normal_encoding", "round(127.5 * (n + 1))"},
           {"invalid_normal_rgb", {0, 0, 0}},
-          {"depth_validity", "occlusion_boundary_and_local_depth_support"},
+          {"depth_validity", "isolated_outlier_removal_occlusion_boundary_and_local_depth_support"},
+          {"depth_support_pixels", 4},
+          {"occlusion_step", "background beyond 1.1 x foreground + 0.05 m within 5x5"},
           {"normal_estimator", motion ? "readout_reference_two_scale_robust_tangent_plane"
                                       : "two_scale_robust_tangent_plane"},
           {"normal_neighbourhood", "3d_ball_of_grid_footprint_at_minimum_incidence"},
