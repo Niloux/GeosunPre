@@ -346,6 +346,8 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   }
   quality["registration"] = registration;
   WriteJson(pending / "quality.json", quality);
+  // Stage reports travel with the delivery; production runs remove the work directory.
+  WriteJson(pending / "result.json", report);
   if (include_ply)
     WriteJson(pending / "initialization.json", initialization);
   Json sizes = Json::object();

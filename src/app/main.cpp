@@ -20,11 +20,8 @@ int Main(const std::vector<std::string>& argv) {
     else if (args.command == "refine" || args.command == "cleanup")
       Postprocess(args);
     else if (args.command == "check") {
-      args.Validate({"--output", "--work"});
-      std::cout << CheckBundle(args.Get("--output").empty() ? args.Path("--work") / "colmap"
-                                                            : args.Path("--output"))
-                       .dump(2)
-                << '\n';
+      args.Validate({"--output"});
+      std::cout << CheckBundle(args.Path("--output")).dump(2) << '\n';
     } else if (args.command == "info") {
       args.Validate({});
       auto info = BuildInfo();
@@ -49,8 +46,12 @@ int Main(const std::vector<std::string>& argv) {
       std::cout
           << "GeosunPre " << BuildVersion
           << " - native dual-fisheye/LAS reconstruction\n"
-             "  geosunpre run --input INPUT --work WORK [--models MODELS] [--config JSON] "
-             "[--refine] [--no-las-supervision]\n"
+             "  geosunpre run --input INPUT [--output OUT] [--work WORK] [--debug] "
+             "[--models MODELS] [--config JSON] [--refine] [--no-las-supervision]\n"
+             "    the delivery is written directly into OUT (default output/<input name>)\n"
+             "    production (default): work and cache live in OUT.work and are removed once "
+             "the delivery is published; an interrupted run resumes with the same command\n"
+             "    --debug keeps the work directory (default work/<input name>) and its cache\n"
              "  geosunpre run --work WORK [--stage "
              "prepare|masks|features|matches|sfm|align|refine|shutter|cleanup|export]\n"
              "    refine is disabled by default; enable with --refine or config refine=true\n"
@@ -58,13 +59,15 @@ int Main(const std::vector<std::string>& argv) {
              "rolling_shutter=false removes it\n"
              "    original Image/L and Image/R photos are used; config enhanced_photos=true "
              "prefers Image/enhanced\n"
-             "  geosunpre prepare --input INPUT --work WORK [--refine]\n"
-             "  geosunpre export --work WORK [--output DIR] [--no-ply] [--ply-voxel METRES] "
+             "  geosunpre prepare --input INPUT [--output OUT] [--work WORK] [--debug] "
+             "[--refine]\n"
+             "  geosunpre export --work WORK --output OUT [--no-ply] [--ply-voxel METRES] "
              "[--no-las-supervision]\n"
-             "  geosunpre refine --work WORK --output NEW_WORK [--workers N] [--no-ply] "
-             "[--ply-voxel METRES] [--no-las-supervision]\n"
-             "  geosunpre cleanup --work WORK --output NEW_WORK [--workers N] [--no-ply] "
-             "[--ply-voxel METRES] [--no-las-supervision]\n"
+             "  geosunpre refine --work WORK --output OUT [--new-work NEW_WORK] [--debug] "
+             "[--workers N] [--no-ply] [--ply-voxel METRES] [--no-las-supervision]\n"
+             "  geosunpre cleanup --work WORK --output OUT [--new-work NEW_WORK] [--debug] "
+             "[--workers N] [--no-ply] [--ply-voxel METRES] [--no-las-supervision]\n"
+             "    export, refine and cleanup read the cache of a --debug work directory\n"
              "    LAS depth/normal supervision is enabled for run/export/refine/cleanup\n"
              "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS] "
              "[--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"

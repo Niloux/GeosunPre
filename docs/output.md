@@ -1,5 +1,7 @@
 # COLMAP 与 PLY 交付
 
+交付直接位于 `--output` 根目录，下游（LFS、Spirula）的数据路径即为该目录。
+
 ```text
 OUTPUT/
   images/{L,R}/**.JPG
@@ -13,6 +15,7 @@ OUTPUT/
   initialization.json
   supervision.json            # 默认生成，--no-las-supervision 省略
   rolling_shutter.json        # 卷帘校正被采用时生成
+  result.json                 # 各阶段报告，与工作目录 result.json 相同，不参与 check
 ```
 
 COLMAP 小端二进制，`OPENCV_FISHEYE` 模型编号 5、8 个参数。相机 ID 1、2；每幅图像独立 frame，使用镜头对应的一传感器 rig。内部索引从 0 开始；仅导出已注册照片，按原输入顺序将图像/frame ID 连续重编号为 1 到注册数量，轨迹中的图像引用同步转换，内部缓存编号保持不变。
@@ -41,7 +44,7 @@ quality.calibration 保存两镜头的初始与最终内参、主点偏移，以
 
 quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 P90，tracks_at_least_3、tracks_at_least_8 保存至少 3、8 次观测的点数，便于结合每图观测数及 occupied_cells 比较配对策略的覆盖。
 
-工作目录 `result.json` 的 joint 保存联合优化候选的完整质量、点位移统计、逐图退化明细、各项接受条件及 failed_checks；候选被拒绝时保留所选原模型，验收阈值不因诊断而放宽。
+`result.json` 的 joint 保存联合优化候选的完整质量、点位移统计、逐图退化明细、各项接受条件及 failed_checks；候选被拒绝时保留所选原模型，验收阈值不因诊断而放宽。
 
 默认在 LAS 对齐后执行卷帘快门校正和独立稀疏点清理，再导出最终所选模型；原图精修默认关闭，`--refine` 或配置 `"refine": true` 在卷帘校正前启用。`result.json` 的 alignment、joint、sfm 是各阶段原报告；refinement 保存精修的启用状态、留出误差、同组 LAS 平面误差及相机优化验收；shutter 保存读出时间、读出转动与平移统计、各镜头读出一致性、留出误差、同组 LAS 平面误差、观测换算位移、各项检查及 used；cleanup 单独保存稀疏点清理与验收。关闭精修时 refinement.enabled=false，且不生成精修缓存；配置 `"rolling_shutter": false` 时 shutter.enabled=false。quality 与 navigation_error_m 更新为最终模型统计。
 

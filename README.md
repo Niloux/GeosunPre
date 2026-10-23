@@ -9,7 +9,7 @@
 ```powershell
 .\build.ps1
 .\prepare-models.ps1
-.\run.ps1 run --input "D:/数据/场景" --work "work/场景"
+.\run.ps1 run --input "D:/数据/场景" --output "D:/成果/场景"
 ```
 
 这就是完整的默认流程。构建始终使用当前源码；GPU 预处理、特征颜色缓存、鱼眼 PnP、解析 BA 导数和迭代 Schur 优化均默认启用。
@@ -27,19 +27,26 @@
 ## 日常运行
 
 ```powershell
+.\run.ps1 run --input "D:/数据/场景" --output "D:/成果/场景"
+.\run.ps1 run --input "D:/数据/场景" --output "D:/成果/场景" --work "work/场景" --debug
 .\run.ps1 run --work "work/场景"
-.\run.ps1 prepare --input "D:/数据/场景" --work "work/场景"
-.\run.ps1 export --work "work/场景" --output "D:/成果/场景"
+.\run.ps1 export --work "work/场景" --output "D:/成果/场景-重新导出"
 .\run.ps1 check --output "D:/成果/场景"
 .\run.ps1 info
 ```
 
-默认交付 `WORK/colmap/`，包含照片（卷帘校正采用时为校正到参考位姿的照片，否则为原图）、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及 LAS 深度和法向监督图。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。完整结构见[输出约定](docs/output.md)。
+交付直接写入 `--output` 根目录（默认 `output/<输入目录名>`），不再有 `colmap/` 子目录。
+
+**生产模式**（默认）：工作目录及缓存放在 `OUT.work`（或 `--work` 指定的目录），交付发布并回读校验后整个删除，最后只剩交付目录。中途失败时保留工作目录，以相同命令重跑即可续跑，成功后再删除。交付目录已存在而没有对应工作目录时拒绝重跑。
+
+**调试模式**（`--debug`）：工作目录（默认 `work/<输入目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`、`refine`、`cleanup`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。旧版工作目录按调试模式处理，续跑时须用 `--output` 指定交付目录。
+
+交付包含照片（卷帘校正采用时为校正到参考位姿的照片，否则为原图）、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及 LAS 深度和法向监督图。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。完整结构见[输出约定](docs/output.md)。
 
 `run` 的导出阶段及独立 `export`、`refine`、`cleanup` 默认从原始有效 LAS 给已注册照片生成 Spirula 可读取的深度和法向图。已有工作目录可以直接导出到新目录，无需重跑重建：
 
 ```powershell
-.\run.ps1 export --work "work/场景" --output "work/场景-supervised"
+.\run.ps1 export --work "work/场景" --output "D:/成果/场景-supervised"
 ```
 
 旧的 `--las-supervision` 显式开启参数仍可使用，与 `--no-las-supervision` 互斥。旧交付包保持原样；给旧结果补监督或改变导出选项时使用新交付目录。续跑已有无监督交付时，可指定新 `--output`，或加 `--no-las-supervision` 复用原包。
@@ -73,7 +80,7 @@ Spirula 直接读取交付包的 `depths/`、`normals/`。训练时显式设置 
 | `refine` 可选原图精修 | 原始分辨率图块匹配及闭环检查，联合优化相机、共享内参和可靠轨迹；通过留出观测验证后采用，否则保留对齐模型 | `cache/refined.bin`、`cache/refinement.json`、`cache/refinement_result.json` |
 | `shutter` 卷帘快门校正 | 联合估计每幅照片读出期间的转动、每个镜头的读出时间，以及相机、点和共享内参；验收后把观测换算到中间行时刻的全局快门成像，否则保留上一步模型 | `cache/shutter.bin`、`cache/shutter.json`、`cache/shutter_result.json` |
 | `cleanup` 稀疏点清理 | 对上一步所选模型独立清理、验收；精修关闭或候选被拒绝时仍正常执行，保留可靠双视图初始化点 | `cache/cleaned.bin`、`cache/cleanup.json`、`result.json` |
-| `export` 交付 | 导出所选模型、已注册照片和掩码（卷帘校正采用时为校正后照片）、鱼眼 COLMAP 稀疏模型，默认附带 LAS PLY、深度及法向监督；在临时目录回读校验通过后发布 | `colmap/` |
+| `export` 交付 | 导出所选模型、已注册照片和掩码（卷帘校正采用时为校正后照片）、鱼眼 COLMAP 稀疏模型，默认附带 LAS PLY、深度及法向监督；在临时目录回读校验通过后发布 | `--output` 交付目录 |
 
 导航回访候选取 5 m 内、曝光时间相隔超过 10 s 的最近 20 幅照片，用于补充重复经过同一区域时的跨时段连接。它属于默认初始匹配，与停滞后的可选补匹配轮数不同。CameraPos 只提供位置；视觉姿态由 SfM 求解，不使用输入四元数，也不施加场景专用的固定角度补偿。
 
@@ -98,14 +105,14 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 新场景需要原图精修时，在首次运行启用：
 
 ```powershell
-.\run.ps1 run --input "D:/数据/场景" --work "work/场景-精修" --refine
+.\run.ps1 run --input "D:/数据/场景" --output "D:/成果/场景-精修" --refine
 ```
 
-已有工作目录可用独立命令处理，结果及新交付写入新目录。独立 `refine` 仅精修相机与点，独立 `cleanup` 仅清理稀疏结构；两者均不重跑前端和 SfM。新目录先在同级 `.pending` 中完整生成后再发布，处理期间锁定来源目录；`--no-ply`、`--ply-voxel` 与 `export` 含义相同：
+调试模式的工作目录可用独立命令处理，新交付写入 `--output`，新工作目录写入 `--new-work`（默认 `OUT.work`）。独立 `refine` 仅精修相机与点，独立 `cleanup` 仅清理稀疏结构；两者均不重跑前端和 SfM。新工作目录先在同级 `.pending` 中完整生成，处理期间锁定来源目录；与 `run` 相同，只有加 `--debug` 时保留新工作目录，否则交付发布后删除；`--no-ply`、`--ply-voxel` 与 `export` 含义相同：
 
 ```powershell
-.\run.ps1 refine --work "work/场景" --output "work/场景-精修" --workers 8
-.\run.ps1 cleanup --work "work/场景" --output "work/场景-清理" --workers 8
+.\run.ps1 refine --work "work/场景" --output "D:/成果/场景-精修" --new-work "work/场景-精修" --debug --workers 8
+.\run.ps1 cleanup --work "work/场景" --output "D:/成果/场景-清理" --workers 8
 ```
 
 精修在原始分辨率上对齐邻近视图的图块，使用鱼眼投影和可靠 LAS 平面处理图块变形，以亚像素位置和亮度参数联合精调，并检查双向往返与轨迹闭环一致性。匹配图块做轻度抗噪处理，精修本身不改写照片。
@@ -116,7 +123,7 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 
 稀疏点清理作为单独候选：至少两次观测、视差至少 1.5°，单观测误差不超过 `min(3 px, quality_p90_px)`。距离和点位不确定度门限按 `las_median_m` 及 LAS 量化精度计算，默认分别为 10 cm 和 5 cm；该不确定度是固定相机的局部估计，不代表独立精度。清理后支撑不足的照片会从候选移除，但只有总照片保留至少 99%、每个镜头保留至少 98%、原可靠 LAS 支撑轨迹保留至少 90%，且图像图仍连通、剩余照片达到 32 个观测和 8 个覆盖格子、几何质量通过，才采用清理。否则保留清理前的模型，不强行删点。清理不修改相机参数，也不改变由原始 LAS 导出的初始化 PLY。
 
-默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`；开启精修时还保留 `cache/refined.bin`。独立处理的新交付在新目录的 `colmap/`；独立 `refine` 的所选模型为 `refined.bin`，独立 `cleanup` 为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 17，旧版工作目录、交付及训练结果保持原样，仍可独立导出或处理；新流程使用新工作目录。
+默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`；开启精修时还保留 `cache/refined.bin`。独立处理的新交付在其 `--output`；独立 `refine` 的所选模型为 `refined.bin`，独立 `cleanup` 为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 17，旧版工作目录、交付及训练结果保持原样，仍可独立导出或处理；新流程使用新工作目录。
 
 `run.ps1` 固定启动 `build/ninja/bin/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
 
@@ -137,7 +144,7 @@ models/
 
 工作目录保存冻结的输入、配置和模型位置。输入、配置或模型改变时使用新工作目录；续跑使用工作目录中记录的模型。不同请求的交付包拒绝覆盖。缓存格式与实现标记须匹配，详见[缓存约定](docs/cache.md)。
 
-进度在 `state.json`，最终结果在 `result.json`。`cache/*_profile.json` 和 `cache/sfm.json` 保存前端耗时、BA 收敛、轨迹和几何质量统计，`result.json` 同时保存联合配准各项验收结果。
+进度在 `state.json`，最终结果在 `result.json`，交付目录也附带一份 `result.json`。`cache/*_profile.json` 和 `cache/sfm.json` 保存前端耗时、BA 收敛、轨迹和几何质量统计，`result.json` 同时保存联合配准各项验收结果。
 
 ## 打包部署
 

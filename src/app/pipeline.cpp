@@ -355,120 +355,164 @@ std::vector<std::string> Stages(const Json& settings, const std::string& request
     throw std::runtime_error("Unknown stage: " + requested);
   return stages;
 }
+// Production runs keep only the delivery: their work directory sits beside it and is removed
+// once the delivery is published. --debug keeps the work directory and its cache.
+fs::path ProductionWork(const fs::path& output) {
+  auto work = output;
+  work += ".work";
+  return work;
+}
 }  // namespace
 void Run(const Arguments& args) {
   args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
                  "--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--refine"});
+                 "--supervision-cache-mb", "--refine", "--debug"});
   const auto delivery = ParseDelivery(args);
-  const auto work = args.Get("--work").empty()
-                        ? fs::absolute(fs::path("work") / args.Path("--input").filename())
-                        : args.Path("--work");
-  fs::create_directories(work);
-  Lock lock(work);
-  WorkState state{work / "state.json", Json::object()};
-  if (fs::exists(state.path))
-    state.value = ReadJson(state.path);
-  if (!state.value.empty() && state.value.at("version") != 1)
-    throw std::runtime_error("Unsupported work format; choose a new work directory");
-  if (!state.value.empty() && state.value.value("pipeline_version", 0) != PipelineVersion)
-    throw std::runtime_error("Reconstruction implementation changed; choose a new work directory");
-  const auto input = args.Get("--input").empty()
-                         ? fs::u8path(state.value.at("input").get<std::string>())
-                         : args.Path("--input");
-  if (Contains(input, work) || Contains(work, input))
-    throw std::runtime_error("Input and work directories must be separate");
-  auto settings = args.Get("--config").empty()
-                      ? (state.value.empty() ? Settings({}) : state.value.at("settings"))
-                      : Settings(args.Path("--config"));
-  if (args.Get("--refine") == "true")
-    settings["refine"] = true;
-  const auto las = args.Get("--las").empty()
-                       ? (state.value.empty()
-                              ? fs::path()
-                              : fs::u8path(state.value.at("scene").at("las").get<std::string>()))
-                       : args.Path("--las");
-  // Work directories frozen before this setting existed read as original photos and
-  // fail the scene comparison below if they had used enhanced copies.
-  const Scene scene = ReadScene(input, las, settings.value("enhanced_photos", false));
-  ReadLasHeader(scene.las);
-  const auto prepared = scene.ToJson();
-  if (state.value.empty()) {
-    state.value = {{"version", 1},
-                   {"pipeline_version", PipelineVersion},
-                   {"input", scene.input.u8string()},
-                   {"settings", settings},
-                   {"scene", prepared},
-                   {"stages", Json::object()}};
-    WriteJson(work / "scene.json", prepared);
-  } else if (state.value.at("scene") != prepared || state.value.at("settings") != settings)
-    throw std::runtime_error("Inputs/settings changed; choose a new work directory");
-  const auto root = args.Get("--models").empty()
-                        ? (state.value.contains("models")
-                               ? fs::u8path(state.value.at("models").get<std::string>())
-                               : DefaultModels())
-                        : args.Path("--models");
-  const auto requested = args.Get("--stage", args.command == "prepare" ? "prepare" : "all");
-  const auto stages = Stages(settings, requested);
-  const auto output = args.Get("--output").empty() ? work / "colmap" : args.Path("--output");
-  if (Contains(input, output) || Contains(output, input))
-    throw std::runtime_error("Output must be separate from input");
-  state.value["status"] = "running";
-  state.value["build"] = BuildInfo();
-  state.value["error"] = nullptr;
-  state.Save();
-  const auto started = Clock::now();
-  try {
-    for (const auto& stage : stages) {
-      if (requested != "all" && stage != requested)
-        continue;
-      auto& completed = state.value.at("stages");
-      if (stage != "prepare") {
-        const auto& previous = *(std::find(stages.begin(), stages.end(), stage) - 1);
-        if (!completed.contains(previous))
-          throw std::runtime_error("Run prerequisite stage: " + previous);
-        if (stage == "refine" || stage == "shutter" || stage == "cleanup" || stage == "export")
-          Verify(work, completed.at(previous).at("files"));
-        // SfM repair rounds run the matcher again with the recorded models.
-        if (stage == "masks" || stage == "features" || stage == "matches" ||
-            (stage == "sfm" && settings.at("sfm_repair_rounds").get<int>() > 0))
-          RecordModels(state, root);
-      }
-      Log("Stage: " + stage);
-      state.value["active_stage"] = stage;
-      state.Save();
-      const auto begin = Clock::now();
-      if (completed.contains(stage)) {
-        Verify(work, completed.at(stage).at("files"));
-        if (stage == "export")
-          ExportSelected(scene, work, output, delivery);
-        Log("Reused " + stage);
-        continue;
-      }
-      const auto products = RunStage(stage, scene, work, root, settings, output, delivery, state);
-      state.value["stages"][stage] = {{"seconds", Seconds(begin)},
-                                      {"files", Inventory(work, products)}};
-      state.Save();
-      Log(stage + ": completed in " + std::to_string(Seconds(begin)) + " s");
-    }
-    state.value["status"] = state.value.at("stages").contains("export") ? "completed" : "ready";
-    state.value["active_stage"] = nullptr;
-    state.value["last_invocation_seconds"] = Seconds(started);
-    state.value["resources"] = Resources();
-    state.Save();
-  } catch (const std::exception& e) {
-    state.value["status"] = "failed";
-    state.value["error"] = e.what();
-    state.Save();
-    throw;
+  // Without --input, an existing work directory supplies the input and output.
+  auto output = args.Get("--output").empty() ? fs::path() : args.Path("--output");
+  fs::path work;
+  if (!args.Get("--work").empty())
+    work = args.Path("--work");
+  else {
+    const auto name = args.Path("--input").filename();
+    if (output.empty())
+      output = fs::absolute(fs::path("output") / name);
+    work = args.Get("--debug") == "true" ? fs::absolute(fs::path("work") / name)
+                                         : ProductionWork(output);
   }
-  std::cout << Json({{"work", work.u8string()},
-                     {"status", state.value.at("status")},
-                     {"registration", state.value.value("registration", Json(nullptr))},
-                     {"seconds", Seconds(started)}})
-                   .dump()
-            << '\n';
+  const bool fresh = !fs::exists(work / "state.json");
+  if (output.empty() && !fresh) {
+    const auto saved = ReadJson(work / "state.json");
+    if (!saved.contains("output"))
+      throw std::runtime_error("Work directory has no recorded output; specify --output");
+    output = fs::u8path(saved.at("output").get<std::string>());
+  }
+  if (output.empty())
+    output = fs::absolute(fs::path("output") / args.Path("--input").filename());
+  if (Contains(work, output) || Contains(output, work))
+    throw std::runtime_error("Output and work directories must be separate");
+  // A finished production run leaves no work directory; do not repeat it over its delivery.
+  if (fresh && fs::exists(output))
+    throw std::runtime_error("Output already exists; choose a new output directory");
+  bool debug = false, finished = false;
+  Json summary;
+  const auto started = Clock::now();
+  {
+    fs::create_directories(work);
+    Lock lock(work);
+    WorkState state{work / "state.json", Json::object()};
+    if (fs::exists(state.path))
+      state.value = ReadJson(state.path);
+    if (!state.value.empty() && state.value.at("version") != 1)
+      throw std::runtime_error("Unsupported work format; choose a new work directory");
+    if (!state.value.empty() && state.value.value("pipeline_version", 0) != PipelineVersion)
+      throw std::runtime_error(
+          "Reconstruction implementation changed; choose a new work directory");
+    const auto input = args.Get("--input").empty()
+                           ? fs::u8path(state.value.at("input").get<std::string>())
+                           : args.Path("--input");
+    if (Contains(input, work) || Contains(work, input))
+      throw std::runtime_error("Input and work directories must be separate");
+    auto settings = args.Get("--config").empty()
+                        ? (state.value.empty() ? Settings({}) : state.value.at("settings"))
+                        : Settings(args.Path("--config"));
+    if (args.Get("--refine") == "true")
+      settings["refine"] = true;
+    const auto las = args.Get("--las").empty()
+                         ? (state.value.empty()
+                                ? fs::path()
+                                : fs::u8path(state.value.at("scene").at("las").get<std::string>()))
+                         : args.Path("--las");
+    // Work directories frozen before this setting existed read as original photos and
+    // fail the scene comparison below if they had used enhanced copies.
+    const Scene scene = ReadScene(input, las, settings.value("enhanced_photos", false));
+    ReadLasHeader(scene.las);
+    const auto prepared = scene.ToJson();
+    if (state.value.empty()) {
+      state.value = {{"version", 1},
+                     {"pipeline_version", PipelineVersion},
+                     {"input", scene.input.u8string()},
+                     {"settings", settings},
+                     {"scene", prepared},
+                     {"stages", Json::object()}};
+      WriteJson(work / "scene.json", prepared);
+    } else if (state.value.at("scene") != prepared || state.value.at("settings") != settings)
+      throw std::runtime_error("Inputs/settings changed; choose a new work directory");
+    const auto root = args.Get("--models").empty()
+                          ? (state.value.contains("models")
+                                 ? fs::u8path(state.value.at("models").get<std::string>())
+                                 : DefaultModels())
+                          : args.Path("--models");
+    const auto requested = args.Get("--stage", args.command == "prepare" ? "prepare" : "all");
+    const auto stages = Stages(settings, requested);
+    if (Contains(input, output) || Contains(output, input))
+      throw std::runtime_error("Output must be separate from input");
+    // Work directories from before this option kept their cache; they stay debug runs.
+    debug = args.Get("--debug") == "true" || (!fresh && state.value.value("debug", true));
+    state.value["debug"] = debug;
+    state.value["output"] = output.u8string();
+    state.value["status"] = "running";
+    state.value["build"] = BuildInfo();
+    state.value["error"] = nullptr;
+    state.Save();
+    try {
+      for (const auto& stage : stages) {
+        if (requested != "all" && stage != requested)
+          continue;
+        auto& completed = state.value.at("stages");
+        if (stage != "prepare") {
+          const auto& previous = *(std::find(stages.begin(), stages.end(), stage) - 1);
+          if (!completed.contains(previous))
+            throw std::runtime_error("Run prerequisite stage: " + previous);
+          if (stage == "refine" || stage == "shutter" || stage == "cleanup" || stage == "export")
+            Verify(work, completed.at(previous).at("files"));
+          // SfM repair rounds run the matcher again with the recorded models.
+          if (stage == "masks" || stage == "features" || stage == "matches" ||
+              (stage == "sfm" && settings.at("sfm_repair_rounds").get<int>() > 0))
+            RecordModels(state, root);
+        }
+        Log("Stage: " + stage);
+        state.value["active_stage"] = stage;
+        state.Save();
+        const auto begin = Clock::now();
+        if (completed.contains(stage)) {
+          Verify(work, completed.at(stage).at("files"));
+          if (stage == "export")
+            ExportSelected(scene, work, output, delivery);
+          Log("Reused " + stage);
+          continue;
+        }
+        const auto products = RunStage(stage, scene, work, root, settings, output, delivery, state);
+        state.value["stages"][stage] = {{"seconds", Seconds(begin)},
+                                        {"files", Inventory(work, products)}};
+        state.Save();
+        Log(stage + ": completed in " + std::to_string(Seconds(begin)) + " s");
+      }
+      state.value["status"] = state.value.at("stages").contains("export") ? "completed" : "ready";
+      state.value["active_stage"] = nullptr;
+      state.value["last_invocation_seconds"] = Seconds(started);
+      state.value["resources"] = Resources();
+      state.Save();
+    } catch (const std::exception& e) {
+      state.value["status"] = "failed";
+      state.value["error"] = e.what();
+      state.Save();
+      throw;
+    }
+    finished = state.value.at("status") == "completed";
+    summary = {{"status", state.value.at("status")},
+               {"registration", state.value.value("registration", Json(nullptr))}};
+  }
+  // The lock is released; a published production delivery no longer needs its work directory.
+  if (finished && !debug) {
+    fs::remove_all(work);
+    Log("Removed work directory " + work.u8string());
+  }
+  summary["output"] = output.u8string();
+  summary["work"] = debug || !finished ? Json(work.u8string()) : Json(nullptr);
+  summary["seconds"] = Seconds(started);
+  std::cout << summary.dump() << '\n';
 }
 void Export(const Arguments& args) {
   args.Validate({"--work", "--output", "--no-ply", "--ply-voxel", "--las-supervision",
@@ -486,19 +530,30 @@ void Export(const Arguments& args) {
     }
   }
   const auto scene = Scene::FromJson(ReadJson(work / "scene.json"));
-  const auto output = args.Get("--output").empty() ? work / "colmap" : args.Path("--output");
+  const auto output = args.Path("--output");
   if (Contains(scene.input, output) || Contains(output, scene.input))
     throw std::runtime_error("Output must be separate from input");
+  if (Contains(work, output) || Contains(output, work))
+    throw std::runtime_error("Output and work directories must be separate");
   ExportSelected(scene, work, output, delivery);
   std::cout << CheckBundle(output).dump() << '\n';
 }
 void Postprocess(const Arguments& args) {
   args.Validate({"--work", "--output", "--workers", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--no-ply", "--ply-voxel"});
+                 "--supervision-cache-mb", "--no-ply", "--ply-voxel", "--new-work", "--debug"});
   const auto delivery = ParseDelivery(args);
   const bool photo = args.command == "refine";
-  const auto source = args.Path("--work"), final_output = args.Path("--output");
+  const bool debug = args.Get("--debug") == "true";
+  const auto source = args.Path("--work"), delivery_output = args.Path("--output");
+  // Like run: the new work directory is kept only with --debug.
+  const auto final_output =
+      args.Get("--new-work").empty() ? ProductionWork(delivery_output) : args.Path("--new-work");
+  if (fs::exists(delivery_output))
+    throw std::runtime_error("Output already exists; choose a new output directory");
+  if (Contains(final_output, delivery_output) || Contains(delivery_output, final_output) ||
+      Contains(source, delivery_output) || Contains(delivery_output, source))
+    throw std::runtime_error("Output must be outside the source and new work directories");
   const int workers = args.Integer("--workers", 4);
   if (workers > 32)
     throw std::runtime_error("workers must be 1-32");
@@ -590,11 +645,17 @@ void Postprocess(const Arguments& args) {
     pixels.setTo(0, domains[image.camera] == 0);
     WriteImage(mask, pixels);
   }
-  ExportBundle(scene, selected, output, output / "colmap", delivery.ply, delivery.voxel, result,
+  if (Contains(scene.input, delivery_output) || Contains(delivery_output, scene.input))
+    throw std::runtime_error("Output must be separate from input");
+  ExportBundle(scene, selected, output, delivery_output, delivery.ply, delivery.voxel, result,
                delivery.supervision);
-  fs::rename(output, final_output);
+  if (debug)
+    fs::rename(output, final_output);
+  else
+    fs::remove_all(output);
   Log(args.command + ": " + report.at("reason").get<std::string>());
-  std::cout << Json({{"work", final_output.u8string()},
+  std::cout << Json({{"output", delivery_output.u8string()},
+                     {"work", debug ? Json(final_output.u8string()) : Json(nullptr)},
                      {"accepted", accepted},
                      {"reason", report.at("reason")}})
                    .dump(2)
