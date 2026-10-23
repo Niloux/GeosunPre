@@ -305,11 +305,16 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las, bool enhanced
       throw std::runtime_error("Duplicate camera position: " + name);
   }
   // Pose-bound JPEGs by file name; Image/L and Image/R hold only their own lens.
-  auto index = [&](const fs::path& folder, const std::string& lens) {
+  auto index = [&](const fs::path& folder, const std::string& lens, bool recursive = true) {
     std::map<std::string, fs::path> files;
     if (!fs::is_directory(folder))
       return files;
-    for (const auto& row : fs::recursive_directory_iterator(folder)) {
+    std::vector<fs::directory_entry> rows;
+    if (recursive)
+      rows.assign(fs::recursive_directory_iterator(folder), fs::recursive_directory_iterator());
+    else
+      rows.assign(fs::directory_iterator(folder), fs::directory_iterator());
+    for (const auto& row : rows) {
       if (!row.is_regular_file())
         continue;
       auto ext = row.path().extension().u8string();
@@ -331,6 +336,9 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las, bool enhanced
     return files;
   };
   const auto originals = [&] {
+    // Without lens folders the originals lie flat in Image/, beside enhanced/ and Imageout/.
+    if (!fs::is_directory(input / "Image/L") && !fs::is_directory(input / "Image/R"))
+      return index(input / "Image", "", false);
     auto files = index(input / "Image/L", "L");
     files.merge(index(input / "Image/R", "R"));
     return files;
