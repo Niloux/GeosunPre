@@ -547,6 +547,12 @@ cv::Mat StaticMask(const Scene& scene, const fs::path& masks, uint32_t image, co
       throw std::runtime_error("Geometry exclusion mask must match its original image");
     mask &= extra == 255;
   }
+  if (options.crop) {
+    const auto& w = (*options.crop)[scene.images[image].camera];
+    if (w.x + w.width > mask.cols || w.y + w.height > mask.rows)
+      throw std::runtime_error("Crop window lies outside the static mask");
+    mask = mask(cv::Rect(w.x, w.y, w.width, w.height)).clone();
+  }
   cv::Mat source, resized;
   mask.convertTo(source, CV_32F, 1. / 255);
   cv::resize(source, resized, {camera.width, camera.height}, 0, 0, cv::INTER_AREA);
@@ -627,6 +633,8 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
                   {"exclusion_masks", masks}};
   if (rolling)
     request["readout_normals_version"] = 1;
+  if (options.crop)
+    request["crop_windows"] = {(*options.crop)[0].ToJson(), (*options.crop)[1].ToJson()};
   return request;
 }
 Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,

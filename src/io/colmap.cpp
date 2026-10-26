@@ -1,5 +1,6 @@
 #include "io/colmap.h"
 #include "io/cache.h"
+#include "io/crop.h"
 #include "io/las.h"
 #include "frontend/frontend.h"
 #include "sfm/shutter.h"
@@ -266,11 +267,27 @@ Reconstruction ReadColmap(const fs::path& path, Scene& scene, const Json* shutte
 }  // namespace
 void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
-                  const SupervisionOptions& options) {
+                  const SupervisionOptions& supervision_options, bool crop) {
   // A rolling-shutter corrected model describes photos at its reference poses; they are delivered
   // original, with the readout motion beside the model.
   const bool rolling = report.contains("shutter") && report.at("shutter").value("used", false);
   const auto masks = work / "cache/masks";
+  ShutterMotion motion;
+  if (rolling)
+    motion =
+        MotionFromJson(ReadJson(work / "cache/shutter.json").at("motion"), selected.images.size());
+  // A cropped delivery keeps each lens's valid domain: photos are cut losslessly on the JPEG MCU
+  // grid and the readout motion is rescaled to the cropped readout axis.
+  auto options = supervision_options;
+  std::optional<std::array<CropWindow, 2>> windows;
+  if (crop) {
+    int mcu = 0;
+    for (const auto& e : scene.images)
+      if (selected.images[e.id].registered)
+        mcu = std::max(mcu, JpegMcuSize(e.source));
+    windows = ValidDomainCrop(scene, selected, masks, rolling ? motion.axis : 1, mcu);
+    options.crop = windows;
+  }
   Json request = {{"scene_file", FileMetadata(work / "scene.json")},
                   {"model_file", FileMetadata(SelectedModelPath(work, report))},
                   {"include_ply", include_ply},
@@ -278,6 +295,9 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   if (rolling)
     request["rolling_shutter"] = {{"motion_file", FileMetadata(work / "cache/shutter.json")},
                                   {"photos", "original"}};
+  if (windows)
+    request["crop"] = {{"mode", "valid_domain"},
+                       {"windows", {(*windows)[0].ToJson(), (*windows)[1].ToJson()}}};
   if (options.enabled)
     request["supervision"] = SupervisionRequest(scene, selected, masks, options, rolling);
   if (fs::exists(output)) {
@@ -302,11 +322,10 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     fs::rename(pending, archived);
   }
   fs::create_directories(pending / "sparse/0");
-  ShutterMotion motion;
-  if (rolling)
-    motion =
-        MotionFromJson(ReadJson(work / "cache/shutter.json").at("motion"), selected.images.size());
-  const auto model = rolling ? OriginalPhotoObservations(selected, motion, 8) : selected;
+  const auto original = rolling ? OriginalPhotoObservations(selected, motion, 8) : selected;
+  if (windows && rolling)
+    motion = CropMotion(motion, original, *windows);
+  const auto model = windows ? CropModel(original, *windows, rolling ? &motion : nullptr) : original;
   WriteColmap(pending / "sparse/0", scene, model);
   Json photos = Json::array();
   for (const auto& e : scene.images) {
@@ -314,12 +333,20 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
       continue;
     const auto destination = pending / "images" / fs::u8path(e.name);
     fs::create_directories(destination.parent_path());
-    fs::copy_file(e.source, destination);
-    if (fs::file_size(destination) != e.source_file.at("size_bytes").get<uint64_t>())
-      throw std::runtime_error("Source image changed while copying: " + e.name);
     const auto mask = pending / "masks" / fs::u8path(e.name + ".png");
     fs::create_directories(mask.parent_path());
-    fs::copy_file(masks / (std::to_string(e.id) + ".png"), mask);
+    const auto source_mask = masks / (std::to_string(e.id) + ".png");
+    if (windows) {
+      CropJpeg(e.source, destination, (*windows)[e.camera]);
+      CropMask(source_mask, mask, (*windows)[e.camera]);
+      if (FileMetadata(e.source) != e.source_file)
+        throw std::runtime_error("Source image changed while cropping: " + e.name);
+    } else {
+      fs::copy_file(e.source, destination);
+      if (fs::file_size(destination) != e.source_file.at("size_bytes").get<uint64_t>())
+        throw std::runtime_error("Source image changed while copying: " + e.name);
+      fs::copy_file(source_mask, mask);
+    }
     photos.push_back({{"image_index", e.id},
                       {"name", e.name},
                       {"camera", e.camera},
@@ -341,7 +368,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     // The delivered observations are original pixels; report their rolling-shutter fit.
     const double median = quality.at("limits").at("median_px"),
                  p90 = quality.at("limits").at("p90_px");
-    quality = model.Quality(scene, median, p90, &motion);
+    quality = model.Quality(windows ? CropScene(scene, *windows) : scene, median, p90, &motion);
     WriteJson(pending / "rolling_shutter.json", DeliveryShutterJson(scene, model, motion));
   }
   quality["registration"] = registration;

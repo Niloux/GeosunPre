@@ -102,10 +102,13 @@ struct Delivery {
   bool ply;
   double voxel;
   SupervisionOptions supervision;
+  bool crop;
 };
 Delivery ParseDelivery(const Arguments& args) {
+  if (args.values.count("--crop-valid-domain") && args.values.count("--no-crop-valid-domain"))
+    throw std::runtime_error("--crop-valid-domain conflicts with --no-crop-valid-domain");
   return {args.Get("--no-ply") != "true", args.Number("--ply-voxel", .05),
-          ParseSupervisionOptions(args)};
+          ParseSupervisionOptions(args), args.Get("--no-crop-valid-domain") != "true"};
 }
 Json Inventory(const fs::path& work, const std::vector<fs::path>& products) {
   Json result = Json::object();
@@ -163,7 +166,7 @@ void ExportSelected(const Scene& scene, const fs::path& work, const fs::path& ou
                     const Delivery& delivery) {
   const auto result = ReadJson(work / "result.json");
   ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, delivery.ply,
-               delivery.voxel, result, delivery.supervision);
+               delivery.voxel, result, delivery.supervision, delivery.crop);
 }
 std::vector<fs::path> ReconstructVisual(const Scene& scene, const fs::path& work,
                                         const fs::path& root, const Json& settings,
@@ -367,7 +370,8 @@ void Run(const Arguments& args) {
   args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
                  "--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--refine", "--debug"});
+                 "--supervision-cache-mb", "--refine", "--debug", "--crop-valid-domain",
+                 "--no-crop-valid-domain"});
   const auto delivery = ParseDelivery(args);
   // Without --input, an existing work directory supplies the input and output.
   auto output = args.Get("--output").empty() ? fs::path() : args.Path("--output");
@@ -517,7 +521,8 @@ void Run(const Arguments& args) {
 void Export(const Arguments& args) {
   args.Validate({"--work", "--output", "--no-ply", "--ply-voxel", "--las-supervision",
                  "--no-las-supervision", "--supervision-max-size", "--supervision-boundary",
-                 "--supervision-mask-dir", "--supervision-cache-mb"});
+                 "--supervision-mask-dir", "--supervision-cache-mb", "--crop-valid-domain",
+                 "--no-crop-valid-domain"});
   const auto delivery = ParseDelivery(args);
   const auto work = args.Path("--work");
   Lock lock(work);
@@ -541,7 +546,8 @@ void Export(const Arguments& args) {
 void Postprocess(const Arguments& args) {
   args.Validate({"--work", "--output", "--workers", "--las-supervision", "--no-las-supervision",
                  "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--no-ply", "--ply-voxel", "--new-work", "--debug"});
+                 "--supervision-cache-mb", "--no-ply", "--ply-voxel", "--new-work", "--debug",
+                 "--crop-valid-domain", "--no-crop-valid-domain"});
   const auto delivery = ParseDelivery(args);
   const bool photo = args.command == "refine";
   const bool debug = args.Get("--debug") == "true";
@@ -648,7 +654,7 @@ void Postprocess(const Arguments& args) {
   if (Contains(scene.input, delivery_output) || Contains(delivery_output, scene.input))
     throw std::runtime_error("Output must be separate from input");
   ExportBundle(scene, selected, output, delivery_output, delivery.ply, delivery.voxel, result,
-               delivery.supervision);
+               delivery.supervision, delivery.crop);
   if (debug)
     fs::rename(output, final_output);
   else

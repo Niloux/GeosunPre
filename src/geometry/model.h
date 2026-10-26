@@ -47,6 +47,11 @@ struct ShutterMotion {
     return a.inverse() * moved + s * readout[camera] * velocity[image];
   }
 };
+// Pixel window of a lens's photos; see ValidDomainCrop.
+struct CropWindow {
+  int x = 0, y = 0, width = 0, height = 0;
+  Json ToJson() const { return {{"x", x}, {"y", y}, {"width", width}, {"height", height}}; }
+};
 struct Reconstruction {
   std::array<Camera, 2> cameras;
   std::vector<ModelImage> images;

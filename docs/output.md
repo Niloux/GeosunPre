@@ -20,13 +20,13 @@ OUTPUT/
 
 COLMAP 小端二进制，`OPENCV_FISHEYE` 模型编号 5、8 个参数。相机 ID 1、2；每幅图像独立 frame，使用镜头对应的一传感器 rig。内部索引从 0 开始；仅导出已注册照片，按原输入顺序将图像/frame ID 连续重编号为 1 到注册数量，轨迹中的图像引用同步转换，内部缓存编号保持不变。
 
-位姿 world-to-camera，COLMAP 四元数顺序 `w x y z`。图像名相对于 images，保留原图名、尺寸、鱼眼畸变与全部特征编号。照片和掩码始终为输入照片拷贝，不做重采样；默认为 L/R 原图，配置 `"enhanced_photos": true` 且输入有 `Image/enhanced` 同名图时为该 enhanced 图。卷帘快门校正被采用时，位姿为读出中线时刻的参考位姿，并附 `rolling_shutter.json`，见下节。点轨迹与图像引用相互一致，无三维点的特征用 uint64 最大值。下游须支持原生鱼眼模型。
+位姿 world-to-camera，COLMAP 四元数顺序 `w x y z`。图像名相对于 images，保留原图名、鱼眼畸变与全部特征编号。照片和掩码不做重采样：默认无损裁到各镜头有效域窗口（见“有效域裁剪交付”），`--no-crop-valid-domain` 时为整幅输入照片拷贝；默认为 L/R 原图，配置 `"enhanced_photos": true` 且输入有 `Image/enhanced` 同名图时为该 enhanced 图。卷帘快门校正被采用时，位姿为读出中线时刻的参考位姿，并附 `rolling_shutter.json`，见下节。点轨迹与图像引用相互一致，无三维点的特征用 uint64 最大值。下游须支持原生鱼眼模型。
 
 points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重投影距离，单位像素；联合优化后重新计算，交付回读时验证。
 
 相机和稀疏点已在输入 LAS 坐标，下游不再应用配准变换。BIN 是视觉稀疏点及轨迹；PLY 是完整有效 LAS 的体素均值，点身份相互独立。默认体素 0.05 m，二进制小端，每点 float32 XYZ、零法向量 XYZ、uint8 RGB，共 27 字节。LAS 头部范围的坐标绝对值须不超过 16777 m，使 float32 舍入不超过 1 mm，否则明确报错。下游需明确选择此 PLY 初始化 3DGS。
 
-掩码为原图尺寸单通道 PNG：静态 255、天空 128、人物及有效域外 0。SfM 只提取 255 区域；有效域按初始标定冻结。五视图融合无覆盖的格子对应原图像素也为 0，独立精修复制旧掩码时同步屏蔽这些像素。
+掩码为与交付照片同尺寸的单通道 PNG：静态 255、天空 128、人物及有效域外 0。SfM 只提取 255 区域；有效域按初始标定冻结。五视图融合无覆盖的格子对应原图像素也为 0，独立精修复制旧掩码时同步屏蔽这些像素。
 
 LAS 深度和法向监督默认在导出阶段生成，`run`、独立 `export`、`refine`、`cleanup` 均可用 `--no-las-supervision` 关闭。监督使用最终所选相机和原始有效 LAS，以 50 万记录分块、GPU 有界批次逐点投影，几何计算为双精度；不读取初始化 PLY。监督图默认最长边 1600，不放大原图，相机内参按输出尺寸缩放。深度是沿视线距离，uint16 毫米，0 表示无效，0.05 m 以下及 65.535 m 以上留空。法向是 OpenCV 相机坐标下朝向相机的单位向量，RGB 为 `round(127.5*(n+1))`，黑色无效。Spirula 需显式设置 `input_depth_is_ray_depth=true`；图像仍保留原始鱼眼畸变。
 
@@ -56,7 +56,7 @@ quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 
 
 ## 卷帘快门交付
 
-卷帘校正被采用的模型交付原图与原掩码拷贝，特征坐标为原图像素，位姿为参考位姿；`rolling_shutter.json` 给出每幅照片的读出运动。按全局快门读取时视图间仍有卷帘偏差，下游须使用该文件（spirula 的 `3dgut` 按卷帘相机训练）。照片不做重采样：读出平移的像素偏移随深度变化，按 LAS 距离重采样会在近处动态物体和 LAS 空洞处错位。旧版按参考位姿重采样照片的 `rectified` 交付不再生成，仍可 `check` 回读。points3D.bin 的 error、quality.json 与 `check` 均按卷帘投影计算；深度和法向监督按每个像素自身读出线的相机投影 LAS；法向的双尺度平面拟合先把各邻域点换算到参考相机，再按逆转置变换到本像素读出线的相机中表示（与参考相机相差不超过整帧读出转动）。supervision.json 的 projection 为 `rolling_shutter_readout_line`，normal_estimator 为 `readout_reference_two_scale_tangent_plane_least_squares`，监督请求另含 `readout_normals_version`。
+卷帘校正被采用的模型交付原图与原掩码（默认按有效域无损裁剪），特征坐标为交付图像像素，位姿为参考位姿；`rolling_shutter.json` 给出每幅照片的读出运动。按全局快门读取时视图间仍有卷帘偏差，下游须使用该文件（spirula 的 `3dgut` 按卷帘相机训练）。照片不做重采样：读出平移的像素偏移随深度变化，按 LAS 距离重采样会在近处动态物体和 LAS 空洞处错位。旧版按参考位姿重采样照片的 `rectified` 交付不再生成，仍可 `check` 回读。points3D.bin 的 error、quality.json 与 `check` 均按卷帘投影计算；深度和法向监督按每个像素自身读出线的相机投影 LAS；法向的双尺度平面拟合先把各邻域点换算到参考相机，再按逆转置变换到本像素读出线的相机中表示（与参考相机相差不超过整帧读出转动）。supervision.json 的 projection 为 `rolling_shutter_readout_line`，normal_estimator 为 `readout_reference_two_scale_tangent_plane_least_squares`，监督请求另含 `readout_normals_version`。
 
 `rolling_shutter.json`（version 1）是卷帘交付的相机接口：
 
@@ -69,3 +69,9 @@ images         [{image_id, camera_id, name, rotation_rad[3], velocity_m_s[3], tr
 读出比例 `s = (c - N/2)/N`，c 为像素沿读出轴的坐标（左上像素中心为 0.5），N 为该轴的图像尺寸。参考位姿为 images.bin 的 world-to-camera `R, t`（s = 0）。三维点 X 在读出比例 s 处的相机坐标为 `p(s) = (I + s[rotation_rad]×)(R X + t - s·translation_m)`，`translation_m = readout_s · velocity_m_s`；rotation_rad、velocity_m_s、translation_m 均在 OpenCV 参考相机坐标中，rotation_rad 与 translation_m 对应整帧读出。X 的像素 x 满足 `x = fisheye(p(s(x)))`，从 s = 0 起不动点迭代 3–4 次即收敛。该一阶模型在读出期间转动不超过约 3° 时足够精确。
 
 原图交付的法向拟合先将邻域三维点按各自读出时间变换到参考相机，再拟合平面并将法向变换到中心像素的读出相机。监督请求的 `readout_normals_version=1` 区分此几何约定；旧交付仍可回读，新导出使用新目录。
+
+## 有效域裁剪交付
+
+`run`、`export`、`refine`、`cleanup` 默认把每个镜头的照片、掩码与模型裁到该镜头有效域的外接窗口；`--no-crop-valid-domain` 交付整幅原图，`--crop-valid-domain` 显式开启，二者冲突。裁剪使下游少处理鱼眼圆外恒为 0 的像素。窗口取该镜头全部已注册照片静态掩码非零像素的外接框，四周各留 16 px（不超出原图）；左上角对齐照片 JPEG 的 MCU 网格，照片按 DCT 系数无损裁剪，不重新编码，EXIF 等标记原样保留（EXIF 中记录的像素尺寸不改写）。掩码按窗口精确裁剪。窗口沿读出轴以图像中心对称，读出比例只按 `N'/N` 缩放（N、N' 为裁剪前后沿读出轴的尺寸）：`rolling_shutter.json` 的 `rotation_rad`、`translation_m` 与 `readout_s` 同乘 `N'/N`，`velocity_m_s` 与参考位姿不变，交付在裁剪后图像上按同一公式 `s = (c - N/2)/N` 使用。
+
+`cameras.bin` 的宽高为窗口尺寸，主点减去窗口原点，畸变参数不变；`images.bin` 的特征坐标减去窗口原点，`points3D.bin` 的 error 按裁剪后的投影重新计算。深度、法向监督按裁剪后的相机生成，静态及额外排除掩码先裁到窗口再缩放到监督图。`manifest.json` 的 request 另含 `crop`（`mode: "valid_domain"` 与两镜头窗口），监督请求另含 `crop_windows`，因此裁剪与未裁剪交付不会被视为同一请求。`check` 对裁剪交付按同样规则回读。

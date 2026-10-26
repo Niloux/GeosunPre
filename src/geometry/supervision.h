@@ -1,5 +1,6 @@
 #pragma once
 #include "geometry/model.h"
+#include <optional>
 
 namespace geosun {
 struct SupervisionOptions {
@@ -7,6 +8,9 @@ struct SupervisionOptions {
   int max_size = 1600, boundary = 6;
   int cache_mb = 1024;
   fs::path mask_dir;
+  // Cropped delivery: each lens's maps cover this window of its original photos, and the
+  // original-size static and exclusion masks are cut to it.
+  std::optional<std::array<CropWindow, 2>> crop;
 };
 SupervisionOptions ParseSupervisionOptions(const Arguments& args);
 // masks is the directory of the selected model's static masks, named by image index.

@@ -13,7 +13,7 @@ include(dependencies/dependencies.cmake)
 find_package(CUDAToolkit REQUIRED)
 set(GEOSUN_SOURCES
   src/app/main.cpp src/app/pipeline.cpp src/app/runtime.cpp
-  src/io/scene.cpp src/io/cache.cpp src/io/las.cpp src/io/colmap.cpp
+  src/io/scene.cpp src/io/cache.cpp src/io/las.cpp src/io/colmap.cpp src/io/crop.cpp
   src/geometry/camera.cpp src/geometry/model.cpp src/geometry/supervision.cu
   src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/preprocessing.cu src/frontend/frontend.cpp
   src/sfm/reconstruction.cpp src/sfm/optimization.cpp src/sfm/photometric.cpp src/sfm/structure.cpp
@@ -59,9 +59,11 @@ target_include_directories(geosunpre PRIVATE src ${tensorrt_SOURCE_DIR}/include 
 target_include_directories(geosunpre SYSTEM PRIVATE ${opencv_BINARY_DIR} ${CMAKE_BINARY_DIR}
   ${opencv_SOURCE_DIR}/modules/core/include ${opencv_SOURCE_DIR}/modules/imgproc/include
   ${opencv_SOURCE_DIR}/modules/imgcodecs/include ${opencv_SOURCE_DIR}/modules/calib3d/include
-  ${opencv_SOURCE_DIR}/modules/features2d/include ${opencv_SOURCE_DIR}/modules/flann/include)
+  ${opencv_SOURCE_DIR}/modules/features2d/include ${opencv_SOURCE_DIR}/modules/flann/include
+  ${opencv_SOURCE_DIR}/3rdparty/libjpeg-turbo/src ${opencv_BINARY_DIR}/3rdparty/libjpeg-turbo)
 target_link_libraries(geosunpre PRIVATE Ceres::ceres Eigen3::Eigen nlohmann_json::nlohmann_json
-  nanoflann::nanoflann opencv_core opencv_imgproc opencv_imgcodecs opencv_calib3d CUDA::cudart)
+  nanoflann::nanoflann opencv_core opencv_imgproc opencv_imgcodecs opencv_calib3d CUDA::cudart
+  libjpeg-turbo)
 if(WIN32)
   target_compile_definitions(geosunpre PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_options(geosunpre PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/W4>)
