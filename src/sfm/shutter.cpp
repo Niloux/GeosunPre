@@ -397,12 +397,18 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
       // Keep the accepted LAS offset; the constraints hold the metric frame, not a new fit.
       inputs.training_planes.back().center = source.points[plane.point].xyz;
     }
-  // Sensors may be stored rotated, so rows and columns are both solved. An accepted hypothesis
-  // wins over a rejected one; otherwise the lower held-out median decides.
+  // Sensors may be stored rotated, so rows and columns are both solved, concurrently since each
+  // works on its own copy of the model. An accepted hypothesis wins over a rejected one;
+  // otherwise the lower held-out median decides.
+  std::array<std::future<ShutterCorrection>, 2> solves;
+  for (const int axis : {1, 0})
+    solves[1 - axis] = std::async(std::launch::async, [&, axis] {
+      return CorrectAlongAxis(scene, source, inputs, axis, workers, limits, ba_workers);
+    });
   ShutterCorrection best;
   Json attempts = Json::array();
-  for (const int axis : {1, 0}) {
-    auto attempt = CorrectAlongAxis(scene, source, inputs, axis, workers, limits, ba_workers);
+  for (auto& solve : solves) {
+    auto attempt = solve.get();
     const auto& r = attempt.report;
     Json explained = Json::array();
     for (const auto& lens : r.at("readout_consistency"))

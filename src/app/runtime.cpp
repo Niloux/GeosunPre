@@ -1,6 +1,7 @@
 #include "app/runtime.h"
 #include "app/build_info.h"
 #include <iostream>
+#include <mutex>
 
 #include <algorithm>
 #include <cmath>
@@ -211,5 +212,10 @@ void PublishFile(const fs::path& temporary, const fs::path& path) {
   fs::rename(temporary, path);
 #endif
 }
-void Log(const std::string& message) { std::cerr << message << std::endl; }
+void Log(const std::string& message) {
+  // Concurrent stages log whole lines.
+  static std::mutex mutex;
+  const std::lock_guard<std::mutex> lock(mutex);
+  std::cerr << message << std::endl;
+}
 }  // namespace geosun
