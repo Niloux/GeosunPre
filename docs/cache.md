@@ -8,9 +8,9 @@ LAS 深度和法向监督默认随最终模型导出，`--no-las-supervision` �
 
 scene.json 保存曝光、初始相机和输入元数据。state.json 版本 1，保存冻结场景、配置、模型元数据和阶段产物元数据。文件变化时拒绝复用；输入、配置或模型改变时使用新 work。
 
-state.json 的 pipeline_version=17 标识当前实现，恢复时须与程序的实现标记一致；不匹配时使用新目录。旧工作目录仍可独立 `export`、`refine` 或 `cleanup`，原结果不迁移、不改写。状态与结果保存本次执行的构建版本、时间和 EXE 路径。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，`geometry_threads` 为几何验证使用的线程数（不影响验证结果），最终 result.json 同时包含此报告。unassigned_completion 记录最终标定后固定相机、对匹配连通分量内未分配观测重新三角化的新增点数和观测数；不重复占用已有特征。timing 细分缓存读取、轨迹构建、候选选择、位姿注册、三角化、过滤、检查点和着色耗时。导航误差按最终所选模型计算。
+state.json 的 pipeline_version=18 标识当前实现，恢复时须与程序的实现标记一致；不匹配时使用新目录。旧工作目录仍可独立 `export`、`refine` 或 `cleanup`，原结果不迁移、不改写。状态与结果保存本次执行的构建版本、时间和 EXE 路径。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，`geometry_threads` 为几何验证使用的线程数（不影响验证结果），最终 result.json 同时包含此报告。unassigned_completion 记录最终标定后固定相机、对匹配连通分量内未分配观测重新三角化的新增点数和观测数；不重复占用已有特征。timing 细分缓存读取、轨迹构建、候选选择、位姿注册、三角化、过滤、检查点和着色耗时。导航误差按最终所选模型计算。
 
-配置中的 `ba_workers` 默认 8，控制注册结束后的标定与全局精调、LAS 联合优化和流水线原图精修的 BA 线程数；增量注册阶段 BA 及其他并行工作沿用 `workers`（默认 4）。每次 BA 保留既有 `build_seconds`、`linear_solver_seconds`、`jacobian_seconds`，新增 `timing` 中的观测建模、参数与先验建模、Ceres 预处理、迭代、后处理及纯残差计算耗时。`threads`、`preconditioner`、`termination`、评估次数、成功与失败步数、线性迭代总数、单轮最大值及触及迭代上限次数说明实际求解过程；`iteration_profile` 逐轮记录代价、梯度、信赖域、步求解耗时和接受状态。逐轮耗时与汇总耗时是同一过程的不同层级，不能将各层统计重复相加。线程数改变使用新工作目录；算法精度及质量门限不因线程数改变而放宽。
+配置中的 `ba_workers` 默认 8，控制注册结束后的标定与全局精调、LAS 联合优化和流水线原图精修的 BA 线程数；增量注册阶段 BA 及其他并行工作沿用 `workers`（默认 4）。每次 BA 保留既有 `build_seconds`、`linear_solver_seconds`、`jacobian_seconds`，新增 `timing` 中的观测建模、参数与先验建模、Ceres 预处理、迭代、后处理及纯残差计算耗时。`threads`、`preconditioner`、`termination`、评估次数、成功与失败步数、线性迭代总数、单轮最大值及触及迭代上限次数说明实际求解过程；`iteration_profile` 逐轮记录代价、梯度、信赖域、步求解耗时和接受状态。逐轮耗时与汇总耗时是同一过程的不同层级，不能将各层统计重复相加。线程数改变使用新工作目录；算法精度及质量门限不因线程数改变而放宽。迭代上限超过 100 或带 LAS 平面、导航约束的 BA 以相对代价下降 1e-6 判定收敛（版本 18 起，此前为 1e-7），其余 BA 为 1e-5；版本 17 的末段迭代每轮代价下降不足百万分之一，相机中心变化在微米级。
 
 cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用数量、读图或缓存读取、预处理、输入等待、写入和推理耗时，最终 result.json 的 frontend 字段包含这些报告。匹配报告还保存配对总数、每图连接数及定向补边的图像编号。GPU 推理由 CUDA 事件测量；累计工作时间可以重叠，不能简单相加为总耗时。恢复运行的报告仅计本次计算，补匹配记录在 matches 报告的 repairs 数组，续跑沿用已完成的轮数。
 
