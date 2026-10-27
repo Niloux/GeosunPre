@@ -19,6 +19,6 @@ Windows x64，需算力 ≥ 8.0 的 NVIDIA GPU（RTX 30/40/50、RTX A 系列等�
 
 `run` 默认在 LAS 对齐后执行卷帘快门校正并独立清理稀疏点，再导出通过验收的所选模型；交付照片始终为原图拷贝；卷帘校正被采用时另附 `rolling_shutter.json`，未采用的原因见交付目录 `result.json` 的 shutter 及调试工作目录的 `cache/shutter.json`。原图精修默认关闭，首次运行加 `--refine` 或配置 `"refine": true` 在卷帘校正前启用，续跑沿用已冻结的选择。精修未启用或候选未通过时，仍对上一步所选模型校正和清理；未采用原因分别见 `cache/refinement.json`、`cache/shutter.json` 与 `cache/cleanup.json`。
 
-初始匹配包含导航回访候选；SfM 默认不在停滞后额外补匹配，而是处理已注册部分，`sfm_repair_rounds` 可设为 `0`、`1` 或 `2`。实现标记为 19，新流程须使用新工作目录；旧成果仍可 `export`，也可通过 `refine --work OLD --output OUT` 或 `cleanup --work OLD --output OUT` 写入新交付，`--new-work NEW --debug` 保留新工作目录。独立 `refine` 仅执行原图精修，独立 `cleanup` 仅清理稀疏结构；复制旧掩码时均屏蔽无覆盖像素，不重跑语义模型、特征和 SfM。
+初始匹配包含导航回访候选；SfM 默认不在停滞后额外补匹配，而是处理已注册部分，`sfm_repair_rounds` 可设为 `0`、`1` 或 `2`。实现标记为 20，新流程须使用新工作目录；旧成果仍可 `export`，也可通过 `refine --work OLD --output OUT` 或 `cleanup --work OLD --output OUT` 写入新交付，`--new-work NEW --debug` 保留新工作目录。独立 `refine` 仅执行原图精修，独立 `cleanup` 仅清理稀疏结构；复制旧掩码时均屏蔽无覆盖像素，不重跑语义模型、特征和 SfM。
 
 `ampere_plus` 模型包可直接在上述 GPU 间迁移；算力低于 8.0 时程序明确拒绝加载。使用 `none` 级别的专用模型包时，GPU 型号须与构建 GPU 一致。完整输入、输出和缓存约定见 `docs/`。

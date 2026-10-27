@@ -8,6 +8,9 @@ namespace geosun {
 class BinaryWriter {
   fs::path path_, temporary_;
   std::ofstream stream_;
+  // Values are a few bytes each; collecting them keeps stream calls per write to one per MiB.
+  std::vector<char> buffer_;
+  void Flush();
 
  public:
   explicit BinaryWriter(const fs::path& path);

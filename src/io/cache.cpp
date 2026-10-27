@@ -17,17 +17,33 @@ BinaryWriter::BinaryWriter(const fs::path& path) : path_(path), temporary_(path)
   if (!stream_)
     throw std::runtime_error("Cannot write: " + path.u8string());
 }
-void BinaryWriter::Bytes(const void* data, size_t count) {
-  if (count)
-    stream_.write(static_cast<const char*>(data), count);
+void BinaryWriter::Flush() {
+  if (!buffer_.empty())
+    stream_.write(buffer_.data(), std::streamsize(buffer_.size()));
+  buffer_.clear();
   if (!stream_)
     throw std::runtime_error("Incomplete binary write: " + path_.u8string());
+}
+void BinaryWriter::Bytes(const void* data, size_t count) {
+  constexpr size_t capacity = 1 << 20;
+  const auto* bytes = static_cast<const char*>(data);
+  if (count >= capacity) {
+    Flush();
+    stream_.write(bytes, std::streamsize(count));
+    if (!stream_)
+      throw std::runtime_error("Incomplete binary write: " + path_.u8string());
+    return;
+  }
+  if (buffer_.size() + count > capacity)
+    Flush();
+  buffer_.insert(buffer_.end(), bytes, bytes + count);
 }
 void BinaryWriter::String(const std::string& v) {
   Value(uint64_t(v.size()));
   Bytes(v.data(), v.size());
 }
 void BinaryWriter::Commit() {
+  Flush();
   stream_.close();
   if (!stream_)
     throw std::runtime_error("Cannot close binary output");

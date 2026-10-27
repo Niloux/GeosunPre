@@ -865,7 +865,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       AddPoint(m, graph.tracks[i], points[i]);
     m.RebuildReferences();
     triangulation_seconds += Seconds(triangulation_started);
-    optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 100));
+    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 100));
     filter();
     Log("Seed " + scene.images[seed->a].name + " + " + scene.images[seed->b].name);
   }
@@ -922,7 +922,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         std::sort(neighbors.rbegin(), neighbors.rend());
         for (size_t k = 0; k < std::min<size_t>(8, neighbors.size()); ++k)
           local.insert(neighbors[k].second);
-        optimization.push_back(Optimize(m, scene.cameras, "fixed", workers, 30, local));
+        optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 30, local));
         filter();
         recent.clear();
       }
@@ -932,10 +932,10 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           if (image.registered)
             ++counts[image.camera];
         if (counts[0] >= 8 && counts[1] >= 8) {
-          optimization.push_back(Optimize(m, scene.cameras, "focal", workers, 100));
+          optimization.push_back(Optimize(m, scene.cameras, "focal", ba_workers, 100));
           filter();
           completion.push_back(CompleteTracks(m, graph, points));
-          optimization.push_back(Optimize(m, scene.cameras, "radial", workers, 100));
+          optimization.push_back(Optimize(m, scene.cameras, "radial", ba_workers, 100));
           filter();
           completion.push_back(CompleteTracks(m, graph, points));
           calibrated = true;
@@ -943,7 +943,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         }
       } else if (registered >= std::max(last_global + 40, size_t(last_global * 1.35))) {
         optimization.push_back(
-            Optimize(m, scene.cameras, calibrated ? "radial" : "fixed", workers, 100));
+            Optimize(m, scene.cameras, calibrated ? "radial" : "fixed", ba_workers, 100));
         filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = registered;
@@ -956,7 +956,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     }
     if (!added) {
       if (m.Registered() > last_global) {
-        optimization.push_back(Optimize(m, scene.cameras, "radial", workers, 150));
+        optimization.push_back(Optimize(m, scene.cameras, "radial", ba_workers, 150));
         filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = m.Registered();

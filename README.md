@@ -88,7 +88,7 @@ SfM 默认不自动补匹配；首次停滞时，对已注册部分完成优化�
 
 默认配置唯一来源是 [configs/default.json](configs/default.json)，构建时编译进程序，独立运行包无需携带。`--config` 文件只需列出要修改的键，其余沿用默认值；未知键报错。内参标定默认使用全部有效轨迹（`calibration_tracks=all`），随后锁定内参补全轨迹并精调。标定选项及坐标约定见[输入文档](docs/input.md)。
 
-`workers` 默认 4，控制前端及增量注册阶段 BA 的并行数；SfM 几何验证逐对独立且结果与线程数无关，使用全部硬件线程（不少于 `workers`，最多 32），实际线程数记录在 `cache/sfm.json` 的 `geometry_threads`；`ba_workers` 默认 8，单独控制注册结束后的标定与全局精调、LAS 联合优化和已启用的原图精修 BA，两者均可设为 1–32。求解器、双精度残差、收敛精度和验收门限保持原有设置；独立 `refine` 的 `--workers` 仍控制其 BA。`cache/sfm.json` 的每次优化记录包含构建、预处理、残差、导数、线性求解耗时及逐轮迭代信息。
+`workers` 默认 4，控制前端等并行工作；SfM 几何验证逐对独立且结果与线程数无关，使用全部硬件线程（不少于 `workers`，最多 32），实际线程数记录在 `cache/sfm.json` 的 `geometry_threads`；`ba_workers` 默认 8，单独控制 SfM 增量注册与注册结束后的标定、全局精调、LAS 联合优化和已启用的原图精修 BA，两者均可设为 1–32。求解器、双精度残差、收敛精度和验收门限保持原有设置；独立 `refine` 的 `--workers` 仍控制其 BA。`cache/sfm.json` 的每次优化记录包含构建、预处理、残差、导数、线性求解耗时及逐轮迭代信息。
 
 原图精修默认关闭。开启后保留对齐模型，相机候选未通过时使用原模型，原因保存在 `cache/refinement.json`。后续 `cleanup` 总是独立执行；清理候选未通过时保留清理前的模型，原因保存在 `cache/cleanup.json`。读图、求解或文件错误仍明确报错。
 
@@ -123,7 +123,7 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 
 稀疏点清理作为单独候选：至少两次观测、视差至少 1.5°，单观测误差不超过 `min(3 px, quality_p90_px)`。距离和点位不确定度门限按 `las_median_m` 及 LAS 量化精度计算，默认分别为 10 cm 和 5 cm；该不确定度是固定相机的局部估计，不代表独立精度。清理后支撑不足的照片会从候选移除，但只有总照片保留至少 99%、每个镜头保留至少 98%、原可靠 LAS 支撑轨迹保留至少 90%，且图像图仍连通、剩余照片达到 32 个观测和 8 个覆盖格子、几何质量通过，才采用清理。否则保留清理前的模型，不强行删点。清理不修改相机参数，也不改变由原始 LAS 导出的初始化 PLY。
 
-默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`；开启精修时还保留 `cache/refined.bin`。独立处理的新交付在其 `--output`；独立 `refine` 的所选模型为 `refined.bin`，独立 `cleanup` 为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 19，旧版工作目录、交付及训练结果保持原样，仍可独立导出或处理；新流程使用新工作目录。
+默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`；开启精修时还保留 `cache/refined.bin`。独立处理的新交付在其 `--output`；独立 `refine` 的所选模型为 `refined.bin`，独立 `cleanup` 为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 20，旧版工作目录、交付及训练结果保持原样，仍可独立导出或处理；新流程使用新工作目录。
 
 `run.ps1` 固定启动 `build/ninja/bin/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
 

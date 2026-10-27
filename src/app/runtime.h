@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 namespace geosun {
 using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
-constexpr int PipelineVersion = 19;
+constexpr int PipelineVersion = 20;
 fs::path ExecutablePath();
 fs::path DefaultModels();
 Json BuildInfo();
