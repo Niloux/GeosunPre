@@ -1103,9 +1103,11 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   }
   // Growth has already refined focal length and distortion. Calibrate the
   // registered image set once, hold intrinsics while incorporating new tracks,
-  // then finish with a strict joint refinement of all parameters.
+  // then check the calibration support again and refine cameras and points with
+  // intrinsics held. A second full calibration there lowered the cost by under
+  // 0.1% on 生产车间; the rolling-shutter stage refines the intrinsics again.
   Json calibration_completion = Json::array();
-  auto calibrate = [&](int iterations) {
+  auto calibrate = [&](const char* stage, int iterations) {
     for (;;) {
       filter();
       calibration_completion.push_back(CompleteUnassignedTracks(m, graph));
@@ -1145,11 +1147,11 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       if (!stable_calibration)
         selected.clear();
       optimization.push_back(
-          Optimize(m, scene.cameras, "principal", ba_workers, iterations, {}, {}, {}, selected));
+          Optimize(m, scene.cameras, stage, ba_workers, iterations, {}, {}, {}, selected));
       break;
     }
   };
-  calibrate(150);
+  calibrate("principal", 150);
   for (int round = 0; round < 3; ++round) {
     const size_t before = m.Observations();
     filter();
@@ -1164,7 +1166,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       break;
     optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 100));
   }
-  calibrate(200);
+  calibrate("fixed", 100);
   if (stable_calibration)
     optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 200));
   filter();

@@ -8,7 +8,7 @@ LAS 深度和法向监督默认随最终模型导出，`--no-las-supervision` �
 
 scene.json 保存曝光、初始相机和输入元数据。state.json 版本 1，保存冻结场景、配置、模型元数据和阶段产物元数据。文件变化时拒绝复用；输入、配置或模型改变时使用新 work。
 
-state.json 的 pipeline_version=21 标识当前实现，恢复时须与程序的实现标记一致；不匹配时使用新目录。旧工作目录仍可独立 `export`、`refine` 或 `cleanup`，原结果不迁移、不改写。状态与结果保存本次执行的构建版本、时间和 EXE 路径。几何验证的五点假设由内置 Eigen 求解器生成（版本 21 起，此前为 OpenCV `findEssentialMat`）：零空间参数化后以十个三次约束消元得到乘 x 的作用矩阵，取实特征向量；生产车间全部 1.58 M 轮中 99.91% 的解与 OpenCV 相差不足 1e-6，12509 对的验证内点数仅一对差 1。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，`geometry_threads` 为几何验证使用的线程数（不影响验证结果），最终 result.json 同时包含此报告。unassigned_completion 记录最终标定后固定相机、对匹配连通分量内未分配观测重新三角化的新增点数和观测数；不重复占用已有特征。timing 细分缓存读取、轨迹构建、候选选择、位姿注册、三角化、过滤、检查点和着色耗时。导航误差按最终所选模型计算。
+state.json 的 pipeline_version=22 标识当前实现，恢复时须与程序的实现标记一致；不匹配时使用新目录。旧工作目录仍可独立 `export`、`refine` 或 `cleanup`，原结果不迁移、不改写。状态与结果保存本次执行的构建版本、时间和 EXE 路径。几何验证的五点假设由内置 Eigen 求解器生成（版本 21 起，此前为 OpenCV `findEssentialMat`）：零空间参数化后以十个三次约束消元得到乘 x 的作用矩阵，取实特征向量；生产车间全部 1.58 M 轮中 99.91% 的解与 OpenCV 相差不足 1e-6，12509 对的验证内点数仅一对差 1。cache/sfm.json 保存几何验证、轨迹补全和各次 BA 的收敛、有效观测及耗时，`geometry_threads` 为几何验证使用的线程数（不影响验证结果），最终 result.json 同时包含此报告。unassigned_completion 记录最终标定后固定相机、对匹配连通分量内未分配观测重新三角化的新增点数和观测数；不重复占用已有特征。timing 细分缓存读取、轨迹构建、候选选择、位姿注册、三角化、过滤、检查点和着色耗时。导航误差按最终所选模型计算。
 
 配置中的 `ba_workers` 默认 8，控制 SfM 全部 BA（增量注册与注册结束后的标定、全局精调）、LAS 联合优化和流水线原图精修的 BA 线程数（版本 20 起增量注册 BA 也用它，此前为 `workers`）；其他并行工作沿用 `workers`（默认 4）。每次 BA 保留既有 `build_seconds`、`linear_solver_seconds`、`jacobian_seconds`，新增 `timing` 中的观测建模、参数与先验建模、Ceres 预处理、迭代、后处理及纯残差计算耗时。`threads`、`preconditioner`、`termination`、评估次数、成功与失败步数、线性迭代总数、单轮最大值及触及迭代上限次数说明实际求解过程；`iteration_profile` 逐轮记录代价、梯度、信赖域、步求解耗时和接受状态。逐轮耗时与汇总耗时是同一过程的不同层级，不能将各层统计重复相加。线程数改变使用新工作目录；算法精度及质量门限不因线程数改变而放宽。迭代上限超过 100 或带 LAS 平面、导航约束的 BA 以相对代价下降 1e-6 判定收敛（版本 18 起，此前为 1e-7），其余 BA 为 1e-5；版本 17 的末段迭代每轮代价下降不足百万分之一，相机中心变化在微米级。
 
@@ -40,7 +40,7 @@ cleanup 阶段默认对上一步所选模型独立清理与验收，写入 `cach
 
 精修误差统计的 `per_image` 按内部图像编号列出样本数、中位数和 P90，`cells` 再按原图 16×12 网格统计，格子编号为 `row*16+column`（从 0 开始）。`image_names` 将内部编号映射到图像文件名；它不等同于导出 COLMAP 的 image_id。`validation_coverage.images_without_holdout` 明确列出没有留出观测的已注册图像。全局验收通过不表示这些照片或未覆盖区域已通过独立校验；此报告中的留出误差是重三角化后的重投影误差，不能代替指定表面的原图投影叠加检查。
 
-`pre_calibration_completion` 记录每次末尾标定支撑检查前的轨迹补全，新增点参与随后的 BA。标定两档的 `calibration_selection` 均记录可靠轨迹的逐图观测数、8×8 覆盖格子和角度带计数。支撑不足的检查也保留报告：`used=false`、`insufficient_images` 列出对应曝光；可用子集收尾排除这些曝光后重新检查，最终 `unregistered.json` 和交付 registration 包含全部省略曝光。
+`pre_calibration_completion` 记录每次末尾标定支撑检查前的轨迹补全，新增点参与随后的 BA。第一次检查后联合标定主点及全部内参；版本 22 起第二次检查后只在固定内参下精调相机和点（此前再做一次至多 200 轮的主点标定，生产车间中代价下降不足 0.1%，交付内参差异小于重跑波动），内参随后由卷帘阶段继续精调。标定两档的 `calibration_selection` 均记录可靠轨迹的逐图观测数、8×8 覆盖格子和角度带计数。支撑不足的检查也保留报告：`used=false`、`insufficient_images` 列出对应曝光；可用子集收尾排除这些曝光后重新检查，最终 `unregistered.json` 和交付 registration 包含全部省略曝光。
 
 原图精修 `refinement_version=7` 的 `validation_coverage` 记录逐图训练及留出覆盖、限值和不足名单；覆盖不足时不运行相机优化。精修报告不再内嵌 structure_filter，清理报告位于独立的 cleanup。`optimization_reference` 说明增量优化的原投影与法向位移基准，`optimization.reference_observations` 记录使用原投影的训练观测数；优化代价包含这些先验，不能直接作为实际观测误差。
 
