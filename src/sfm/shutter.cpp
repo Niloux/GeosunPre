@@ -37,51 +37,28 @@ double ShutterPointCost(const Reconstruction& model, const ShutterMotion& motion
     const double error = ShutterError(model, motion, o, point);
     if (!std::isfinite(error))
       return INFINITY;
-    cost += error <= 2 ? .5 * error * error : 2 * (error - 1);
+    cost += TrackCost(error);
   }
   return cost;
 }
 // RefinePoint with the cameras and their readout motion fixed.
 void RefineShutterPoint(const Reconstruction& model, const ShutterMotion& motion,
                         const std::vector<Observation>& track, Eigen::Vector3d& point) {
-  double cost = ShutterPointCost(model, motion, track, point);
-  for (int iteration = 0; iteration < 6; ++iteration) {
-    Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
-    Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
-    for (const auto& o : track) {
-      const auto& image = model.images[o.image];
-      const auto& camera = model.cameras[image.camera];
-      const auto& pixel = image.pixels[o.feature];
-      const double s = motion.Fraction(camera, pixel);
-      const Eigen::Vector3d v = motion.Apply(o.image, image.camera, s, image.pose.Apply(point));
-      const Eigen::Vector2d residual = camera.Project(v) - pixel;
-      const Eigen::Matrix<double, 2, 3> j = camera.ProjectionJacobian(v) *
-                                            Readout(motion, o.image, s) *
-                                            image.pose.Rotation().toRotationMatrix();
-      const double weight = std::min(1., 2 / std::max(residual.norm(), 1e-12));
-      normal.noalias() += weight * j.transpose() * j;
-      rhs.noalias() -= weight * j.transpose() * residual;
-    }
-    const Eigen::Vector3d step = normal.ldlt().solve(rhs);
-    if (!step.allFinite())
-      throw std::runtime_error("Nonfinite rolling-shutter triangulation refinement");
-    bool accepted = false;
-    for (int backtrack = 0; backtrack < 6; ++backtrack) {
-      const Eigen::Vector3d candidate = point + step * std::pow(.5, backtrack);
-      const double next = ShutterPointCost(model, motion, track, candidate);
-      if (std::isfinite(next) && next < cost) {
-        point = candidate;
-        const double improvement = cost - next;
-        cost = next;
-        accepted = true;
-        if (improvement < 1e-7 * std::max(1., cost))
-          return;
-        break;
-      }
-    }
-    if (!accepted)
-      break;
-  }
+  RefineTrackPoint(
+      track, point,
+      [&](const Eigen::Vector3d& p) { return ShutterPointCost(model, motion, track, p); },
+      [&](const Observation& o, const Eigen::Vector3d& p, Eigen::Vector2d& residual,
+          Eigen::Matrix<double, 2, 3>& j) {
+        const auto& image = model.images[o.image];
+        const auto& camera = model.cameras[image.camera];
+        const auto& pixel = image.pixels[o.feature];
+        const double s = motion.Fraction(camera, pixel);
+        const Eigen::Vector3d v = motion.Apply(o.image, image.camera, s, image.pose.Apply(p));
+        residual = camera.Project(v) - pixel;
+        j = camera.ProjectionJacobian(v) * Readout(motion, o.image, s) *
+            image.pose.Rotation().toRotationMatrix();
+      },
+      "Nonfinite rolling-shutter triangulation refinement");
 }
 // Pixel the reference pose records for a ray observed at pixel, at the given range.
 Eigen::Vector2d Rectify(const Camera& camera, const ShutterMotion& motion, uint32_t image,

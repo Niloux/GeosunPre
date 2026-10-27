@@ -1174,7 +1174,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     // Masks for the following images decode while the GPU projects the current batch.
     std::deque<std::future<LoadedMask>> masks;
     size_t requested = 0;
-    auto request = [&] {
+    auto load_masks = [&] {
       for (; masks.size() < Lookahead && requested < images.size(); ++requested)
         masks.push_back(std::async(std::launch::async, [&, id = images[requested]] {
           auto pixels = StaticMask(scene, masks_dir, id, camera, options);
@@ -1183,7 +1183,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         }));
     };
     for (size_t first = 0; first < images.size(); first += batch) {
-      request();
+      load_masks();
       const size_t count = std::min(batch, images.size() - first);
       std::vector<Projection> projection(count);
       for (size_t j = 0; j < count; ++j) {
@@ -1220,7 +1220,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         const uint32_t id = images[first + j];
         const auto static_mask = masks.front().get();
         masks.pop_front();
-        request();
+        load_masks();
         CudaCheck(cudaMemcpyAsync(mask.data, static_mask.pixels.data, size, cudaMemcpyHostToDevice,
                                   stream));
         auto* raw_depth = static_cast<float*>(projected.data);

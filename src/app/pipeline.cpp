@@ -104,6 +104,15 @@ struct Delivery {
   SupervisionOptions supervision;
   bool crop;
 };
+// The options ParseDelivery reads, accepted by every command that writes a delivery.
+std::vector<std::string> WithDeliveryOptions(std::vector<std::string> options) {
+  for (const auto* option :
+       {"--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
+        "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
+        "--supervision-cache-mb", "--crop-valid-domain", "--no-crop-valid-domain"})
+    options.push_back(option);
+  return options;
+}
 Delivery ParseDelivery(const Arguments& args) {
   if (args.values.count("--crop-valid-domain") && args.values.count("--no-crop-valid-domain"))
     throw std::runtime_error("--crop-valid-domain conflicts with --no-crop-valid-domain");
@@ -367,11 +376,8 @@ fs::path ProductionWork(const fs::path& output) {
 }
 }  // namespace
 void Run(const Arguments& args) {
-  args.Validate({"--input", "--work", "--models", "--config", "--stage", "--output", "--las",
-                 "--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
-                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--refine", "--debug", "--crop-valid-domain",
-                 "--no-crop-valid-domain"});
+  args.Validate(WithDeliveryOptions({"--input", "--work", "--models", "--config", "--stage",
+                                     "--output", "--las", "--refine", "--debug"}));
   const auto delivery = ParseDelivery(args);
   // Without --input, an existing work directory supplies the input and output.
   auto output = args.Get("--output").empty() ? fs::path() : args.Path("--output");
@@ -519,10 +525,7 @@ void Run(const Arguments& args) {
   std::cout << summary.dump() << '\n';
 }
 void Export(const Arguments& args) {
-  args.Validate({"--work", "--output", "--no-ply", "--ply-voxel", "--las-supervision",
-                 "--no-las-supervision", "--supervision-max-size", "--supervision-boundary",
-                 "--supervision-mask-dir", "--supervision-cache-mb", "--crop-valid-domain",
-                 "--no-crop-valid-domain"});
+  args.Validate(WithDeliveryOptions({"--work", "--output"}));
   const auto delivery = ParseDelivery(args);
   const auto work = args.Path("--work");
   Lock lock(work);
@@ -544,10 +547,8 @@ void Export(const Arguments& args) {
   std::cout << CheckBundle(output).dump() << '\n';
 }
 void Postprocess(const Arguments& args) {
-  args.Validate({"--work", "--output", "--workers", "--las-supervision", "--no-las-supervision",
-                 "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-                 "--supervision-cache-mb", "--no-ply", "--ply-voxel", "--new-work", "--debug",
-                 "--crop-valid-domain", "--no-crop-valid-domain"});
+  args.Validate(
+      WithDeliveryOptions({"--work", "--output", "--workers", "--new-work", "--debug"}));
   const auto delivery = ParseDelivery(args);
   const bool photo = args.command == "refine";
   const bool debug = args.Get("--debug") == "true";
@@ -575,12 +576,7 @@ void Postprocess(const Arguments& args) {
   if (Contains(source, output) || Contains(output, source) || Contains(scene.input, output) ||
       Contains(output, scene.input))
     throw std::runtime_error("Postprocessing .pending directory overlaps source work or input");
-  if (fs::exists(output)) {
-    auto archived = output;
-    archived += ".interrupted-" +
-                std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
-    fs::rename(output, archived);
-  }
+  ArchiveInterrupted(output);
   if (ReadScene(scene.input, scene.las, scene.enhanced).ToJson() != scene.ToJson())
     throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
   const auto original = ReadJson(source / "result.json");

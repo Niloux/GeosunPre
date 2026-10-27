@@ -854,16 +854,8 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
     }
   }
   for (auto& point : model.points)
-    if (!point.track.empty()) {
-      point.error = 0;
-      for (const auto& observation : point.track) {
-        const auto& image = model.images[observation.image];
-        point.error += (model.cameras[image.camera].Project(image.pose.Apply(point.xyz)) -
-                        image.pixels[observation.feature])
-                           .norm();
-      }
-      point.error /= point.track.size();
-    }
+    if (!point.track.empty())
+      point.error = model.PointError(point);
   nav_errors.clear();
   for (uint32_t i = 0; i < model.images.size(); ++i)
     if (model.images[i].registered)

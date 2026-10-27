@@ -147,20 +147,8 @@ Reconstruction CropModel(const Reconstruction& model, const std::array<CropWindo
         throw std::runtime_error("Observation lies outside the crop window");
     }
   }
-  for (auto& point : cropped.points) {
-    if (motion) {
-      point.error = ShutterPointError(cropped, *motion, point);
-      continue;
-    }
-    double error = 0;
-    for (const auto& o : point.track) {
-      const auto& image = cropped.images[o.image];
-      error += (cropped.cameras[image.camera].Project(image.pose.Apply(point.xyz)) -
-                image.pixels[o.feature])
-                   .norm();
-    }
-    point.error = point.track.empty() ? 0 : error / point.track.size();
-  }
+  for (auto& point : cropped.points)
+    point.error = motion ? ShutterPointError(cropped, *motion, point) : cropped.PointError(point);
   return cropped;
 }
 ShutterMotion CropMotion(const ShutterMotion& motion, const Reconstruction& uncropped,

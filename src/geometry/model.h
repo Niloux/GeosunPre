@@ -64,6 +64,8 @@ struct Reconstruction {
   void Apply(const Similarity& transform);
   void RebuildReferences();
   void Filter(double max_error = 6, double min_angle_degrees = .5);
+  // Mean reprojection distance of a point over its track, 0 for an empty track.
+  double PointError(const ModelPoint& point) const;
   // Reprojection uses the rolling-shutter projection when motion is given.
   Json Quality(const Scene& scene, double median_limit, double p90_limit,
                const ShutterMotion* motion = nullptr) const;

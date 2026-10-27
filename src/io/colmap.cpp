@@ -248,18 +248,7 @@ Reconstruction ReadColmap(const fs::path& path, Scene& scene, const Json* shutte
   if (shutter)
     motion = DeliveryShutterFromJson(*shutter, scene, m);
   for (const auto& point : m.points) {
-    double error = 0;
-    if (shutter)
-      error = ShutterPointError(m, motion, point);
-    else {
-      for (const auto& observation : point.track) {
-        const auto& image = m.images[observation.image];
-        error += (m.cameras[image.camera].Project(image.pose.Apply(point.xyz)) -
-                  image.pixels[observation.feature])
-                     .norm();
-      }
-      error /= point.track.size();
-    }
+    const double error = shutter ? ShutterPointError(m, motion, point) : m.PointError(point);
     if (std::abs(error - point.error) > 1e-6)
       throw std::runtime_error("COLMAP point error differs from its observations");
   }
@@ -331,12 +320,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     throw std::runtime_error("LAS changed since reconstruction; choose a new work directory");
   auto pending = output;
   pending += ".pending";
-  if (fs::exists(pending)) {
-    auto archived = pending;
-    archived += ".interrupted-" +
-                std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
-    fs::rename(pending, archived);
-  }
+  ArchiveInterrupted(pending);
   fs::create_directories(pending / "sparse/0");
   timed("source checks");
   const auto original = rolling ? OriginalPhotoObservations(selected, motion, 8) : selected;

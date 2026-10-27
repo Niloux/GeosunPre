@@ -5,7 +5,6 @@
 #include <Eigen/SVD>
 #include <Eigen/Eigenvalues>
 #include <atomic>
-#include <mutex>
 #include <thread>
 #include <numeric>
 #include <unordered_map>
@@ -341,6 +340,21 @@ Pair Verify(const Scene& scene, const Reconstruction& model, const MatchSet& mat
   if (result.inliers.size() < 24)
     result.inliers.clear();
   return result;
+}
+// Each pair is verified independently with its own fixed seed, so the result does not depend on
+// the thread count.
+std::vector<Pair> VerifyPairs(const Scene& scene, const Reconstruction& model, const fs::path& work,
+                              const std::vector<std::array<uint32_t, 2>>& candidates, int workers) {
+  std::vector<Pair> pairs(candidates.size());
+  std::atomic<size_t> done{0};
+  ParallelFor(candidates.size(), workers, 1, [&](size_t i) {
+    const auto p = candidates[i];
+    pairs[i] = Verify(scene, model, ReadMatches(MatchPath(work, p[0], p[1])));
+    const auto n = done.fetch_add(1) + 1;
+    if (n % 500 == 0)
+      Log("Geometry " + std::to_string(n) + "/" + std::to_string(candidates.size()));
+  });
+  return pairs;
 }
 struct Tracks {
   std::vector<std::vector<Observation>> tracks;
@@ -901,42 +915,11 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   std::vector<std::array<uint32_t, 2>> candidates;
   for (const auto& pair : catalog.at("pairs"))
     candidates.push_back(pair.get<std::array<uint32_t, 2>>());
-  std::vector<Pair> pairs(candidates.size());
   const auto geometry_started = Clock::now();
-  std::atomic<size_t> next{0}, done{0};
-  std::exception_ptr error;
-  std::mutex mutex;
-  std::vector<std::thread> threads;
-  // Each pair is verified independently with its own fixed seed, so the result does not depend
-  // on the thread count. Use the whole CPU for this stage.
+  // Pair verification uses the whole CPU.
   const int geometry_workers =
       std::clamp(int(std::thread::hardware_concurrency()), workers, 32);
-  for (int worker = 0; worker < geometry_workers; ++worker)
-    threads.emplace_back([&] {
-      try {
-        for (;;) {
-          const size_t i = next.fetch_add(1);
-          if (i >= candidates.size())
-            break;
-          const auto p = candidates[i];
-          pairs[i] = Verify(scene, m, ReadMatches(MatchPath(work, p[0], p[1])));
-          const auto n = done.fetch_add(1) + 1;
-          if (n % 500 == 0) {
-            std::lock_guard<std::mutex> lock(mutex);
-            Log("Geometry " + std::to_string(n) + "/" + std::to_string(candidates.size()));
-          }
-        }
-      } catch (...) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!error)
-          error = std::current_exception();
-        next = candidates.size();
-      }
-    });
-  for (auto& t : threads)
-    t.join();
-  if (error)
-    std::rethrow_exception(error);
+  const auto pairs = VerifyPairs(scene, m, work, candidates, geometry_workers);
   const double geometry_seconds = Seconds(geometry_started);
   const auto graph_started = Clock::now();
   Tracks graph(m, pairs);

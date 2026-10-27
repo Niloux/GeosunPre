@@ -83,6 +83,15 @@ void Reconstruction::Filter(double threshold, double min_angle) {
   }
   RebuildReferences();
 }
+double Reconstruction::PointError(const ModelPoint& point) const {
+  double error = 0;
+  for (const auto& o : point.track) {
+    const auto& image = images[o.image];
+    error += (cameras[image.camera].Project(image.pose.Apply(point.xyz)) - image.pixels[o.feature])
+                 .norm();
+  }
+  return point.track.empty() ? 0 : error / point.track.size();
+}
 Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90_limit,
                              const ShutterMotion* motion) const {
   Json rows = Json::array(), failures = Json::array();

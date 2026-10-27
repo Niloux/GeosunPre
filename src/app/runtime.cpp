@@ -115,7 +115,7 @@ double Arguments::Number(const std::string& name, double fallback) const {
     throw std::invalid_argument("Expected positive finite number: " + name);
   return number;
 }
-void Arguments::Validate(std::initializer_list<const char*> options) const {
+void Arguments::Validate(const std::vector<std::string>& options) const {
   for (const auto& [name, value] : values)
     if (std::find(options.begin(), options.end(), name) == options.end())
       throw std::invalid_argument("Unknown option: " + name);
@@ -211,6 +211,14 @@ void PublishFile(const fs::path& temporary, const fs::path& path) {
 #else
   fs::rename(temporary, path);
 #endif
+}
+void ArchiveInterrupted(const fs::path& pending) {
+  if (!fs::exists(pending))
+    return;
+  auto archived = pending;
+  archived += ".interrupted-" +
+              std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+  fs::rename(pending, archived);
 }
 void Log(const std::string& message) {
   // Concurrent stages log whole lines.

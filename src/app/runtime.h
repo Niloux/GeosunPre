@@ -24,6 +24,8 @@ void WriteJson(const fs::path& path, const Json& value);
 Json FileMetadata(const fs::path& path);
 Json Resources();
 void PublishFile(const fs::path& temporary, const fs::path& path);
+// Keeps a .pending directory left by an interrupted run under a timestamped name.
+void ArchiveInterrupted(const fs::path& pending);
 void Log(const std::string& message);
 // Calls function(i) for every i < count on workers threads, handing out chunk indices at a time.
 // A worker exception is rethrown once every worker has finished.
@@ -52,7 +54,7 @@ struct Arguments {
   fs::path Path(const std::string& name) const;
   int Integer(const std::string& name, int fallback) const;
   double Number(const std::string& name, double fallback) const;
-  void Validate(std::initializer_list<const char*> options) const;
+  void Validate(const std::vector<std::string>& options) const;
 };
 #ifdef _WIN32
 std::vector<std::string> Utf8Arguments(int argc, wchar_t** argv);

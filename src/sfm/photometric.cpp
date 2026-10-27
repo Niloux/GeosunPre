@@ -655,16 +655,8 @@ PhotometricRefinement RefinePhotometric(const Scene& scene, const Reconstruction
   report["plane_before_m"] = plane_before;
   report["plane_after_m"] = PlaneErrors(model, planes);
   for (auto& point : model.points)
-    if (!point.track.empty()) {
-      point.error = 0;
-      for (const auto& o : point.track) {
-        const auto& image = model.images[o.image];
-        point.error += (model.cameras[image.camera].Project(image.pose.Apply(point.xyz)) -
-                        image.pixels[o.feature])
-                           .norm();
-      }
-      point.error /= point.track.size();
-    }
+    if (!point.track.empty())
+      point.error = model.PointError(point);
   // Apply the same geometric validity filter as SfM. Strong pruning is a
   // separate candidate, and cannot make an unsuccessful camera solve pass.
   model.Filter();
