@@ -1,6 +1,6 @@
 # GeosunPre
 
-原生 C++17/CUDA 双鱼眼与 LAS 重建程序。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、卷帘快门校正、稀疏点清理、COLMAP/PLY 及 LAS 深度和法向监督导出，可选原图精修。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
+原生 C++17/CUDA 双鱼眼与 LAS 输入预处理程序，交付包是定制 LichtFeld Studio（LFS）3DGS 训练的数据目录。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、卷帘快门校正、稀疏点清理、COLMAP/PLY 及 LAS 深度和法向监督导出，可选原图精修。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
 
 ## 开始使用
 
@@ -43,7 +43,7 @@
 
 交付包含照片（卷帘校正采用时为校正到参考位姿的照片，否则为原图）、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及 LAS 深度和法向监督图。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。完整结构见[输出约定](docs/output.md)。
 
-`run` 的导出阶段及独立 `export`、`refine`、`cleanup` 默认从原始有效 LAS 给已注册照片生成 Spirula 可读取的深度和法向图。已有工作目录可以直接导出到新目录，无需重跑重建：
+`run` 的导出阶段及独立 `export`、`refine`、`cleanup` 默认从原始有效 LAS 给已注册照片生成定制 LFS 直接读取的深度和法向图。已有工作目录可以直接导出到新目录，无需重跑重建：
 
 ```powershell
 .\run.ps1 export --work "work/场景" --output "D:/成果/场景-supervised"
@@ -57,12 +57,12 @@
 
 几何过滤不识别玻璃材质。可用 `--supervision-mask-dir DIR` 追加仅影响几何的排除掩码：按 `DIR/{L,R}/**.JPG.png` 保存原图尺寸灰度 PNG，仅 255 保留；未提供文件的照片沿用原静态区域。不同排除掩码使用新交付目录。
 
-Spirula 直接读取交付包的 `depths/`、`normals/`。训练时显式设置 `input_depth_is_ray_depth=true` 并开启相应监督权重；现有深度相关性损失约束形状，不是绝对米制深度拟合。`supervision.json` 记录每图有效像素、生成参数及文件身份，`check` 会回读监督图。
+定制 LFS 以交付目录为数据路径，直接读取 `depths/`、`normals/` 和 `supervision.json`：识别到毫米深度和 OpenCV 相机法向后，自动把深度损失切到米制 `metric`、法向损失切到 `camera-opencv`，并关闭单目深度和法向的自动生成；显式指定的非默认选择保持不变。深度是沿视线距离，只有 GUT 光栅化按鱼眼视线渲染，训练须加 `--gut`，否则 LFS 告警且离轴处深度监督有偏。监督默认关闭，用 `--use-depth-loss`、`--use-normal-loss` 开启，权重由 `--depth-loss-weight`、`--normal-loss-weight` 设置。掩码的 255/128/0 对应 LFS `segment_and_ignore`。`supervision.json` 记录每图有效像素、生成参数及文件身份，`check` 会回读监督图。
 
-在 Spirula 目录中可从较小权重开始试训，并与关闭监督的相同设置对照评估：
+在 LFS 目录中开启监督试训，并与关闭监督的相同设置对照评估：
 
 ```powershell
-.\build_vulkan\spirula.exe train 3dgs --data "交付目录" --primitive 3dgut --mask-mode segment_and_ignore --input-depth-is-ray-depth 1 --depth-supervision-weight 0.01 --normal-supervision-weight 0.002 --use-bilateral-grid-for-geometry 0
+.\build-windows-release\LichtFeld-Studio.exe --headless -d "交付目录" -o "训练输出" --gut --mask-mode segment_and_ignore --use-depth-loss --use-normal-loss
 ```
 
 默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。首次运行加 `--refine`，或在配置中设置 `"refine": true`，会在 `align` 与 `shutter` 之间增加原图精修；默认 `false`。配置 `"rolling_shutter": false` 去掉卷帘校正阶段，默认 `true`。配置 `"enhanced_photos": true` 改用 `Image/enhanced` 照片，默认 `false` 只用原图。这些选择随配置冻结，续跑自动沿用，改变选择须使用新工作目录。
@@ -100,7 +100,7 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 
 编号能被 5 整除的至少三视图轨迹整条留出，固定相机后分别在原模型与卷帘模型中重新三角化：全部留出观测误差的中位数和 P90 均须下降；至少有 16 个留出观测的照片，其留出中位数不得超过原值 1.1 倍加 0.1 px，再加该图校正前留出中位数的 95% 无分布置信区间半宽（秩次 l = ⌊(n − 1.96√n)/2⌋ 与 n − l + 1，样本少时自动放宽）；单图 P90 主要随离群点波动，只做全局检查；全部观测 P90 不超过原值 1.05 倍加 0.05 px，同组 LAS 平面距离 P90 不超过原值 1.25 倍加 1 cm。物理检查要求由平移项求得的 τ 乘以相邻曝光的角速度，在每个镜头至少 20 个相邻曝光样本上解释至少 10% 的逐图读出转动，且 ω、τ 不触及边界。未通过时保留上一步模型，后续阶段和交付与未校正时相同，原因保存在 `cache/shutter.json`。
 
-采用后，每个观测按其三维点的距离换算到参考位姿的像素，无三维点的特征使用该图点的中位距离；此后清理和阶段质量统计使用普通全局快门投影。导出时观测换算回原图像素，交付原图、原掩码，另附 `rolling_shutter.json` 给出每幅照片的读出运动，COLMAP 误差、质量统计、深度和法向监督按逐行相机投影；下游须按卷帘相机渲染（spirula 的 `3dgut`），格式见[输出约定](docs/output.md)。照片不做重采样：平移项的像素偏移随深度变化，按 LAS 距离重采样在近处动态物体和 LAS 空洞处会错位。独立 `refine` 需要原图几何，拒绝卷帘校正后的来源；独立 `cleanup` 会复制运动参数。
+采用后，每个观测按其三维点的距离换算到参考位姿的像素，无三维点的特征使用该图点的中位距离；此后清理和阶段质量统计使用普通全局快门投影。导出时观测换算回原图像素，交付原图、原掩码，另附 `rolling_shutter.json` 给出每幅照片的读出运动，COLMAP 误差、质量统计、深度和法向监督按逐行相机投影；下游须按卷帘相机渲染（定制 LFS 在 `--gut` 且未开启 undistort 时读取 `rolling_shutter.json`），格式见[输出约定](docs/output.md)。照片不做重采样：平移项的像素偏移随深度变化，按 LAS 距离重采样在近处动态物体和 LAS 空洞处会错位。独立 `refine` 需要原图几何，拒绝卷帘校正后的来源；独立 `cleanup` 会复制运动参数。
 
 新场景需要原图精修时，在首次运行启用：
 
@@ -123,7 +123,7 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 
 稀疏点清理作为单独候选：至少两次观测、视差至少 1.5°，单观测误差不超过 `min(3 px, quality_p90_px)`。距离和点位不确定度门限按 `las_median_m` 及 LAS 量化精度计算，默认分别为 10 cm 和 5 cm；该不确定度是固定相机的局部估计，不代表独立精度。清理后支撑不足的照片会从候选移除，但只有总照片保留至少 99%、每个镜头保留至少 98%、原可靠 LAS 支撑轨迹保留至少 90%，且图像图仍连通、剩余照片达到 32 个观测和 8 个覆盖格子、几何质量通过，才采用清理。否则保留清理前的模型，不强行删点。清理不修改相机参数，也不改变由原始 LAS 导出的初始化 PLY。
 
-默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`；开启精修时还保留 `cache/refined.bin`。独立处理的新交付在其 `--output`；独立 `refine` 的所选模型为 `refined.bin`，独立 `cleanup` 为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 17，旧版工作目录、交付及训练结果保持原样，仍可独立导出或处理；新流程使用新工作目录。
+默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`；开启精修时还保留 `cache/refined.bin`。独立处理的新交付在其 `--output`；独立 `refine` 的所选模型为 `refined.bin`，独立 `cleanup` 为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 18，旧版工作目录、交付及训练结果保持原样，仍可独立导出或处理；新流程使用新工作目录。
 
 `run.ps1` 固定启动 `build/ninja/bin/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
 
