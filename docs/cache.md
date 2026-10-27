@@ -46,4 +46,4 @@ cleanup 阶段默认对上一步所选模型独立清理与验收，写入 `cach
 
 `training_error_px`、`validation_before_px/after_px` 均使用实际像素；后者包含全部留出轨迹，`photo_validation_before_px/after_px` 单独统计成功光度精修的留出轨迹，用于改善门限。逐图及有至少 8 个样本的格子退化名单另存样本数和前后中位数、P90。
 
-清理的 `las_support_passes` 记录抽样元数据、完整 LAS 复核数、`rescued_from_sample_gaps` 和最终无支撑数。`nearest_las_m` 是至已搜索到的有效 LAS 点的距离，为完整点云最近距离的上界；仅在距离大于门限时需要遍历完整 LAS 确认无支撑。临时点云与原始 LAS 块保持有界内存。
+清理的 `las_support_passes` 记录抽样元数据、完整 LAS 复核数、`rescued_from_sample_gaps` 和最终无支撑数，以及抽样、抽样检索和完整复核的耗时。完整复核把待查点按支撑距离宽的网格登记到周围 27 格，逐条 LAS 记录只查一格。`nearest_las_m` 是至已搜索到的有效 LAS 点的距离，为完整点云最近距离的上界；仅在距离大于门限时需要遍历完整 LAS 确认无支撑。临时点云与原始 LAS 块保持有界内存。

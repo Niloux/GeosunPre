@@ -65,7 +65,7 @@ StructureCleanup CleanSparseStructure(const Scene& scene, const Reconstruction& 
               {"seconds", Seconds(started)}};
     return cleanup;
   }
-  report = FilterSparseStructure(scene, cleanup.candidate, limits, workers);
+  report = FilterSparseStructure(scene, cleanup.candidate, limits);
   const auto quality = cleanup.candidate.Quality(scene, limits.median_px, limits.p90_px);
   report["coverage"] = StructureCoverage(source, cleanup.candidate, planes);
   std::vector<PlaneConstraint> retained_planes;

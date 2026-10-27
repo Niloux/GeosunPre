@@ -8,6 +8,7 @@
 #include <future>
 #include <set>
 #include <random>
+#include <unordered_map>
 namespace geosun {
 namespace {
 using Tile = std::array<int64_t, 3>;
@@ -410,13 +411,14 @@ double FixedCameraPositionSigma(const Reconstruction& model, const ModelPoint& p
   return std::max(.5, point.error) / std::sqrt(std::max(eigen[0], 1e-18));
 }
 std::vector<double> LasSupportDistances(const Scene& scene, const Reconstruction& model,
-                                        const LasHeader& header, double maximum, int workers,
+                                        const LasHeader& header, double maximum,
                                         Json& report) {
   const auto started = Clock::now();
   const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
   Json sampling;
   Surface sample;
   sample.points = SampleLas(scene.las, header, sampling);
+  const double sample_seconds = Seconds(started);
   for (auto& point : sample.points)
     point -= origin;
   sample.Index();
@@ -434,49 +436,71 @@ std::vector<double> LasSupportDistances(const Scene& scene, const Reconstruction
       unresolved.push_back(id);
   }
   const size_t rechecked = unresolved.size();
+  const double search_seconds = Seconds(started) - sample_seconds;
   // A missing neighbour in the bounded sample is not evidence of missing LAS
   // support. Recheck only those points against every valid record, one chunk
   // at a time, before removing them. No plane assumption is made here.
   if (!unresolved.empty()) {
     sample.tree.reset();
     sample.points.clear();
-    ScanLas(scene.las, header, [&](uint64_t, const std::vector<LasPoint>& records) {
-      if (unresolved.empty())
-        return;
-      Surface chunk;
-      Eigen::Vector3d lower = Eigen::Vector3d::Constant(INFINITY), upper = -lower;
-      chunk.points.reserve(records.size());
-      for (const auto& record : records)
-        if (KeepLasPoint(record)) {
-          const Eigen::Vector3d xyz = LasCoordinates(header, record) - origin;
-          chunk.points.push_back(xyz);
-          lower = lower.cwiseMin(xyz);
-          upper = upper.cwiseMax(xyz);
-        }
-      if (chunk.points.empty())
-        return;
-      std::vector<uint64_t> nearby;
-      for (uint64_t id : unresolved) {
-        const Eigen::Vector3d xyz = model.points[id].xyz - origin;
-        if ((xyz.array() >= lower.array() - maximum).all() &&
-            (xyz.array() <= upper.array() + maximum).all())
-          nearby.push_back(id);
+    // Cells as wide as the support distance: every record within it of a point lies in one of
+    // the 27 cells around the point, where the point is listed, so one lookup per record finds
+    // it. A point resolved by a chunk keeps that chunk's nearest record, as before.
+    constexpr int64_t limit = int64_t(1) << 20;
+    auto cell = [&](const Eigen::Vector3d& xyz, std::array<int64_t, 3>& index) {
+      for (int k = 0; k < 3; ++k) {
+        index[k] = int64_t(std::floor(xyz[k] / maximum));
+        if (std::abs(index[k]) >= limit - 1)
+          return false;
       }
-      if (nearby.empty())
-        return;
-      chunk.Index();
-      ParallelFor(nearby.size(), workers, 1024, [&](size_t index) {
-        const uint64_t id = nearby[index];
-        const Eigen::Vector3d xyz = model.points[id].xyz - origin;
-        size_t nearest;
-        double squared;
-        chunk.tree->knnSearch(xyz.data(), 1, &nearest, &squared);
-        distances[id] = std::min(distances[id], std::sqrt(squared));
-      });
-      unresolved.erase(std::remove_if(unresolved.begin(), unresolved.end(),
-                                      [&](uint64_t id) { return distances[id] <= maximum; }),
-                       unresolved.end());
+      return true;
+    };
+    auto key = [&](const std::array<int64_t, 3>& index) {
+      return uint64_t(index[0] + limit) << 42 | uint64_t(index[1] + limit) << 21 |
+             uint64_t(index[2] + limit);
+    };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> grid;
+    std::vector<Eigen::Vector3d> local(unresolved.size());
+    for (uint32_t i = 0; i < unresolved.size(); ++i) {
+      local[i] = model.points[unresolved[i]].xyz - origin;
+      std::array<int64_t, 3> centre;
+      // Beyond the grid a point is far outside the LAS bounds and stays unsupported.
+      if (!cell(local[i], centre))
+        continue;
+      for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dx = -1; dx <= 1; ++dx)
+            grid[key({centre[0] + dx, centre[1] + dy, centre[2] + dz})].push_back(i);
+    }
+    std::vector<uint8_t> resolved(unresolved.size());
+    std::vector<double> nearest(unresolved.size());
+    ScanLas(scene.las, header, [&](uint64_t, const std::vector<LasPoint>& records) {
+      std::fill(nearest.begin(), nearest.end(), INFINITY);
+      for (const auto& record : records) {
+        if (!KeepLasPoint(record))
+          continue;
+        const Eigen::Vector3d xyz = LasCoordinates(header, record) - origin;
+        std::array<int64_t, 3> index;
+        if (!cell(xyz, index))
+          continue;
+        const auto found = grid.find(key(index));
+        if (found == grid.end())
+          continue;
+        for (const uint32_t i : found->second)
+          if (!resolved[i])
+            nearest[i] = std::min(nearest[i], (xyz - local[i]).squaredNorm());
+      }
+      for (uint32_t i = 0; i < unresolved.size(); ++i)
+        if (!resolved[i] && nearest[i] <= maximum * maximum) {
+          distances[unresolved[i]] = std::sqrt(nearest[i]);
+          resolved[i] = 1;
+        }
     });
+    std::vector<uint64_t> remaining;
+    for (uint32_t i = 0; i < unresolved.size(); ++i)
+      if (!resolved[i])
+        remaining.push_back(unresolved[i]);
+    unresolved = std::move(remaining);
   }
   report = {{"sample", sampling},
             {"rechecked_against_full_las", rechecked},
@@ -484,6 +508,9 @@ std::vector<double> LasSupportDistances(const Scene& scene, const Reconstruction
             {"unsupported_after_full_scan", unresolved.size()},
             {"distance_scope",
              "distance to a searched valid LAS record; upper bound on full-cloud nearest distance"},
+            {"sample_seconds", sample_seconds},
+            {"sample_search_seconds", search_seconds},
+            {"recheck_seconds", Seconds(started) - sample_seconds - search_seconds},
             {"seconds", Seconds(started)}};
   return distances;
 }
@@ -527,8 +554,8 @@ std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Recon
   }
   return planes;
 }
-Json FilterSparseStructure(const Scene& scene, Reconstruction& model, const AlignmentLimits& limits,
-                           int workers) {
+Json FilterSparseStructure(const Scene& scene, Reconstruction& model,
+                           const AlignmentLimits& limits) {
   // Camera refinement requires >=3 views; reliable two-view points can still
   // seed 3DGS when parallax, depth precision and LAS support pass.
   constexpr size_t minimum_track_length = 2;
@@ -558,7 +585,7 @@ Json FilterSparseStructure(const Scene& scene, Reconstruction& model, const Alig
   }
   Json support;
   auto support_distances =
-      LasSupportDistances(scene, model, header, max_distance, workers, support);
+      LasSupportDistances(scene, model, header, max_distance, support);
   Json support_passes = Json::array({support});
   for (uint64_t id = 0; id < model.points.size(); ++id) {
     auto& point = model.points[id];
@@ -615,7 +642,7 @@ Json FilterSparseStructure(const Scene& scene, Reconstruction& model, const Alig
   std::vector<double> distances, uncertainty;
   retained = 0;
   if (!removed_images.empty()) {
-    support_distances = LasSupportDistances(scene, model, header, max_distance, workers, support);
+    support_distances = LasSupportDistances(scene, model, header, max_distance, support);
     support_passes.push_back(support);
   }
   for (uint64_t id = 0; id < model.points.size(); ++id) {
