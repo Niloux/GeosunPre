@@ -555,17 +555,19 @@ Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
   timing.write = writer.seconds;
   return timing.Report(started, &models);
 }
-Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
-                 const std::set<uint32_t>& repair) {
-  const auto started = Clock::now();
-  FrontendTiming timing;
+namespace {
+// Pairs to match: the cached ones, near exposures, navigation revisits and descriptor retrieval
+// over several exposure distances. Repair adds dense edges for the requested images only.
+std::set<std::pair<uint32_t, uint32_t>> CandidatePairs(const Scene& scene, const fs::path& work,
+                                                       const std::set<uint32_t>& repair,
+                                                       size_t& navigation_added_pairs) {
   const uint32_t n = uint32_t(scene.images.size());
   std::vector<std::array<float, 256>> retrieval;
   for (uint32_t id = 0; id < n; ++id)
     retrieval.push_back(ReadFeatures(FeaturePath(work, id)).retrieval);
   std::set<std::pair<uint32_t, uint32_t>> pairs;
   const auto velocities = NavigationVelocities(scene);
-  size_t navigation_added_pairs = 0;
+  navigation_added_pairs = 0;
   auto add = [&](uint32_t a, uint32_t b) {
     if (a != b)
       pairs.emplace(std::min(a, b), std::max(a, b));
@@ -631,6 +633,16 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
       }
     }
   }
+  return pairs;
+}
+}  // namespace
+Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
+                 const std::set<uint32_t>& repair) {
+  const auto started = Clock::now();
+  FrontendTiming timing;
+  const uint32_t n = uint32_t(scene.images.size());
+  size_t navigation_added_pairs;
+  const auto pairs = CandidatePairs(scene, work, repair, navigation_added_pairs);
   std::vector<std::pair<uint32_t, uint32_t>> pending;
   for (const auto& [a, b] : pairs) {
     if (fs::exists(MatchPath(work, a, b)))

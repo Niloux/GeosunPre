@@ -86,8 +86,8 @@ std::vector<Eigen::Matrix3d> FivePoint(const std::vector<cv::Point2d>& a,
   std::array<Cubic, 10> equations;
   // det(E) by the first row.
   const auto minor = [&](int r0, int c0, int r1, int c1) {
-    return Combine(Multiply(at(r0, c0), 1, at(r1, c1), 1), 1, Multiply(at(r0, c1), 1, at(r1, c0), 1),
-                   -1);
+    return Combine(Multiply(at(r0, c0), 1, at(r1, c1), 1), 1,
+                   Multiply(at(r0, c1), 1, at(r1, c0), 1), -1);
   };
   equations[0] = Combine(Combine(Multiply(at(0, 0), 1, minor(1, 1, 2, 2), 2), 1,
                                  Multiply(at(0, 1), 1, minor(1, 0, 2, 2), 2), -1),
@@ -355,6 +355,44 @@ std::vector<Pair> VerifyPairs(const Scene& scene, const Reconstruction& model, c
       Log("Geometry " + std::to_string(n) + "/" + std::to_string(candidates.size()));
   });
   return pairs;
+}
+using FeatureColors = std::vector<std::vector<std::array<uint8_t, 3>>>;
+// Cached features become the observations of a new model, or must match those of a resumed one.
+FeatureColors LoadFeatures(const Scene& scene, const fs::path& work, Reconstruction& m,
+                           bool resumed) {
+  FeatureColors colors(m.images.size());
+  for (uint32_t id = 0; id < m.images.size(); ++id) {
+    auto f = ReadFeatures(FeaturePath(work, id));
+    if (f.image != id)
+      throw std::runtime_error("Feature/image identity differs");
+    if (resumed) {
+      if (m.images[id].camera != scene.images[id].camera ||
+          m.images[id].pixels.size() != f.pixels.size())
+        throw std::runtime_error("Incremental feature identity differs");
+      for (size_t k = 0; k < f.pixels.size(); ++k)
+        if (m.images[id].pixels[k] != Eigen::Vector2d(f.pixels[k][0], f.pixels[k][1]))
+          throw std::runtime_error("Incremental feature coordinates differ");
+    } else {
+      m.images[id].camera = scene.images[id].camera;
+      for (const auto& p : f.pixels)
+        m.images[id].pixels.emplace_back(p[0], p[1]);
+      m.images[id].points.assign(f.pixels.size(), NoPoint);
+    }
+    colors[id] = std::move(f.colors);
+  }
+  return colors;
+}
+// Each point takes the colour of its feature in the first image of its track.
+void ColorPoints(Reconstruction& m, const FeatureColors& colors) {
+  for (uint32_t id = 0; id < m.images.size(); ++id) {
+    for (uint32_t k = 0; k < m.images[id].points.size(); ++k)
+      if (m.images[id].points[k] != NoPoint) {
+        auto& p = m.points[m.images[id].points[k]];
+        if (p.track.front().image != id)
+          continue;
+        p.color = colors[id][k];
+      }
+  }
 }
 struct Tracks {
   std::vector<std::vector<Observation>> tracks;
@@ -890,26 +928,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     m.cameras = scene.cameras;
     m.images.resize(scene.images.size());
   }
-  std::vector<std::vector<std::array<uint8_t, 3>>> colors(m.images.size());
-  for (uint32_t id = 0; id < m.images.size(); ++id) {
-    auto f = ReadFeatures(FeaturePath(work, id));
-    if (f.image != id)
-      throw std::runtime_error("Feature/image identity differs");
-    if (resumed) {
-      if (m.images[id].camera != scene.images[id].camera ||
-          m.images[id].pixels.size() != f.pixels.size())
-        throw std::runtime_error("Incremental feature identity differs");
-      for (size_t k = 0; k < f.pixels.size(); ++k)
-        if (m.images[id].pixels[k] != Eigen::Vector2d(f.pixels[k][0], f.pixels[k][1]))
-          throw std::runtime_error("Incremental feature coordinates differ");
-    } else {
-      m.images[id].camera = scene.images[id].camera;
-      for (const auto& p : f.pixels)
-        m.images[id].pixels.emplace_back(p[0], p[1]);
-      m.images[id].points.assign(f.pixels.size(), NoPoint);
-    }
-    colors[id] = std::move(f.colors);
-  }
+  const auto colors = LoadFeatures(scene, work, m, resumed);
   const double cache_read_seconds = Seconds(started);
   const auto catalog = ReadJson(work / "cache/pairs.json");
   std::vector<std::array<uint32_t, 2>> candidates;
@@ -1155,15 +1174,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   filter();
   const auto unassigned_completion = CompleteUnassignedTracks(m, graph);
   const auto color_started = Clock::now();
-  for (uint32_t id = 0; id < m.images.size(); ++id) {
-    for (uint32_t k = 0; k < m.images[id].points.size(); ++k)
-      if (m.images[id].points[k] != NoPoint) {
-        auto& p = m.points[m.images[id].points[k]];
-        if (p.track.front().image != id)
-          continue;
-        p.color = colors[id][k];
-      }
-  }
+  ColorPoints(m, colors);
   report = {{"verified_pairs", std::count_if(pairs.begin(), pairs.end(),
                                              [](const auto& p) { return !p.inliers.empty(); })},
             {"tracks", graph.tracks.size()},

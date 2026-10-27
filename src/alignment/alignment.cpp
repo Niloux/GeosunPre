@@ -679,6 +679,77 @@ Json FilterSparseStructure(const Scene& scene, Reconstruction& model,
             {"maximum_sigma_proxy_m", max_sigma},
             {"maximum_nearest_las_m", max_distance}}}};
 }
+namespace {
+// Joint refinement of cameras and points with the reliable LAS surfaces. The candidate replaces
+// the model, and its alignment the accepted one, only if it keeps the visual fit and every image
+// stable and improves the LAS fit; joint records the comparison either way.
+void JointRefinement(const Scene& scene, Reconstruction& model,
+                     const std::vector<PlaneConstraint>& constraints,
+                     const std::vector<Eigen::Vector3d>& navigation,
+                     const std::vector<uint64_t>& identities, const Eigen::Vector3d& origin,
+                     const Surface& surface, const Regions& regions, const AlignmentLimits& limits,
+                     const Json& base_quality, int ba_workers, Json& acceptance, Json& joint) {
+  Reconstruction candidate = model;
+  const auto solve =
+      Optimize(candidate, scene.cameras, "fixed", ba_workers, 100, {}, constraints, navigation);
+  const auto quality = candidate.Quality(scene, limits.median_px, limits.p90_px);
+  Points candidate_points;
+  std::vector<double> displacement;
+  for (uint64_t id : identities) {
+    candidate_points.push_back(candidate.points[id].xyz - origin);
+    displacement.push_back((candidate.points[id].xyz - model.points[id].xyz).norm());
+  }
+  const auto proposed = Acceptance(Residuals(candidate_points, surface, limits.p90_m), regions,
+                                   limits.support_fraction, limits.median_m, limits.p90_m);
+  const double before = base_quality.at("reprojection_px").at("p90"),
+               after = quality.at("reprojection_px").at("p90");
+  bool image_stable = true;
+  Json unstable_images = Json::array();
+  for (size_t i = 0; i < quality.at("images").size(); ++i) {
+    if (!model.images[i].registered)
+      continue;
+    const auto& previous = base_quality.at("images")[i];
+    const auto& next = quality.at("images")[i];
+    const double a = previous.at("reprojection_px").at("p90"),
+                 b = next.at("reprojection_px").at("p90");
+    if (b > a * 1.1 + .1) {
+      image_stable = false;
+      unstable_images.push_back({{"name", next.at("name")},
+                                 {"before_p90_px", a},
+                                 {"after_p90_px", b},
+                                 {"limit_px", a * 1.1 + .1}});
+    }
+  }
+  const bool improved = proposed.at("point_to_plane_m").at("median").get<double>() <
+                        acceptance.at("point_to_plane_m").at("median").get<double>();
+  const Json checks = {{"visual_acceptance", quality.at("passed")},
+                       {"alignment_acceptance", proposed.at("passed")},
+                       {"global_reprojection", after <= before * 1.05 + .05},
+                       {"per_image_reprojection", image_stable},
+                       {"point_displacement", Quantile(displacement, .9) <= .1},
+                       {"plane_improvement", improved}};
+  const auto failed_checks = FailedChecks(checks);
+  const bool accepted = failed_checks.empty();
+  joint["used"] = accepted;
+  joint["reason"] =
+      accepted ? "accepted" : "candidate did not preserve visual fit or improve LAS fit";
+  joint["optimization"] = solve;
+  joint["candidate_alignment"] = proposed;
+  joint["candidate_quality"] = quality;
+  joint["checks"] = checks;
+  joint["failed_checks"] = failed_checks;
+  joint["unstable_images"] = unstable_images;
+  joint["point_displacement_m"] = Statistics(displacement);
+  joint["comparison"] = {{"before_reprojection_p90_px", before},
+                         {"after_reprojection_p90_px", after},
+                         {"reprojection_limit_px", before * 1.05 + .05},
+                         {"point_displacement_p90_limit_m", .1}};
+  if (accepted) {
+    model = std::move(candidate);
+    acceptance = proposed;
+  }
+}
+}  // namespace
 Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits,
            int ba_workers) {
   if (!ba_workers)
@@ -792,67 +863,9 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
     joint["reason"] = "insufficient reliable surface directions";
   else if (Quantile(normalized, .5) <= 1 && Quantile(normalized, .9) <= 2)
     joint["reason"] = "already within surface noise proxy";
-  else {
-    Reconstruction candidate = model;
-    const auto solve =
-        Optimize(candidate, scene.cameras, "fixed", ba_workers, 100, {}, constraints, navigation);
-    const auto quality = candidate.Quality(scene, limits.median_px, limits.p90_px);
-    Points candidate_points;
-    std::vector<double> displacement;
-    for (uint64_t id : identities) {
-      candidate_points.push_back(candidate.points[id].xyz - origin);
-      displacement.push_back((candidate.points[id].xyz - model.points[id].xyz).norm());
-    }
-    const auto proposed = Acceptance(Residuals(candidate_points, *surface, limits.p90_m), regions,
-                                     limits.support_fraction, limits.median_m, limits.p90_m);
-    const double before = base_quality.at("reprojection_px").at("p90"),
-                 after = quality.at("reprojection_px").at("p90");
-    bool image_stable = true;
-    Json unstable_images = Json::array();
-    for (size_t i = 0; i < quality.at("images").size(); ++i) {
-      if (!model.images[i].registered)
-        continue;
-      const auto& previous = base_quality.at("images")[i];
-      const auto& next = quality.at("images")[i];
-      const double a = previous.at("reprojection_px").at("p90"),
-                   b = next.at("reprojection_px").at("p90");
-      if (b > a * 1.1 + .1) {
-        image_stable = false;
-        unstable_images.push_back({{"name", next.at("name")},
-                                   {"before_p90_px", a},
-                                   {"after_p90_px", b},
-                                   {"limit_px", a * 1.1 + .1}});
-      }
-    }
-    const bool improved = proposed.at("point_to_plane_m").at("median").get<double>() <
-                          acceptance.at("point_to_plane_m").at("median").get<double>();
-    const Json checks = {{"visual_acceptance", quality.at("passed")},
-                         {"alignment_acceptance", proposed.at("passed")},
-                         {"global_reprojection", after <= before * 1.05 + .05},
-                         {"per_image_reprojection", image_stable},
-                         {"point_displacement", Quantile(displacement, .9) <= .1},
-                         {"plane_improvement", improved}};
-    const auto failed_checks = FailedChecks(checks);
-    const bool accepted = failed_checks.empty();
-    joint["used"] = accepted;
-    joint["reason"] =
-        accepted ? "accepted" : "candidate did not preserve visual fit or improve LAS fit";
-    joint["optimization"] = solve;
-    joint["candidate_alignment"] = proposed;
-    joint["candidate_quality"] = quality;
-    joint["checks"] = checks;
-    joint["failed_checks"] = failed_checks;
-    joint["unstable_images"] = unstable_images;
-    joint["point_displacement_m"] = Statistics(displacement);
-    joint["comparison"] = {{"before_reprojection_p90_px", before},
-                           {"after_reprojection_p90_px", after},
-                           {"reprojection_limit_px", before * 1.05 + .05},
-                           {"point_displacement_p90_limit_m", .1}};
-    if (accepted) {
-      model = std::move(candidate);
-      acceptance = proposed;
-    }
-  }
+  else
+    JointRefinement(scene, model, constraints, navigation, identities, origin, *surface, regions,
+                    limits, base_quality, ba_workers, acceptance, joint);
   for (auto& point : model.points)
     if (!point.track.empty())
       point.error = model.PointError(point);
