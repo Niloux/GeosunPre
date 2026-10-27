@@ -376,17 +376,20 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   for (auto& row : rows)
     photos.push_back(std::move(row));
   timed("photos and masks");
-  Json initialization = nullptr;
+  // The PLY voxelizes the LAS on the CPU while the supervision projects it on the GPU.
+  std::future<Json> initialization_job;
   if (include_ply)
-    initialization = ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);
-  timed("PLY");
+    initialization_job = std::async(std::launch::async, [&] {
+      return ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);
+    });
   Json supervision = nullptr;
   if (options.enabled) {
     supervision =
         ExportLasSupervision(scene, model, masks, pending, options, rolling ? &motion : nullptr);
     WriteJson(pending / "supervision.json", supervision);
-    timed("supervision");
   }
+  const Json initialization = include_ply ? initialization_job.get() : Json(nullptr);
+  timed("PLY and supervision");
   const auto registration = model.Registration(scene);
   auto quality = report.at("quality");
   if (rolling) {

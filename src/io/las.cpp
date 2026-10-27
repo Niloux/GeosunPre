@@ -350,7 +350,8 @@ Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel) {
         throw std::runtime_error("Cannot write LAS voxel partition");
     }
     if (start == 0 || (start + block.size()) % 10000000 == 0 || start + block.size() == h.count)
-      std::cerr << "Native LAS initialization " << start + block.size() << '/' << h.count << '\n';
+      Log("Native LAS initialization " + std::to_string(start + block.size()) + "/" +
+          std::to_string(h.count));
   });
   for (auto& stream : buckets) {
     stream.close();
