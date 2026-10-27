@@ -78,4 +78,4 @@ images         [{image_id, camera_id, name, rotation_rad[3], velocity_m_s[3], tr
 
 `run`、`export`、`refine`、`cleanup` 默认把每个镜头的照片、掩码与模型裁到该镜头有效域的外接窗口；`--no-crop-valid-domain` 交付整幅原图，`--crop-valid-domain` 显式开启，二者冲突。裁剪使下游少处理鱼眼圆外恒为 0 的像素。窗口取该镜头全部已注册照片静态掩码非零像素的外接框，四周各留 16 px（不超出原图）；左上角对齐照片 JPEG 的 MCU 网格，照片按 DCT 系数无损裁剪，不重新编码，EXIF 等标记原样保留（EXIF 中记录的像素尺寸不改写）。掩码按窗口精确裁剪。窗口沿读出轴以图像中心对称，读出比例只按 `N'/N` 缩放（N、N' 为裁剪前后沿读出轴的尺寸）：`rolling_shutter.json` 的 `rotation_rad`、`translation_m` 与 `readout_s` 同乘 `N'/N`，`velocity_m_s` 与参考位姿不变，交付在裁剪后图像上按同一公式 `s = (c - N/2)/N` 使用。
 
-`cameras.bin` 的宽高为窗口尺寸，主点减去窗口原点，畸变参数不变；`images.bin` 的特征坐标减去窗口原点，`points3D.bin` 的 error 按裁剪后的投影重新计算。深度、法向监督按裁剪后的相机生成，静态及额外排除掩码先裁到窗口再缩放到监督图。`manifest.json` 的 request 另含 `crop`（`mode: "valid_domain"` 与两镜头窗口），监督请求另含 `crop_windows`，因此裁剪与未裁剪交付不会被视为同一请求。`check` 对裁剪交付按同样规则回读。
+`cameras.bin` 的宽高为窗口尺寸，主点减去窗口原点，畸变参数不变；`images.bin` 的特征坐标减去窗口原点，`points3D.bin` 的 error 按裁剪后的投影重新计算。深度、法向监督按裁剪后的相机生成，静态及额外排除掩码先裁到窗口再缩放到监督图；监督图像素只有在其原图面积内全部有效时才有效（对无效像素做面积缩放，结果须严格为 0）。`manifest.json` 的 request 另含 `crop`（`mode: "valid_domain"` 与两镜头窗口），监督请求另含 `crop_windows`，因此裁剪与未裁剪交付不会被视为同一请求。`check` 对裁剪交付按同样规则回读。

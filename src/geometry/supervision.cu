@@ -17,7 +17,7 @@
 
 namespace geosun {
 namespace {
-constexpr int Version = 6;
+constexpr int Version = 7;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
 constexpr double MaxTheta = 1.396263401595464;
@@ -991,10 +991,13 @@ cv::Mat StaticMask(const Scene& scene, const fs::path& masks, uint32_t image, co
       throw std::runtime_error("Crop window lies outside the static mask");
     mask = mask(cv::Rect(w.x, w.y, w.width, w.height)).clone();
   }
-  cv::Mat source, resized;
-  mask.convertTo(source, CV_32F, 1. / 255);
-  cv::resize(source, resized, {camera.width, camera.height}, 0, 0, cv::INTER_AREA);
-  mask = resized >= 1.f - 1e-6f;
+  // A map pixel is valid only when its whole footprint is. The invalid indicator is resampled,
+  // so a fully valid footprint sums exact zeros; resampling the valid one instead lets float
+  // area weights fall short of 1 on fixed columns of non-integer scales.
+  cv::Mat invalid, resized;
+  cv::Mat(mask == 0).convertTo(invalid, CV_32F, 1. / 255);
+  cv::resize(invalid, resized, {camera.width, camera.height}, 0, 0, cv::INTER_AREA);
+  mask = resized == 0.f;
   mask /= 255;
   return mask;
 }
