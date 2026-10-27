@@ -9,10 +9,13 @@ try {
     if ($LASTEXITCODE -or -not $vs) { throw 'Cannot find the Visual Studio C++ tools.' }
     Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
     Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
-    # CMake's /showIncludes probe and Ninja must use the same output encoding.
-    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-    & "$env:SystemRoot\System32\chcp.com" 65001 | Out-Null
-    if ($LASTEXITCODE) { throw 'Cannot select UTF-8 console output for the build.' }
+    # CMake writes cl's /showIncludes prefix into rules.ninja in the ANSI code page, so cl must
+    # print in that code page too; under any other console code page Ninja records no header
+    # dependencies and header edits rebuild nothing.
+    $acp = [int](Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage').ACP
+    & "$env:SystemRoot\System32\chcp.com" $acp | Out-Null
+    if ($LASTEXITCODE) { throw "Cannot select console code page $acp for the build." }
+    [Console]::OutputEncoding = [Text.Encoding]::GetEncoding($acp)
     if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
         $ninjaRoot = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja'
         if (-not (Test-Path -LiteralPath (Join-Path $ninjaRoot 'ninja.exe'))) {
