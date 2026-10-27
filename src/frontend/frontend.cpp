@@ -18,7 +18,19 @@ fs::path MaskPath(const fs::path& work, uint32_t id) {
   return work / "cache/masks" / (std::to_string(id) + ".png");
 }
 namespace {
-std::vector<uint32_t> NavigationRevisitCandidates(const Scene& scene, uint32_t image) {
+// A same-lens exposure passed in the opposite travel direction faces the other side: the rig has
+// turned half a circle, so the other lens covers what this one saw. On 生产车间 half of these pairs
+// shared no reconstructed point. Exposures with no clear motion are kept.
+bool FacesAway(const Scene& scene, const std::vector<Eigen::Vector3d>& velocities, uint32_t a,
+               uint32_t b) {
+  constexpr double moving_m_s = .1;
+  const auto &va = velocities[a], &vb = velocities[b];
+  return scene.images[a].camera == scene.images[b].camera && va.norm() > moving_m_s &&
+         vb.norm() > moving_m_s && va.dot(vb) < -.5 * va.norm() * vb.norm();
+}
+std::vector<uint32_t> NavigationRevisitCandidates(const Scene& scene,
+                                                  const std::vector<Eigen::Vector3d>& velocities,
+                                                  uint32_t image) {
   constexpr double radius_m = 5., minimum_seconds = 10.;
   constexpr size_t maximum_candidates = 20;
   std::vector<std::pair<double, uint32_t>> nearby;
@@ -37,7 +49,8 @@ std::vector<uint32_t> NavigationRevisitCandidates(const Scene& scene, uint32_t i
   std::sort(nearby.begin(), nearby.end());
   std::vector<uint32_t> candidates;
   for (size_t k = 0; k < std::min(maximum_candidates, nearby.size()); ++k)
-    candidates.push_back(nearby[k].second);
+    if (!FacesAway(scene, velocities, image, nearby[k].second))
+      candidates.push_back(nearby[k].second);
   return candidates;
 }
 struct Fusion {
@@ -549,6 +562,7 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
   for (uint32_t id = 0; id < n; ++id)
     retrieval.push_back(ReadFeatures(FeaturePath(work, id)).retrieval);
   std::set<std::pair<uint32_t, uint32_t>> pairs;
+  const auto velocities = NavigationVelocities(scene);
   size_t navigation_added_pairs = 0;
   auto add = [&](uint32_t a, uint32_t b) {
     if (a != b)
@@ -575,7 +589,7 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
     // their scale and the surrounding scene changed. Navigation supplies
     // independent candidates; matching and ray-space verification still decide
     // whether the images actually overlap. Do not assume L/R synchronization.
-    for (uint32_t candidate : NavigationRevisitCandidates(scene, id)) {
+    for (uint32_t candidate : NavigationRevisitCandidates(scene, velocities, id)) {
       const auto before = pairs.size();
       add(id, candidate);
       navigation_added_pairs += pairs.size() - before;
