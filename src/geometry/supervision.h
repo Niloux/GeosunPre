@@ -6,7 +6,7 @@ namespace geosun {
 struct SupervisionOptions {
   bool enabled = true;
   int max_size = 1600, boundary = 6;
-  int cache_mb = 1024;
+  int cache_mb = 2048;
   fs::path mask_dir;
   // Cropped delivery: each lens's maps cover this window of its original photos, and the
   // original-size static and exclusion masks are cut to it.

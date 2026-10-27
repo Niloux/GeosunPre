@@ -5,6 +5,7 @@
 #include "frontend/frontend.h"
 #include "sfm/shutter.h"
 #include <set>
+#include <thread>
 #include <unordered_map>
 
 namespace geosun {
@@ -272,6 +273,11 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   // original, with the readout motion beside the model.
   const bool rolling = report.contains("shutter") && report.at("shutter").value("used", false);
   const auto masks = work / "cache/masks";
+  auto step = Clock::now();
+  const auto timed = [&](const char* name) {
+    Log(std::string("Export ") + name + ": " + std::to_string(Seconds(step)) + " s");
+    step = Clock::now();
+  };
   ShutterMotion motion;
   if (rolling)
     motion =
@@ -279,14 +285,23 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   // A cropped delivery keeps each lens's valid domain: photos are cut losslessly on the JPEG MCU
   // grid and the readout motion is rescaled to the cropped readout axis.
   auto options = supervision_options;
+  // Photos and masks are independent files; their decoding and writing run on all cores.
+  const int workers = std::clamp(int(std::thread::hardware_concurrency()), 1, 16);
+  std::vector<const Exposure*> registered;
+  for (const auto& e : scene.images)
+    if (selected.images[e.id].registered)
+      registered.push_back(&e);
   std::optional<std::array<CropWindow, 2>> windows;
   if (crop) {
+    std::vector<int> mcus(registered.size());
+    ParallelFor(registered.size(), workers, 8,
+                [&](size_t i) { mcus[i] = JpegMcuSize(registered[i]->source); });
     int mcu = 0;
-    for (const auto& e : scene.images)
-      if (selected.images[e.id].registered)
-        mcu = std::max(mcu, JpegMcuSize(e.source));
-    windows = ValidDomainCrop(scene, selected, masks, rolling ? motion.axis : 1, mcu);
+    for (const int size : mcus)
+      mcu = std::max(mcu, size);
+    windows = ValidDomainCrop(scene, selected, masks, rolling ? motion.axis : 1, mcu, workers);
     options.crop = windows;
+    timed("crop windows");
   }
   Json request = {{"scene_file", FileMetadata(work / "scene.json")},
                   {"model_file", FileMetadata(SelectedModelPath(work, report))},
@@ -300,6 +315,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
                        {"windows", {(*windows)[0].ToJson(), (*windows)[1].ToJson()}}};
   if (options.enabled)
     request["supervision"] = SupervisionRequest(scene, selected, masks, options, rolling);
+  timed("request");
   if (fs::exists(output)) {
     if (!fs::is_regular_file(output / "manifest.json") ||
         ReadJson(output / "manifest.json").at("request") != request)
@@ -322,19 +338,22 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     fs::rename(pending, archived);
   }
   fs::create_directories(pending / "sparse/0");
+  timed("source checks");
   const auto original = rolling ? OriginalPhotoObservations(selected, motion, 8) : selected;
   if (windows && rolling)
     motion = CropMotion(motion, original, *windows);
   const auto model = windows ? CropModel(original, *windows, rolling ? &motion : nullptr) : original;
   WriteColmap(pending / "sparse/0", scene, model);
-  Json photos = Json::array();
-  for (const auto& e : scene.images) {
-    if (!model.images[e.id].registered)
-      continue;
+  timed("model");
+  for (const auto* e : registered) {
+    fs::create_directories((pending / "images" / fs::u8path(e->name)).parent_path());
+    fs::create_directories((pending / "masks" / fs::u8path(e->name + ".png")).parent_path());
+  }
+  std::vector<Json> rows(registered.size());
+  ParallelFor(registered.size(), workers, 1, [&](size_t i) {
+    const auto& e = *registered[i];
     const auto destination = pending / "images" / fs::u8path(e.name);
-    fs::create_directories(destination.parent_path());
     const auto mask = pending / "masks" / fs::u8path(e.name + ".png");
-    fs::create_directories(mask.parent_path());
     const auto source_mask = masks / (std::to_string(e.id) + ".png");
     if (windows) {
       CropJpeg(e.source, destination, (*windows)[e.camera]);
@@ -347,20 +366,26 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
         throw std::runtime_error("Source image changed while copying: " + e.name);
       fs::copy_file(source_mask, mask);
     }
-    photos.push_back({{"image_index", e.id},
-                      {"name", e.name},
-                      {"camera", e.camera},
-                      {"mask_size", fs::file_size(mask)},
-                      {"image_size", fs::file_size(destination)}});
-  }
+    rows[i] = {{"image_index", e.id},
+               {"name", e.name},
+               {"camera", e.camera},
+               {"mask_size", fs::file_size(mask)},
+               {"image_size", fs::file_size(destination)}};
+  });
+  Json photos = Json::array();
+  for (auto& row : rows)
+    photos.push_back(std::move(row));
+  timed("photos and masks");
   Json initialization = nullptr;
   if (include_ply)
     initialization = ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);
+  timed("PLY");
   Json supervision = nullptr;
   if (options.enabled) {
     supervision =
         ExportLasSupervision(scene, model, masks, pending, options, rolling ? &motion : nullptr);
     WriteJson(pending / "supervision.json", supervision);
+    timed("supervision");
   }
   const auto registration = model.Registration(scene);
   auto quality = report.at("quality");
@@ -392,7 +417,9 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     manifest["rolling_shutter"] = {{"file", "rolling_shutter.json"},
                                    {"size_bytes", fs::file_size(pending / "rolling_shutter.json")}};
   WriteJson(pending / "manifest.json", manifest);
+  timed("reports");
   CheckBundle(pending);
+  timed("readback");
   fs::rename(pending, output);
 }
 Json CheckBundle(const fs::path& output) {

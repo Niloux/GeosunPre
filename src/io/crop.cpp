@@ -45,25 +45,45 @@ struct Extent {
 };
 }  // namespace
 std::array<CropWindow, 2> ValidDomainCrop(const Scene& scene, const Reconstruction& model,
-                                          const fs::path& masks, int readout_axis, int mcu) {
-  std::array<Extent, 2> extents;
-  for (const auto& e : scene.images) {
-    if (!model.images[e.id].registered)
-      continue;
+                                          const fs::path& masks, int readout_axis, int mcu,
+                                          int workers) {
+  std::vector<const Exposure*> registered;
+  for (const auto& e : scene.images)
+    if (model.images[e.id].registered)
+      registered.push_back(&e);
+  // Each mask's own extent; the row and column maxima bound its non-zero pixels.
+  std::vector<Extent> boxes(registered.size());
+  ParallelFor(registered.size(), workers, 1, [&](size_t i) {
+    const auto& e = *registered[i];
     const auto mask = ReadImage(masks / (std::to_string(e.id) + ".png"), cv::IMREAD_GRAYSCALE);
     const auto& camera = model.cameras[e.camera];
     if (mask.cols != camera.width || mask.rows != camera.height)
       throw std::runtime_error("Static mask size differs from its camera: " + e.name);
-    cv::Mat points;
-    cv::findNonZero(mask, points);
-    if (points.empty())
+    cv::Mat columns, rows;
+    cv::reduce(mask, columns, 0, cv::REDUCE_MAX);
+    cv::reduce(mask, rows, 1, cv::REDUCE_MAX);
+    auto& box = boxes[i];
+    for (int x = 0; x < mask.cols; ++x)
+      if (columns.at<uint8_t>(0, x)) {
+        box.x0 = std::min(box.x0, x);
+        box.x1 = x + 1;
+      }
+    for (int y = 0; y < mask.rows; ++y)
+      if (rows.at<uint8_t>(y, 0)) {
+        box.y0 = std::min(box.y0, y);
+        box.y1 = y + 1;
+      }
+  });
+  std::array<Extent, 2> extents;
+  for (size_t i = 0; i < registered.size(); ++i) {
+    const auto& box = boxes[i];
+    if (box.x1 <= box.x0)
       continue;
-    const auto box = cv::boundingRect(points);
-    auto& extent = extents[e.camera];
-    extent.x0 = std::min(extent.x0, box.x);
-    extent.y0 = std::min(extent.y0, box.y);
-    extent.x1 = std::max(extent.x1, box.x + box.width);
-    extent.y1 = std::max(extent.y1, box.y + box.height);
+    auto& extent = extents[registered[i]->camera];
+    extent.x0 = std::min(extent.x0, box.x0);
+    extent.y0 = std::min(extent.y0, box.y0);
+    extent.x1 = std::max(extent.x1, box.x1);
+    extent.y1 = std::max(extent.y1, box.y1);
   }
   // Observations of the original rolling-shutter photos may sit a few pixels off the masks.
   constexpr int Margin = 16;

@@ -8,7 +8,8 @@ namespace geosun {
 // axis it is centred on the image, so the readout fraction only scales: a pixel's fraction in the
 // window is s' = s N / N', with N and N' the sizes along that axis.
 std::array<CropWindow, 2> ValidDomainCrop(const Scene& scene, const Reconstruction& model,
-                                          const fs::path& masks, int readout_axis, int mcu);
+                                          const fs::path& masks, int readout_axis, int mcu,
+                                          int workers);
 // The scene's cameras (the initial calibration, used for angle statistics) cut to the windows.
 Scene CropScene(const Scene& scene, const std::array<CropWindow, 2>& windows);
 // Cameras and observations moved into the windows; point errors are recomputed with the cropped

@@ -1069,7 +1069,7 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   options.enabled = args.Get("--no-las-supervision") != "true";
   options.max_size = args.Integer("--supervision-max-size", 1600);
   options.boundary = args.Integer("--supervision-boundary", 6);
-  options.cache_mb = args.Integer("--supervision-cache-mb", 1024);
+  options.cache_mb = args.Integer("--supervision-cache-mb", 2048);
   if (!args.Get("--supervision-mask-dir").empty())
     options.mask_dir = args.Path("--supervision-mask-dir");
   if (options.max_size < 128 || options.max_size > 4096 || options.boundary > 32)
