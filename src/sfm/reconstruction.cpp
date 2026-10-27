@@ -23,6 +23,129 @@ Eigen::Matrix3d Matrix(const cv::Mat& input) {
       out(r, c) = m.at<double>(r, c);
   return out;
 }
+// Polynomials in x, y, z of degree at most 3; monomials ordered 1, x, y, z, then degree 2 and 3.
+struct Cubic {
+  std::array<double, 20> c{};
+};
+struct Monomials {
+  std::array<std::array<int, 3>, 20> exponent{};
+  int index[4][4][4];
+  int count[4];  // monomials of degree below d, for d = 1..3 ending at 4, 10, 20
+  Monomials() {
+    int n = 0;
+    for (int degree = 0; degree <= 3; ++degree) {
+      for (int a = degree; a >= 0; --a)
+        for (int b = degree - a; b >= 0; --b) {
+          exponent[n] = {a, b, degree - a - b};
+          index[a][b][degree - a - b] = n++;
+        }
+      count[degree] = n;
+    }
+  }
+};
+const Monomials monomials;
+// Product of a polynomial of degree da with one of degree db, da + db <= 3.
+Cubic Multiply(const Cubic& p, int da, const Cubic& q, int db) {
+  Cubic r;
+  for (int i = 0; i < monomials.count[da]; ++i) {
+    if (p.c[i] == 0)
+      continue;
+    const auto& u = monomials.exponent[i];
+    for (int j = 0; j < monomials.count[db]; ++j) {
+      const auto& v = monomials.exponent[j];
+      r.c[monomials.index[u[0] + v[0]][u[1] + v[1]][u[2] + v[2]]] += p.c[i] * q.c[j];
+    }
+  }
+  return r;
+}
+Cubic Combine(const Cubic& p, double a, const Cubic& q, double b) {
+  Cubic r;
+  for (int i = 0; i < 20; ++i)
+    r.c[i] = a * p.c[i] + b * q.c[i];
+  return r;
+}
+// Essential matrices with b^T E a = 0 for five perspective correspondences, unit Frobenius norm:
+// E = xX + yY + zZ + W spans the null space of the epipolar constraints; det(E) = 0 and
+// 2 E E^T E - tr(E E^T) E = 0 give ten cubics, whose degree-3 monomials are eliminated to an
+// action matrix for multiplication by x. Its real eigenvectors are the solutions (Stewenius).
+std::vector<Eigen::Matrix3d> FivePoint(const std::vector<cv::Point2d>& a,
+                                       const std::vector<cv::Point2d>& b) {
+  Eigen::Matrix<double, 5, 9> q;
+  for (int i = 0; i < 5; ++i)
+    q.row(i) << b[i].x * a[i].x, b[i].x * a[i].y, b[i].x, b[i].y * a[i].x, b[i].y * a[i].y,
+        b[i].y, a[i].x, a[i].y, 1;
+  const Eigen::JacobiSVD<Eigen::Matrix<double, 5, 9>> svd(q, Eigen::ComputeFullV);
+  const Eigen::Matrix<double, 9, 4> basis = svd.matrixV().rightCols<4>();
+  std::array<Cubic, 9> e;
+  for (int k = 0; k < 9; ++k) {
+    e[k].c[1] = basis(k, 0);
+    e[k].c[2] = basis(k, 1);
+    e[k].c[3] = basis(k, 2);
+    e[k].c[0] = basis(k, 3);
+  }
+  auto at = [&](int r, int c) -> const Cubic& { return e[3 * r + c]; };
+  std::array<Cubic, 10> equations;
+  // det(E) by the first row.
+  const auto minor = [&](int r0, int c0, int r1, int c1) {
+    return Combine(Multiply(at(r0, c0), 1, at(r1, c1), 1), 1, Multiply(at(r0, c1), 1, at(r1, c0), 1),
+                   -1);
+  };
+  equations[0] = Combine(Combine(Multiply(at(0, 0), 1, minor(1, 1, 2, 2), 2), 1,
+                                 Multiply(at(0, 1), 1, minor(1, 0, 2, 2), 2), -1),
+                         1, Multiply(at(0, 2), 1, minor(1, 0, 2, 1), 2), 1);
+  std::array<Cubic, 9> eet;
+  for (int i = 0; i < 3; ++i)
+    for (int k = 0; k < 3; ++k)
+      for (int j = 0; j < 3; ++j)
+        eet[3 * i + k] = Combine(eet[3 * i + k], 1, Multiply(at(i, j), 1, at(k, j), 1), 1);
+  const Cubic trace = Combine(Combine(eet[0], 1, eet[4], 1), 1, eet[8], 1);
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) {
+      Cubic sum;
+      for (int k = 0; k < 3; ++k)
+        sum = Combine(sum, 1, Multiply(eet[3 * i + k], 2, at(k, j), 1), 1);
+      equations[1 + 3 * i + j] = Combine(sum, 2, Multiply(trace, 2, at(i, j), 1), -1);
+    }
+  // Columns: the ten cubic monomials, then the basis x^2, xy, xz, y^2, yz, z^2, x, y, z, 1.
+  Eigen::Matrix<double, 10, 10> cubic, rest;
+  for (int r = 0; r < 10; ++r)
+    for (int k = 0; k < 10; ++k) {
+      cubic(r, k) = equations[r].c[10 + k];
+      rest(r, k) = k < 6 ? equations[r].c[4 + k] : equations[r].c[k == 9 ? 0 : k - 5];
+    }
+  const Eigen::FullPivLU<Eigen::Matrix<double, 10, 10>> lu(cubic);
+  if (!lu.isInvertible())
+    return {};
+  const Eigen::Matrix<double, 10, 10> reduced = lu.solve(rest);
+  // x times each basis monomial: x^3, x^2y, x^2z, xy^2, xyz, xz^2 are cubic, the rest are basis.
+  const std::array<std::array<int, 3>, 6> raised{
+      {{3, 0, 0}, {2, 1, 0}, {2, 0, 1}, {1, 2, 0}, {1, 1, 1}, {1, 0, 2}}};
+  Eigen::Matrix<double, 10, 10> action = Eigen::Matrix<double, 10, 10>::Zero();
+  for (int i = 0; i < 6; ++i)
+    action.row(i) = -reduced.row(
+        monomials.index[raised[i][0]][raised[i][1]][raised[i][2]] - 10);
+  action(6, 0) = action(7, 1) = action(8, 2) = action(9, 6) = 1;
+  const Eigen::EigenSolver<Eigen::Matrix<double, 10, 10>> eigen(action);
+  if (eigen.info() != Eigen::Success)
+    return {};
+  std::vector<Eigen::Matrix3d> solutions;
+  for (int s = 0; s < 10; ++s) {
+    if (std::abs(eigen.eigenvalues()[s].imag()) > 1e-10)
+      continue;
+    const Eigen::Matrix<double, 10, 1> v = eigen.eigenvectors().col(s).real();
+    if (std::abs(v[9]) < 1e-10)
+      continue;
+    const Eigen::Matrix<double, 9, 1> flat =
+        basis.col(0) * (v[6] / v[9]) + basis.col(1) * (v[7] / v[9]) + basis.col(2) * (v[8] / v[9]) +
+        basis.col(3);
+    Eigen::Matrix3d candidate;
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c)
+        candidate(r, c) = flat[3 * r + c];
+    solutions.push_back(candidate / candidate.norm());
+  }
+  return solutions;
+}
 bool Triangulate(const Pose& a, const Pose& b, const Eigen::Vector3d& ra, const Eigen::Vector3d& rb,
                  Eigen::Vector3d& point) {
   Eigen::Matrix<double, 3, 4> pa, pb;
@@ -168,10 +291,8 @@ Pair Verify(const Scene& scene, const Reconstruction& model, const MatchSet& mat
       sa.push_back(na[id]);
       sb.push_back(nb[id]);
     }
-    const cv::Mat hypotheses =
-        cv::findEssentialMat(sa, sb, 1., cv::Point2d(), cv::RANSAC, .999, 1e-6, 1);
-    for (int row = 0; row + 3 <= hypotheses.rows; row += 3)
-      score(Matrix(hypotheses.rowRange(row, row + 3)));
+    for (const auto& e : FivePoint(sa, sb))
+      score(e);
     if (best >= 24) {
       const double success = std::pow(double(best) / ra.size(), 5);
       const double needed = success >= 1 ? 32 : std::ceil(std::log(.001) / std::log1p(-success));

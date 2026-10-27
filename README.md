@@ -123,7 +123,7 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 
 稀疏点清理作为单独候选：至少两次观测、视差至少 1.5°，单观测误差不超过 `min(3 px, quality_p90_px)`。距离和点位不确定度门限按 `las_median_m` 及 LAS 量化精度计算，默认分别为 10 cm 和 5 cm；该不确定度是固定相机的局部估计，不代表独立精度。清理后支撑不足的照片会从候选移除，但只有总照片保留至少 99%、每个镜头保留至少 98%、原可靠 LAS 支撑轨迹保留至少 90%，且图像图仍连通、剩余照片达到 32 个观测和 8 个覆盖格子、几何质量通过，才采用清理。否则保留清理前的模型，不强行删点。清理不修改相机参数，也不改变由原始 LAS 导出的初始化 PLY。
 
-默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`；开启精修时还保留 `cache/refined.bin`。独立处理的新交付在其 `--output`；独立 `refine` 的所选模型为 `refined.bin`，独立 `cleanup` 为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 20，旧版工作目录、交付及训练结果保持原样，仍可独立导出或处理；新流程使用新工作目录。
+默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`；开启精修时还保留 `cache/refined.bin`。独立处理的新交付在其 `--output`；独立 `refine` 的所选模型为 `refined.bin`，独立 `cleanup` 为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。当前实现标记为 21，旧版工作目录、交付及训练结果保持原样，仍可独立导出或处理；新流程使用新工作目录。
 
 `run.ps1` 固定启动 `build/ninja/bin/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
 
