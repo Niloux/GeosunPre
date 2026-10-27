@@ -142,8 +142,10 @@ class ImageReader {
   const std::array<Fusion, 2>* fusion;
   size_t next = 0;
   std::deque<std::future<PreparedImage>> ready;
+  // Decoding and the five mask views take longer than the GPU's share of an image; four in
+  // flight keep the GPU fed with a few full-size photos in memory.
   void Fill() {
-    while (ready.size() < 2 && next < images.size()) {
+    while (ready.size() < 4 && next < images.size()) {
       const auto record = images[next++];
       ready.push_back(std::async(std::launch::async, [this, record] {
         PreparedImage image;
