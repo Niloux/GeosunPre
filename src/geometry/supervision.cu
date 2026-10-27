@@ -17,7 +17,7 @@
 
 namespace geosun {
 namespace {
-constexpr int Version = 7;
+constexpr int Version = 8;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
 constexpr double MaxTheta = 1.396263401595464;
@@ -33,6 +33,10 @@ constexpr float NormalCell = .03f, NormalRadius = .03f, PlaneBand = .02f, PlaneR
 // Footprints reach at most this many map pixels from the projected centre.
 constexpr int MaxSplat = 8;
 constexpr float MinNormalAgreement = .95f;
+// Metric spread of LAS foreground silhouettes beyond the photographed ones, measured on the
+// indoor scene; the foreground-side occlusion margin covers it, up to MaxOcclusionMargin.
+constexpr float OcclusionSpread = .01f;
+constexpr int MaxOcclusionMargin = 24;
 // Device bytes per point of a normal-estimation slab, all buffers at their worst-case size.
 constexpr size_t SlabPointBytes = 192;
 constexpr size_t MaxSlabPoints = 64 * 1000 * 1000;
@@ -877,9 +881,12 @@ __global__ void Fill(const float* input, float* output, const uint8_t* mask, int
 }
 // Cull leaves no depth jump inside a 5x5 window, so occlusions are found on the supported
 // projection before culling: a background pixel a clear step behind a supported foreground
-// pixel seeds the margin. The step exceeds the depth ramp across two pixels of oblique
-// floors, ceilings and side walls, so those surfaces do not seed.
-__global__ void Edges(const float* depth, const uint8_t* mask, uint8_t* edges, int w, int h) {
+// pixel within two pixels is a step seed, which also forms the background-side margin; its
+// depth is kept for the foreground side. The step exceeds the depth ramp across two pixels
+// of oblique floors, ceilings and side walls, so those surfaces do not seed. Pixels next to
+// the semantic mask limit are marked separately.
+__global__ void Edges(const float* depth, const uint8_t* mask, uint8_t* limits, float* seeds,
+                      int w, int h) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= w * h)
     return;
@@ -899,7 +906,33 @@ __global__ void Edges(const float* depth, const uint8_t* mask, uint8_t* edges, i
       if (v > 0 && mask[yy * w + xx])
         nearest = fminf(nearest, v);
     }
-  edges[i] = boundary || At(depth, x, y, w, h) > nearest * 1.1f + .05f;
+  limits[i] = boundary;
+  const float d = At(depth, x, y, w, h);
+  seeds[i] = mask[i] && d > nearest * 1.1f + .05f ? d : 0;
+}
+// LAS foreground silhouettes spread by about OcclusionSpread beyond the photographed ones
+// (lateral range noise and overlapping scans win the nearest-depth test), so a foreground
+// pixel is dropped within that spread, in pixels at its depth, of a step seed behind it.
+__global__ void Margins(const float* depth, const float* projected, const float* seeds,
+                        const uint8_t* limits, uint8_t* edges, int w, int h, float focal) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= w * h)
+    return;
+  edges[i] = limits[i] || seeds[i] > 0;
+  const int x = i % w, y = i / w;
+  float d = At(depth, x, y, w, h);
+  if (!d)
+    d = At(projected, x, y, w, h);
+  if (edges[i] || !d)
+    return;
+  const int radius = min(MaxOcclusionMargin, int(ceilf(OcclusionSpread * focal / d)));
+  const float behind = d * 1.1f + .05f;
+  for (int yy = max(0, y - radius); yy <= min(h - 1, y + radius); ++yy)
+    for (int xx = max(0, x - radius); xx <= min(w - 1, x + radius); ++xx)
+      if (seeds[yy * w + xx] > behind) {
+        edges[i] = 1;
+        return;
+      }
 }
 __global__ void Dilate(const uint8_t* input, uint8_t* output, int w, int h, int radius,
                          bool horizontal) {
@@ -1134,7 +1167,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         cameras(batch * sizeof(Projection)), rays(size * sizeof(float3)),
         projected(size * sizeof(float)), codes(size * sizeof(unsigned)),
         clean(size * sizeof(float)), filled(size * sizeof(float)),
-        mask(size), edge(size), dilated(size), millimetres(size * sizeof(uint16_t)), normals(size * sizeof(uchar3));
+        seeds(size * sizeof(float)), mask(size), limit(size), dilated(size), edge(size),
+        millimetres(size * sizeof(uint16_t)), normals(size * sizeof(uchar3));
     CudaCheck(
         cudaMemcpyAsync(rays.data, ray_host.data(), rays.bytes, cudaMemcpyHostToDevice, stream));
     // Masks for the following images decode while the GPU projects the current batch.
@@ -1197,17 +1231,22 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         const auto* keep = static_cast<const uint8_t*>(mask.data);
         Isolate<<<blocks, 256, 0, stream>>>(raw_depth, scratch, w, h);
         Cull<<<blocks, 256, 0, stream>>>(scratch, filtered, keep, w, h);
-        Edges<<<blocks, 256, 0, stream>>>(scratch, keep, static_cast<uint8_t*>(edge.data), w, h);
+        Edges<<<blocks, 256, 0, stream>>>(scratch, keep, static_cast<uint8_t*>(limit.data),
+                                          static_cast<float*>(seeds.data), w, h);
         for (int pass = 0; pass < 2; ++pass) {
           Fill<<<blocks, 256, 0, stream>>>(filtered, scratch, keep, w, h);
           std::swap(filtered, scratch);
         }
-        Dilate<<<blocks, 256, 0, stream>>>(static_cast<const uint8_t*>(edge.data),
+        Dilate<<<blocks, 256, 0, stream>>>(static_cast<const uint8_t*>(limit.data),
                                            static_cast<uint8_t*>(dilated.data), w, h,
                                            options.boundary, true);
         Dilate<<<blocks, 256, 0, stream>>>(static_cast<const uint8_t*>(dilated.data),
-                                           static_cast<uint8_t*>(edge.data), w, h, options.boundary,
-                                           false);
+                                           static_cast<uint8_t*>(limit.data), w, h,
+                                           options.boundary, false);
+        Margins<<<blocks, 256, 0, stream>>>(filtered, raw_depth, static_cast<const float*>(seeds.data),
+                                            static_cast<const uint8_t*>(limit.data),
+                                            static_cast<uint8_t*>(edge.data), w, h,
+                                            float(camera.params[0]));
         Encode<<<blocks, 256, 0, stream>>>(
             filtered, raw_depth, static_cast<const unsigned*>(codes.data),
             static_cast<const float3*>(rays.data), static_cast<const uint8_t*>(edge.data),
@@ -1267,6 +1306,10 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"depth_validity", "isolated_outlier_removal_occlusion_boundary_and_local_depth_support"},
           {"depth_support_pixels", 4},
           {"occlusion_step", "background beyond 1.1 x foreground + 0.05 m within 5x5"},
+          {"occlusion_margin", {{"background_pixels", 2},
+                                {"foreground_spread_m", OcclusionSpread},
+                                {"foreground_pixels", "ceil(spread x fx / depth), at most 24"}}},
+          {"semantic_margin_pixels", options.boundary},
           {"depth_rendering", "las_surfel_tangent_disks_blended_within_0.01_m_plus_1_percent_of_nearest"},
           {"normal_blend_minimum_agreement", MinNormalAgreement},
           {"normal_estimator", motion ? "las_knn_pca_surfel_readout_line" : "las_knn_pca_surfel"},
