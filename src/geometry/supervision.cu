@@ -17,7 +17,7 @@
 
 namespace geosun {
 namespace {
-constexpr int Version = 5;
+constexpr int Version = 6;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
 constexpr double MaxTheta = 1.396263401595464;
@@ -29,12 +29,12 @@ constexpr size_t Lookahead = 6;
 // footprint; the tangent plane is a trimmed PCA over a ball of at least NormalRadius.
 constexpr int Neighbours = 16, MinNeighbours = 10, NormalRings = 2;
 constexpr float NormalCell = .03f, NormalRadius = .03f, PlaneBand = .02f, PlaneRms = .01f,
-                FootprintScale = 1.5f, MaxFootprint = .05f;
+                FootprintScale = 2.f, MaxFootprint = .05f, StraySpacing = 2.f;
 // Footprints reach at most this many map pixels from the projected centre.
 constexpr int MaxSplat = 8;
 constexpr float MinNormalAgreement = .95f;
 // Device bytes per point of a normal-estimation slab, all buffers at their worst-case size.
-constexpr size_t SlabPointBytes = 128;
+constexpr size_t SlabPointBytes = 192;
 constexpr size_t MaxSlabPoints = 64 * 1000 * 1000;
 constexpr int SlabBins = 1 << 16;
 // The world normal is octahedral-coded as two 16-bit values in 1..65535; 0 means no normal.
@@ -347,20 +347,10 @@ __device__ void SymmetricEigen(double a[3][3], double values[3], double3& normal
     values[i] = a[index[i]][index[i]];
   normal = make_double3(v[0][index[0]], v[1][index[0]], v[2][index[0]]);
 }
-// One thread per slab point in cell order; only the slab's own points (original index below
-// own) produce surfels, the halo only supplies neighbours.
-__global__ void EstimateSurfels(CellGrid grid, const unsigned* order, int count, int own,
-                                const int3* raw, Surfel* surfels, float* rms) {
-  const int s = blockIdx.x * blockDim.x + threadIdx.x;
-  if (s >= count)
-    return;
-  const unsigned index = order[s];
-  if (index >= unsigned(own))
-    return;
-  const float3 p = grid.xyz[s];
+// K nearest neighbours of p within the reach, as squared distances and cell-order indices.
+__device__ int Nearest(const CellGrid& grid, float3 p, float* best, unsigned* nearest) {
   const int3 cell = CellOf(p);
   const float reach = NormalRings * NormalCell;
-  float best[Neighbours];
   int found = 0;
   for (int ring = 0; ring <= NormalRings; ++ring) {
     for (int dz = -ring; dz <= ring; ++dz)
@@ -376,9 +366,12 @@ __global__ void EstimateSurfels(CellGrid grid, const unsigned* order, int count,
             if (d2 > reach * reach || (found == Neighbours && d2 >= best[Neighbours - 1]))
               continue;
             int j = found < Neighbours ? found++ : Neighbours - 1;
-            for (; j > 0 && best[j - 1] > d2; --j)
+            for (; j > 0 && best[j - 1] > d2; --j) {
               best[j] = best[j - 1];
+              nearest[j] = nearest[j - 1];
+            }
             best[j] = d2;
+            nearest[j] = k;
           }
         }
     // Points beyond the searched cube lie farther than ring cells from p.
@@ -386,10 +379,39 @@ __global__ void EstimateSurfels(CellGrid grid, const unsigned* order, int count,
     if (found == Neighbours && best[Neighbours - 1] <= guaranteed * guaranteed)
       break;
   }
+  return found;
+}
+// The K-th neighbour distance, or the reach when fewer are found, gives the local area per
+// point; computed for every slab point in cell order, halo included.
+__global__ void Spacings(CellGrid grid, int count, float* spacing) {
+  const int s = blockIdx.x * blockDim.x + threadIdx.x;
+  if (s >= count)
+    return;
+  float best[Neighbours];
+  unsigned nearest[Neighbours];
+  const int found = Nearest(grid, grid.xyz[s], best, nearest);
+  spacing[s] = found == Neighbours ? sqrtf(best[Neighbours - 1]) : NormalRings * NormalCell;
+}
+// One thread per slab point in cell order; only the slab's own points (original index below
+// own) produce surfels, the halo only supplies neighbours.
+__global__ void EstimateSurfels(CellGrid grid, const unsigned* order, const float* spacings,
+                                int count, int own, const int3* raw, Surfel* surfels,
+                                float* rms) {
+  const int s = blockIdx.x * blockDim.x + threadIdx.x;
+  if (s >= count)
+    return;
+  const unsigned index = order[s];
+  if (index >= unsigned(own))
+    return;
+  const float3 p = grid.xyz[s];
+  const int3 cell = CellOf(p);
+  const float reach = NormalRings * NormalCell;
+  float best[Neighbours];
+  unsigned nearest[Neighbours];
+  const int found = Nearest(grid, p, best, nearest);
   Surfel out{raw[index], 0, 0};
   rms[index] = -1;
-  // The K-th distance, or the reach when fewer are found, gives the local area per point.
-  const float spacing = found == Neighbours ? sqrtf(best[Neighbours - 1]) : reach;
+  const float spacing = spacings[s];
   if (found < MinNeighbours) {
     surfels[index] = out;
     return;
@@ -447,14 +469,27 @@ __global__ void EstimateSurfels(CellGrid grid, const unsigned* order, int count,
   }
   const double sigma = sqrt(fmax(values[0], 0.)),
                offset = fabs(centre.x * normal.x + centre.y * normal.y + centre.z * normal.z);
+  // A stray return ahead of a surface finds its neighbours far away on that surface, whose
+  // own points are close together: compare with the median spacing of the neighbours.
+  float around[Neighbours];
+  int others = 0;
+  for (int j = 0; j < found; ++j)
+    if (nearest[j] != unsigned(s)) {
+      int k = others++;
+      for (; k > 0 && around[k - 1] > spacings[nearest[j]]; --k)
+        around[k] = around[k - 1];
+      around[k] = spacings[nearest[j]];
+    }
+  const float surface = around[others / 2];
   if (inliers >= MinNeighbours && inliers >= .6 * total && sigma <= PlaneRms &&
-      values[1] >= .05 * values[2] && offset <= PlaneBand) {
-    // Only points on an accepted plane with all K neighbours inside the reach get a
-    // footprint: a sparse neighbourhood gives no spacing. Others stay single projected
-    // pixels, so stray returns are dropped before culling.
+      values[1] >= .05 * values[2] && offset <= PlaneBand && spacing <= StraySpacing * surface) {
+    // Only points with all K neighbours inside the reach get a footprint: a sparse
+    // neighbourhood gives no spacing. Others, and points without a plane, stay single
+    // projected pixels, so stray returns are dropped before culling.
     out.normal = EncodeNormal(float(normal.x), float(normal.y), float(normal.z));
     if (found == Neighbours)
-      out.radius = fminf(MaxFootprint, FootprintScale * spacing * rsqrtf(float(found)));
+      out.radius = fminf(MaxFootprint,
+                         FootprintScale * fminf(spacing, surface) * rsqrtf(float(Neighbours)));
     rms[index] = float(sigma);
   }
   surfels[index] = out;
@@ -523,7 +558,13 @@ std::vector<Surfel> SlabSurfels(const std::vector<int3>& points, size_t own, int
   const CellGrid grid{static_cast<const float3*>(sorted.data),
                       static_cast<const unsigned long long*>(table.data),
                       static_cast<const uint2*>(ranges.data), slots - 1};
-  EstimateSurfels<<<(count + 127) / 128, 128, 0, stream>>>(grid, o_out, count, int(own),
+  DeviceBuffer spacing(count * sizeof(float));
+  Spacings<<<(count + 127) / 128, 128, 0, stream>>>(grid, count,
+                                                    static_cast<float*>(spacing.data));
+  CudaCheck(cudaGetLastError());
+  EstimateSurfels<<<(count + 127) / 128, 128, 0, stream>>>(grid, o_out,
+                                                          static_cast<const float*>(spacing.data),
+                                                          count, int(own),
                                              static_cast<const int3*>(raw.data),
                                              static_cast<Surfel*>(surfels.data),
                                              static_cast<float*>(rms.data));
@@ -628,8 +669,9 @@ class LasPointCache {
     }
     prepare_seconds_ = Seconds(started);
     const auto surfel_started = Clock::now();
-    // Halo points reach every neighbour the estimator can use for an own point.
-    const double halo = (NormalRings + 1) * NormalCell / header.scale[axis];
+    // Halo points hold every neighbour of an own point together with that neighbour's own
+    // neighbours, whose spacing the stray test reads.
+    const double halo = (2 * NormalRings + 1) * NormalCell / header.scale[axis];
     uint64_t stored = 0;
     std::vector<int3> chunk(PointChunk), own, rest;
     for (const auto& [first, last] : slabs) {
@@ -767,7 +809,8 @@ class LasPointCache {
             {"inlier_band_m", PlaneBand},
             {"plane_rms_limit_m", PlaneRms},
             {"minimum_inlier_fraction", .6},
-            {"footprint", "tangent disk of 1.5 x kth-neighbour distance / sqrt(k), at most 0.05 m, planar points with k neighbours within the reach only"},
+            {"footprint", "tangent disk of 2 x min(kth-neighbour distance, neighbour median) / sqrt(k), at most 0.05 m, planar points with k neighbours within the reach only"},
+            {"maximum_spacing_to_neighbour_median_spacing", StraySpacing},
             {"maximum_splat_pixels", MaxSplat},
             {"slabs", slabs_},
             {"points_with_normal", stats_.normals},
