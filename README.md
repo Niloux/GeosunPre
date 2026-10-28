@@ -1,6 +1,6 @@
 # GeosunPre
 
-原生 C++17/CUDA 双鱼眼与 LAS 输入预处理程序，交付包是定制 LichtFeld Studio（LFS）3DGS 训练的数据目录。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、卷帘快门校正、稀疏点清理、COLMAP/PLY 及 LAS 深度和法向监督导出，可选原图精修。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
+原生 C++17/CUDA 双鱼眼与 LAS 输入预处理程序，交付包是定制 LichtFeld Studio（LFS）3DGS 训练的数据目录。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、卷帘快门校正、稀疏点清理、COLMAP/PLY 及深度和法向监督导出（默认由 MoGe-2 生成、LAS 定尺度），可选原图精修。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
 
 ## 开始使用
 
@@ -18,7 +18,7 @@
 | --- | --- |
 | `build.ps1` | 使用 Ninja 编译 Release 程序到 `build/ninja/bin/geosunpre.exe`，自动应用 Ceres Schur 回代修复 |
 | `prepare-models.ps1` | 为 GPU 0 准备 `models/`，匹配器默认 FP16，检测器支持动态宽高 |
-| `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准、卷帘快门校正、独立稀疏点清理及 COLMAP/PLY、LAS 深度和法向监督导出；原图精修默认关闭 |
+| `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准、卷帘快门校正、独立稀疏点清理及 COLMAP/PLY、深度和法向监督导出；原图精修默认关闭 |
 
 构建统一使用单配置 Ninja Release。脚本自动加载 x64 MSVC 环境，优先使用 PATH 中的 Ninja，否则使用 Visual Studio 自带的 Ninja。首次构建下载固定依赖到 `build/ninja/_deps/` 并编译，此后复用缓存。日常构建只编译变化影响到的文件，CMake 文件变化由 Ninja 自动重新配置；修改 preset 后自动重新配置，也可用 `build.ps1 -Configure` 显式重新配置，`-Jobs` 控制并行数（默认 8）。构建版本与时间单独生成，不会使全部源码因时间变化而重编。
 
@@ -41,7 +41,7 @@
 
 **调试模式**（`--debug`）：工作目录（默认 `work/<输入目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`、`refine`、`cleanup`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。旧版工作目录按调试模式处理，续跑时须用 `--output` 指定交付目录。
 
-交付包含照片（卷帘校正采用时为校正到参考位姿的照片，否则为原图）、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及 LAS 深度和法向监督图。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。完整结构见[输出约定](docs/output.md)。
+交付包含照片（卷帘校正采用时为校正到参考位姿的照片，否则为原图）、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及深度和法向监督图：默认由 MoGe-2 在各镜头透视子图上估计，按法向与之一致的可信 LAS 定尺度；`--supervision-source las` 改为 LAS 投影监督。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。完整结构见[输出约定](docs/output.md)。
 
 `run` 的导出阶段及独立 `export`、`refine`、`cleanup` 默认从原始有效 LAS 给已注册照片生成定制 LFS 直接读取的深度和法向图。已有工作目录可以直接导出到新目录，无需重跑重建：
 
@@ -138,11 +138,11 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 ```text
 models/
   manifest.json
-  engines/{detector,descriptor,matcher,segmentation}.engine
+  engines/{detector,descriptor,matcher,segmentation,geometry}.engine
   runtime/nvinfer_10.dll
 ```
 
-匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32。原图按最长边 1536 缩放后送入动态检测器，横图、竖图及不同分辨率共用同一模型包。模型准备后自动用真实照片验证动态宽高、四模型输出、动态描述子数量和匹配补零行为。输入范围、设备和精度参数见[模型文档](docs/models.md)。
+匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32。原图按最长边 1536 缩放后送入动态检测器，横图、竖图及不同分辨率共用同一模型包。geometry 为 MoGe-2 ViT-L normal（FP16，644×644 透视子图），供默认的 MoGe 监督使用。模型准备后自动用真实照片验证动态宽高、五模型输出、动态描述子数量和匹配补零行为。输入范围、设备和精度参数见[模型文档](docs/models.md)。
 
 模型目录中完整且兼容的包会校验后复用。更换 GPU 或匹配精度时使用新模型目录，并用 `--models` 指定；更换图像分辨率不需要重建。已有固定尺寸包可执行 `.\prepare-models.ps1 -Models models/dynamic -OnnxFrom models`，只重建检测器，然后使用 `--models models/dynamic`。新生成的目录同时保留 ONNX 和准备元数据，模型资源不进入 Git。
 
@@ -160,7 +160,7 @@ models/
 .\package.ps1
 ```
 
-`package.ps1` 默认读取 `models-ampere-plus/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 及同名 `.zip`、`.zip.sha256`。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行四模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
+`package.ps1` 默认读取 `models-ampere-plus/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 及同名 `.zip`、`.zip.sha256`。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行五模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
 
 将 zip 复制到目标 Windows 机器解压，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
 

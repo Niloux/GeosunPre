@@ -10,4 +10,5 @@
 *.user
 /packages/
 /models-ampere-plus/
-/models-v3/
+/models-v2/
+/models-ampere-plus-v2/

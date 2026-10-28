@@ -8,9 +8,9 @@ struct SupervisionOptions {
   int max_size = 1600, boundary = 6;
   int cache_mb = 2048;
   fs::path mask_dir;
-  // las: maps projected from the LAS; moge: MoGe-2 faces of the photo scaled to that projection,
-  // with the geometry engine of the geometry_models package.
-  std::string source = "las";
+  // moge (default): MoGe-2 faces of the photo scaled to the LAS projection, with the geometry
+  // engine of the geometry_models package; las: maps projected from the LAS.
+  std::string source = "moge";
   fs::path geometry_models;
   // Cropped delivery: each lens's maps cover this window of its original photos, and the
   // original-size static and exclusion masks are cut to it.

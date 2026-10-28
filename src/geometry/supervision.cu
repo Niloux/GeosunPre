@@ -1102,7 +1102,9 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
     throw std::runtime_error("Supervision options cannot be used with --no-las-supervision");
   if (!options.mask_dir.empty() && !fs::is_directory(options.mask_dir))
     throw std::runtime_error("Geometry exclusion mask directory does not exist");
-  options.source = args.Get("--supervision-source", "las");
+  if (!options.enabled)
+    return options;
+  options.source = args.Get("--supervision-source", "moge");
   if (options.source != "las" && options.source != "moge")
     throw std::runtime_error("Supervision source must be las or moge");
   if (!args.Get("--supervision-models").empty()) {
@@ -1110,8 +1112,17 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
       throw std::runtime_error("--supervision-models requires --supervision-source moge");
     options.geometry_models = args.Path("--supervision-models");
   } else if (options.source == "moge") {
-    options.geometry_models = DefaultModels();
+    // The reconstruction package of run, else the default one.
+    options.geometry_models = args.Get("--models").empty() ? DefaultModels() : args.Path("--models");
   }
+  // Fail before reconstruction, not at the export hours later.
+  if (options.source == "moge" &&
+      !ReadJson(options.geometry_models / "manifest.json").at("models").contains("geometry"))
+    throw std::runtime_error(
+        "MoGe supervision needs a version 3 model package with the geometry engine: " +
+        options.geometry_models.u8string() +
+        "; prepare one with prepare-models.ps1, pass --supervision-models, or use "
+        "--supervision-source las");
   return options;
 }
 Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const fs::path& masks_dir,
