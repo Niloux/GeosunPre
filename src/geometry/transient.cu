@@ -1,6 +1,5 @@
 #define EIGEN_NO_CUDA
 #include "geometry/transient.h"
-#include "geometry/symmetric_eigen.cuh"
 #include "frontend/inference.h"
 #include "io/las.h"
 #include <algorithm>
@@ -8,11 +7,9 @@
 
 namespace geosun {
 namespace {
-constexpr int Version = 2;
-// Carving grid: a ray counts a voxel when it crosses the plane fitted to the voxel's returns
-// inside the voxel, up to a margin short of its own return. A ray grazing a surface on its way
-// to a farther one stays on one side of that plane; counting every traversed voxel instead
-// carved table tops, desk edges and ceiling slats seen at shallow angles.
+constexpr int Version = 1;
+// Carving grid: a ray counts each voxel it crosses once, up to a margin short of its own return
+// so that grazing rays do not pass through the surface they end on.
 constexpr float Voxel = .1f, Margin = .15f, MarginRelative = .05f;
 // A voxel is transient when the rays crossing it outnumber its returns this many times; on the
 // exhibition hall this separated the walking-person trails from walls, floor and exhibits.
@@ -21,18 +18,12 @@ constexpr float PassRatio = 4;
 constexpr double MinTimedFraction = .9;
 constexpr size_t PointChunk = 500000;
 constexpr int MaxProbes = 64, MaxSteps = 1 << 14;
-// Voxels with fewer returns have no plane, and any traversal counts.
-constexpr unsigned MinPlaneReturns = 3;
 constexpr unsigned long long EmptyKey = ~0ull;
 
-// moments holds per voxel the sums of x, y, z, xx, xy, xz, yy, yz, zz of its returns in metres
-// from the voxel corner; planes holds the fitted unit normal and offset in the same frame.
 struct VoxelTable {
   unsigned long long* keys;
   unsigned* hits;
   unsigned* passes;
-  float* moments;
-  float4* planes;
   unsigned mask;
 };
 __device__ unsigned long long Key(int x, int y, int z) {
@@ -57,10 +48,6 @@ __device__ int Find(const VoxelTable& t, unsigned long long key) {
 __device__ unsigned long long PointKey(float3 p) {
   return Key(int(floorf(p.x / Voxel)), int(floorf(p.y / Voxel)), int(floorf(p.z / Voxel)));
 }
-__device__ float3 Local(float3 p) {
-  return make_float3(p.x - floorf(p.x / Voxel) * Voxel, p.y - floorf(p.y / Voxel) * Voxel,
-                     p.z - floorf(p.z / Voxel) * Voxel);
-}
 __global__ void Insert(VoxelTable t, const float3* points, int count, int* overflow) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count)
@@ -70,38 +57,10 @@ __global__ void Insert(VoxelTable t, const float3* points, int count, int* overf
     const auto previous = atomicCAS(&t.keys[s], EmptyKey, key);
     if (previous == EmptyKey || previous == key) {
       atomicAdd(&t.hits[s], 1u);
-      const float3 q = Local(points[i]);
-      const float values[9] = {q.x,       q.y,       q.z,       q.x * q.x, q.x * q.y,
-                               q.x * q.z, q.y * q.y, q.y * q.z, q.z * q.z};
-      for (int k = 0; k < 9; ++k)
-        atomicAdd(&t.moments[size_t(s) * 9 + k], values[k]);
       return;
     }
   }
   atomicExch(overflow, 1);
-}
-__global__ void FitPlanes(VoxelTable t) {
-  const unsigned s = blockIdx.x * blockDim.x + threadIdx.x;
-  if (s > t.mask || t.keys[s] == EmptyKey)
-    return;
-  const unsigned n = t.hits[s];
-  if (n < MinPlaneReturns) {
-    t.planes[s] = make_float4(0, 0, 0, 0);
-    return;
-  }
-  const float* m = t.moments + size_t(s) * 9;
-  const double cx = m[0] / n, cy = m[1] / n, cz = m[2] / n;
-  double a[3][3] = {{m[3] / n - cx * cx, m[4] / n - cx * cy, m[5] / n - cx * cz},
-                    {0, m[6] / n - cy * cy, m[7] / n - cy * cz},
-                    {0, 0, m[8] / n - cz * cz}};
-  a[1][0] = a[0][1];
-  a[2][0] = a[0][2];
-  a[2][1] = a[1][2];
-  double values[3];
-  double3 normal;
-  SymmetricEigen(a, values, normal);
-  t.planes[s] = make_float4(float(normal.x), float(normal.y), float(normal.z),
-                            float(normal.x * cx + normal.y * cy + normal.z * cz));
 }
 // Amanatides-Woo traversal from the scanner to Margin short of the return.
 __global__ void Carve(VoxelTable t, const float3* points, const float3* sensors, int count) {
@@ -128,23 +87,12 @@ __global__ void Carve(VoxelTable t, const float3* points, const float3* sensors,
   }
   float entry = 0;
   for (int n = 0; n < MaxSteps && entry < end; ++n) {
-    const int k = next[0] < next[1] ? (next[0] < next[2] ? 0 : 2) : (next[1] < next[2] ? 1 : 2);
     if (Inside(c[0], c[1], c[2])) {
       const int s = Find(t, Key(c[0], c[1], c[2]));
-      if (s >= 0) {
-        // Signed plane distances where the ray enters and leaves the voxel (or stops).
-        const float4 plane = t.planes[s];
-        auto side = [&](float u) {
-          float distance = -plane.w;
-          for (int j = 0; j < 3; ++j)
-            distance += (&plane.x)[j] * (a[j] + d[j] * u - c[j]) * Voxel;
-          return distance;
-        };
-        const bool flat = plane.x != 0 || plane.y != 0 || plane.z != 0;
-        if (!flat || (side(entry) > 0) != (side(fminf(next[k], end)) > 0))
-          atomicAdd(&t.passes[s], 1u);
-      }
+      if (s >= 0)
+        atomicAdd(&t.passes[s], 1u);
     }
+    const int k = next[0] < next[1] ? (next[0] < next[2] ? 0 : 2) : (next[1] < next[2] ? 1 : 2);
     entry = next[k];
     next[k] += delta[k];
     c[k] += step[k];
@@ -169,8 +117,7 @@ __global__ void CountVoxels(VoxelTable t, unsigned long long* counts) {
 
 Json TransientLasRequest() {
   return {{"version", Version},
-          {"method", "scanner_ray_carving_voxel_plane_crossing"},
-          {"min_plane_returns", MinPlaneReturns},
+          {"method", "scanner_ray_carving"},
           {"sensor", "navigation position at the record GPS time"},
           {"voxel_m", Voxel},
           {"end_margin", {{"metres", Margin}, {"relative", MarginRelative}}},
@@ -235,7 +182,7 @@ TransientLas FindTransientLas(const Scene& scene) {
                          cudaMemcpyHostToDevice));
   };
   // Returns fill the table; it doubles until every voxel finds a slot within MaxProbes.
-  std::unique_ptr<DeviceBuffer> keys, hits, passes, moments, planes;
+  std::unique_ptr<DeviceBuffer> keys, hits, passes;
   VoxelTable table{};
   uint64_t kept = 0;
   for (size_t slots = size_t(1) << 20;; slots *= 2) {
@@ -244,16 +191,12 @@ TransientLas FindTransientLas(const Scene& scene) {
     keys = std::make_unique<DeviceBuffer>(slots * sizeof(unsigned long long));
     hits = std::make_unique<DeviceBuffer>(slots * sizeof(unsigned));
     passes = std::make_unique<DeviceBuffer>(slots * sizeof(unsigned));
-    moments = std::make_unique<DeviceBuffer>(slots * 9 * sizeof(float));
-    planes = std::make_unique<DeviceBuffer>(slots * sizeof(float4));
     CudaCheck(cudaMemset(keys->data, 0xff, keys->bytes));
-    CudaCheck(cudaMemset(moments->data, 0, moments->bytes));
     CudaCheck(cudaMemset(hits->data, 0, hits->bytes));
     CudaCheck(cudaMemset(passes->data, 0, passes->bytes));
     CudaCheck(cudaMemset(overflow.data, 0, overflow.bytes));
     table = {static_cast<unsigned long long*>(keys->data), static_cast<unsigned*>(hits->data),
-             static_cast<unsigned*>(passes->data), static_cast<float*>(moments->data),
-             static_cast<float4*>(planes->data), unsigned(slots - 1)};
+             static_cast<unsigned*>(passes->data), unsigned(slots - 1)};
     kept = 0;
     ScanLas(scene.las, header, [&](uint64_t start, const std::vector<LasPoint>& chunk) {
       load(start, chunk, false);
@@ -273,8 +216,6 @@ TransientLas FindTransientLas(const Scene& scene) {
     if (slots >= (size_t(1) << 31))
       throw std::runtime_error("LAS voxel table for transient carving is too large");
   }
-  FitPlanes<<<unsigned((uint64_t(table.mask) + 256) / 256), 256>>>(table);
-  CudaCheck(cudaGetLastError());
   uint64_t timed = 0;
   ScanLas(scene.las, header, [&](uint64_t start, const std::vector<LasPoint>& chunk) {
     load(start, chunk, true);
