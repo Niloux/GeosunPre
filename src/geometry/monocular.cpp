@@ -3,6 +3,7 @@
 #include "io/scene.h"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <Eigen/SparseCholesky>
 #include <algorithm>
 #include <cmath>
 
@@ -16,6 +17,17 @@ constexpr double FeatherBand = .3;
 constexpr size_t MinimumShiftSamples = 32;
 // Fewest grid pixels two faces must share to constrain their relative scale.
 constexpr size_t MinimumOverlapPixels = 500;
+// LAS scale fit: lattice step in grid pixels, Cauchy scale and inlier bound in log distance,
+// overlap residual weight against a LAS residual, and the photo acceptance.
+constexpr int FitLattice = 2;
+constexpr double CauchyScale = .03, InlierLog = .05, OverlapWeight = .25;
+// Node first-difference weight per mean LAS anchor of a field node.
+constexpr double FieldSmoothing = .1;
+constexpr size_t MinimumImageAnchors = 2000;
+constexpr double MinimumInlierFraction = .5;
+// Encoding: depth step between neighbours, LAS agreement and the delivered depth range.
+constexpr double StepLog = .04, AgreementFraction = .03, AgreementMetres = .03;
+constexpr double MinimumDepth = .05, MaximumDepth = 65.535;
 
 double Radians(double degrees) { return degrees * Pi / 180; }
 std::vector<Eigen::Matrix3d> FaceRotations(int ring, double tilt) {
@@ -210,9 +222,12 @@ MonocularLens PlanMonocularLens(const Camera& source, const Camera& grid, int si
   }
   lens.samples.assign(rays.size(), {});
   lens.counts.assign(rays.size(), 0);
+  lens.rays = cv::Mat::zeros(h, w, CV_32FC3);
   for (size_t i = 0; i < rays.size(); ++i) {
     if (rays[i].isZero())
       continue;
+    lens.rays.at<cv::Vec3f>(int(i / w), int(i % w)) =
+        cv::Vec3f(float(rays[i].x()), float(rays[i].y()), float(rays[i].z()));
     std::vector<FaceSample> found;
     for (size_t f = 0; f < rotations.size(); ++f) {
       const Eigen::Vector3d q = rotations[f] * rays[i];
@@ -241,6 +256,9 @@ MonocularEstimator::MonocularEstimator(Models& models)
         "Model package has no geometry engine; prepare a version 3 package with "
         "prepare-models.ps1");
   size_ = manifest.at("geometry_size");
+  // Load the engine now, so device memory budgets measured afterwards see it.
+  pixels_.Upload(cv::Mat::zeros(size_, size_, CV_8UC3));
+  models_.Predict("geometry", {pixels_.Normalize(size_, size_)});
 }
 std::vector<cv::Mat> MonocularEstimator::Faces(const MonocularLens& lens, const cv::Mat& rgb) {
   const auto source = Prefiltered(lens, rgb);
@@ -254,11 +272,10 @@ std::vector<cv::Mat> MonocularEstimator::Faces(const MonocularLens& lens, const 
   return faces;
 }
 std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens,
-                                                       const cv::Mat& rgb) {
-  if (lens.size != size_)
-    throw std::runtime_error("Monocular face size differs from the geometry engine");
+                                                       const std::vector<cv::Mat>& images) {
+  if (lens.size != size_ || images.size() != lens.faces.size())
+    throw std::runtime_error("Monocular faces differ from the geometry engine or lens plan");
   const int size = size_;
-  const auto images = Faces(lens, rgb);
   std::vector<FaceEstimate> estimates;
   for (size_t f = 0; f < images.size(); ++f) {
     pixels_.Upload(images[f]);
@@ -380,9 +397,9 @@ FaceAlignment AlignFaces(const MonocularLens& lens, const std::vector<FaceEstima
   return alignment;
 }
 MonocularMaps GatherFaces(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
-                          const std::vector<double>& scales) {
-  if (faces.size() != lens.faces.size() || scales.size() != faces.size())
-    throw std::runtime_error("Monocular faces and scales differ from the lens plan");
+                          const std::function<double(const FaceSample&)>& log_scale) {
+  if (faces.size() != lens.faces.size())
+    throw std::runtime_error("Monocular faces differ from the lens plan");
   const int w = lens.grid.width, h = lens.grid.height;
   MonocularMaps maps{cv::Mat::zeros(h, w, CV_32FC1), cv::Mat::zeros(h, w, CV_32FC3)};
   for (size_t i = 0; i < lens.counts.size(); ++i) {
@@ -395,7 +412,7 @@ MonocularMaps GatherFaces(const MonocularLens& lens, const std::vector<FaceEstim
       if (!SampleFace(faces[sample.face], sample, distance, n))
         continue;
       weights += sample.weight;
-      log_distance += sample.weight * std::log(distance * scales[sample.face]);
+      log_distance += sample.weight * (std::log(distance) + log_scale(sample));
       normal += sample.weight * n;
     }
     if (weights <= 0 || normal.norm() < 1e-6)
@@ -406,6 +423,277 @@ MonocularMaps GatherFaces(const MonocularLens& lens, const std::vector<FaceEstim
         cv::Vec3f(float(normal.x()), float(normal.y()), float(normal.z()));
   }
   return maps;
+}
+namespace {
+// Bilinear field node indices and weights of a face sample.
+struct FieldCorners {
+  int node[4];
+  double weight[4];
+};
+FieldCorners Corners(const FaceSample& sample, int size) {
+  constexpr int n = FaceFit::Cells + 1;
+  const double u = sample.x / (size - 1) * FaceFit::Cells, v = sample.y / (size - 1) * FaceFit::Cells;
+  const int c = std::clamp(int(u), 0, FaceFit::Cells - 1), r = std::clamp(int(v), 0, FaceFit::Cells - 1);
+  const double fu = u - c, fv = v - r;
+  const int base = sample.face * n * n + r * n + c;
+  return {{base, base + 1, base + n, base + n + 1},
+          {(1 - fu) * (1 - fv), fu * (1 - fv), (1 - fu) * fv, fu * fv}};
+}
+}  // namespace
+double FaceFit::LogScale(const FaceSample& sample, int size) const {
+  constexpr int n = Cells + 1;
+  const auto corners = Corners(sample, size);
+  double value = 0;
+  for (int k = 0; k < 4; ++k)
+    value += corners.weight[k] * fields[sample.face][corners.node[k] - sample.face * n * n];
+  return value;
+}
+Json FaceFit::ToJson() const {
+  return {{"accepted", accepted}, {"anchors", anchors}, {"inliers", inliers},
+          {"field_cells", Cells}, {"scales", scales}, {"faces", faces}};
+}
+FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
+                      const cv::Mat& las) {
+  if (faces.size() != lens.faces.size() || las.type() != CV_16UC1 ||
+      las.cols != lens.grid.width || las.rows != lens.grid.height)
+    throw std::runtime_error("LAS depth or monocular faces differ from the lens plan");
+  struct Anchor {
+    FaceSample sample;
+    float value;  // log(LAS distance / face distance)
+  };
+  struct Tie {
+    FaceSample a, b;
+    float value;  // log(face b distance / face a distance)
+  };
+  std::vector<Anchor> anchors;
+  std::vector<Tie> ties;
+  const int w = lens.grid.width;
+  for (int y = 0; y < lens.grid.height; y += FitLattice)
+    for (int x = 0; x < w; x += FitLattice) {
+      const size_t i = size_t(y) * w + x;
+      double distance[MonocularLens::MaxSamples];
+      bool valid[MonocularLens::MaxSamples];
+      Eigen::Vector3d normal;
+      for (int k = 0; k < lens.counts[i]; ++k)
+        valid[k] = SampleFace(faces[lens.samples[i][k].face], lens.samples[i][k], distance[k], normal);
+      const double target = las.at<uint16_t>(y, x) / 1000.;
+      for (int a = 0; a < lens.counts[i]; ++a) {
+        if (!valid[a])
+          continue;
+        if (target > 0)
+          anchors.push_back({lens.samples[i][a], float(std::log(target / distance[a]))});
+        for (int b = a + 1; b < lens.counts[i]; ++b)
+          if (valid[b])
+            ties.push_back({lens.samples[i][a], lens.samples[i][b],
+                            float(std::log(distance[b] / distance[a]))});
+      }
+    }
+  const size_t count = faces.size();
+  constexpr int n = FaceFit::Cells + 1;
+  FaceFit fit;
+  fit.scales.assign(count, 1.);
+  fit.fields.assign(count, std::vector<double>(n * n, 0.));
+  fit.anchors = anchors.size();
+  fit.faces = Json::array();
+  if (anchors.size() < MinimumImageAnchors)
+    return fit;
+  auto weight = [](double residual) {
+    const double r = residual / CauchyScale;
+    return 1 / (1 + r * r);
+  };
+  // One scale per face first; a small pull to the current value keeps every face defined.
+  std::vector<double> start;
+  for (const auto& anchor : anchors)
+    start.push_back(anchor.value);
+  Eigen::VectorXd logs = Eigen::VectorXd::Constant(count, Quantile(start, .5));
+  for (int iteration = 0; iteration < 50; ++iteration) {
+    Eigen::MatrixXd normal = Eigen::MatrixXd::Identity(count, count) * 1e-6;
+    Eigen::VectorXd right = logs * 1e-6;
+    for (const auto& anchor : anchors) {
+      const int f = anchor.sample.face;
+      const double wi = weight(logs[f] - anchor.value);
+      normal(f, f) += wi;
+      right[f] += wi * anchor.value;
+    }
+    for (const auto& tie : ties) {
+      const int a = tie.a.face, b = tie.b.face;
+      const double wi = OverlapWeight * weight(logs[a] - logs[b] - tie.value);
+      normal(a, a) += wi;
+      normal(b, b) += wi;
+      normal(a, b) -= wi;
+      normal(b, a) -= wi;
+      right[a] += wi * tie.value;
+      right[b] -= wi * tie.value;
+    }
+    const Eigen::VectorXd next = normal.ldlt().solve(right);
+    const double change = (next - logs).cwiseAbs().maxCoeff();
+    logs = next;
+    if (!(change > 1e-7))
+      break;
+  }
+  // The fields refine those scales. Node neighbours are tied with a weight relative to the mean
+  // number of anchors per node, so LAS-rich cells follow the LAS and empty cells follow the face.
+  const int size = lens.size, nodes = int(count) * n * n;
+  Eigen::VectorXd field(nodes);
+  for (size_t f = 0; f < count; ++f)
+    field.segment(f * n * n, n * n).setConstant(logs[f]);
+  const double smooth = FieldSmoothing * double(anchors.size()) / nodes;
+  std::vector<FieldCorners> anchor_corners, tie_a, tie_b;
+  for (const auto& anchor : anchors)
+    anchor_corners.push_back(Corners(anchor.sample, size));
+  for (const auto& tie : ties) {
+    tie_a.push_back(Corners(tie.a, size));
+    tie_b.push_back(Corners(tie.b, size));
+  }
+  auto evaluate = [&](const FieldCorners& c) {
+    double value = 0;
+    for (int k = 0; k < 4; ++k)
+      value += c.weight[k] * field[c.node[k]];
+    return value;
+  };
+  // The normal matrix is accumulated densely (a few MB) and solved sparse: nodes couple only
+  // within a cell, to their neighbours and across overlapping faces.
+  Eigen::MatrixXd dense(nodes, nodes);
+  for (int iteration = 0; iteration < 10; ++iteration) {
+    dense.setZero();
+    dense.diagonal().setConstant(1e-6);
+    Eigen::VectorXd right = field * 1e-6;
+    // Accumulate a row J (with right-hand side t) of weight wi into the normal equations.
+    auto add = [&](const int* index, const double* value, int length, double t, double wi) {
+      for (int p = 0; p < length; ++p) {
+        right[index[p]] += wi * value[p] * t;
+        for (int q = 0; q < length; ++q)
+          dense(index[p], index[q]) += wi * value[p] * value[q];
+      }
+    };
+    for (size_t i = 0; i < anchors.size(); ++i) {
+      const auto& c = anchor_corners[i];
+      add(c.node, c.weight, 4, anchors[i].value, weight(evaluate(c) - anchors[i].value));
+    }
+    for (size_t i = 0; i < ties.size(); ++i) {
+      int index[8];
+      double value[8];
+      for (int k = 0; k < 4; ++k) {
+        index[k] = tie_a[i].node[k];
+        value[k] = tie_a[i].weight[k];
+        index[4 + k] = tie_b[i].node[k];
+        value[4 + k] = -tie_b[i].weight[k];
+      }
+      const double residual = evaluate(tie_a[i]) - evaluate(tie_b[i]) - ties[i].value;
+      add(index, value, 8, ties[i].value, OverlapWeight * weight(residual));
+    }
+    for (size_t f = 0; f < count; ++f)
+      for (int r = 0; r < n; ++r)
+        for (int c = 0; c < n; ++c) {
+          const int node = int(f) * n * n + r * n + c;
+          for (const int other : {c + 1 < n ? node + 1 : -1, r + 1 < n ? node + n : -1}) {
+            if (other < 0)
+              continue;
+            const int index[2] = {node, other};
+            const double value[2] = {1, -1};
+            add(index, value, 2, 0, smooth);
+          }
+        }
+    const Eigen::SparseMatrix<double> matrix = dense.sparseView();
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver(matrix);
+    if (solver.info() != Eigen::Success)
+      throw std::runtime_error("Monocular scale field fit is singular");
+    const Eigen::VectorXd next = solver.solve(right);
+    const double change = (next - field).cwiseAbs().maxCoeff();
+    field = next;
+    if (!(change > 1e-4))
+      break;
+  }
+  if (!field.allFinite())
+    throw std::runtime_error("Monocular face scale fit diverged");
+  std::vector<std::vector<double>> residuals(count);
+  for (size_t i = 0; i < anchors.size(); ++i) {
+    const double r = anchors[i].value - evaluate(anchor_corners[i]);
+    residuals[anchors[i].sample.face].push_back(r);
+    fit.inliers += std::abs(r) <= InlierLog;
+  }
+  for (size_t f = 0; f < count; ++f) {
+    const Eigen::VectorXd nodes_f = field.segment(f * n * n, n * n);
+    fit.fields[f].assign(nodes_f.data(), nodes_f.data() + n * n);
+    fit.scales[f] = std::exp(nodes_f.mean());
+    auto& values = residuals[f];
+    Json row = {{"scale", fit.scales[f]},
+                {"field_log_range", {nodes_f.minCoeff(), nodes_f.maxCoeff()}},
+                {"anchors", values.size()}};
+    if (!values.empty()) {
+      const double median = Quantile(values, .5);
+      size_t inside = 0;
+      for (auto& value : values) {
+        inside += std::abs(value) <= InlierLog;
+        value = std::abs(value - median);
+      }
+      row["inlier_fraction"] = double(inside) / values.size();
+      row["log_residual_median"] = median;
+      row["log_residual_mad"] = Quantile(values, .5);
+    }
+    fit.faces.push_back(row);
+  }
+  fit.accepted = double(fit.inliers) >= MinimumInlierFraction * fit.anchors;
+  return fit;
+}
+Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps, const cv::Mat& las,
+                     const cv::Mat& allowed, bool depth, double min_incidence, cv::Mat& depth_mm,
+                     cv::Mat& normal_rgb) {
+  const int w = lens.grid.width, h = lens.grid.height;
+  if (las.size() != cv::Size(w, h) || allowed.size() != las.size() || allowed.type() != CV_8UC1 ||
+      maps.distance.size() != las.size())
+    throw std::runtime_error("Monocular maps differ from the supervision grid");
+  // A pixel next to a jump of more than StepLog in log distance holds a blend of both sides.
+  cv::Mat step = cv::Mat::zeros(h, w, CV_8UC1);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const float d = maps.distance.at<float>(y, x);
+      if (d <= 0)
+        continue;
+      for (int dy = -1; dy <= 1 && !step.at<uint8_t>(y, x); ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= w || yy >= h)
+            continue;
+          const float other = maps.distance.at<float>(yy, xx);
+          if (other > 0 && std::abs(std::log(other / d)) > StepLog) {
+            step.at<uint8_t>(y, x) = 1;
+            break;
+          }
+        }
+    }
+  cv::Mat blended;
+  cv::dilate(step, blended, cv::Mat::ones(3, 3, CV_8UC1));
+  depth_mm = cv::Mat::zeros(h, w, CV_16UC1);
+  normal_rgb = cv::Mat::zeros(h, w, CV_8UC3);
+  std::vector<double> agreement;
+  size_t disagreeing = 0;
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const float d = maps.distance.at<float>(y, x);
+      if (d <= 0 || !allowed.at<uint8_t>(y, x) || blended.at<uint8_t>(y, x))
+        continue;
+      const double target = las.at<uint16_t>(y, x) / 1000.;
+      bool agrees = true;
+      if (target > 0) {
+        const double ratio = std::abs(std::log(d / target));
+        agreement.push_back(ratio);
+        agrees = ratio <= std::log1p(std::max(AgreementFraction, AgreementMetres / target));
+        disagreeing += !agrees;
+      }
+      if (depth && agrees && d >= MinimumDepth && d <= MaximumDepth)
+        depth_mm.at<uint16_t>(y, x) = uint16_t(std::clamp<long>(std::lround(d * 1000.), 1, 65535));
+      const auto& n = maps.normal.at<cv::Vec3f>(y, x);
+      const auto& ray = lens.rays.at<cv::Vec3f>(y, x);
+      if (-(n[0] * ray[0] + n[1] * ray[1] + n[2] * ray[2]) >= min_incidence)
+        normal_rgb.at<cv::Vec3b>(y, x) =
+            cv::Vec3b(uint8_t(127.5f + 127.5f * n[2] + .5f), uint8_t(127.5f + 127.5f * n[1] + .5f),
+                      uint8_t(127.5f + 127.5f * n[0] + .5f));
+    }
+  Json stats = {{"las_compared_pixels", agreement.size()}, {"las_disagreeing_pixels", disagreeing}};
+  if (!agreement.empty())
+    stats["las_log_ratio"] = {{"p50", Quantile(agreement, .5)}, {"p90", Quantile(agreement, .9)}};
+  return stats;
 }
 Json CheckMonocular(const fs::path& input, const fs::path& root, const std::string& image,
                     const fs::path& output, int max_size) {
@@ -426,11 +714,13 @@ Json CheckMonocular(const fs::path& input, const fs::path& root, const std::stri
   cv::Mat rgb;
   cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
   started = Clock::now();
-  const auto estimates = estimator.Estimate(lens, rgb);
+  const auto estimates = estimator.Estimate(lens, MonocularEstimator::Faces(lens, rgb));
   const double estimate_seconds = Seconds(started);
   started = Clock::now();
   const auto alignment = AlignFaces(lens, estimates);
-  const auto maps = GatherFaces(lens, estimates, alignment.scales);
+  const auto maps = GatherFaces(lens, estimates, [&](const FaceSample& sample) {
+    return std::log(alignment.scales[sample.face]);
+  });
   const double gather_seconds = Seconds(started);
 
   fs::create_directories(output / "faces");

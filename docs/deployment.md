@@ -15,7 +15,7 @@ Windows x64，需算力 ≥ 8.0 的 NVIDIA GPU（RTX 30/40/50、RTX A 系列等�
 
 `info` 显示程序路径、构建版本、GPU 和默认模型目录。`check-models` 使用指定的真实照片执行四个模型，照片仅用于本次检查，不会写入模型或运行包。version=2 模型包的检测器支持动态宽高，检查报告包含实际检测输入尺寸；换场景分辨率或宽高比无需重建模型。
 
-交付直接写入 `--output` 根目录。默认生产模式在交付发布后删除工作目录 `OUT.work` 及其缓存，中途失败时保留，以相同命令续跑；`--debug` 保留工作目录（默认 `work/<输入目录名>`，或 `--work` 指定），用于续跑单阶段及独立 `export`、`refine`、`cleanup`。输入、配置或模型改变时使用新工作目录，保留已有成果。默认交付原图、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及 LAS 深度和法向监督图；下游需支持 OPENCV_FISHEYE。`--no-ply` 省略 PLY，`--ply-voxel 0.1` 生成 10 cm 初始化，`--no-las-supervision` 省略监督图。交付目录直接作为定制 LFS 的训练数据路径；监督深度为沿视线距离，须用 `--gut` 训练。旧重建可直接 `export --work OLD --output NEW` 补监督，保留原交付包。
+交付直接写入 `--output` 根目录。默认生产模式在交付发布后删除工作目录 `OUT.work` 及其缓存，中途失败时保留，以相同命令续跑；`--debug` 保留工作目录（默认 `work/<输入目录名>`，或 `--work` 指定），用于续跑单阶段及独立 `export`、`refine`、`cleanup`。输入、配置或模型改变时使用新工作目录，保留已有成果。默认交付原图、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及 LAS 深度和法向监督图；下游需支持 OPENCV_FISHEYE。`--no-ply` 省略 PLY，`--ply-voxel 0.1` 生成 10 cm 初始化，`--no-las-supervision` 省略监督图。`--supervision-source moge --supervision-models MODELS` 改用 MoGe-2 生成深度和法向图、LAS 只定尺度，需 version=3 模型包（含 geometry 引擎）。交付目录直接作为定制 LFS 的训练数据路径；监督深度为沿视线距离，须用 `--gut` 训练。旧重建可直接 `export --work OLD --output NEW` 补监督，保留原交付包。
 
 `run` 默认在 LAS 对齐后执行卷帘快门校正并独立清理稀疏点，再导出通过验收的所选模型；交付照片始终为原图拷贝；卷帘校正被采用时另附 `rolling_shutter.json`，未采用的原因见交付目录 `result.json` 的 shutter 及调试工作目录的 `cache/shutter.json`。原图精修默认关闭，首次运行加 `--refine` 或配置 `"refine": true` 在卷帘校正前启用，续跑沿用已冻结的选择。精修未启用或候选未通过时，仍对上一步所选模型校正和清理；未采用原因分别见 `cache/refinement.json`、`cache/shutter.json` 与 `cache/cleanup.json`。
 

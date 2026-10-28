@@ -2,6 +2,7 @@
 #include "geometry/supervision.h"
 #include "frontend/frontend.h"
 #include "frontend/inference.h"
+#include "geometry/monocular.h"
 #include "io/las.h"
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -18,6 +19,9 @@
 namespace geosun {
 namespace {
 constexpr int Version = 8;
+// Monocular supervision (source moge) is published as version 9; LAS maps keep version 8.
+constexpr int MonocularVersion = 9;
+constexpr const char* MonocularSource = "moge2_faces_las_scaled";
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
 constexpr double MaxTheta = 1.396263401595464;
@@ -1024,7 +1028,8 @@ cv::Mat StaticMask(const Scene& scene, const fs::path& masks, uint32_t image, co
   mask /= 255;
   return mask;
 }
-std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal) {
+std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal,
+                                     bool normal_needs_depth) {
   static const auto squares = [] {
     std::array<double, 256> values;
     for (int v = 0; v < 256; ++v)
@@ -1039,7 +1044,7 @@ std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal
       const bool has_depth = d[x] != 0;
       const bool has_normal = n[0] || n[1] || n[2];
       if (has_normal) {
-        if (!has_depth)
+        if (normal_needs_depth && !has_depth)
           throw std::runtime_error("Normal has no corresponding valid LAS depth");
         const double norm = squares[n[0]] + squares[n[1]] + squares[n[2]];
         if (std::abs(norm - 1) > .025)
@@ -1050,6 +1055,20 @@ std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal
     }
   }
   return {depths, normals};
+}
+// The geometry engine a monocular request was made with.
+Json GeometryIdentity(const fs::path& root) {
+  const auto manifest = ReadJson(root / "manifest.json");
+  if (!manifest.at("models").contains("geometry"))
+    throw std::runtime_error(
+        "Supervision models have no geometry engine; prepare a version 3 model package");
+  return {{"models", root.u8string()},
+          {"manifest", FileMetadata(root / "manifest.json")},
+          {"engine", FileMetadata(root / "engines/geometry.engine")},
+          {"sha256", manifest.at("models").at("geometry").at("sha256")},
+          {"source", manifest.at("geometry_source")},
+          {"face_size", manifest.at("geometry_size")},
+          {"tokens", manifest.at("geometry_tokens")}};
 }
 }  // namespace
 Camera MapCamera(const Camera& source, int max_size) {
@@ -1078,10 +1097,21 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
     throw std::runtime_error("Supervision cache budget must be 1-4096 MiB");
   if (!options.enabled &&
       (args.values.count("--supervision-max-size") || args.values.count("--supervision-boundary") ||
-       args.values.count("--supervision-cache-mb") || !options.mask_dir.empty()))
+       args.values.count("--supervision-cache-mb") || !options.mask_dir.empty() ||
+       args.values.count("--supervision-source") || args.values.count("--supervision-models")))
     throw std::runtime_error("Supervision options cannot be used with --no-las-supervision");
   if (!options.mask_dir.empty() && !fs::is_directory(options.mask_dir))
     throw std::runtime_error("Geometry exclusion mask directory does not exist");
+  options.source = args.Get("--supervision-source", "las");
+  if (options.source != "las" && options.source != "moge")
+    throw std::runtime_error("Supervision source must be las or moge");
+  if (!args.Get("--supervision-models").empty()) {
+    if (options.source != "moge")
+      throw std::runtime_error("--supervision-models requires --supervision-source moge");
+    options.geometry_models = args.Path("--supervision-models");
+  } else if (options.source == "moge") {
+    options.geometry_models = DefaultModels();
+  }
   return options;
 }
 Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const fs::path& masks_dir,
@@ -1098,7 +1128,8 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
     if (!options.mask_dir.empty() && fs::exists(ExtraMask(options, image.name)))
       masks[image.name] = FileMetadata(ExtraMask(options, image.name));
   }
-  Json request = {{"version", Version},
+  const bool monocular = options.source == "moge";
+  Json request = {{"version", monocular ? MonocularVersion : Version},
                   {"max_size", options.max_size},
                   {"boundary_pixels", options.boundary},
                   {"las_file", FileMetadata(scene.las)},
@@ -1109,6 +1140,10 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
     request["readout_normals_version"] = 2;
   if (options.crop)
     request["crop_windows"] = {(*options.crop)[0].ToJson(), (*options.crop)[1].ToJson()};
+  if (monocular) {
+    request["source"] = "moge";
+    request["geometry"] = GeometryIdentity(options.geometry_models);
+  }
   return request;
 }
 Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
@@ -1118,6 +1153,14 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   const auto header = ReadLasHeader(scene.las);
   const auto request = SupervisionRequest(scene, model, masks_dir, options, motion != nullptr);
   std::vector<Json> rows(model.images.size());
+  const bool monocular = options.source == "moge";
+  std::unique_ptr<Models> geometry;
+  std::unique_ptr<MonocularEstimator> estimator;
+  if (monocular) {
+    geometry = std::make_unique<Models>(options.geometry_models);
+    estimator = std::make_unique<MonocularEstimator>(*geometry);
+  }
+  Json lenses = Json::array();
   LasPointCache points(scene.las, header, output, options.cache_mb);
   const auto stream = points.StreamHandle();
   uint64_t depth_pixels = 0, normal_pixels = 0;
@@ -1141,7 +1184,10 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   struct LoadedMask {
     cv::Mat pixels;
     int count;
+    std::vector<cv::Mat> faces;  // MoGe faces of the photo for monocular supervision
   };
+  // Lens plans outlive their camera's loop: the monocular fits run with the pending writes.
+  std::array<std::optional<MonocularLens>, 2> lens_plans;
   for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
     std::vector<uint32_t> images;
     for (uint32_t i = 0; i < model.images.size(); ++i)
@@ -1151,6 +1197,11 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
       continue;
     const auto camera = MapCamera(model.cameras[cid], options.max_size);
     const int w = camera.width, h = camera.height, size = w * h, blocks = (size + 255) / 256;
+    auto& lens = lens_plans.at(cid);
+    if (monocular) {
+      lens = PlanMonocularLens(model.cameras[cid], camera, estimator->FaceSize());
+      lenses.push_back({{"camera", cid}, {"plan", lens->ToJson()}});
+    }
     const size_t batch = std::min<size_t>(
         32, std::max<size_t>(1, DepthBudget / (size * (sizeof(float) + sizeof(Blend)))));
     std::vector<float3> ray_host(size);
@@ -1179,7 +1230,17 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         masks.push_back(std::async(std::launch::async, [&, id = images[requested]] {
           auto pixels = StaticMask(scene, masks_dir, id, camera, options);
           const int count = cv::countNonZero(pixels);
-          return LoadedMask{std::move(pixels), count};
+          LoadedMask loaded{std::move(pixels), count, {}};
+          if (lens) {
+            auto photo = ReadImage(scene.images[id].source, cv::IMREAD_COLOR);
+            if (options.crop) {
+              const auto& window = (*options.crop)[cid];
+              photo = photo(cv::Rect(window.x, window.y, window.width, window.height)).clone();
+            }
+            cv::cvtColor(photo, photo, cv::COLOR_BGR2RGB);
+            loaded.faces = MonocularEstimator::Faces(*lens, photo);
+          }
+          return loaded;
         }));
     };
     for (size_t first = 0; first < images.size(); first += batch) {
@@ -1257,7 +1318,23 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                                   cudaMemcpyDeviceToHost, stream));
         CudaCheck(cudaMemcpyAsync(normal.data, normals.data, normals.bytes, cudaMemcpyDeviceToHost,
                                   stream));
+        cv::Mat semantic;
+        if (monocular) {
+          semantic.create(h, w, CV_8UC1);
+          CudaCheck(cudaMemcpyAsync(semantic.data, limit.data, limit.bytes, cudaMemcpyDeviceToHost,
+                                    stream));
+        }
         CudaCheck(cudaStreamSynchronize(stream));
+        // MoGe faces replace the maps; the LAS depth only scales them and gates their depth. The
+        // GPU estimates the faces here; the fit and encoding run with the write on the CPU.
+        std::vector<FaceEstimate> estimates;
+        cv::Mat allowed;
+        if (monocular) {
+          allowed = static_mask.pixels.clone();
+          allowed.setTo(0, semantic);
+          estimates = estimator->Estimate(*lens, static_mask.faces);
+        }
+        const MonocularLens* plan = monocular ? &*lens : nullptr;
         const auto& name = scene.images[id].name;
         const auto dp = output / "depths" / fs::u8path(name + ".png"),
                    np = output / "normals" / fs::u8path(name + ".png");
@@ -1265,15 +1342,35 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         fs::create_directories(np.parent_path());
         if (writes.size() >= Lookahead)
           finish();
-        writes.push_back(std::async(std::launch::async, [=, static_pixels = static_mask.count] {
-          const auto valid = Counts(depth, normal);
+        writes.push_back(std::async(std::launch::async, [=, estimates = std::move(estimates),
+                                                         static_pixels = static_mask.count]() mutable {
+          Json monocular_row;
+          if (plan) {
+            const auto fit = FitFaceScales(*plan, estimates, depth);
+            const auto maps = GatherFaces(*plan, estimates, [&](const FaceSample& sample) {
+              return fit.LogScale(sample, plan->size);
+            });
+            cv::Mat monocular_depth, monocular_normal;
+            monocular_row = EncodeMonocular(*plan, maps, depth, allowed, fit.accepted, MinIncidence,
+                                            monocular_depth, monocular_normal);
+            Json faces = Json::array();
+            for (const auto& estimate : estimates)
+              faces.push_back(estimate.ToJson());
+            monocular_row["fit"] = fit.ToJson();
+            monocular_row["faces"] = faces;
+            depth = monocular_depth;
+            normal = monocular_normal;
+          }
+          const auto valid = Counts(depth, normal, !monocular);
           WriteImage(dp, depth);
           WriteImage(np, normal);
-          return Written{id,
-                         {{"image_index", id}, {"name", name}, {"width", w}, {"height", h},
-                          {"depth_size", fs::file_size(dp)}, {"normal_size", fs::file_size(np)},
-                          {"static_pixels", static_pixels}, {"depth_pixels", valid.first},
-                          {"normal_pixels", valid.second}}};
+          Json row = {{"image_index", id}, {"name", name}, {"width", w}, {"height", h},
+                      {"depth_size", fs::file_size(dp)}, {"normal_size", fs::file_size(np)},
+                      {"static_pixels", static_pixels}, {"depth_pixels", valid.first},
+                      {"normal_pixels", valid.second}};
+          if (monocular)
+            row["monocular"] = monocular_row;
+          return Written{id, std::move(row)};
         }));
       }
     }
@@ -1289,7 +1386,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   if (request != SupervisionRequest(scene, model, masks_dir, options, motion != nullptr))
     throw std::runtime_error("LAS or geometry exclusion masks changed during supervision export");
   points.Finish();
-  return {{"version", Version},
+  Json summary = {{"version", Version},
           {"request", request},
           {"source", "valid original LAS records"},
           {"projection", motion ? "rolling_shutter_readout_line" : "global_shutter"},
@@ -1319,10 +1416,36 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"normal_pixels", normal_pixels},
           {"images", images},
           {"seconds", Seconds(started)}};
+  if (monocular) {
+    summary["version"] = MonocularVersion;
+    summary["source"] = MonocularSource;
+    summary["anchor_source"] = "valid original LAS records";
+    summary["geometry_model"] = request.at("geometry");
+    summary["lenses"] = lenses;
+    summary["depth_rendering"] =
+        "moge2 faces scaled per face to the LAS depth, blended in log distance";
+    summary["depth_validity"] =
+        "accepted face fit, static mask off the semantic margin, no blended depth step, "
+        "LAS agreement where LAS holds depth";
+    summary["normal_estimator"] = "moge2_vitl_faces";
+    summary["normal_validity"] =
+        "static mask off the semantic margin, no blended depth step, incidence";
+    summary["monocular"] = {{"fit", "per-face 12 x 12 bilinear log-scale field, Cauchy IRLS in log "
+                                    "distance, scale 0.03, inliers within 0.05, overlap weight 0.25, "
+                                    "node first difference 0.1 x mean anchors per node, lattice 2 px"},
+                            {"accept", "at least 2000 LAS anchors, half of them inliers"},
+                            {"depth_step_log", .04},
+                            {"las_agreement", "within max(3%, 0.03 m)"},
+                            {"normals_need_depth", false},
+                            {"inference", geometry->Profile()}};
+  }
+  return summary;
 }
 void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
                          const Json& photos, const Json& summary) {
-  if (summary.at("version") < 1 || summary.at("version") > Version ||
+  const bool monocular = summary.value("source", std::string()) == MonocularSource;
+  if (summary.at("version") < 1 ||
+      summary.at("version") > (monocular ? MonocularVersion : Version) ||
       summary.at("depth_type") != "ray_distance" ||
       summary.at("depth_format") != "uint16_png_mm" || summary.at("normal_format") != "rgb8_png" ||
       summary.at("normal_frame") != "opencv_camera_facing_camera" ||
@@ -1359,7 +1482,7 @@ void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
       if (depth.type() != CV_16UC1 || normal.type() != CV_8UC3 || depth.size() != normal.size() ||
           depth.cols != camera.width || depth.rows != camera.height)
         throw std::runtime_error("LAS supervision map dimensions or pixel types differ");
-      const auto counts = Counts(depth, normal);
+      const auto counts = Counts(depth, normal, !monocular);
       if (counts.first != depths || counts.second != normals)
         throw std::runtime_error("LAS supervision valid pixel counts differ");
       return counts;
