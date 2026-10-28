@@ -57,6 +57,13 @@ void RefinePoint(const Reconstruction& model, const std::vector<Observation>& tr
 // three test scenes; a centre off by more than the gate is a wrong registration (repeated texture
 // put 展厅 R exposures 0.5-1.4 m away).
 constexpr double NavigationSigma = .03, NavigationGate = .25;
+// Synchronous L/R exposures share one body pose: R = extrinsic * L. Independent solutions on 室内
+// and 展厅 scatter about the mean extrinsic by 0.03-0.06 degrees and 2 mm (median).
+constexpr double RigRotationSigma = Pi / 180 * .01, RigPositionSigma = .001;
+// Robust mean extrinsic (R from L) of the frames with both exposures registered; false with
+// fewer than four such frames.
+bool RigExtrinsic(const Reconstruction& model, const std::vector<std::array<uint32_t, 2>>& frames,
+                  Pose& rig);
 // Navigation positions give the metric gauge: without them the gauge image is held and the
 // gauge baseline kept.
 Json Optimize(Reconstruction& model, const std::array<Camera, 2>& initial, const std::string& stage,
@@ -65,5 +72,6 @@ Json Optimize(Reconstruction& model, const std::array<Camera, 2>& initial, const
               const std::vector<Eigen::Vector3d>& navigation = {},
               const std::set<uint64_t>& selected_points = {},
               const std::vector<std::vector<uint8_t>>& precise_observations = {},
-              const Reconstruction* reference = nullptr, ShutterMotion* shutter = nullptr);
+              const Reconstruction* reference = nullptr, ShutterMotion* shutter = nullptr,
+              const std::vector<std::array<uint32_t, 2>>& frames = {});
 }  // namespace geosun

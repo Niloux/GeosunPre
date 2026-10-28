@@ -2,6 +2,7 @@
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
 #include <ceres/product_manifold.h>
+#include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <cmath>
 
@@ -202,6 +203,27 @@ struct Position {
     return true;
   }
 };
+// A synchronous frame: the R pose is the rig extrinsic applied to the L pose. Residuals are the
+// rotation (rad) and translation (m, R camera frame) differences over their sigmas.
+struct RigLink {
+  template <class T>
+  bool operator()(const T* left, const T* right, const T* rig, T* r) const {
+    const T ql[] = {left[3], left[0], left[1], left[2]},
+            qr[] = {right[3], right[0], right[1], right[2]},
+            qe[] = {rig[3], rig[0], rig[1], rig[2]};
+    T predicted[4], difference[4], moved[3];
+    ceres::QuaternionProduct(qe, ql, predicted);
+    const T inverse[] = {predicted[0], -predicted[1], -predicted[2], -predicted[3]};
+    ceres::QuaternionProduct(qr, inverse, difference);
+    const T sign = difference[0] < T(0) ? T(-2) : T(2);
+    ceres::UnitQuaternionRotatePoint(qe, left + 4, moved);
+    for (int i = 0; i < 3; ++i) {
+      r[i] = sign * difference[i + 1] / T(RigRotationSigma);
+      r[i + 3] = (right[4 + i] - moved[i] - rig[4 + i]) / T(RigPositionSigma);
+    }
+    return true;
+  }
+};
 class Progress : public ceres::IterationCallback {
   Clock::time_point last = Clock::now();
 
@@ -266,12 +288,63 @@ void RefinePose(const Camera& camera, Pose& pose, const std::vector<Eigen::Vecto
   if (!summary.IsSolutionUsable())
     throw std::runtime_error("Pose refinement failed: " + summary.BriefReport());
 }
+bool RigExtrinsic(const Reconstruction& m, const std::vector<std::array<uint32_t, 2>>& frames,
+                  Pose& rig) {
+  std::vector<Eigen::Quaterniond> rotations;
+  std::vector<Eigen::Vector3d> translations;
+  for (const auto& f : frames) {
+    const auto& left = m.images[f[0]];
+    const auto& right = m.images[f[1]];
+    if (!left.registered || !right.registered)
+      continue;
+    const Eigen::Quaterniond q = right.pose.Rotation() * left.pose.Rotation().conjugate();
+    rotations.push_back(q);
+    translations.push_back(right.pose.Translation() - q * left.pose.Translation());
+  }
+  if (rotations.size() < 4)
+    return false;
+  // Start from the per-axis median translation and the full mean, then average the frames
+  // within 1 degree and 5 cm of the estimate: a wrong registration does not move it.
+  Eigen::Vector3d t;
+  for (int k = 0; k < 3; ++k) {
+    std::vector<double> values;
+    for (const auto& x : translations)
+      values.push_back(x[k]);
+    t[k] = Quantile(values, .5);
+  }
+  std::vector<uint8_t> inlier(rotations.size(), 1);
+  Eigen::Quaterniond q = Eigen::Quaterniond::Identity();
+  for (int pass = 0; pass < 3; ++pass) {
+    Eigen::Matrix4d sum = Eigen::Matrix4d::Zero();
+    Eigen::Vector3d total = Eigen::Vector3d::Zero();
+    size_t count = 0;
+    for (size_t i = 0; i < rotations.size(); ++i)
+      if (inlier[i]) {
+        sum += rotations[i].coeffs() * rotations[i].coeffs().transpose();
+        total += translations[i];
+        ++count;
+      }
+    if (count < 4)
+      return false;
+    const Eigen::Vector4d mean =
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d>(sum).eigenvectors().col(3);
+    q = Eigen::Quaterniond(mean[3], mean[0], mean[1], mean[2]).normalized();
+    if (pass)
+      t = total / double(count);
+    for (size_t i = 0; i < rotations.size(); ++i)
+      inlier[i] =
+          rotations[i].angularDistance(q) <= Pi / 180 && (translations[i] - t).norm() <= .05;
+  }
+  rig.Set(q, t);
+  return true;
+}
 Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std::string& stage,
               int workers, int iterations, const std::set<uint32_t>& variable_images,
               const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav,
               const std::set<uint64_t>& selected_points,
               const std::vector<std::vector<uint8_t>>& precise_observations,
-              const Reconstruction* reference, ShutterMotion* shutter) {
+              const Reconstruction* reference, ShutterMotion* shutter,
+              const std::vector<std::array<uint32_t, 2>>& frames) {
   const auto started = Clock::now();
   ceres::Problem problem;
   auto ordering = std::make_shared<ceres::ParameterBlockOrdering>();
@@ -389,6 +462,21 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
       problem.AddResidualBlock(
           new ceres::AutoDiffCostFunction<Position, 3, 7>(new Position{nav.at(id)}),
           new ceres::HuberLoss(2), m.images[id].pose.params.data());
+  Pose rig;
+  size_t rig_frames = 0;
+  if (!frames.empty() && RigExtrinsic(m, frames, rig))
+    for (const auto& f : frames)
+      if (used_images.count(f[0]) && used_images.count(f[1])) {
+        problem.AddResidualBlock(new ceres::AutoDiffCostFunction<RigLink, 6, 7, 7, 7>(new RigLink),
+                                 new ceres::HuberLoss(2), m.images[f[0]].pose.params.data(),
+                                 m.images[f[1]].pose.params.data(), rig.params.data());
+        if (!rig_frames++) {
+          problem.SetManifold(rig.params.data(),
+                              new ceres::ProductManifold<ceres::EigenQuaternionManifold,
+                                                         ceres::EuclideanManifold<3>>());
+          ordering->AddElementToGroup(rig.params.data(), 1);
+        }
+      }
   ceres::Solver::Options options;
   options.num_threads = workers;
   options.max_num_iterations = iterations;
@@ -451,6 +539,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"images", used_images.size()},
           {"variable_images", variable_count},
           {"metric_constraints", metric},
+          {"rig_frames", rig_frames},
           {"rolling_shutter", shutter != nullptr},
           {"observations", observations},
           {"precise_observations", precise_count},

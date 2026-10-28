@@ -194,9 +194,11 @@ ShutterCorrection CorrectAlongAxis(const Scene& scene, const Reconstruction& sou
   Log(std::string("Rolling-shutter readout along ") + (axis ? "rows" : "columns"));
   auto& report = result.report;
   report = {{"readout_axis", axis ? "rows" : "columns"}, {"used", false}};
+  // Synchronous L/R reference (middle-line) poses are rigid; this is the only BA given the rig.
   report["optimization"] =
       Optimize(model, scene.cameras, "principal", ba_workers, 150, {}, inputs.training_planes,
-               inputs.navigation, inputs.training, {}, nullptr, &motion);
+               inputs.navigation, inputs.training, {}, nullptr, &motion,
+               SynchronousFrames(scene));
   // Held-out reprojection with every camera fixed: the source projection against the
   // rolling-shutter projection, each with its points refit to the same observations.
   auto before = source;

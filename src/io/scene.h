@@ -32,4 +32,7 @@ Json ImageHeader(const fs::path& path);
 std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene);
 // Trajectory velocity in the LAS frame (m/s) at every exposure, from +-50 ms of navigation.
 std::vector<Eigen::Vector3d> NavigationVelocities(const Scene& scene);
+// (L, R) image indices of each frame number exposed by both lenses when every such pair was
+// exposed within 2 ms; empty when the lenses are not synchronized.
+std::vector<std::array<uint32_t, 2>> SynchronousFrames(const Scene& scene);
 }  // namespace geosun

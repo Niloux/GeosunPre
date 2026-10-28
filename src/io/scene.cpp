@@ -474,6 +474,23 @@ std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene) {
     positions.push_back(navigation.conversion.Apply(image.navigation_raw - navigation.center));
   return positions;
 }
+std::vector<std::array<uint32_t, 2>> SynchronousFrames(const Scene& scene) {
+  std::map<int, std::array<uint32_t, 2>> lenses;
+  for (uint32_t i = 0; i < scene.images.size(); ++i)
+    lenses.try_emplace(scene.images[i].frame, std::array<uint32_t, 2>{UINT32_MAX, UINT32_MAX})
+        .first->second[scene.images[i].camera] = i;
+  std::vector<std::array<uint32_t, 2>> frames;
+  for (const auto& [frame, ids] : lenses) {
+    if (ids[0] == UINT32_MAX || ids[1] == UINT32_MAX)
+      continue;
+    const auto& a = scene.images[ids[0]];
+    const auto& b = scene.images[ids[1]];
+    if (a.week != b.week || std::abs(a.seconds - b.seconds) > .002)
+      return {};
+    frames.push_back(ids);
+  }
+  return frames;
+}
 std::vector<Eigen::Vector3d> NavigationVelocities(const Scene& scene) {
   constexpr double half_window = .05;
   const auto navigation = ReadNavigation(scene);

@@ -15,13 +15,13 @@ INPUT/
 
 输入目录须且仅有一份 `.pro`（PCC 解算项目），其文件名即场景名：CameraPos、两份导航表和默认 LAS 均按该名称读取，不按目录中其他同类文件推断；`--las` 可显式改选。
 
-仅使用 `.pro` 中 L/R 相机及 CameraPos 有精确同名记录的 JPEG，M 不参与。照片默认只从 `Image/L`、`Image/R`（各自只能放对应镜头）读取原图；两者都不存在时改读 `Image/` 根目录下的平铺原图，不递归子目录；忽略 `Image/enhanced`：enhanced 是逐图不同的非线性增强，原图曝光固定、颜色一致，更适合 3DGS 外观建模。配置 `"enhanced_photos": true` 时另读 `Image/enhanced`，同名时优先使用 enhanced，交付图像名仍按 L/R 原图的相对路径，原图缺失时为 `镜头/文件名`。各目录内图像名和各镜头帧号须唯一，Pose 绑定图像在所读目录中都缺失时报错。照片来源随配置冻结并记入 scene.json 的 `photos`，改变须使用新工作目录。所用照片尺寸须等于 `.pro`，EXIF orientation 须为 1。按 GPS 周、文件名时间、镜头和图像名排序；L/R 同帧号不表示同步。
+仅使用 `.pro` 中 L/R 相机及 CameraPos 有精确同名记录的 JPEG，M 不参与。照片默认只从 `Image/L`、`Image/R`（各自只能放对应镜头）读取原图；两者都不存在时改读 `Image/` 根目录下的平铺原图，不递归子目录；忽略 `Image/enhanced`：enhanced 是逐图不同的非线性增强，原图曝光固定、颜色一致，更适合 3DGS 外观建模。配置 `"enhanced_photos": true` 时另读 `Image/enhanced`，同名时优先使用 enhanced，交付图像名仍按 L/R 原图的相对路径，原图缺失时为 `镜头/文件名`。各目录内图像名和各镜头帧号须唯一，Pose 绑定图像在所读目录中都缺失时报错。照片来源随配置冻结并记入 scene.json 的 `photos`，改变须使用新工作目录。所用照片尺寸须等于 `.pro`，EXIF orientation 须为 1。按 GPS 周、文件名时间、镜头和图像名排序；L/R 同帧号本身不表示同步：只有同时具有 L、R 的全部帧号的文件名时间都相差不超过 2 ms 时，才按同步刚性 rig 处理（室内、展厅为同步，生产车间 R 先于 L 约 65 ms，为异步）。
 
 文件名为 `GPS周-秒-毫秒_帧号-L或R.JPG`。CameraPos 每行 11 字段：文件名、设备编号、GPS 周、秒、XYZ、四元数四分量。仅使用位置，四元数不用于视觉初始化；不改写时间戳。
 
 鱼眼参数为 `fx fy cx cy k1 k2 k3 k4`。初值：`fx=fy=focalLength/pixelSize`，`cx=width/2+principalX/pixelSize`，`cy=height/2+principalY/pixelSize`，`k4=p3`。主点偏移与 G203 参考流程采用相同的图像坐标方向；p3 含义尚未独立核对。旧版本对 principalY 使用减号，已有 scene.json 和特征缓存不能直接视为修正后的结果，须使用新工作目录。
 
-左上像素中心为 `(0.5,0.5)`。`theta=atan2(sqrt(X²+Y²),Z)`，径向多项式为 `theta*(1+k1*theta²+k2*theta⁴+k3*theta⁶+k4*theta⁸)`。有效域为完整视场 160°，多项式须单调。L/R 内参各共享一组，每次曝光独立位姿。
+左上像素中心为 `(0.5,0.5)`。`theta=atan2(sqrt(X²+Y²),Z)`，径向多项式为 `theta*(1+k1*theta²+k2*theta⁴+k3*theta⁶+k4*theta⁸)`。有效域为完整视场 160°，多项式须单调。L/R 内参各共享一组，每次曝光有独立位姿；同步数据在卷帘 BA 中另以全局 L→R 外参软约束同帧两参考位姿（见 README）。
 
 两视图及 PnP 的 RANSAC 共识按原始鱼眼像素计算；透视归一化坐标仅供最小求解器产生候选。PnP 使用 AP3P 候选、6 px 内点门限及鱼眼位姿精调，不将中心与边缘观测混用同一透视坐标容差。
 

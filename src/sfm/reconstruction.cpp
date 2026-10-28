@@ -963,13 +963,22 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   // Empty until the model is moved into the navigation frame; then every BA holds the camera
   // centres to navigation and registration is gated by it.
   std::vector<Eigen::Vector3d> nav;
+  // SfM bundle adjustment, with the navigation prior once it applies. Synchronous L/R poses are
+  // not tied here: a global-shutter pose absorbs its own lens's readout distortion, so they are
+  // not rigid (on 展厅 a rig-constrained SfM left the L readout time at zero later on, and a rig
+  // pose hypothesis in registration lost three R exposures).
+  auto ba = [&](const std::string& stage, int iterations, const std::set<uint32_t>& variable = {},
+                const std::set<uint64_t>& selected = {}) {
+    return Optimize(m, scene.cameras, stage, ba_workers, iterations, variable, {}, nav, selected);
+  };
   auto unregister = [&](const std::vector<uint32_t>& ids) {
     for (uint32_t id : ids)
       m.images[id].registered = false;
     for (auto& point : m.points)
-      point.track.erase(std::remove_if(point.track.begin(), point.track.end(),
-                                       [&](const auto& o) { return !m.images[o.image].registered; }),
-                        point.track.end());
+      point.track.erase(
+          std::remove_if(point.track.begin(), point.track.end(),
+                         [&](const auto& o) { return !m.images[o.image].registered; }),
+          point.track.end());
     filter();
   };
   if (resumed) {
@@ -1006,7 +1015,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       AddPoint(m, graph.tracks[i], points[i]);
     m.RebuildReferences();
     triangulation_seconds += Seconds(triangulation_started);
-    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 100));
+    optimization.push_back(ba("fixed", 100));
     filter();
     Log("Seed " + scene.images[seed->a].name + " + " + scene.images[seed->b].name);
   }
@@ -1073,8 +1082,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
                         {"registered_images", ids.size()},
                         {"scale", fit.scale},
                         {"unregistered", omitted}};
-    optimization.push_back(
-        Optimize(m, scene.cameras, calibrated ? "radial" : "fixed", ba_workers, 100, {}, {}, nav));
+    optimization.push_back(ba(calibrated ? "radial" : "fixed", 100));
     filter();
     Log("Navigation frame at " + std::to_string(m.Registered()) + " registered images");
   };
@@ -1125,7 +1133,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         std::sort(neighbors.rbegin(), neighbors.rend());
         for (size_t k = 0; k < std::min<size_t>(8, neighbors.size()); ++k)
           local.insert(neighbors[k].second);
-        optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 30, local, {}, nav));
+        optimization.push_back(ba("fixed", 30, local));
         filter();
         recent.clear();
       }
@@ -1135,18 +1143,17 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           if (image.registered)
             ++counts[image.camera];
         if (counts[0] >= 8 && counts[1] >= 8) {
-          optimization.push_back(Optimize(m, scene.cameras, "focal", ba_workers, 100, {}, {}, nav));
+          optimization.push_back(ba("focal", 100));
           filter();
           completion.push_back(CompleteTracks(m, graph, points));
-          optimization.push_back(Optimize(m, scene.cameras, "radial", ba_workers, 100, {}, {}, nav));
+          optimization.push_back(ba("radial", 100));
           filter();
           completion.push_back(CompleteTracks(m, graph, points));
           calibrated = true;
           last_global = registered;
         }
       } else if (registered >= std::max(last_global + 40, size_t(last_global * 1.35))) {
-        optimization.push_back(
-            Optimize(m, scene.cameras, calibrated ? "radial" : "fixed", ba_workers, 100, {}, {}, nav));
+        optimization.push_back(ba(calibrated ? "radial" : "fixed", 100));
         filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = registered;
@@ -1159,7 +1166,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     }
     if (!added) {
       if (m.Registered() > last_global) {
-        optimization.push_back(Optimize(m, scene.cameras, "radial", ba_workers, 150, {}, {}, nav));
+        optimization.push_back(ba("radial", 150));
         filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = m.Registered();
@@ -1222,8 +1229,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       calibration_selection.push_back(std::move(support));
       if (!stable_calibration)
         selected.clear();
-      optimization.push_back(
-          Optimize(m, scene.cameras, stage, ba_workers, iterations, {}, {}, nav, selected));
+      optimization.push_back(ba(stage, iterations, {}, selected));
       break;
     }
   };
@@ -1240,11 +1246,11 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     if (round == 2 || (changed <= std::max<size_t>(1, size_t(before * .0005)) &&
                        optimization.back().at("converged").get<bool>()))
       break;
-    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 100, {}, {}, nav));
+    optimization.push_back(ba("fixed", 100));
   }
   calibrate("fixed", 100);
   if (stable_calibration)
-    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 200, {}, {}, nav));
+    optimization.push_back(ba("fixed", 200));
   filter();
   const auto unassigned_completion = CompleteUnassignedTracks(m, graph);
   const auto color_started = Clock::now();
