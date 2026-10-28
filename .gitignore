@@ -10,3 +10,4 @@
 *.user
 /packages/
 /models-ampere-plus/
+/models-v3/

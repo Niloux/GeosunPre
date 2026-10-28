@@ -118,3 +118,29 @@ class Segmentation(nn.Module):
     def forward(self, image):
         probability = self.model(image, return_dict=False)[0].softmax(1)[:, self.labels]
         return F.interpolate(probability, (512, 512), mode='bilinear', align_corners=False).float()
+
+
+def fix_geometry_positions(model, size):
+    """Freeze upstream DINOv2 positions at the fixed input before ONNX mode changes their interpolation."""
+    vit = model.encoder.backbone
+    with torch.inference_mode():
+        tokens = torch.zeros((1, (size // 14) ** 2 + 1, vit.embed_dim), device='cuda')
+        vit.register_buffer('_export_positions', vit.interpolate_pos_encoding(tokens, size, size).clone())
+
+    def positions(self, x, width, height):
+        return self._export_positions.to(x.dtype)
+
+    vit.interpolate_pos_encoding = MethodType(positions, vit)
+    model.onnx_compatible_mode = True
+
+
+class Geometry(nn.Module):
+    """MoGe-2 raw forward at a fixed square size and token count; post-processing stays native."""
+    def __init__(self, model, tokens):
+        super().__init__()
+        self.model = model
+        self.tokens = tokens
+
+    def forward(self, image):
+        output = self.model(image, self.tokens)
+        return tuple(output[key].float() for key in ('points', 'normal', 'mask', 'metric_scale'))

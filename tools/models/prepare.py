@@ -4,6 +4,7 @@ import gc
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -14,26 +15,33 @@ import torch
 import onnx
 import tensorrt as trt
 
-from resources import CACHE, LOMA_COMMIT, SEGMENTATION_REVISION, loma_source, segmentation_source, sha256, torch_weights
-from networks import Detector, Descriptor, Matcher, Segmentation, fix_descriptor_positions
+from resources import (CACHE, GEOMETRY_REVISION, LOMA_COMMIT, MOGE_COMMIT, SEGMENTATION_REVISION, geometry_weights,
+                       loma_source, moge_source, segmentation_source, sha256, torch_weights)
+from networks import Detector, Descriptor, Geometry, Matcher, Segmentation, fix_descriptor_positions, fix_geometry_positions
 
 TRT_VERSION = '10.13.3.9'
 MAX_FEATURES = 3072
 DETECTOR_PROFILE = {'min': [16, 16], 'opt': [1152, 1536], 'max': [1536, 1536]}
 DETECTOR_CHECK_SIZES = ((1152, 1536), (1536, 1152), (1536, 864), (1000, 1536),
                         (1536, 1536), (16, 1536), (1536, 16))
+# MoGe-2 runs on square pinhole faces: 46x46 ViT tokens, inside the suggested 1200-2500.
+GEOMETRY_SIZE = 644
+GEOMETRY_TOKENS = 2116
 LOGGER = trt.Logger(trt.Logger.WARNING)
 CONTRACTS = {
     'detector': (['image'], ['logits']),
     'descriptor': (['image', 'keypoints'], ['descriptors']),
     'matcher': (['ka', 'kb', 'da', 'db', 'mask_a', 'mask_b'], ['matches', 'confidence']),
     'segmentation': (['image'], ['probabilities']),
+    'geometry': (['image'], ['points', 'normal', 'mask', 'metric_scale']),
 }
+# Version 1 ONNX bundles predate the geometry model; it is exported from the pinned weights.
+BUNDLE_MODELS = {1: [name for name in CONTRACTS if name != 'geometry'], 2: list(CONTRACTS)}
 BUNDLE = 'onnx-bundle.json'
 # Hardware compatibility trades some tactics for one engine set on every Ampere+ GPU.
 HARDWARE_LEVELS = {'none': None, 'ampere_plus': (8, 0)}
 REFERENCES = [f'{name}.npz' for name in CONTRACTS] + [
-    f'detector_{width}x{height}.npz' for width, height in DETECTOR_CHECK_SIZES]
+    f'detector_{width}x{height}.npz' for width, height in DETECTOR_CHECK_SIZES] + ['geometry_B.npz']
 
 
 def write_json(path, value):
@@ -96,6 +104,24 @@ def load_loma(source):
     return model
 
 
+def load_geometry():
+    os.environ['XFORMERS_DISABLED'] = '1'
+    sys.path.insert(0, str(moge_source()))
+    from moge.model.v2 import MoGeModel
+    model = MoGeModel.from_pretrained(str(geometry_weights())).eval().float().cuda()
+    generator = torch.Generator('cuda').manual_seed(0)
+    image = torch.rand((1, 3, GEOMETRY_SIZE, GEOMETRY_SIZE), device='cuda', generator=generator)
+    with torch.inference_mode():
+        upstream = Geometry(model, GEOMETRY_TOKENS)(image)
+        fix_geometry_positions(model, GEOMETRY_SIZE)
+        exported = Geometry(model, GEOMETRY_TOKENS)(image)
+    # At the fixed size the ONNX-mode resize is an identity; the frozen positions must match upstream.
+    for before, after in zip(upstream, exported):
+        if not torch.allclose(before, after, atol=1e-5, rtol=1e-4):
+            raise RuntimeError('Export-mode geometry model differs from upstream inference')
+    return Geometry(model, GEOMETRY_TOKENS)
+
+
 def detector_size(width, height):
     size = [value * 1536 // max(width, height) // 8 * 8 for value in (width, height)]
     if min(size) < 16:
@@ -111,6 +137,7 @@ def expected_shapes():
                     [1, MAX_FEATURES, 256], [1, MAX_FEATURES, 256],
                     [1, MAX_FEATURES], [1, MAX_FEATURES]],
         'segmentation': [[1, 3, 512, 512]],
+        'geometry': [[1, 3, GEOMETRY_SIZE, GEOMETRY_SIZE]],
     }
 
 
@@ -174,7 +201,7 @@ def export_graph(name, module, inputs, directory, shapes, references):
 
 def export_models(directory, shapes, source, images, references):
     required = [name for name in CONTRACTS if not (directory / f'{name}.onnx').is_file()]
-    if any(name != 'segmentation' for name in required):
+    if any(name in ('detector', 'descriptor', 'matcher') for name in required):
         if source is None:
             source = loma_source()
         model = load_loma(source)
@@ -216,6 +243,17 @@ def export_models(directory, shapes, source, images, references):
         pixels = (image_tensor(images[0], 512, 512) - mean) / std
         export_graph('segmentation', Segmentation(model), (pixels,), directory, shapes['segmentation'], references)
         del model, pixels
+        gc.collect()
+        torch.cuda.empty_cache()
+    if 'geometry' in required:
+        module = load_geometry()
+        pixels = image_tensor(images[0], GEOMETRY_SIZE, GEOMETRY_SIZE)
+        export_graph('geometry', module, (pixels,), directory, shapes['geometry'], references)
+        with torch.inference_mode():
+            pixels = image_tensor(images[1], GEOMETRY_SIZE, GEOMETRY_SIZE)
+            np.savez(references / 'geometry_B.npz', input0=pixels.cpu().numpy(),
+                     **{f'output{i}': value.cpu().numpy() for i, value in enumerate(module(pixels))})
+        del module, pixels
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -327,8 +365,24 @@ class Engine:
         return tuple(outputs)
 
 
+def geometry_errors(expected, actual):
+    """Depth, normal, mask and scale differences where the PyTorch mask is valid."""
+    valid = expected[2][0] > .5
+    if valid.sum() < 1000:
+        raise RuntimeError('Geometry reference has too few valid pixels')
+    depth = (actual[0][0, ..., 2].clamp_min(1e-6).log() - expected[0][0, ..., 2].log()).abs()[valid]
+    cosine = (actual[1][0] * expected[1][0]).sum(-1).clamp(-1, 1)[valid]
+    return {'log_depth_p99': float(depth.quantile(.99)),
+            'normal_degrees_p99': float(torch.rad2deg(cosine.acos()).quantile(.99)),
+            'mask_p99': float((actual[2] - expected[2]).abs().flatten().quantile(.99)),
+            'scale': float(((actual[3] - expected[3]).abs() / expected[3]).max())}
+
+
 def compare_reference(root, name, shapes, references):
-    paths = sorted(references.glob('detector*.npz')) if name == 'detector' else [references / f'{name}.npz']
+    if name in ('detector', 'geometry'):
+        paths = sorted(references.glob(f'{name}*.npz'))
+    else:
+        paths = [references / f'{name}.npz']
     paths = [path for path in paths if path.is_file()]
     if not paths:
         return  # --onnx-from verifies existing exported graphs by their runtime behavior.
@@ -337,6 +391,17 @@ def compare_reference(root, name, shapes, references):
         with np.load(path) as example, torch.inference_mode():
             inputs = [torch.from_numpy(example[f'input{i}']).cuda() for i in range(len(CONTRACTS[name][0]))]
             outputs = engine(*inputs)
+            if name == 'geometry':
+                expected = [torch.from_numpy(example[f'output{i}']).cuda() for i in range(len(outputs))]
+                if [value.shape for value in expected] != [value.shape for value in outputs]:
+                    raise RuntimeError(f'Engine output differs from the export reference: {path.stem}')
+                errors = geometry_errors(expected, outputs)
+                limits = {'log_depth_p99': .01, 'normal_degrees_p99': 1., 'mask_p99': .05, 'scale': .005}
+                if any(errors[key] >= limit for key, limit in limits.items()):
+                    raise RuntimeError(f'TensorRT geometry differs from PyTorch: {path.stem}: {errors}')
+                print(f'PyTorch/TensorRT comparison: {path.stem}: ' +
+                      ', '.join(f'{key}={value:.6g}' for key, value in errors.items()), flush=True)
+                continue
             for i, actual in enumerate(outputs):
                 expected = torch.from_numpy(example[f'output{i}']).cuda()
                 if expected.shape != actual.shape:
@@ -363,7 +428,7 @@ def installed_runtime():
 def verify(root, shapes, images):
     if sha256(root / 'runtime' / 'nvinfer_10.dll') != sha256(installed_runtime()):
         raise RuntimeError('Packaged runtime differs from the pinned TensorRT DLL')
-    print('Verify all four engines with real images, dynamic counts and padding...', flush=True)
+    print('Verify all five engines with real images, dynamic counts and padding...', flush=True)
     with torch.inference_mode():
         detector = Engine(root, 'detector', shapes['detector'])
         points = []
@@ -423,7 +488,20 @@ def verify(root, shapes, images):
             probabilities, = segmentation((image_tensor(path, 512, 512) - mean) / std)
             if tuple(probabilities.shape) != (1, 2, 512, 512) or (probabilities < 0).any() or (probabilities > 1.00001).any() or (probabilities.sum(1) > 1.00001).any():
                 raise RuntimeError('Segmentation output contract differs')
-    print(f'Verified: four engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}', flush=True)
+        del segmentation
+        geometry = Engine(root, 'geometry', shapes['geometry'])
+        size = GEOMETRY_SIZE
+        for path in images:
+            points, normal, mask, scale = geometry(image_tensor(path, size, size))
+            if (tuple(points.shape) != (1, size, size, 3) or tuple(normal.shape) != (1, size, size, 3) or
+                    tuple(mask.shape) != (1, size, size) or tuple(scale.shape) != (1,)):
+                raise RuntimeError('Geometry output contract differs')
+            valid = mask[0] > .5
+            if valid.float().mean() < .5 or (points[0, ..., 2][valid] <= 0).any() or scale.item() <= 0:
+                raise RuntimeError('Geometry output is not a valid point map')
+            if ((normal.norm(dim=-1) - 1).abs() > 1e-3).any() or (mask < 0).any() or (mask > 1).any():
+                raise RuntimeError('Geometry normals or mask are out of range')
+    print(f'Verified: five engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}; geometry point maps', flush=True)
 
 
 def matcher_precisions(manifest):
@@ -444,7 +522,7 @@ def same_target(manifest, settings):
 
 def verify_package(root, settings, shapes, images):
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
-    if manifest.get('version') != 2 or not same_target(manifest, settings) or manifest.get('detector_profile') != settings['detector_profile']:
+    if manifest.get('version') != 3 or not same_target(manifest, settings) or manifest.get('detector_profile') != settings['detector_profile']:
         raise RuntimeError('Existing model GPU/hardware level/version/profile differs. Choose a new -Models directory; use -OnnxFrom to upgrade a static package.')
     if matcher_precisions(manifest) != matcher_precisions(settings):
         raise RuntimeError('Existing matcher calculation/scoring precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
@@ -461,9 +539,13 @@ def verify_package(root, settings, shapes, images):
 
 def read_bundle(root):
     bundle = json.loads((root / BUNDLE).read_text(encoding='utf-8'))
-    if bundle.get('version') != 1 or bundle.get('detector_profile') != DETECTOR_PROFILE or bundle.get('max_features') != MAX_FEATURES:
+    if bundle.get('version') not in BUNDLE_MODELS or bundle.get('detector_profile') != DETECTOR_PROFILE or bundle.get('max_features') != MAX_FEATURES:
         raise RuntimeError(f'ONNX bundle version/profile differs from this preparation tool: {root}')
-    required = [f'onnx/{name}.onnx' for name in CONTRACTS] + [f'references/{name}' for name in REFERENCES] + bundle['images']
+    if bundle['version'] == 2 and (bundle.get('geometry_size') != GEOMETRY_SIZE or bundle.get('geometry_tokens') != GEOMETRY_TOKENS):
+        raise RuntimeError(f'ONNX bundle geometry input differs from this preparation tool: {root}')
+    models = BUNDLE_MODELS[bundle['version']]
+    references = [name for name in REFERENCES if name.split('_')[0].split('.')[0] in models]
+    required = [f'onnx/{name}.onnx' for name in models] + [f'references/{name}' for name in references] + bundle['images']
     files = bundle['files']
     if len(bundle['images']) != 2 or any(name not in files for name in required):
         raise RuntimeError(f'ONNX bundle is incomplete: {root}')
@@ -502,9 +584,11 @@ def export_bundle(root, shapes, source, images):
         shutil.copy2(path, pending / names[-1])
     files = [f'onnx/{name}.onnx' for name in CONTRACTS] + [f'references/{name}' for name in REFERENCES] + names
     write_json(pending / BUNDLE, {
-        'version': 1, 'recipe': settings['recipe'], 'loma_commit': LOMA_COMMIT,
-        'segmentation_revision': SEGMENTATION_REVISION, 'detector_profile': DETECTOR_PROFILE,
-        'max_features': MAX_FEATURES, 'images': names,
+        'version': 2, 'recipe': settings['recipe'], 'loma_commit': LOMA_COMMIT,
+        'segmentation_revision': SEGMENTATION_REVISION, 'moge_commit': MOGE_COMMIT,
+        'geometry_revision': GEOMETRY_REVISION, 'detector_profile': DETECTOR_PROFILE,
+        'max_features': MAX_FEATURES, 'geometry_size': GEOMETRY_SIZE,
+        'geometry_tokens': GEOMETRY_TOKENS, 'images': names,
         'files': {name: sha256(pending / name) for name in files}})
     read_bundle(pending)
     print(f'ONNX bundle verified: {pending}', flush=True)
@@ -554,7 +638,9 @@ def main():
             origin = origin / 'onnx'
         if (origin.parent / BUNDLE).is_file():
             bundle = read_bundle(origin.parent)
-        settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in CONTRACTS}
+        # Packages and bundles from before the geometry model supply the other four graphs.
+        settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in CONTRACTS
+                                 if name != 'geometry' or (origin / f'{name}.onnx').is_file()}
         if (origin.parent / 'manifest.json').is_file():
             reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
     # A bundle carries its own validation images; no upstream source download is needed.
@@ -591,11 +677,14 @@ def main():
     if settings_path.is_file() and json.loads(settings_path.read_text(encoding='utf-8')) != settings:
         raise RuntimeError(f'Unfinished conversion has different settings: {pending}. Choose a new -Models directory.')
     write_json(settings_path, settings)
-    if bundle:
+    if bundle and bundle['version'] == 2:
         references = origin.parent / 'references'
     else:
         references = CACHE / 'references' / sha256(settings_path)
         references.mkdir(parents=True, exist_ok=True)
+        # A version 1 bundle stays read-only; its references join the new geometry ones.
+        for path in (origin.parent / 'references').glob('*.npz') if bundle else ():
+            shutil.copy2(path, references / path.name)
     for directory in ('onnx', 'engines', 'runtime'):
         (pending / directory).mkdir(exist_ok=True)
     copied = set()
@@ -603,7 +692,7 @@ def main():
         origin = args.onnx_from.resolve()
         if (origin / 'onnx').is_dir():
             origin = origin / 'onnx'
-        for name in CONTRACTS:
+        for name in settings['onnx_from']:
             candidate = origin / f'{name}.onnx'
             if name == 'detector' and (reuse_manifest or {}).get('version') == 1:
                 check_onnx(candidate, name, reuse_manifest['models'][name]['shapes'])
@@ -643,13 +732,16 @@ def main():
     for name in CONTRACTS:
         compare_reference(pending, name, shapes, references)
     verify(pending, shapes, images)
-    manifest = {'version': 2, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
+    manifest = {'version': 3, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
                 'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': settings['matcher_score_precision'],
                 'detector_profile': DETECTOR_PROFILE, 'descriptor_size': [784, 784],
                 'max_features': MAX_FEATURES, 'descriptor_dimension': 256,
                 'segmentation_mean': [.485, .456, .406], 'segmentation_std': [.229, .224, .225],
+                'geometry_size': GEOMETRY_SIZE, 'geometry_tokens': GEOMETRY_TOKENS,
+                'geometry_source': {'moge_commit': MOGE_COMMIT, 'model': 'Ruicheng/moge-2-vitl-normal',
+                                    'revision': GEOMETRY_REVISION},
                 'models': {name: {'inputs': names[0], 'outputs': names[1], 'shapes': shapes[name],
                                  'sha256': sha256(pending / 'engines' / f'{name}.engine')}
                            for name, names in CONTRACTS.items()}}

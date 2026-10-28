@@ -160,7 +160,7 @@ Models::Models(const fs::path& root) : impl_(std::make_unique<Implementation>())
   impl_->root = root;
   impl_->manifest = ReadJson(root / "manifest.json");
   const int version = impl_->manifest.at("version");
-  if ((version != 1 && version != 2) || impl_->manifest.at("tensorrt") != "10.13.3.9")
+  if (version < 1 || version > 3 || impl_->manifest.at("tensorrt") != "10.13.3.9")
     throw std::runtime_error("Models require the pinned TensorRT 10.13.3.9 runtime");
   CudaCheck(cudaSetDevice(0));
   const auto gpu = GpuInfo();

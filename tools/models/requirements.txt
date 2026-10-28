@@ -8,3 +8,6 @@ transformers==4.57.1
 einops==0.8.1
 tensorrt-cu12==10.13.3.9
 nvidia-cuda-runtime-cu12==12.9.79
+# Imported by the pinned MoGe source; its geometry model forward uses neither.
+scipy==1.17.1
+utils3d_moge @ git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37

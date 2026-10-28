@@ -392,6 +392,37 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
     }
     report["inference"]["segmentation"] = models.Profile().at("segmentation");
   }
+  // Version 3 packages add the monocular geometry model used by supervision export.
+  if (manifest.at("models").contains("geometry")) {
+    Models models(root);
+    ImagePreprocessor pixels(models.Stream());
+    pixels.Upload(rgb);
+    const int64_t size = manifest.at("geometry_size");
+    const auto outputs = models.Predict("geometry", {pixels.Normalize(int(size), int(size))});
+    if (outputs.size() != 4)
+      throw std::runtime_error("Model verification: invalid geometry outputs");
+    check(outputs[0], {1, size, size, 3});
+    check(outputs[1], {1, size, size, 3});
+    check(outputs[2], {1, size, size});
+    check(outputs[3], {1});
+    const auto *points = outputs[0].Floats(), *normals = outputs[1].Floats(),
+               *mask = outputs[2].Floats();
+    size_t valid = 0;
+    for (int64_t i = 0; i < size * size; ++i) {
+      const float* n = normals + 3 * i;
+      if (mask[i] < 0 || mask[i] > 1 || std::abs(n[0] * n[0] + n[1] * n[1] + n[2] * n[2] - 1) > 2e-3f)
+        throw std::runtime_error("Model verification: invalid geometry mask or normal");
+      if (mask[i] > .5f) {
+        if (points[3 * i + 2] <= 0)
+          throw std::runtime_error("Model verification: geometry depth is not positive");
+        ++valid;
+      }
+    }
+    if (valid * 2 < size_t(size * size) || outputs[3].Floats()[0] <= 0)
+      throw std::runtime_error("Model verification: geometry point map is mostly invalid");
+    report["geometry_valid_pixels"] = valid;
+    report["inference"]["geometry"] = models.Profile().at("geometry");
+  }
   return report;
 }
 cv::Mat MaskDomain(const Camera& camera) {

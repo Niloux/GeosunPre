@@ -9,6 +9,8 @@ ROOT = Path(__file__).resolve().parents[2]
 CACHE = ROOT / '.cache' / 'model-prepare'
 LOMA_COMMIT = '8fb59c458f2a2ef44314f462467b229c27786bf0'
 SEGMENTATION_REVISION = 'de01bae28967510f9ddd496c60a969357195400c'
+MOGE_COMMIT = '74fbce054ebed49800de42d0ad0e83495065719a'
+GEOMETRY_REVISION = 'cb0e8bbd6b1e243589717c78e750b1ba4c093acf'
 TORCH_RESOURCES = {
     'dad.pth': ('https://github.com/Parskatt/dad/releases/download/v0.1.0/dad.pth',
                 '7d827844649faf5213ba97e7adb43e16b936dd3d11ab2d0fc0d602c67fae781f'),
@@ -65,6 +67,25 @@ def loma_source():
             source.extractall(destination.parent)
         ready.write_text(LOMA_COMMIT, encoding='ascii')
     return destination
+
+
+def moge_source():
+    archive = resource(Path(f'MoGe-{MOGE_COMMIT}.zip'),
+                       f'https://codeload.github.com/microsoft/MoGe/zip/{MOGE_COMMIT}',
+                       'c256a67674c7779ef5e873199353ecff507b9430e4cea5fedfbfce23ceb68035')
+    destination = CACHE / 'source' / f'MoGe-{MOGE_COMMIT}'
+    ready = destination / '.source-ready'
+    if not ready.is_file():
+        with zipfile.ZipFile(archive) as source:
+            source.extractall(destination.parent)
+        ready.write_text(MOGE_COMMIT, encoding='ascii')
+    return destination
+
+
+def geometry_weights():
+    return resource(Path('huggingface/hub/models--Ruicheng--moge-2-vitl-normal/snapshots') / GEOMETRY_REVISION / 'model.pt',
+                    f'https://huggingface.co/Ruicheng/moge-2-vitl-normal/resolve/{GEOMETRY_REVISION}/model.pt',
+                    '280741fd09bc3f403ccff9967784c2a391b52d2c0742ae3efdb21d9f90cc1a01')
 
 
 def torch_weights():
