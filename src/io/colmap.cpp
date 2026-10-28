@@ -364,7 +364,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   std::future<Json> initialization_job;
   if (include_ply)
     initialization_job = std::async(std::launch::async, [&] {
-      return ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);
+      return ExportLasPly(scene.las, pending / "sparse/0/lidar.ply", voxel);
     });
   Json supervision = nullptr;
   if (options.enabled) {
@@ -452,8 +452,11 @@ Json CheckBundle(const fs::path& output) {
         mh.at("height") != camera.height || mh.at("mode") != "L")
       throw std::runtime_error("Image/mask geometry differs");
   }
+  // Deliveries before the rename named the LAS PLY points3D.ply.
   if (!manifest.at("initialization").is_null())
-    VerifyInitializationPly(sparse / "points3D.ply", manifest.at("initialization").at("points"));
+    VerifyInitializationPly(fs::exists(sparse / "lidar.ply") ? sparse / "lidar.ply"
+                                                             : sparse / "points3D.ply",
+                            manifest.at("initialization").at("points"));
   if (manifest.contains("supervision")) {
     if (ReadJson(output / "supervision.json") != manifest.at("supervision") ||
         manifest.at("supervision").at("request") != manifest.at("request").at("supervision"))
