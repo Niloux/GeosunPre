@@ -3,7 +3,6 @@
 #include "io/crop.h"
 #include "io/las.h"
 #include "frontend/frontend.h"
-#include "geometry/transient.h"
 #include "sfm/shutter.h"
 #include <set>
 #include <thread>
@@ -305,10 +304,6 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
                        {"windows", {(*windows)[0].ToJson(), (*windows)[1].ToJson()}}};
   if (options.enabled)
     request["supervision"] = SupervisionRequest(scene, selected, masks, options, rolling);
-  // Both LAS products leave out the returns of what moved during the scan.
-  const bool las_products = include_ply || options.enabled;
-  if (las_products)
-    request["transient_las"] = TransientLasRequest();
   timed("request");
   if (fs::exists(output)) {
     if (!fs::is_regular_file(output / "manifest.json") ||
@@ -365,21 +360,16 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   for (auto& row : rows)
     photos.push_back(std::move(row));
   timed("photos and masks");
-  TransientLas transient;
-  if (las_products) {
-    transient = FindTransientLas(scene);
-    timed("transient LAS");
-  }
   // The PLY voxelizes the LAS on the CPU while the supervision projects it on the GPU.
   std::future<Json> initialization_job;
   if (include_ply)
     initialization_job = std::async(std::launch::async, [&] {
-      return ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel, transient.drop);
+      return ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);
     });
   Json supervision = nullptr;
   if (options.enabled) {
-    supervision = ExportLasSupervision(scene, model, masks, pending, options,
-                                       rolling ? &motion : nullptr, transient.drop);
+    supervision =
+        ExportLasSupervision(scene, model, masks, pending, options, rolling ? &motion : nullptr);
     WriteJson(pending / "supervision.json", supervision);
   }
   const Json initialization = include_ply ? initialization_job.get() : Json(nullptr);
@@ -410,8 +400,6 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
                    {"initialization", initialization}};
   if (options.enabled)
     manifest["supervision"] = supervision;
-  if (las_products)
-    manifest["transient_las"] = transient.report;
   if (rolling)
     manifest["rolling_shutter"] = {{"file", "rolling_shutter.json"},
                                    {"size_bytes", fs::file_size(pending / "rolling_shutter.json")}};

@@ -276,8 +276,7 @@ void VerifyInitializationPly(const fs::path& path, uint64_t points) {
       }
   }
 }
-Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel,
-                  const std::vector<bool>& drop) {
+Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel) {
   if (!std::isfinite(voxel) || voxel <= 0 || fs::absolute(las) == fs::absolute(output))
     throw std::runtime_error("Invalid PLY voxel size or output");
   if (fs::exists(output))
@@ -311,20 +310,13 @@ Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel,
   std::vector<std::ofstream> buckets;
   for (unsigned i = 0; i < 128; ++i)
     buckets.emplace_back(workspace / (Number(i) + ".bin"), std::ios::binary);
-  if (!drop.empty() && drop.size() != h.count)
-    throw std::runtime_error("LAS drop flags do not match the record count");
-  uint64_t accepted = 0, rejected = 0, transient = 0, rgb_max = 0, vertices = 0;
+  uint64_t accepted = 0, rejected = 0, rgb_max = 0, vertices = 0;
   ScanLas(las, h, [&](uint64_t start, const std::vector<LasPoint>& block) {
     std::vector<Aggregate> values;
     values.reserve(block.size());
-    for (size_t i = 0; i < block.size(); ++i) {
-      const auto& p = block[i];
+    for (const auto& p : block) {
       if (!KeepLasPoint(p)) {
         ++rejected;
-        continue;
-      }
-      if (!drop.empty() && drop[start + i]) {
-        ++transient;
         continue;
       }
       ++accepted;
@@ -415,13 +407,9 @@ Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel,
           {"source_point_count", h.count},
           {"accepted_records", accepted},
           {"excluded_withheld_or_noise", rejected},
-          {"excluded_transient", transient},
           {"points", vertices},
           {"voxel_size_m", voxel},
-          {"sampling", drop.empty()
-                           ? "all non-withheld, non-class-7 LAS records; one centroid per voxel"
-                           : "all non-withheld, non-class-7, non-transient LAS records; one "
-                             "centroid per voxel"},
+          {"sampling", "all non-withheld, non-class-7 LAS records; one centroid per voxel"},
           {"color", "voxel mean of LAS RGB; auto-detect 8/16-bit range; gray if absent"},
           {"normals", "zero"},
           {"coordinate_frame", "input_las_xyz"},

@@ -17,7 +17,7 @@
 
 namespace geosun {
 namespace {
-constexpr int Version = 9;
+constexpr int Version = 8;
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
 constexpr double MaxTheta = 1.396263401595464;
@@ -594,17 +594,15 @@ class LasPointCache {
   // Drain both streams before releasing any buffers, including constructor failure.
   Stream compute_, upload_;
   fs::path file_;
-  uint64_t count_ = 0, excluded_ = 0, transient_ = 0, uploaded_bytes_ = 0;
+  uint64_t count_ = 0, excluded_ = 0, uploaded_bytes_ = 0;
   size_t budget_ = 0, batches_ = 0, slabs_ = 0;
   double prepare_seconds_ = 0, surfel_seconds_ = 0;
   SurfelStats stats_;
 
  public:
   LasPointCache(const fs::path& las, const LasHeader& header, const fs::path& output,
-                int cache_mb, const std::vector<bool>& drop) {
+                int cache_mb) {
     const auto started = Clock::now();
-    if (!drop.empty() && drop.size() != header.count)
-      throw std::runtime_error("LAS drop flags do not match the record count");
     // Kept coordinates go to a compact file with a histogram along the longest axis, which
     // splits normal estimation into slabs that fit the device together with their halo.
     const Eigen::Vector3d extent = header.upper - header.lower;
@@ -625,18 +623,14 @@ class LasPointCache {
       if (!packed)
         throw std::runtime_error("Cannot create LAS coordinate cache");
       std::vector<int3> kept;
-      ScanLas(las, header, [&](uint64_t start, const std::vector<LasPoint>& chunk) {
+      ScanLas(las, header, [&](uint64_t, const std::vector<LasPoint>& chunk) {
         kept.clear();
-        for (size_t i = 0; i < chunk.size(); ++i) {
-          const auto& point = chunk[i];
-          if (!KeepLasPoint(point))
-            ++excluded_;
-          else if (!drop.empty() && drop[start + i])
-            ++transient_;
-          else {
+        for (const auto& point : chunk) {
+          if (KeepLasPoint(point)) {
             kept.push_back(make_int3(point.raw[0], point.raw[1], point.raw[2]));
             ++histogram[bin(point.raw[axis])];
-          }
+          } else
+            ++excluded_;
         }
         packed.write(reinterpret_cast<const char*>(kept.data()),
                      std::streamsize(kept.size() * sizeof(int3)));
@@ -746,7 +740,6 @@ class LasPointCache {
   cudaStream_t StreamHandle() const { return compute_.value; }
   uint64_t Count() const { return count_; }
   uint64_t Excluded() const { return excluded_; }
-  uint64_t Transient() const { return transient_; }
   void Project(const Projection* cameras, const float3* rays, float* nearest, Blend* blends,
                int width, int height, size_t images) {
     for (const bool accumulate : {false, true})
@@ -1120,13 +1113,12 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
 }
 Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                           const fs::path& masks_dir, const fs::path& output,
-                          const SupervisionOptions& options, const ShutterMotion* motion,
-                          const std::vector<bool>& drop) {
+                          const SupervisionOptions& options, const ShutterMotion* motion) {
   const auto started = Clock::now();
   const auto header = ReadLasHeader(scene.las);
   const auto request = SupervisionRequest(scene, model, masks_dir, options, motion != nullptr);
   std::vector<Json> rows(model.images.size());
-  LasPointCache points(scene.las, header, output, options.cache_mb, drop);
+  LasPointCache points(scene.las, header, output, options.cache_mb);
   const auto stream = points.StreamHandle();
   uint64_t depth_pixels = 0, normal_pixels = 0;
   size_t done = 0;
@@ -1303,7 +1295,6 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"projection", motion ? "rolling_shutter_readout_line" : "global_shutter"},
           {"accepted_records", points.Count()},
           {"excluded_records", points.Excluded()},
-          {"excluded_transient_records", points.Transient()},
           {"point_cache", points.Profile()},
           {"depth_format", "uint16_png_mm"},
           {"depth_type", "ray_distance"},

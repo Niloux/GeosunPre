@@ -25,8 +25,6 @@ void ScanLas(const fs::path& path, const LasHeader& header,
              const std::function<void(uint64_t, const std::vector<LasPoint>&)>& consume);
 std::vector<Eigen::Vector3d> SampleLas(const fs::path& path, const LasHeader& header,
                                        Json& metadata, size_t maximum = 1500000);
-// drop, when not empty, holds one flag per record to leave out besides KeepLasPoint.
-Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel = .05,
-                  const std::vector<bool>& drop = {});
+Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel = .05);
 void VerifyInitializationPly(const fs::path& path, uint64_t points);
 }  // namespace geosun
