@@ -17,10 +17,12 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args);
 Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const fs::path& masks,
                         const SupervisionOptions& options, bool rolling = false);
 // With motion, each pixel uses the camera of its own readout line (original rolling-shutter
-// photos); its normal is expressed in that camera.
+// photos); its normal is expressed in that camera. drop, when not empty, holds one flag per LAS
+// record to leave out besides KeepLasPoint (see FindTransientLas).
 Json ExportLasSupervision(const Scene& scene, const Reconstruction& model, const fs::path& masks,
                           const fs::path& output, const SupervisionOptions& options,
-                          const ShutterMotion* motion = nullptr);
+                          const ShutterMotion* motion = nullptr,
+                          const std::vector<bool>& drop = {});
 void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
                          const Json& photos, const Json& summary);
 }  // namespace geosun

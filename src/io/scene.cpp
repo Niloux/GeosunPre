@@ -474,6 +474,13 @@ std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene) {
     positions.push_back(navigation.conversion.Apply(image.navigation_raw - navigation.center));
   return positions;
 }
+std::vector<std::pair<double, Eigen::Vector3d>> NavigationTrack(const Scene& scene) {
+  const auto navigation = ReadNavigation(scene);
+  std::vector<std::pair<double, Eigen::Vector3d>> track;
+  for (const auto& row : navigation.rows)
+    track.emplace_back(row.time, navigation.conversion.Apply(row.point - navigation.center));
+  return track;
+}
 std::vector<std::array<uint32_t, 2>> SynchronousFrames(const Scene& scene) {
   std::map<int, std::array<uint32_t, 2>> lenses;
   for (uint32_t i = 0; i < scene.images.size(); ++i)
