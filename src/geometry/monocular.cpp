@@ -27,6 +27,10 @@ constexpr size_t MinimumImageAnchors = 2000;
 constexpr double MinimumInlierFraction = .5;
 // Encoding: depth step between neighbours, LAS agreement and the delivered depth range.
 constexpr double StepLog = .04, AgreementFraction = .03, AgreementMetres = .03;
+// LAS depth is trusted only where its surfel normal is within this angle of MoGe's normal: two
+// independent estimates of the same surface. Gaps showing the background, stray or transient
+// returns and silhouette spread rarely agree, so they neither shape the fit nor veto MoGe.
+constexpr double TrustedNormalDegrees = 15;
 constexpr double MinimumDepth = .05, MaximumDepth = 65.535;
 
 double Radians(double degrees) { return degrees * Pi / 180; }
@@ -430,6 +434,15 @@ struct FieldCorners {
   int node[4];
   double weight[4];
 };
+// las_normal is the LAS supervision encoding (B, G, R = z, y, x; black where none).
+bool Trusted(const cv::Mat& las_normal, int x, int y, const Eigen::Vector3d& normal) {
+  const auto& code = las_normal.at<cv::Vec3b>(y, x);
+  if (!code[0] && !code[1] && !code[2])
+    return false;
+  const Eigen::Vector3d las(code[2] / 127.5 - 1, code[1] / 127.5 - 1, code[0] / 127.5 - 1);
+  return normal.dot(las) >=
+         std::cos(TrustedNormalDegrees * Pi / 180) * normal.norm() * las.norm();
+}
 FieldCorners Corners(const FaceSample& sample, int size) {
   constexpr int n = FaceFit::Cells + 1;
   const double u = sample.x / (size - 1) * FaceFit::Cells, v = sample.y / (size - 1) * FaceFit::Cells;
@@ -449,13 +462,15 @@ double FaceFit::LogScale(const FaceSample& sample, int size) const {
   return value;
 }
 Json FaceFit::ToJson() const {
-  return {{"accepted", accepted}, {"anchors", anchors}, {"inliers", inliers},
+  return {{"accepted", accepted}, {"las_samples", las_samples}, {"anchors", anchors},
+          {"inliers", inliers},
           {"field_cells", Cells}, {"scales", scales}, {"faces", faces}};
 }
 FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
-                      const cv::Mat& las) {
+                      const cv::Mat& las, const cv::Mat& las_normal) {
   if (faces.size() != lens.faces.size() || las.type() != CV_16UC1 ||
-      las.cols != lens.grid.width || las.rows != lens.grid.height)
+      las.cols != lens.grid.width || las.rows != lens.grid.height ||
+      las_normal.type() != CV_8UC3 || las_normal.size() != las.size())
     throw std::runtime_error("LAS depth or monocular faces differ from the lens plan");
   struct Anchor {
     FaceSample sample;
@@ -467,21 +482,26 @@ FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>
   };
   std::vector<Anchor> anchors;
   std::vector<Tie> ties;
+  FaceFit fit;
   const int w = lens.grid.width;
   for (int y = 0; y < lens.grid.height; y += FitLattice)
     for (int x = 0; x < w; x += FitLattice) {
       const size_t i = size_t(y) * w + x;
       double distance[MonocularLens::MaxSamples];
       bool valid[MonocularLens::MaxSamples];
-      Eigen::Vector3d normal;
+      Eigen::Vector3d normal[MonocularLens::MaxSamples];
       for (int k = 0; k < lens.counts[i]; ++k)
-        valid[k] = SampleFace(faces[lens.samples[i][k].face], lens.samples[i][k], distance[k], normal);
+        valid[k] =
+            SampleFace(faces[lens.samples[i][k].face], lens.samples[i][k], distance[k], normal[k]);
       const double target = las.at<uint16_t>(y, x) / 1000.;
       for (int a = 0; a < lens.counts[i]; ++a) {
         if (!valid[a])
           continue;
-        if (target > 0)
-          anchors.push_back({lens.samples[i][a], float(std::log(target / distance[a]))});
+        if (target > 0) {
+          ++fit.las_samples;
+          if (Trusted(las_normal, x, y, normal[a]))
+            anchors.push_back({lens.samples[i][a], float(std::log(target / distance[a]))});
+        }
         for (int b = a + 1; b < lens.counts[i]; ++b)
           if (valid[b])
             ties.push_back({lens.samples[i][a], lens.samples[i][b],
@@ -490,7 +510,6 @@ FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>
     }
   const size_t count = faces.size();
   constexpr int n = FaceFit::Cells + 1;
-  FaceFit fit;
   fit.scales.assign(count, 1.);
   fit.fields.assign(count, std::vector<double>(n * n, 0.));
   fit.anchors = anchors.size();
@@ -637,11 +656,12 @@ FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>
   return fit;
 }
 Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps, const cv::Mat& las,
-                     const cv::Mat& allowed, bool depth, double min_incidence, cv::Mat& depth_mm,
-                     cv::Mat& normal_rgb) {
+                     const cv::Mat& las_normal, const cv::Mat& allowed, bool depth,
+                     double min_incidence, cv::Mat& depth_mm, cv::Mat& normal_rgb) {
   const int w = lens.grid.width, h = lens.grid.height;
   if (las.size() != cv::Size(w, h) || allowed.size() != las.size() || allowed.type() != CV_8UC1 ||
-      maps.distance.size() != las.size())
+      maps.distance.size() != las.size() || las_normal.size() != las.size() ||
+      las_normal.type() != CV_8UC3)
     throw std::runtime_error("Monocular maps differ from the supervision grid");
   // A pixel next to a jump of more than StepLog in log distance holds a blend of both sides.
   cv::Mat step = cv::Mat::zeros(h, w, CV_8UC1);
@@ -667,30 +687,40 @@ Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps, const
   depth_mm = cv::Mat::zeros(h, w, CV_16UC1);
   normal_rgb = cv::Mat::zeros(h, w, CV_8UC3);
   std::vector<double> agreement;
-  size_t disagreeing = 0;
+  size_t disagreeing = 0, untrusted = 0, untrusted_disagreeing = 0;
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x) {
       const float d = maps.distance.at<float>(y, x);
       if (d <= 0 || !allowed.at<uint8_t>(y, x) || blended.at<uint8_t>(y, x))
         continue;
+      // Only trusted LAS depth vetoes MoGe; elsewhere the disagreement is only counted.
+      const auto& n = maps.normal.at<cv::Vec3f>(y, x);
       const double target = las.at<uint16_t>(y, x) / 1000.;
       bool agrees = true;
       if (target > 0) {
         const double ratio = std::abs(std::log(d / target));
-        agreement.push_back(ratio);
-        agrees = ratio <= std::log1p(std::max(AgreementFraction, AgreementMetres / target));
-        disagreeing += !agrees;
+        const bool within = ratio <= std::log1p(std::max(AgreementFraction, AgreementMetres / target));
+        if (Trusted(las_normal, x, y, Eigen::Vector3d(n[0], n[1], n[2]))) {
+          agreement.push_back(ratio);
+          agrees = within;
+          disagreeing += !within;
+        } else {
+          ++untrusted;
+          untrusted_disagreeing += !within;
+        }
       }
       if (depth && agrees && d >= MinimumDepth && d <= MaximumDepth)
         depth_mm.at<uint16_t>(y, x) = uint16_t(std::clamp<long>(std::lround(d * 1000.), 1, 65535));
-      const auto& n = maps.normal.at<cv::Vec3f>(y, x);
       const auto& ray = lens.rays.at<cv::Vec3f>(y, x);
       if (-(n[0] * ray[0] + n[1] * ray[1] + n[2] * ray[2]) >= min_incidence)
         normal_rgb.at<cv::Vec3b>(y, x) =
             cv::Vec3b(uint8_t(127.5f + 127.5f * n[2] + .5f), uint8_t(127.5f + 127.5f * n[1] + .5f),
                       uint8_t(127.5f + 127.5f * n[0] + .5f));
     }
-  Json stats = {{"las_compared_pixels", agreement.size()}, {"las_disagreeing_pixels", disagreeing}};
+  Json stats = {{"las_compared_pixels", agreement.size()},
+                {"las_disagreeing_pixels", disagreeing},
+                {"las_untrusted_pixels", untrusted},
+                {"las_untrusted_disagreeing_pixels", untrusted_disagreeing}};
   if (!agreement.empty())
     stats["las_log_ratio"] = {{"p50", Quantile(agreement, .5)}, {"p90", Quantile(agreement, .9)}};
   return stats;

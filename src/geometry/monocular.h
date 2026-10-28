@@ -71,30 +71,33 @@ MonocularMaps GatherFaces(const MonocularLens& lens, const std::vector<FaceEstim
 // MoGe's depth errors vary within a face (near objects against the room behind them), so every
 // face gets a smooth log-scale field on a Cells x Cells grid of bilinear cells, fitted to LAS ray
 // distances (las: CV_16U millimetres on the grid, 0 where invalid) together with the face
-// overlaps. On a 2-pixel lattice of the grid each covering face contributes one LAS residual and
-// each pair of covering faces one overlap residual; neighbouring nodes are tied by a first
-// difference. The iteratively reweighted Cauchy least squares in log distance starts from one
+// overlaps. On a 2-pixel lattice of the grid each covering face contributes one LAS residual where
+// the LAS is trusted (las_normal, the LAS normal encoding, within 15 degrees of the face's MoGe
+// normal) and each pair of covering faces one overlap residual; neighbouring nodes are tied by a
+// first difference. The iteratively reweighted Cauchy least squares in log distance starts from one
 // scale per face. The LAS sets the low frequencies of the depth; MoGe keeps its detail.
 struct FaceFit {
   static constexpr int Cells = 12;
   std::vector<double> scales;  // exp of each field's mean, for reports
   std::vector<std::vector<double>> fields;  // (Cells + 1)^2 log-scale nodes per face, row-major
   Json faces;  // per face: LAS anchors, inlier fraction, residual median and MAD, field range
-  size_t anchors = 0, inliers = 0;
+  size_t las_samples = 0;  // lattice LAS depths over valid face samples, trusted or not
+  size_t anchors = 0, inliers = 0;  // trusted LAS residuals and those within 0.05
   bool accepted = false;  // enough agreeing LAS anchors to give the photo metric depth
   double LogScale(const FaceSample& sample, int size) const;
   Json ToJson() const;
 };
 FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
-                      const cv::Mat& las);
+                      const cv::Mat& las, const cv::Mat& las_normal);
 // Supervision maps of one photo in the LAS supervision encoding: uint16 millimetre ray distance
 // and RGB8 normals (B, G, R = z, y, x), zero where invalid. allowed (CV_8U, nonzero valid) holds
 // the static mask with its semantic margin removed. Both maps drop MoGe's blended depth steps;
-// depth further needs an accepted fit, the 0.05-65.535 m range and LAS agreement where LAS holds
-// depth, normals an incidence of at least min_incidence. Returns per-photo statistics.
+// depth further needs an accepted fit, the 0.05-65.535 m range and agreement with the LAS where
+// the LAS is trusted (as in FitFaceScales, against the gathered normal); untrusted LAS depth never
+// vetoes. Normals need an incidence of at least min_incidence. Returns per-photo statistics.
 Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps, const cv::Mat& las,
-                     const cv::Mat& allowed, bool depth, double min_incidence, cv::Mat& depth_mm,
-                     cv::Mat& normal_rgb);
+                     const cv::Mat& las_normal, const cv::Mat& allowed, bool depth,
+                     double min_incidence, cv::Mat& depth_mm, cv::Mat& normal_rgb);
 // Writes the faces and gathered maps of one photo into a new directory for inspection.
 Json CheckMonocular(const fs::path& input, const fs::path& models, const std::string& image,
                     const fs::path& output, int max_size);

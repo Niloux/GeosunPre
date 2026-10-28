@@ -19,8 +19,8 @@
 namespace geosun {
 namespace {
 constexpr int Version = 8;
-// Monocular supervision (source moge) is published as version 9; LAS maps keep version 8.
-constexpr int MonocularVersion = 9;
+// Monocular supervision (source moge) is published as version 10; LAS maps keep version 8.
+constexpr int MonocularVersion = 10;
 constexpr const char* MonocularSource = "moge2_faces_las_scaled";
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
@@ -1346,13 +1346,13 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                                                          static_pixels = static_mask.count]() mutable {
           Json monocular_row;
           if (plan) {
-            const auto fit = FitFaceScales(*plan, estimates, depth);
+            const auto fit = FitFaceScales(*plan, estimates, depth, normal);
             const auto maps = GatherFaces(*plan, estimates, [&](const FaceSample& sample) {
               return fit.LogScale(sample, plan->size);
             });
             cv::Mat monocular_depth, monocular_normal;
-            monocular_row = EncodeMonocular(*plan, maps, depth, allowed, fit.accepted, MinIncidence,
-                                            monocular_depth, monocular_normal);
+            monocular_row = EncodeMonocular(*plan, maps, depth, normal, allowed, fit.accepted,
+                                            MinIncidence, monocular_depth, monocular_normal);
             Json faces = Json::array();
             for (const auto& estimate : estimates)
               faces.push_back(estimate.ToJson());
@@ -1426,14 +1426,16 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         "moge2 faces scaled per face to the LAS depth, blended in log distance";
     summary["depth_validity"] =
         "accepted face fit, static mask off the semantic margin, no blended depth step, "
-        "LAS agreement where LAS holds depth";
+        "agreement with trusted LAS depth";
     summary["normal_estimator"] = "moge2_vitl_faces";
     summary["normal_validity"] =
         "static mask off the semantic margin, no blended depth step, incidence";
     summary["monocular"] = {{"fit", "per-face 12 x 12 bilinear log-scale field, Cauchy IRLS in log "
                                     "distance, scale 0.03, inliers within 0.05, overlap weight 0.25, "
                                     "node first difference 0.1 x mean anchors per node, lattice 2 px"},
-                            {"accept", "at least 2000 LAS anchors, half of them inliers"},
+                            {"trusted_las", "LAS depth whose surfel normal is within 15 degrees of the "
+                                            "MoGe normal; only it is fitted and vetoes MoGe depth"},
+                            {"accept", "at least 2000 trusted LAS anchors, half of them inliers"},
                             {"depth_step_log", .04},
                             {"las_agreement", "within max(3%, 0.03 m)"},
                             {"normals_need_depth", false},
