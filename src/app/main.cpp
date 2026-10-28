@@ -4,6 +4,7 @@
 #include "io/las.h"
 #include "frontend/inference.h"
 #include "frontend/frontend.h"
+#include "geometry/monocular.h"
 #include <opencv2/core.hpp>
 #include <iostream>
 
@@ -34,6 +35,15 @@ int Main(const std::vector<std::string>& argv) {
       std::cout << CheckModels(
                        args.Get("--models").empty() ? DefaultModels() : args.Path("--models"),
                        args.Path("--image"))
+                       .dump(2)
+                << '\n';
+    } else if (args.command == "check-monocular") {
+      args.Validate({"--input", "--image", "--output", "--models", "--supervision-max-size"});
+      std::cout << CheckMonocular(
+                       args.Path("--input"),
+                       args.Get("--models").empty() ? DefaultModels() : args.Path("--models"),
+                       args.Get("--image"), args.Path("--output"),
+                       args.Integer("--supervision-max-size", 1600))
                        .dump(2)
                 << '\n';
     } else if (args.command == "las-ply") {
@@ -81,6 +91,8 @@ int Main(const std::vector<std::string>& argv) {
              "  geosunpre check --output DIR\n"
              "  geosunpre info\n"
              "  geosunpre check-models --image FILE [--models MODELS]\n"
+             "  geosunpre check-monocular --input INPUT --image NAME --output DIR "
+             "[--models MODELS] [--supervision-max-size PIXELS]\n"
              "  geosunpre las-ply --las FILE --output FILE [--voxel METRES]\n";
     } else
       throw std::runtime_error("Unknown command: " + args.command);

@@ -13,6 +13,8 @@ struct SupervisionOptions {
   std::optional<std::array<CropWindow, 2>> crop;
 };
 SupervisionOptions ParseSupervisionOptions(const Arguments& args);
+// Supervision-map camera: the longest side reduced to max_size, never enlarged.
+Camera MapCamera(const Camera& source, int max_size);
 // masks is the directory of the selected model's static masks, named by image index.
 Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const fs::path& masks,
                         const SupervisionOptions& options, bool rolling = false);

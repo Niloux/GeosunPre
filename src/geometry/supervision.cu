@@ -992,16 +992,6 @@ __global__ void Encode(const float* depth, const float* projected, const unsigne
   normals[i] = make_uchar3(uint8_t(127.5f + 127.5f * n.z + .5f), uint8_t(127.5f + 127.5f * n.y + .5f),
                            uint8_t(127.5f + 127.5f * n.x + .5f));
 }
-Camera MapCamera(const Camera& source, int max_size) {
-  auto camera = source;
-  const double scale = std::min(1., double(max_size) / std::max(source.width, source.height));
-  camera.width = std::max(1, int(std::lround(source.width * scale)));
-  camera.height = std::max(1, int(std::lround(source.height * scale)));
-  for (int i = 0; i < 4; ++i)
-    camera.params[i] *= i % 2 ? double(camera.height) / source.height
-                              : double(camera.width) / source.width;
-  return camera;
-}
 fs::path ExtraMask(const SupervisionOptions& options, const std::string& name) {
   return options.mask_dir / fs::u8path(name + ".png");
 }
@@ -1062,6 +1052,16 @@ std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal
   return {depths, normals};
 }
 }  // namespace
+Camera MapCamera(const Camera& source, int max_size) {
+  auto camera = source;
+  const double scale = std::min(1., double(max_size) / std::max(source.width, source.height));
+  camera.width = std::max(1, int(std::lround(source.width * scale)));
+  camera.height = std::max(1, int(std::lround(source.height * scale)));
+  for (int i = 0; i < 4; ++i)
+    camera.params[i] *= i % 2 ? double(camera.height) / source.height
+                              : double(camera.width) / source.width;
+  return camera;
+}
 SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   SupervisionOptions options;
   if (args.values.count("--las-supervision") && args.values.count("--no-las-supervision"))
