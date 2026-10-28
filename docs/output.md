@@ -9,7 +9,7 @@ OUTPUT/
   depths/{L,R}/**.JPG.png       # 默认生成，--no-las-supervision 省略
   normals/{L,R}/**.JPG.png      # 默认生成，--no-las-supervision 省略
   sparse/0/{cameras,images,points3D,rigs,frames}.bin
-  sparse/0/lidar.ply
+  sparse/0/points3D.ply
   manifest.json
   quality.json
   initialization.json
@@ -24,7 +24,7 @@ COLMAP 小端二进制，`OPENCV_FISHEYE` 模型编号 5、8 个参数。相机 
 
 points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重投影距离，单位像素；联合优化后重新计算，交付回读时验证。
 
-相机和稀疏点已在输入 LAS 坐标，下游不再应用配准变换。BIN 是视觉稀疏点及轨迹；`lidar.ply` 是完整有效 LAS 的体素均值，点身份相互独立。默认体素 0.05 m，二进制小端，每点 float32 XYZ、零法向量 XYZ、uint8 RGB，共 27 字节。LAS 头部范围的坐标绝对值须不超过 16777 m，使 float32 舍入不超过 1 mm，否则明确报错。下游需明确选择此 PLY 初始化 3DGS：它不叫 `points3D.ply`，按 COLMAP 目录约定自动寻找 `points3D.ply` 的工具不会把它当作初始点云，定制 LFS 用 `--init <交付>/sparse/0/lidar.ply`。旧交付中同一文件名为 `points3D.ply`，`check` 仍可回读。
+相机和稀疏点已在输入 LAS 坐标，下游不再应用配准变换。BIN 是视觉稀疏点及轨迹；PLY 是完整有效 LAS 的体素均值，点身份相互独立。默认体素 0.05 m，二进制小端，每点 float32 XYZ、零法向量 XYZ、uint8 RGB，共 27 字节。LAS 头部范围的坐标绝对值须不超过 16777 m，使 float32 舍入不超过 1 mm，否则明确报错。下游需明确选择此 PLY 初始化 3DGS。
 
 掩码为与交付照片同尺寸的单通道 PNG：静态 255、天空 128、人物及有效域外 0。SfM 只提取 255 区域；有效域按初始标定冻结。五视图融合无覆盖的格子对应原图像素也为 0，独立精修复制旧掩码时同步屏蔽这些像素。
 
