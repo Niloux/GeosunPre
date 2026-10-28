@@ -361,41 +361,6 @@ Json Acceptance(const std::vector<Residual>& rows, const Regions& regions, doubl
 }  // namespace
 
 namespace {
-Similarity NavigationFit(const std::vector<Eigen::Vector3d>& centers,
-                         const std::vector<Eigen::Vector3d>& positions) {
-  std::mt19937 rng(0);
-  std::uniform_int_distribution<size_t> choose(0, centers.size() - 1);
-  size_t best = 0;
-  Similarity selected;
-  for (int trial = 0; trial < 1000; ++trial) {
-    const size_t a = choose(rng), b = choose(rng), c = choose(rng);
-    if (a == b || a == c || b == c ||
-        (centers[b] - centers[a]).cross(centers[c] - centers[a]).norm() < 1e-6)
-      continue;
-    const auto fit = FitSimilarity({centers[a], centers[b], centers[c]},
-                                   {positions[a], positions[b], positions[c]});
-    size_t support = 0;
-    for (size_t i = 0; i < centers.size(); ++i)
-      if ((fit.Apply(centers[i]) - positions[i]).norm() <= .5)
-        ++support;
-    if (support > best) {
-      best = support;
-      selected = fit;
-    }
-  }
-  if (best < std::max<size_t>(3, centers.size() / 4))
-    throw std::runtime_error("Navigation does not support a metric similarity");
-  for (int pass = 0; pass < 3; ++pass) {
-    Points a, b;
-    for (size_t i = 0; i < centers.size(); ++i)
-      if ((selected.Apply(centers[i]) - positions[i]).norm() <= .5) {
-        a.push_back(centers[i]);
-        b.push_back(positions[i]);
-      }
-    selected = FitSimilarity(a, b);
-  }
-  return selected;
-}
 double FixedCameraPositionSigma(const Reconstruction& model, const ModelPoint& point) {
   // Local uncertainty proxy with camera parameters fixed, not absolute accuracy.
   Eigen::Matrix3d information = Eigen::Matrix3d::Zero();
@@ -767,7 +732,7 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
       centers.push_back(model.images[i].pose.Center());
       positions.push_back(navigation[i] - origin);
     }
-  const auto initial = NavigationFit(centers, positions);
+  const auto initial = RobustSimilarity(centers, positions, .5);
   std::vector<double> nav_errors;
   for (size_t i = 0; i < centers.size(); ++i)
     nav_errors.push_back((initial.Apply(centers[i]) - positions[i]).norm());

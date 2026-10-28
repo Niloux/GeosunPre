@@ -51,6 +51,10 @@ struct Similarity {
 };
 Similarity FitSimilarity(const std::vector<Eigen::Vector3d>& source,
                          const std::vector<Eigen::Vector3d>& target);
+// Three-point RANSAC fit refined on the pairs within inlier metres of the target; throws unless at
+// least a quarter of the pairs (and three) agree.
+Similarity RobustSimilarity(const std::vector<Eigen::Vector3d>& source,
+                            const std::vector<Eigen::Vector3d>& target, double inlier);
 double Quantile(std::vector<double> values, double fraction);
 Json Statistics(const std::vector<double>& values);
 }  // namespace geosun

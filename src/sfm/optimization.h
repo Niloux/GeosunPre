@@ -53,6 +53,12 @@ void RefineTrackPoint(const std::vector<Observation>& track, Eigen::Vector3d& po
 }
 void RefinePoint(const Reconstruction& model, const std::vector<Observation>& track,
                  Eigen::Vector3d& point);
+// CameraPos agrees with the final camera centres to 6-19 mm (median) and at most 87 mm on the
+// three test scenes; a centre off by more than the gate is a wrong registration (repeated texture
+// put 展厅 R exposures 0.5-1.4 m away).
+constexpr double NavigationSigma = .03, NavigationGate = .25;
+// Navigation positions give the metric gauge: without them the gauge image is held and the
+// gauge baseline kept.
 Json Optimize(Reconstruction& model, const std::array<Camera, 2>& initial, const std::string& stage,
               int workers, int iterations, const std::set<uint32_t>& variable_images = {},
               const std::vector<PlaneConstraint>& planes = {},

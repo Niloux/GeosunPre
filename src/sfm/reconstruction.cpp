@@ -700,8 +700,11 @@ size_t Correspondences(const Reconstruction& model, const std::vector<Pair>& pai
   }
   return xyz->size();
 }
+// With the model in the navigation frame, pose hypotheses whose centre is beyond the navigation
+// gate are rejected: repeated texture can otherwise support a pose shifted along the pattern.
 bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
-              const std::vector<size_t>& neighbors, uint32_t id) {
+              const std::vector<size_t>& neighbors, uint32_t id,
+              const Eigen::Vector3d* navigation) {
   std::vector<cv::Point3d> xyz;
   std::vector<cv::Point2d> xy;
   std::vector<uint32_t> features;
@@ -714,6 +717,8 @@ bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
   size_t maximum = 0;
   double best_cost = INFINITY;
   auto score = [&](const Pose& pose) {
+    if (navigation && (pose.Center() - *navigation).norm() > NavigationGate)
+      return false;
     size_t support = 0;
     double cost = 0;
     for (size_t i = 0; i < xyz.size(); ++i) {
@@ -952,7 +957,21 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   Json optimization = Json::array();
   Json completion = Json::array();
   Json calibration_selection = Json::array();
+  Json navigation_frame = {{"used", false}};
   const double graph_seconds = Seconds(graph_started);
+  const auto positions = NavigationPositions(scene);
+  // Empty until the model is moved into the navigation frame; then every BA holds the camera
+  // centres to navigation and registration is gated by it.
+  std::vector<Eigen::Vector3d> nav;
+  auto unregister = [&](const std::vector<uint32_t>& ids) {
+    for (uint32_t id : ids)
+      m.images[id].registered = false;
+    for (auto& point : m.points)
+      point.track.erase(std::remove_if(point.track.begin(), point.track.end(),
+                                       [&](const auto& o) { return !m.images[o.image].registered; }),
+                        point.track.end());
+    filter();
+  };
   if (resumed) {
     for (size_t i = 0; i < graph.tracks.size(); ++i) {
       std::set<uint64_t> existing;
@@ -965,7 +984,6 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   } else {
     const Pair* seed = nullptr;
     double best = 0;
-    const auto positions = NavigationPositions(scene);
     for (const auto& p : pairs)
       if (p.inliers.size() >= 100 && p.angle >= 1. &&
           (positions[p.a] - positions[p.b]).norm() > .2) {
@@ -1002,6 +1020,65 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       ++resumed_counts[image.camera];
   bool calibrated =
       resumed && m.Registered() >= 32 && resumed_counts[0] >= 8 && resumed_counts[1] >= 8;
+  // Move the visual model into the navigation frame once the registered exposures span at least
+  // 0.3 m across their main direction, so the similarity is also fixed about that axis. Exposures
+  // beyond the navigation gate are unregistered and may register again under the gate. A model
+  // that is already in the navigation frame (a resumed checkpoint) fits to about the identity.
+  auto to_navigation = [&] {
+    std::vector<uint32_t> ids;
+    std::vector<Eigen::Vector3d> centers, targets;
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (uint32_t id = 0; id < m.images.size(); ++id)
+      if (m.images[id].registered) {
+        ids.push_back(id);
+        centers.push_back(m.images[id].pose.Center());
+        targets.push_back(positions[id]);
+        mean += positions[id];
+      }
+    if (ids.size() < 8)
+      return;
+    mean /= double(ids.size());
+    Eigen::Matrix3d spread = Eigen::Matrix3d::Zero();
+    for (const auto& p : targets)
+      spread += (p - mean) * (p - mean).transpose();
+    if (Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(spread / double(ids.size()))
+            .eigenvalues()[1] < .3 * .3)
+      return;
+    Similarity fit;
+    try {
+      fit = RobustSimilarity(centers, targets, NavigationGate);
+    } catch (const std::runtime_error&) {
+      return;
+    }
+    std::vector<uint32_t> outliers;
+    Json omitted = Json::array();
+    for (size_t k = 0; k < ids.size(); ++k) {
+      const double error = (fit.Apply(centers[k]) - targets[k]).norm();
+      if (error > NavigationGate) {
+        outliers.push_back(ids[k]);
+        omitted.push_back({{"image_index", ids[k]}, {"error_m", error}});
+      }
+    }
+    // A few outliers are wrong registrations; many mean the visual model has not settled yet.
+    if (outliers.size() > ids.size() / 10 ||
+        std::count(outliers.begin(), outliers.end(), m.gauge_image) ||
+        std::count(outliers.begin(), outliers.end(), m.scale_image))
+      return;
+    m.Apply(fit);
+    for (uint32_t id : outliers)
+      Log("Unregister " + scene.images[id].name + " (beyond the navigation gate)");
+    unregister(outliers);
+    nav = positions;
+    navigation_frame = {{"used", true},
+                        {"registered_images", ids.size()},
+                        {"scale", fit.scale},
+                        {"unregistered", omitted}};
+    optimization.push_back(
+        Optimize(m, scene.cameras, calibrated ? "radial" : "fixed", ba_workers, 100, {}, {}, nav));
+    filter();
+    Log("Navigation frame at " + std::to_string(m.Registered()) + " registered images");
+  };
+  to_navigation();
   while (m.Registered() < m.images.size()) {
     const auto selection_started = Clock::now();
     std::vector<std::pair<size_t, uint32_t>> options;
@@ -1015,7 +1092,8 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       if (count < 24)
         break;
       const auto registration_started = Clock::now();
-      const bool success = Register(m, pairs, adjacency[id], id);
+      const bool success =
+          Register(m, pairs, adjacency[id], id, nav.empty() ? nullptr : &positions[id]);
       registration_seconds += Seconds(registration_started);
       if (!success)
         continue;
@@ -1029,6 +1107,8 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       for (uint32_t track : touched)
         AddPoint(m, graph.tracks[track], points[track]);
       triangulation_seconds += Seconds(triangulation_started);
+      if (nav.empty())
+        to_navigation();
       const auto registered = m.Registered();
       if (registered % 8 == 0) {
         std::set<uint32_t> local = recent;
@@ -1045,7 +1125,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         std::sort(neighbors.rbegin(), neighbors.rend());
         for (size_t k = 0; k < std::min<size_t>(8, neighbors.size()); ++k)
           local.insert(neighbors[k].second);
-        optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 30, local));
+        optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 30, local, {}, nav));
         filter();
         recent.clear();
       }
@@ -1055,10 +1135,10 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           if (image.registered)
             ++counts[image.camera];
         if (counts[0] >= 8 && counts[1] >= 8) {
-          optimization.push_back(Optimize(m, scene.cameras, "focal", ba_workers, 100));
+          optimization.push_back(Optimize(m, scene.cameras, "focal", ba_workers, 100, {}, {}, nav));
           filter();
           completion.push_back(CompleteTracks(m, graph, points));
-          optimization.push_back(Optimize(m, scene.cameras, "radial", ba_workers, 100));
+          optimization.push_back(Optimize(m, scene.cameras, "radial", ba_workers, 100, {}, {}, nav));
           filter();
           completion.push_back(CompleteTracks(m, graph, points));
           calibrated = true;
@@ -1066,7 +1146,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         }
       } else if (registered >= std::max(last_global + 40, size_t(last_global * 1.35))) {
         optimization.push_back(
-            Optimize(m, scene.cameras, calibrated ? "radial" : "fixed", ba_workers, 100));
+            Optimize(m, scene.cameras, calibrated ? "radial" : "fixed", ba_workers, 100, {}, {}, nav));
         filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = registered;
@@ -1079,7 +1159,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     }
     if (!added) {
       if (m.Registered() > last_global) {
-        optimization.push_back(Optimize(m, scene.cameras, "radial", ba_workers, 150));
+        optimization.push_back(Optimize(m, scene.cameras, "radial", ba_workers, 150, {}, {}, nav));
         filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = m.Registered();
@@ -1130,16 +1210,10 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           if (id == m.gauge_image || id == m.scale_image)
             throw std::runtime_error("Calibration cannot retain its reference images: " +
                                      scene.images[id].name);
-          m.images[id].registered = false;
           Log("Omit from final calibration: " + scene.images[id].name +
               " (insufficient reliable track coverage)");
         }
-        for (auto& point : m.points)
-          point.track.erase(
-              std::remove_if(point.track.begin(), point.track.end(),
-                             [&](const auto& o) { return !m.images[o.image].registered; }),
-              point.track.end());
-        filter();
+        unregister(missing.images);
         save_checkpoint();
         continue;
       }
@@ -1149,7 +1223,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       if (!stable_calibration)
         selected.clear();
       optimization.push_back(
-          Optimize(m, scene.cameras, stage, ba_workers, iterations, {}, {}, {}, selected));
+          Optimize(m, scene.cameras, stage, ba_workers, iterations, {}, {}, nav, selected));
       break;
     }
   };
@@ -1166,11 +1240,11 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     if (round == 2 || (changed <= std::max<size_t>(1, size_t(before * .0005)) &&
                        optimization.back().at("converged").get<bool>()))
       break;
-    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 100));
+    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 100, {}, {}, nav));
   }
   calibrate("fixed", 100);
   if (stable_calibration)
-    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 200));
+    optimization.push_back(Optimize(m, scene.cameras, "fixed", ba_workers, 200, {}, {}, nav));
   filter();
   const auto unassigned_completion = CompleteUnassignedTracks(m, graph);
   const auto color_started = Clock::now();
@@ -1193,6 +1267,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
             {"completion", completion},
             {"unassigned_completion", unassigned_completion},
             {"pre_calibration_completion", calibration_completion},
+            {"navigation_frame", navigation_frame},
             {"calibration_tracks", stable_calibration ? "stable" : "all"},
             {"calibration_selection", calibration_selection},
             {"optimization", optimization}};

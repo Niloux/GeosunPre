@@ -2,6 +2,7 @@
 #include <Eigen/SVD>
 #include <algorithm>
 #include <cmath>
+#include <random>
 
 namespace geosun {
 Camera Camera::FromJson(const Json& v) {
@@ -147,6 +148,41 @@ Similarity FitSimilarity(const std::vector<Eigen::Vector3d>& a,
     throw std::runtime_error("Degenerate similarity fit");
   return {s, Eigen::Quaterniond(m.topLeftCorner<3, 3>() / s).normalized(),
           m.topRightCorner<3, 1>()};
+}
+Similarity RobustSimilarity(const std::vector<Eigen::Vector3d>& source,
+                            const std::vector<Eigen::Vector3d>& target, double inlier) {
+  std::mt19937 rng(0);
+  std::uniform_int_distribution<size_t> choose(0, source.size() - 1);
+  size_t best = 0;
+  Similarity selected;
+  for (int trial = 0; trial < 1000; ++trial) {
+    const size_t a = choose(rng), b = choose(rng), c = choose(rng);
+    if (a == b || a == c || b == c ||
+        (source[b] - source[a]).cross(source[c] - source[a]).norm() < 1e-6)
+      continue;
+    const auto fit = FitSimilarity({source[a], source[b], source[c]},
+                                   {target[a], target[b], target[c]});
+    size_t support = 0;
+    for (size_t i = 0; i < source.size(); ++i)
+      if ((fit.Apply(source[i]) - target[i]).norm() <= inlier)
+        ++support;
+    if (support > best) {
+      best = support;
+      selected = fit;
+    }
+  }
+  if (best < std::max<size_t>(3, source.size() / 4))
+    throw std::runtime_error("Navigation does not support a metric similarity");
+  for (int pass = 0; pass < 3; ++pass) {
+    std::vector<Eigen::Vector3d> a, b;
+    for (size_t i = 0; i < source.size(); ++i)
+      if ((selected.Apply(source[i]) - target[i]).norm() <= inlier) {
+        a.push_back(source[i]);
+        b.push_back(target[i]);
+      }
+    selected = FitSimilarity(a, b);
+  }
+  return selected;
 }
 double Quantile(std::vector<double> v, double f) {
   if (v.empty())

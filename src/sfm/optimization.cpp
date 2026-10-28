@@ -198,7 +198,7 @@ struct Position {
     T c[3];
     Center(pose, c);
     for (int i = 0; i < 3; ++i)
-      r[i] = (c[i] - T(target[i])) / T(.5);
+      r[i] = (c[i] - T(target[i])) / T(NavigationSigma);
     return true;
   }
 };
@@ -279,7 +279,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   std::set<uint32_t> used_images, used_cameras;
   size_t observations = 0;
   size_t precise_count = 0, reference_count = 0;
-  const bool metric = !nav.empty() && !planes.empty();
+  const bool metric = !nav.empty();
   size_t variable_count = 0;
   for (auto& p : m.points)
     if (p.track.size() >= 2) {
@@ -402,7 +402,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   options.linear_solver_ordering = ordering;
   // Below 1e-6 the final refinements only creep: in the shutter BA the last half of the
   // iterations moved camera centres by under 5 um and changed held-out error by 3e-5 px.
-  options.function_tolerance = iterations <= 100 && planes.empty() && nav.empty() ? 1e-5 : 1e-6;
+  options.function_tolerance = iterations <= 100 && planes.empty() ? 1e-5 : 1e-6;
   Progress progress;
   options.callbacks.push_back(&progress);
   ceres::Solver::Summary summary;
