@@ -160,7 +160,7 @@ __global__ void Morphology(const uchar2* input, uchar2* output, int width, int h
 }
 __global__ void Composite(const uchar2* classes, const uint8_t* valid, const float* weights,
                           uint8_t* output, int width, int height, int small_width, int small_height,
-                          double sx, double sy) {
+                          double sx, double sy, bool persons) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= width * height)
     return;
@@ -169,7 +169,7 @@ __global__ void Composite(const uchar2* classes, const uint8_t* valid, const flo
             yy = min(__double2int_rd(y * sy), small_height - 1);
   const int cell = yy * small_width + xx;
   const auto value = classes[cell];
-  output[i] = valid[i] && weights[cell] > 0 ? (value.y ? 0 : value.x ? 128 : 255) : 0;
+  output[i] = valid[i] && weights[cell] > 0 ? (value.y && persons ? 0 : value.x ? 128 : 255) : 0;
 }
 }  // namespace
 struct ImagePreprocessor::Implementation {
@@ -248,12 +248,14 @@ Tensor ImagePreprocessor::Normalize(int width, int height, const std::array<floa
 struct MaskFusion::Implementation {
   cudaStream_t stream;
   int width, height, small_width, small_height;
+  bool persons;
   std::vector<std::unique_ptr<Projection>> projections;
   DeviceBuffer sum, weight, classes, morphed, valid, output;
   PinnedBuffer host;
   Implementation(const std::vector<MaskView>& views, const cv::Mat& total, const cv::Mat& domain,
-                 cudaStream_t value)
+                 cudaStream_t value, bool person_class)
       : stream(value),
+        persons(person_class),
         width(domain.cols),
         height(domain.rows),
         small_width(total.cols),
@@ -273,8 +275,8 @@ struct MaskFusion::Implementation {
   ~Implementation() { cudaStreamSynchronize(stream); }
 };
 MaskFusion::MaskFusion(const std::vector<MaskView>& views, const cv::Mat& weight,
-                       const cv::Mat& valid, cudaStream_t stream)
-    : impl_(std::make_unique<Implementation>(views, weight, valid, stream)) {}
+                       const cv::Mat& valid, cudaStream_t stream, bool persons)
+    : impl_(std::make_unique<Implementation>(views, weight, valid, stream, persons)) {}
 MaskFusion::~MaskFusion() = default;
 void MaskFusion::Begin() {
   CudaCheck(cudaMemsetAsync(impl_->sum.data, 0, impl_->sum.bytes, impl_->stream));
@@ -307,7 +309,7 @@ cv::Mat MaskFusion::Finish() {
       static_cast<const uchar2*>(p.morphed.data), static_cast<const uint8_t*>(p.valid.data),
       static_cast<const float*>(p.weight.data), static_cast<uint8_t*>(p.output.data), p.width,
       p.height, p.small_width, p.small_height, double(p.small_width) / p.width,
-      double(p.small_height) / p.height);
+      double(p.small_height) / p.height, p.persons);
   CudaCheck(cudaGetLastError());
   CudaCheck(cudaMemcpyAsync(p.host.data, p.output.data, p.output.bytes, cudaMemcpyDeviceToHost,
                             p.stream));

@@ -132,7 +132,7 @@ struct FrontendTiming {
 };
 struct PreparedImage {
   uint32_t id;
-  cv::Mat rgb, mask;
+  cv::Mat rgb, mask, grounding;
   std::vector<cv::Mat> views;
   double decode = 0, preprocess = 0;
 };
@@ -140,6 +140,7 @@ class ImageReader {
   const std::vector<Exposure>& images;
   const fs::path work;
   const std::array<Fusion, 2>* fusion;
+  const int grounding;  // square side of the whole-photo grounding input, 0 without grounding
   size_t next = 0;
   std::deque<std::future<PreparedImage>> ready;
   // Decoding and the five mask views take longer than the GPU's share of an image; four in
@@ -156,6 +157,8 @@ class ImageReader {
         started = Clock::now();
         cv::cvtColor(image.rgb, image.rgb, cv::COLOR_BGR2RGB);
         if (fusion) {
+          if (grounding)
+            cv::resize(image.rgb, image.grounding, {grounding, grounding}, 0, 0, cv::INTER_AREA);
           for (const auto& view : (*fusion)[record.camera].views) {
             cv::Mat sampled;
             cv::remap(image.rgb, sampled, view.source, cv::Mat(), cv::INTER_LINEAR,
@@ -173,8 +176,8 @@ class ImageReader {
 
  public:
   ImageReader(const std::vector<Exposure>& records, fs::path path,
-              const std::array<Fusion, 2>* maps = nullptr)
-      : images(records), work(std::move(path)), fusion(maps) {
+              const std::array<Fusion, 2>* maps = nullptr, int grounding_size = 0)
+      : images(records), work(std::move(path)), fusion(maps), grounding(grounding_size) {
     Fill();
   }
   PreparedImage Next() {
@@ -302,6 +305,71 @@ class FeatureCache {
     return entries.emplace(id, std::move(entry)).first->second;
   }
 };
+// SAM3 grounding of the whole photo (version 4 packages), prompts person, shadow and robot.
+constexpr float kGroundingScore = .5f;
+// A shadow is transient only within this many mask cells (about 8% of the photo side) of a
+// person: static furniture and exhibit shadows are seen in every view and stay static.
+constexpr int kShadowReach = 24;
+struct GroundingCounts {
+  size_t persons = 0, robots = 0, shadows = 0, distant_shadows = 0;
+};
+int GroundingSize(const Json& manifest) {
+  if (manifest.at("grounding_prompts") != Json{"person", "shadow", "robot"} ||
+      manifest.at("models").at("grounding").at("outputs") !=
+          Json{"scores", "boxes", "masks", "semantic"})
+    throw std::runtime_error("Grounding model contract differs from person/shadow/robot");
+  return manifest.at("grounding_size");
+}
+// Full-size 255 where people and the shadows next to them are. A person detection mostly
+// covered by an at least as confident robot detection is a humanoid exhibit and stays static.
+cv::Mat GroundingMask(const std::vector<Tensor>& outputs, int width, int height,
+                      GroundingCounts& counts) {
+  const int k = int(outputs[0].shape[1]), size = int(outputs[2].shape[3]);
+  const float *scores = outputs[0].Floats(), *logits = outputs[2].Floats();
+  auto detections = [&](int prompt) {
+    std::vector<std::pair<float, cv::Mat>> found;
+    // Scores arrive sorted in descending order.
+    for (int q = 0; q < k && scores[prompt * k + q] >= kGroundingScore; ++q) {
+      const cv::Mat logit(size, size, CV_32FC1,
+                          const_cast<float*>(logits + (size_t(prompt) * k + q) * size * size));
+      found.emplace_back(scores[prompt * k + q], logit > 0);
+    }
+    return found;
+  };
+  const auto persons = detections(0), shadows = detections(1), robots = detections(2);
+  cv::Mat people = cv::Mat::zeros(size, size, CV_8UC1);
+  for (const auto& [score, mask] : persons) {
+    const int area = cv::countNonZero(mask);
+    bool robot = false;
+    for (const auto& [robot_score, robot_mask] : robots)
+      robot = robot || (robot_score >= score && 2 * cv::countNonZero(mask & robot_mask) >= area);
+    if (robot) {
+      ++counts.robots;
+    } else {
+      ++counts.persons;
+      people |= mask;
+    }
+  }
+  cv::Mat transient = people.clone();
+  if (!shadows.empty()) {
+    cv::Mat reach;
+    cv::dilate(people, reach,
+               cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                         {2 * kShadowReach + 1, 2 * kShadowReach + 1}));
+    for (const auto& [score, mask] : shadows)
+      if (cv::countNonZero(mask & reach)) {
+        ++counts.shadows;
+        transient |= mask;
+      } else {
+        ++counts.distant_shadows;
+      }
+  }
+  // One cell of margin covers the coarse mask boundary and the soft shadow edge.
+  cv::dilate(transient, transient, cv::Mat::ones(3, 3, CV_8UC1));
+  cv::Mat full;
+  cv::resize(transient, full, {width, height}, 0, 0, cv::INTER_LINEAR);
+  return full >= 128;
+}
 }  // namespace
 Json CheckModels(const fs::path& root, const fs::path& image) {
   auto rgb = ReadImage(image, cv::IMREAD_COLOR);
@@ -423,6 +491,36 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
     report["geometry_valid_pixels"] = valid;
     report["inference"]["geometry"] = models.Profile().at("geometry");
   }
+  // Version 4 packages add SAM3 grounding of people, shadows and robots for the masks.
+  if (manifest.at("models").contains("grounding")) {
+    Models models(root);
+    ImagePreprocessor pixels(models.Stream());
+    pixels.Upload(rgb);
+    const int64_t size = GroundingSize(manifest), prompts = 3,
+                  k = manifest.at("grounding_top_k"), cells = manifest.at("grounding_mask_size");
+    const auto outputs =
+        models.Predict("grounding", {pixels.Normalize(int(size), int(size), {.5f, .5f, .5f},
+                                                      {.5f, .5f, .5f})});
+    if (outputs.size() != 4)
+      throw std::runtime_error("Model verification: invalid grounding outputs");
+    check(outputs[0], {prompts, k});
+    check(outputs[1], {prompts, k, 4});
+    check(outputs[2], {prompts, k, cells, cells});
+    check(outputs[3], {prompts, 1, cells, cells});
+    Json detected = Json::object();
+    for (int64_t p = 0; p < prompts; ++p) {
+      const float* scores = outputs[0].Floats() + p * k;
+      size_t confident = 0;
+      for (int64_t q = 0; q < k; ++q) {
+        if (scores[q] < 0 || scores[q] > 1 || (q && scores[q] > scores[q - 1]))
+          throw std::runtime_error("Model verification: grounding scores out of range or order");
+        confident += scores[q] >= kGroundingScore;
+      }
+      detected[manifest.at("grounding_prompts").at(p).get<std::string>()] = confident;
+    }
+    report["grounding_detections"] = detected;
+    report["inference"]["grounding"] = models.Profile().at("grounding");
+  }
   return report;
 }
 cv::Mat MaskDomain(const Camera& camera) {
@@ -457,13 +555,17 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
   ImagePreprocessor pixels(models.Stream());
   const std::array<Fusion, 2> fusion{VirtualViews(scene.cameras[0]),
                                      VirtualViews(scene.cameras[1])};
+  // With grounding, SAM3 decides people and their shadows and the segmentation keeps only sky.
+  const bool grounding = models.Manifest().at("models").contains("grounding");
+  const int grounding_size = grounding ? GroundingSize(models.Manifest()) : 0;
+  GroundingCounts counts;
   std::array<std::unique_ptr<MaskFusion>, 2> masks;
   for (int c = 0; c < 2; ++c)
     masks[c] = std::make_unique<MaskFusion>(fusion[c].views, fusion[c].weight,
-                                            scene.cameras[c].Mask(), models.Stream());
+                                            scene.cameras[c].Mask(), models.Stream(), !grounding);
   const auto mean = models.Manifest().at("segmentation_mean").get<std::array<float, 3>>(),
              deviation = models.Manifest().at("segmentation_std").get<std::array<float, 3>>();
-  ImageReader reader(pending, work, &fusion);
+  ImageReader reader(pending, work, &fusion, grounding_size);
   AsyncWriter writer;
   for (const auto& record : pending) {
     auto phase = Clock::now();
@@ -481,6 +583,13 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
       fusion_gpu.Add(output, view);
     }
     auto mask = fusion_gpu.Finish();
+    if (grounding) {
+      pixels.Upload(image.grounding);
+      const auto outputs = models.Predict(
+          "grounding", {pixels.Normalize(grounding_size, grounding_size, {.5f, .5f, .5f},
+                                         {.5f, .5f, .5f})});
+      mask.setTo(0, GroundingMask(outputs, mask.cols, mask.rows, counts));
+    }
     timing.gpu_pipeline += Seconds(phase);
     const auto path = MaskPath(work, record.id);
     writer.Submit([path, mask = std::move(mask)] {
@@ -494,7 +603,15 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
   }
   writer.Finish();
   timing.write = writer.seconds;
-  return timing.Report(started, &models);
+  auto report = timing.Report(started, &models);
+  if (grounding)
+    report["grounding"] = {{"score_threshold", kGroundingScore},
+                           {"shadow_reach_cells", kShadowReach},
+                           {"persons", counts.persons},
+                           {"persons_kept_as_robots", counts.robots},
+                           {"shadows", counts.shadows},
+                           {"shadows_far_from_persons", counts.distant_shadows}};
+  return report;
 }
 Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root) {
   const auto started = Clock::now();

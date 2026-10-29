@@ -10,3 +10,5 @@
 *.user
 /packages/
 /models-ampere-plus/
+/models-v4/
+/models-v4.pending/

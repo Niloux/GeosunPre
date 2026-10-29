@@ -1,0 +1,4 @@
+# Installed without dependencies: only the SAM3 model code is used, and the full ultralytics
+# dependency set would replace opencv-python-headless and other pinned packages.
+ultralytics==8.4.192
+clip @ git+https://github.com/ultralytics/CLIP.git@7ffa84b3bfa40c42ecc1c77147a855e69cb2dd40

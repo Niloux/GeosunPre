@@ -10,15 +10,15 @@
 .\prepare-models.ps1
 ```
 
-默认向 `models/` 准备五个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）为 FP16，输入为 644×644 方形透视图、固定 2116 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。`run.ps1` 默认使用这个目录；交付打包默认使用 `models-ampere-plus/`，见 README。
+默认向 `models/` 准备五个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）为 FP16，输入为 644×644 方形透视图、固定 2116 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。传入 `-Sam3 sam3.pt`（[facebook/sam3](https://huggingface.co/facebook/sam3) 检查点，Hugging Face 需登录申请，按 SHA256 校验）时另建 grounding 引擎，包为 version=4，见下文。`run.ps1` 默认使用这个目录；交付打包默认使用 `models-ampere-plus/`，见 README。
 
 首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。同 GPU 上更换照片分辨率、横竖方向或宽高比不需要重建模型。更换 GPU、模型协议或精度时需指定新的输出目录。
 
 ## 模型接口
 
-manifest.json：version=3、tensorrt=`10.13.3.9`、gpu、hardware_compatibility、matcher_precision、matcher_score_precision、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、segmentation_mean、segmentation_std、geometry_size=644、geometry_tokens=2116、geometry_source（MoGe 提交、模型名与 revision）、models。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`。matcher_score_precision 记录最终评分精度，默认 FP16 主干搭配 FP32 评分；旧清单缺少该字段时按 matcher_precision 解析。hardware_compatibility 为 `none` 或 `ampere_plus`，缺少时按 `none` 解析；gpu 始终记录构建 GPU。
+manifest.json：version=3、tensorrt=`10.13.3.9`、gpu、hardware_compatibility、matcher_precision、matcher_score_precision、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、segmentation_mean、segmentation_std、geometry_size=644、geometry_tokens=2116、geometry_source（MoGe 提交、模型名与 revision）、models；version=4 另含 grounding_size=1008、grounding_mask_size=288、grounding_prompts=`["person","shadow","robot"]`、grounding_top_k=20、grounding_source（模型名、检查点 SHA256、导出所用 ultralytics 版本）。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`。matcher_score_precision 记录最终评分精度，默认 FP16 主干搭配 FP32 评分；旧清单缺少该字段时按 matcher_precision 解析。hardware_compatibility 为 `none` 或 `ampere_plus`，缺少时按 `none` 解析；gpu 始终记录构建 GPU。
 
-detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max=[1536,1536]`。opt 只用于 TensorRT 编译优化，不限制原图尺寸。运行端仍兼容 version=1 的固定尺寸包，但该包继续受 detector_size 限制。version=1/2 的包没有 geometry 引擎，可继续用于重建和 LAS 监督。
+detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max=[1536,1536]`。opt 只用于 TensorRT 编译优化，不限制原图尺寸。运行端仍兼容 version=1 的固定尺寸包，但该包继续受 detector_size 限制。version=1/2 的包没有 geometry 引擎，可继续用于重建和 LAS 监督；version=3 及以下没有 grounding 引擎，掩码中的人物仍由 segmentation 决定。
 
 | 引擎 | 输入 | 输出 |
 | --- | --- | --- |
@@ -27,6 +27,9 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 | matcher | ka/kb float32 `[1,3072,2]`；da/db `[1,3072,256]`；mask_a/mask_b float32 `[1,3072]` | matches int32 `[1,3072]`；confidence float32 `[1,3072]` |
 | segmentation | image float32 `[1,3,512,512]`，RGB/255 后按 mean/std 归一化 | probabilities float32 `[1,2,512,512]`，天空/人物 |
 | geometry | image float32 `[1,3,644,644]` RGB/255 | points float32 `[1,644,644,3]`；normal `[1,644,644,3]`；mask `[1,644,644]`；metric_scale `[1]` |
+| grounding | image float32 `[1,3,1008,1008]`，整幅照片拉伸缩放，RGB/127.5−1 | scores float32 `[3,20]`；boxes `[3,20,4]`；masks `[3,20,288,288]`；semantic `[3,1,288,288]` |
+
+grounding 为 SAM3 概念检测，三个提示 person、shadow、robot 的文本特征在导出时算好并固化进图，不含文本编码器；改提示须重新导出并使用新模型目录。每个提示输出按联合分数（查询分数乘存在分数）降序的前 20 个查询：分数、归一化 cxcywh 框、实例掩码 logits 及该提示的语义 logits。ViT 的复数旋转位置编码导出为等价的实数 cos/sin 形式，导出前在随机输入上与原实现比对。TensorRT 构建工作区为 12 GiB；FP16 下注意力打分会超出半精度范围（PyTorch FP16 的注意力在 FP32 中累加，因此不受影响），故每个 Softmax 及其输入链直到打分矩阵乘保留 FP32，其余可用 FP16。
 
 检测最长边缩放到 1536，各边向下取 8 的倍数；3000×4000 输入对应 W=1152、H=1536，4000×3000 对应 W=1536、H=1152，1920×1080 对应 W=1536、H=864，均使用同一引擎。范围约束作用于缩放后的检测输入，原图无需限制为这些尺寸；短边缩放后小于 16 时明确报错。原图与 `.pro` 标定尺寸仍须一致。
 
@@ -43,6 +46,7 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 - [DINOv2](https://github.com/facebookresearch/dinov2)：ViT-L/14。
 - [SegFormer B2 ADE20K](https://huggingface.co/nvidia/segformer-b2-finetuned-ade-512-512)：revision `de01bae28967510f9ddd496c60a969357195400c`。
 - [MoGe](https://github.com/microsoft/MoGe/tree/74fbce054ebed49800de42d0ad0e83495065719a) 源码与 [MoGe-2 ViT-L normal](https://huggingface.co/Ruicheng/moge-2-vitl-normal)：revision `cb0e8bbd6b1e243589717c78e750b1ba4c093acf`，均为 MIT 许可。
+- [SAM3](https://huggingface.co/facebook/sam3)：`sam3.pt`，SHA256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`，SAM License；模型代码取自 ultralytics 8.4.192 及其 CLIP 分词器（固定提交），两者不带依赖安装，只用于导出。
 
 导出和 ONNX→TensorRT 编译是独立资源准备，由根目录 `prepare-models.ps1` 完成。引擎针对构建 GPU，更换 GPU 时重新构建，不默认承诺跨型号兼容。
 
@@ -55,7 +59,7 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 .\prepare-models.ps1 -Models models/other-gpu -OnnxFrom packages/onnx-bundle-v1
 ```
 
-`-OnnxBundle` 总是从固定权重重新导出，不接受 `-Models`、`-OnnxFrom`、`-MatcherPrecision`；输出目录已存在时报错。包内含 `onnx/` 五个单文件 ONNX、`references/` 导出时的 PyTorch 输入输出、`images/` 两张验证照片及 `onnx-bundle.json`（version=2、来源版本、检测器范围、max_features、geometry 输入尺寸与 token 数及全部文件 SHA256）。version=1 的四模型发布包仍可作为 `-OnnxFrom`，geometry 由固定 MoGe 权重导出，原包保持只读。导出同样经 `.pending` 目录校验后发布。
+`-OnnxBundle` 总是从固定权重重新导出，不接受 `-Models`、`-OnnxFrom`、`-Sam3`、`-MatcherPrecision`；发布包只含五个基础模型，grounding 在目标机器上由 `-Sam3` 导出；输出目录已存在时报错。包内含 `onnx/` 五个单文件 ONNX、`references/` 导出时的 PyTorch 输入输出、`images/` 两张验证照片及 `onnx-bundle.json`（version=2、来源版本、检测器范围、max_features、geometry 输入尺寸与 token 数及全部文件 SHA256）。version=1 的四模型发布包仍可作为 `-OnnxFrom`，geometry 由固定 MoGe 权重导出，原包保持只读。导出同样经 `.pending` 目录校验后发布。
 
 `-OnnxFrom` 指向发布包时先校验清单与全部 SHA256，默认用包内照片验证，并用包内参考数据完成 PyTorch/TensorRT 逐模型比较，门限与首次导出相同。构建仍需项目内 Python、PyTorch 与 TensorRT 环境，但不需要原始权重。
 
@@ -74,6 +78,7 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 - `-HardwareCompatibility`：`none`（默认）或 `ampere_plus`。`none` 引擎只用于构建 GPU 同型号；`ampere_plus` 使用 TensorRT AMPERE_PLUS 兼容级别，一套引擎可在任意算力 ≥ 8.0 的 GPU（RTX 30/40/50、A 系列等）上运行，代价是部分优化策略不可用。构建 GPU 本身须算力 ≥ 8.0。修改级别时使用新目录，并在真实场景比较耗时与几何质量。
 - `-MatcherPrecision`：`fp16`（默认）、`fp32` 或 `tf32`，用于显式调整匹配引擎的计算精度。TF32 允许 Tensor Core 矩阵乘法。模型清单保存该选择；未声明 `matcher_precision` 的清单按 FP32 解析。修改精度时使用新目录，并用真实场景检查最终几何质量。
 - version=2 的四模型包升级到 version=3 时使用新目录，例如 `-Models models-v3 -OnnxFrom models`：复用四个 ONNX 与引擎，只导出并构建 geometry。
+- `-Sam3`：SAM3 检查点路径，加入 grounding 引擎，生成 version=4 包。由 version=3 包升级时使用新目录，例如 `-Models models-v4 -OnnxFrom models -Sam3 sam3.pt`：复用五个 ONNX 与引擎，只导出并构建 grounding（ONNX 约 1.9 GB）。grounding 在两张验证照片上比较 PyTorch FP32 与 TensorRT：全部查询分数差 < 0.05，PyTorch 分数 > 0.3 的每个检测与引擎同提示最接近掩码的 IoU ≥ 0.95；验证照片应含人物或影子，例如 `-Images` 指定两张展厅照片。真实推理另检查形状、分数范围与降序、框归一化。
 - 当 `-OnnxFrom` 指向同 GPU、TensorRT 版本的完整模型包时，复用未改变接口和精度且清单及校验通过的引擎；升级固定尺寸包只需重建 detector，切换匹配精度只需重建 matcher。
 - 旧 FP16 模型未保留最终评分的 FP32 精度时，使用新目录和 `-OnnxFrom` 升级；复用 ONNX 和其他引擎，只重建 matcher。置信度仍按原有相对误差 `<0.005` 验收，不放宽门限。
 - `-Images`：两张真实验证照片；默认使用固定 LoMa 源码包中的 `0015_A.jpg` / `0015_B.jpg`。验证包括检测器动态宽高及边界、四模型有限输出及形状、描述子数量 32 / 127 / 3072、匹配有效数量不等、补零值变化不影响有效结果、同图匹配和语义概率范围。新导出的检测图在横图、竖图、方图及短边边界上比较 PyTorch 与 TensorRT 输出。geometry 在两张照片上比较 PyTorch FP32 与 TensorRT：PyTorch 掩码有效处对数深度差 p99 < 0.01、法向夹角 p99 < 1°、掩码差 p99 < 0.05、metric_scale 相对差 < 0.5%；真实推理还检查有效掩码过半、有效深度为正、法向为单位长度。
@@ -88,4 +93,4 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 
 新模型在同级 `目录.pending/` 中准备，通过验证且 Python 进程退出后，由 PowerShell 改名为目标目录，避免进程中的 Windows 文件占用阻止发布。中断后相同请求复用已完成的 ONNX 和引擎；已有完整清单的 `.pending` 包重新校验后直接发布。参数或导出脚本变化时拒绝混用未完成目录。保留原始权重、已有模型和运行成果。新目录包含清单、`engines/`、`runtime/`、`onnx/` 与 `preparation.json`；打包仅携带运行资源。
 
-DaD 的 ImageNet 归一化留在检测图内；描述图不增加归一化，并固定 784×784 对应的 DINO 位置编码。匹配图在自注意力、交叉注意力和双 softmax 中屏蔽补齐项。检测、描述与分割引擎允许 FP16 内部计算，匹配引擎精度由准备参数确定；所有浮点输入输出保持 float32。原生 `check-models --models MODELS --image FILE` 依次运行四模型，检查形状、有限值、同图匹配与语义概率；version=3 包再运行 geometry，检查形状、有限值、掩码范围、单位法向、有效深度为正且有效掩码过半。运行时明确拒绝与当前 GPU 型号不匹配的 `none` 模型包，以及算力低于 8.0 的 GPU 加载 `ampere_plus` 模型包。
+DaD 的 ImageNet 归一化留在检测图内；描述图不增加归一化，并固定 784×784 对应的 DINO 位置编码。匹配图在自注意力、交叉注意力和双 softmax 中屏蔽补齐项。检测、描述与分割引擎允许 FP16 内部计算，匹配引擎精度由准备参数确定；所有浮点输入输出保持 float32。原生 `check-models --models MODELS --image FILE` 依次运行四模型，检查形状、有限值、同图匹配与语义概率；version=3 包再运行 geometry，检查形状、有限值、掩码范围、单位法向、有效深度为正且有效掩码过半；version=4 包再运行 grounding，检查形状、有限值、分数范围与降序，并报告各提示分数 ≥ 0.5 的检测数。运行时明确拒绝与当前 GPU 型号不匹配的 `none` 模型包，以及算力低于 8.0 的 GPU 加载 `ampere_plus` 模型包。

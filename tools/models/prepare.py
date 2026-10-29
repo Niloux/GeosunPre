@@ -15,9 +15,11 @@ import torch
 import onnx
 import tensorrt as trt
 
-from resources import (CACHE, GEOMETRY_REVISION, LOMA_COMMIT, MOGE_COMMIT, SEGMENTATION_REVISION, geometry_weights,
-                       loma_source, moge_source, segmentation_source, sha256, torch_weights)
-from networks import Detector, Descriptor, Geometry, Matcher, Segmentation, fix_descriptor_positions, fix_geometry_positions
+from resources import (CACHE, GEOMETRY_REVISION, GROUNDING_SHA256, LOMA_COMMIT, MOGE_COMMIT, SEGMENTATION_REVISION,
+                       geometry_weights, grounding_weights, loma_source, moge_source, segmentation_source, sha256,
+                       torch_weights)
+from networks import (Detector, Descriptor, Geometry, Grounding, Matcher, Segmentation, fix_descriptor_positions,
+                      fix_geometry_positions, real_rotary)
 
 TRT_VERSION = '10.13.3.9'
 MAX_FEATURES = 3072
@@ -27,6 +29,11 @@ DETECTOR_CHECK_SIZES = ((1152, 1536), (1536, 1152), (1536, 864), (1000, 1536),
 # MoGe-2 runs on square pinhole faces: 46x46 ViT tokens, inside the suggested 1200-2500.
 GEOMETRY_SIZE = 644
 GEOMETRY_TOKENS = 2116
+# SAM3 runs on the whole photo stretched to its native square input; prompts are baked in.
+GROUNDING_SIZE = 1008
+GROUNDING_MASK_SIZE = 288
+GROUNDING_PROMPTS = ['person', 'shadow', 'robot']
+GROUNDING_TOP_K = 20
 LOGGER = trt.Logger(trt.Logger.WARNING)
 CONTRACTS = {
     'detector': (['image'], ['logits']),
@@ -34,13 +41,17 @@ CONTRACTS = {
     'matcher': (['ka', 'kb', 'da', 'db', 'mask_a', 'mask_b'], ['matches', 'confidence']),
     'segmentation': (['image'], ['probabilities']),
     'geometry': (['image'], ['points', 'normal', 'mask', 'metric_scale']),
+    'grounding': (['image'], ['scores', 'boxes', 'masks', 'semantic']),
 }
+# Version 3 packages hold the first five models; version 4 adds the optional SAM3 grounding model.
+BASE_MODELS = [name for name in CONTRACTS if name != 'grounding']
 # Version 1 ONNX bundles predate the geometry model; it is exported from the pinned weights.
-BUNDLE_MODELS = {1: [name for name in CONTRACTS if name != 'geometry'], 2: list(CONTRACTS)}
+BUNDLE_MODELS = {1: [name for name in BASE_MODELS if name != 'geometry'], 2: BASE_MODELS}
 BUNDLE = 'onnx-bundle.json'
+RECIPE_FILES = ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt', 'requirements-nodeps.txt')
 # Hardware compatibility trades some tactics for one engine set on every Ampere+ GPU.
 HARDWARE_LEVELS = {'none': None, 'ampere_plus': (8, 0)}
-REFERENCES = [f'{name}.npz' for name in CONTRACTS] + [
+REFERENCES = [f'{name}.npz' for name in BASE_MODELS] + [
     f'detector_{width}x{height}.npz' for width, height in DETECTOR_CHECK_SIZES] + ['geometry_B.npz']
 
 
@@ -122,6 +133,31 @@ def load_geometry():
     return Geometry(model, GEOMETRY_TOKENS)
 
 
+def load_grounding(weights):
+    """SAM3 with baked prompt embeddings and the real-valued rotary encoding used for export."""
+    from ultralytics.models.sam.build_sam3 import build_sam3_image_model
+    import ultralytics.models.sam.sam3.vitdet as vitdet
+    model = build_sam3_image_model(str(weights)).float().eval().cuda().requires_grad_(False)
+    with torch.no_grad():
+        model.set_classes(GROUNDING_PROMPTS)
+    module = Grounding(model, GROUNDING_PROMPTS, GROUNDING_TOP_K).cuda().eval()
+    generator = torch.Generator('cuda').manual_seed(0)
+    image = torch.rand((1, 3, GROUNDING_SIZE, GROUNDING_SIZE), device='cuda', generator=generator) * 2 - 1
+    with torch.no_grad():
+        upstream = module(image)
+        vitdet.apply_rotary_enc = real_rotary
+        exported = module(image)
+    # Mask logits are unbounded; scores and boxes carry the detections.
+    for before, after, tolerance in zip(upstream, exported, (1e-4, 1e-3, .5, .5)):
+        if before.shape != after.shape or (before - after).abs().max() > tolerance:
+            raise RuntimeError('Real-valued rotary encoding differs from upstream SAM3 inference')
+    return module
+
+
+def grounding_tensor(path):
+    return image_tensor(path, GROUNDING_SIZE, GROUNDING_SIZE) * 2 - 1
+
+
 def detector_size(width, height):
     size = [value * 1536 // max(width, height) // 8 * 8 for value in (width, height)]
     if min(size) < 16:
@@ -138,6 +174,7 @@ def expected_shapes():
                     [1, MAX_FEATURES], [1, MAX_FEATURES]],
         'segmentation': [[1, 3, 512, 512]],
         'geometry': [[1, 3, GEOMETRY_SIZE, GEOMETRY_SIZE]],
+        'grounding': [[1, 3, GROUNDING_SIZE, GROUNDING_SIZE]],
     }
 
 
@@ -183,15 +220,18 @@ def export_graph(name, module, inputs, directory, shapes, references):
     dynamic = {'keypoints': {1: 'N'}, 'descriptors': {1: 'N'}} if name == 'descriptor' else None
     if name == 'detector':
         dynamic = {'image': {2: 'H', 3: 'W'}, 'logits': {2: 'H', 3: 'W'}}
-    with torch.inference_mode():
+    # SAM3 keeps position tables on the CPU, which PyTorch constant folding cannot mix with CUDA
+    # weights; TensorRT folds the constants instead.
+    grounding = name == 'grounding'
+    with torch.no_grad() if grounding else torch.inference_mode():
         expected = module(*inputs)
         expected = expected if isinstance(expected, tuple) else (expected,)
         reference = {f'input{i}': value.cpu().numpy() for i, value in enumerate(inputs)}
         reference.update({f'output{i}': value.cpu().numpy() for i, value in enumerate(expected)})
         np.savez(references / f'{name}.npz', **reference)
-        torch.onnx.export(module.eval(), inputs, str(temporary), opset_version=17,
+        torch.onnx.export(module.eval(), inputs, str(temporary), opset_version=18 if grounding else 17,
                           input_names=CONTRACTS[name][0], output_names=CONTRACTS[name][1],
-                          dynamic_axes=dynamic, dynamo=False)
+                          dynamic_axes=dynamic, dynamo=False, do_constant_folding=not grounding)
     check_onnx(temporary, name, shapes)
     # Reject incompatible exports before spending time tuning any engines.
     parsed = parse_network(temporary)
@@ -199,8 +239,8 @@ def export_graph(name, module, inputs, directory, shapes, references):
     temporary.replace(path)
 
 
-def export_models(directory, shapes, source, images, references):
-    required = [name for name in CONTRACTS if not (directory / f'{name}.onnx').is_file()]
+def export_models(directory, names, shapes, source, images, references, sam3=None):
+    required = [name for name in names if not (directory / f'{name}.onnx').is_file()]
     if any(name in ('detector', 'descriptor', 'matcher') for name in required):
         if source is None:
             source = loma_source()
@@ -256,6 +296,51 @@ def export_models(directory, shapes, source, images, references):
         del module, pixels
         gc.collect()
         torch.cuda.empty_cache()
+    if 'grounding' in required:
+        module = load_grounding(grounding_weights(sam3))
+        export_graph('grounding', module, (grounding_tensor(images[0]),), directory, shapes['grounding'], references)
+        with torch.no_grad():
+            pixels = grounding_tensor(images[1])
+            np.savez(references / 'grounding_B.npz', input0=pixels.cpu().numpy(),
+                     **{f'output{i}': value.cpu().numpy() for i, value in enumerate(module(pixels))})
+        del module, pixels
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def pin_attention_logits(network):
+    """Keep every softmax and the layers producing its input, back to the score matmul, in FP32.
+
+    SAM3 attention logits leave the FP16 range inside TensorRT although PyTorch FP16 inference
+    (FP32 attention accumulation) is fine."""
+    producer = {}
+    for index in range(network.num_layers):
+        layer = network.get_layer(index)
+        for i in range(layer.num_outputs):
+            producer[layer.get_output(i).name] = layer
+    pinned = {}
+    for index in range(network.num_layers):
+        layer = network.get_layer(index)
+        if layer.type != trt.LayerType.SOFTMAX:
+            continue
+        stack = [(layer, 0)]
+        while stack:
+            current, depth = stack.pop()
+            pinned[current.name] = current
+            if current.type == trt.LayerType.MATRIX_MULTIPLY or depth >= 6:
+                continue
+            for i in range(current.num_inputs):
+                tensor = current.get_input(i)
+                if tensor is not None and tensor.name in producer and producer[tensor.name].type != trt.LayerType.CONSTANT:
+                    stack.append((producer[tensor.name], depth + 1))
+    if not pinned:
+        raise RuntimeError('Grounding ONNX has no attention softmax')
+    for layer in pinned.values():
+        floating = [i for i in range(layer.num_outputs) if layer.get_output(i).dtype == trt.float32]
+        if floating:
+            layer.precision = trt.float32
+            for output in floating:
+                layer.set_output_type(output, trt.float32)
 
 
 def build_engine(path, name, shapes, matcher_precision='fp16', hardware='none'):
@@ -266,7 +351,8 @@ def build_engine(path, name, shapes, matcher_precision='fp16', hardware='none'):
     onnx_path = path.parent.parent / 'onnx' / f'{name}.onnx'
     builder, network, parser = parse_network(onnx_path)
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 << 30)
+    # One fused SAM3 attention block needs about 5.3 GB of scratch memory.
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, (12 if name == 'grounding' else 2) << 30)
     if name != 'matcher':
         config.set_flag(trt.BuilderFlag.FP16)
     config.clear_flag(trt.BuilderFlag.TF32)
@@ -295,6 +381,9 @@ def build_engine(path, name, shapes, matcher_precision='fp16', hardware='none'):
                     layer.set_output_type(output, trt.float32)
         if not scoring:
             raise RuntimeError('FP16 matcher ONNX is missing the final scoring projection')
+    if name == 'grounding':
+        config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+        pin_attention_logits(network)
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
     if hardware == 'ampere_plus':
         config.hardware_compatibility_level = trt.HardwareCompatibilityLevel.AMPERE_PLUS
@@ -378,8 +467,23 @@ def geometry_errors(expected, actual):
             'scale': float(((actual[3] - expected[3]).abs() / expected[3]).max())}
 
 
+def grounding_errors(expected, actual):
+    """Score error over all queries and the mask IoU of every reference detection above 0.3.
+
+    Near-tied queries may swap their top-k order, so each reference mask is matched to the best
+    engine mask of the same prompt."""
+    error = float((expected[0] - actual[0]).abs().max())
+    iou = 1.
+    for prompt, query in (expected[0] > .3).nonzero().tolist():
+        reference = expected[2][prompt, query] > 0
+        engine = actual[2][prompt] > 0
+        overlap = (reference & engine).flatten(1).sum(1) / (reference | engine).flatten(1).sum(1).clamp_min(1)
+        iou = min(iou, float(overlap.max()))
+    return {'score_max': error, 'mask_iou_min': iou, 'detections': int((expected[0] > .3).sum())}
+
+
 def compare_reference(root, name, shapes, references):
-    if name in ('detector', 'geometry'):
+    if name in ('detector', 'geometry', 'grounding'):
         paths = sorted(references.glob(f'{name}*.npz'))
     else:
         paths = [references / f'{name}.npz']
@@ -399,6 +503,16 @@ def compare_reference(root, name, shapes, references):
                 limits = {'log_depth_p99': .01, 'normal_degrees_p99': 1., 'mask_p99': .05, 'scale': .005}
                 if any(errors[key] >= limit for key, limit in limits.items()):
                     raise RuntimeError(f'TensorRT geometry differs from PyTorch: {path.stem}: {errors}')
+                print(f'PyTorch/TensorRT comparison: {path.stem}: ' +
+                      ', '.join(f'{key}={value:.6g}' for key, value in errors.items()), flush=True)
+                continue
+            if name == 'grounding':
+                expected = [torch.from_numpy(example[f'output{i}']).cuda() for i in range(len(outputs))]
+                if [value.shape for value in expected] != [value.shape for value in outputs]:
+                    raise RuntimeError(f'Engine output differs from the export reference: {path.stem}')
+                errors = grounding_errors(expected, outputs)
+                if errors['score_max'] >= .05 or errors['mask_iou_min'] < .95:
+                    raise RuntimeError(f'TensorRT grounding differs from PyTorch: {path.stem}: {errors}')
                 print(f'PyTorch/TensorRT comparison: {path.stem}: ' +
                       ', '.join(f'{key}={value:.6g}' for key, value in errors.items()), flush=True)
                 continue
@@ -428,7 +542,7 @@ def installed_runtime():
 def verify(root, shapes, images):
     if sha256(root / 'runtime' / 'nvinfer_10.dll') != sha256(installed_runtime()):
         raise RuntimeError('Packaged runtime differs from the pinned TensorRT DLL')
-    print('Verify all five engines with real images, dynamic counts and padding...', flush=True)
+    print('Verify all engines with real images, dynamic counts and padding...', flush=True)
     with torch.inference_mode():
         detector = Engine(root, 'detector', shapes['detector'])
         points = []
@@ -501,7 +615,22 @@ def verify(root, shapes, images):
                 raise RuntimeError('Geometry output is not a valid point map')
             if ((normal.norm(dim=-1) - 1).abs() > 1e-3).any() or (mask < 0).any() or (mask > 1).any():
                 raise RuntimeError('Geometry normals or mask are out of range')
-    print(f'Verified: five engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}; geometry point maps', flush=True)
+        del geometry
+        if not (root / 'engines' / 'grounding.engine').is_file():
+            print(f'Verified: five engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}; geometry point maps', flush=True)
+            return
+        grounding = Engine(root, 'grounding', shapes['grounding'])
+        prompts, k, size = len(GROUNDING_PROMPTS), GROUNDING_TOP_K, GROUNDING_MASK_SIZE
+        for path in images:
+            scores, boxes, masks, semantic = grounding(grounding_tensor(path))
+            if (tuple(scores.shape) != (prompts, k) or tuple(boxes.shape) != (prompts, k, 4) or
+                    tuple(masks.shape) != (prompts, k, size, size) or tuple(semantic.shape) != (prompts, 1, size, size)):
+                raise RuntimeError('Grounding output contract differs')
+            if (scores < 0).any() or (scores > 1).any() or (scores[:, 1:] > scores[:, :-1]).any():
+                raise RuntimeError('Grounding scores are out of range or unsorted')
+            if (boxes < 0).any() or (boxes > 1).any():
+                raise RuntimeError('Grounding boxes are not normalized')
+    print(f'Verified: six engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}; geometry point maps; grounding detections', flush=True)
 
 
 def matcher_precisions(manifest):
@@ -520,13 +649,22 @@ def same_target(manifest, settings):
     return settings['hardware_compatibility'] != 'none' or manifest.get('gpu') == settings['gpu']
 
 
+def package_models(settings):
+    return BASE_MODELS + (['grounding'] if settings['grounding'] else [])
+
+
 def verify_package(root, settings, shapes, images):
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
-    if manifest.get('version') != 3 or not same_target(manifest, settings) or manifest.get('detector_profile') != settings['detector_profile']:
+    names = package_models(settings)
+    version = 4 if settings['grounding'] else 3
+    if manifest.get('version') != version or not same_target(manifest, settings) or manifest.get('detector_profile') != settings['detector_profile']:
         raise RuntimeError('Existing model GPU/hardware level/version/profile differs. Choose a new -Models directory; use -OnnxFrom to upgrade a static package.')
     if matcher_precisions(manifest) != matcher_precisions(settings):
         raise RuntimeError('Existing matcher calculation/scoring precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
-    for name, (inputs, outputs) in CONTRACTS.items():
+    if sorted(manifest['models']) != sorted(names):
+        raise RuntimeError('Existing model package holds different models. Choose a new -Models directory.')
+    for name in names:
+        inputs, outputs = CONTRACTS[name]
         spec = manifest['models'][name]
         if spec['inputs'] != inputs or spec['outputs'] != outputs or spec['shapes'] != shapes[name]:
             raise RuntimeError(f'Existing model manifest contract differs: {name}')
@@ -564,7 +702,7 @@ def export_bundle(root, shapes, source, images):
         read_bundle(pending)
         print(f'Reuse verified pending ONNX bundle: {pending}', flush=True)
         return
-    recipe = ''.join(sha256(Path(__file__).with_name(name)) for name in ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt'))
+    recipe = ''.join(sha256(Path(__file__).with_name(name)) for name in RECIPE_FILES)
     settings = {'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest(), 'images': [sha256(path) for path in images]}
     settings_path = pending / 'preparation.json'
     if pending.is_dir() and any(pending.iterdir()) and (not settings_path.is_file() or json.loads(settings_path.read_text(encoding='utf-8')) != settings):
@@ -572,17 +710,17 @@ def export_bundle(root, shapes, source, images):
     for directory in ('onnx', 'references', 'images'):
         (pending / directory).mkdir(parents=True, exist_ok=True)
     write_json(settings_path, settings)
-    export_models(pending / 'onnx', shapes, source, images, pending / 'references')
+    export_models(pending / 'onnx', BASE_MODELS, shapes, source, images, pending / 'references')
     missing = [name for name in REFERENCES if not (pending / 'references' / name).is_file()]
     if missing:
         raise RuntimeError(f'Unfinished ONNX bundle lacks PyTorch references {missing}. Choose a new -OnnxBundle directory.')
-    for name in CONTRACTS:
+    for name in BASE_MODELS:
         check_onnx(pending / 'onnx' / f'{name}.onnx', name, shapes[name])
     names = []
     for letter, path in zip('AB', images):
         names.append(f'images/{letter}{path.suffix.lower()}')
         shutil.copy2(path, pending / names[-1])
-    files = [f'onnx/{name}.onnx' for name in CONTRACTS] + [f'references/{name}' for name in REFERENCES] + names
+    files = [f'onnx/{name}.onnx' for name in BASE_MODELS] + [f'references/{name}' for name in REFERENCES] + names
     write_json(pending / BUNDLE, {
         'version': 2, 'recipe': settings['recipe'], 'loma_commit': LOMA_COMMIT,
         'segmentation_revision': SEGMENTATION_REVISION, 'moge_commit': MOGE_COMMIT,
@@ -604,9 +742,14 @@ def main():
                         help='TensorRT engine hardware compatibility (default: %(default)s)')
     parser.add_argument('--onnx-from', type=Path)
     parser.add_argument('--images', type=Path, nargs=2)
+    parser.add_argument('--sam3', type=Path, help='SAM3 checkpoint (facebook/sam3 sam3.pt); adds the grounding model')
     args = parser.parse_args()
     if bool(args.models) == bool(args.bundle) or (args.bundle and args.onnx_from):
         raise RuntimeError('Use either --models (optionally with --onnx-from) or --bundle')
+    if args.bundle and args.sam3:
+        raise RuntimeError('ONNX bundles hold the five base graphs; --sam3 needs --models')
+    if args.sam3:
+        args.sam3 = grounding_weights(args.sam3.resolve())
     if trt.__version__ != TRT_VERSION:
         raise RuntimeError(f'Requires TensorRT {TRT_VERSION}, found {trt.__version__}')
     if not torch.cuda.is_available():
@@ -624,13 +767,15 @@ def main():
     torch.backends.cuda.enable_cudnn_sdp(False)
     torch.backends.cuda.enable_math_sdp(True)
     shapes = expected_shapes()
-    recipe = ''.join(sha256(Path(__file__).with_name(name)) for name in ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt'))
+    recipe = ''.join(sha256(Path(__file__).with_name(name)) for name in RECIPE_FILES)
     settings = {'gpu': torch.cuda.get_device_name(0), 'tensorrt': TRT_VERSION,
                 'detector_profile': DETECTOR_PROFILE,
                 'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': 'fp32' if args.matcher_precision == 'fp16' else args.matcher_precision,
-                'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest()}
+                'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest(),
+                'grounding': GROUNDING_SHA256 if args.sam3 else None}
+    names = package_models(settings)
     reuse_manifest = bundle = None
     if args.onnx_from:
         origin = args.onnx_from.resolve()
@@ -639,8 +784,8 @@ def main():
         if (origin.parent / BUNDLE).is_file():
             bundle = read_bundle(origin.parent)
         # Packages and bundles from before the geometry model supply the other four graphs.
-        settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in CONTRACTS
-                                 if name != 'geometry' or (origin / f'{name}.onnx').is_file()}
+        settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in names
+                                 if name not in ('geometry', 'grounding') or (origin / f'{name}.onnx').is_file()}
         if (origin.parent / 'manifest.json').is_file():
             reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
     # A bundle carries its own validation images; no upstream source download is needed.
@@ -705,11 +850,11 @@ def main():
             elif sha256(destination) != settings['onnx_from'][name]:
                 raise RuntimeError(f'Unfinished ONNX differs from the requested source: {destination}')
             copied.add(name)
-    export_models(pending / 'onnx', shapes, source, images, references)
+    export_models(pending / 'onnx', names, shapes, source, images, references, args.sam3)
     # Reuse unchanged engines only from the complete package supplying these ONNX files.
     if reuse_manifest and not same_target(reuse_manifest, settings):
         reuse_manifest = None
-    for name in CONTRACTS:
+    for name in names:
         check_onnx(pending / 'onnx' / f'{name}.onnx', name, shapes[name])
         destination = pending / 'engines' / f'{name}.engine'
         same_precision = name != 'matcher' or matcher_precisions(reuse_manifest or {}) == matcher_precisions(settings)
@@ -729,10 +874,10 @@ def main():
         distribution = importlib.metadata.distribution(package)
         license_file = next(file for file in distribution.files if file.name.lower() in ('license.txt', 'license'))
         shutil.copy2(distribution.locate_file(license_file), pending / 'runtime' / name)
-    for name in CONTRACTS:
+    for name in names:
         compare_reference(pending, name, shapes, references)
     verify(pending, shapes, images)
-    manifest = {'version': 3, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
+    manifest = {'version': 4 if args.sam3 else 3, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
                 'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': settings['matcher_score_precision'],
@@ -742,9 +887,15 @@ def main():
                 'geometry_size': GEOMETRY_SIZE, 'geometry_tokens': GEOMETRY_TOKENS,
                 'geometry_source': {'moge_commit': MOGE_COMMIT, 'model': 'Ruicheng/moge-2-vitl-normal',
                                     'revision': GEOMETRY_REVISION},
-                'models': {name: {'inputs': names[0], 'outputs': names[1], 'shapes': shapes[name],
-                                 'sha256': sha256(pending / 'engines' / f'{name}.engine')}
-                           for name, names in CONTRACTS.items()}}
+                'models': {name: {'inputs': CONTRACTS[name][0], 'outputs': CONTRACTS[name][1],
+                                  'shapes': shapes[name],
+                                  'sha256': sha256(pending / 'engines' / f'{name}.engine')}
+                           for name in names}}
+    if args.sam3:
+        manifest.update({'grounding_size': GROUNDING_SIZE, 'grounding_mask_size': GROUNDING_MASK_SIZE,
+                         'grounding_prompts': GROUNDING_PROMPTS, 'grounding_top_k': GROUNDING_TOP_K,
+                         'grounding_source': {'model': 'facebook/sam3', 'checkpoint_sha256': GROUNDING_SHA256,
+                                              'ultralytics': importlib.metadata.version('ultralytics')}})
     write_json(pending / 'manifest.json', manifest)
     # Publish in PowerShell after this process releases any Windows file handles.
     print(f'Model package verified: {pending}', flush=True)

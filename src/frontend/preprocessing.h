@@ -22,8 +22,9 @@ class MaskFusion {
   std::unique_ptr<Implementation> impl_;
 
  public:
+  // persons=false leaves the segmentation person class static; grounding masks people instead.
   MaskFusion(const std::vector<MaskView>& views, const cv::Mat& weight, const cv::Mat& valid,
-             cudaStream_t stream);
+             cudaStream_t stream, bool persons = true);
   ~MaskFusion();
   void Begin();
   void Add(const Tensor& probabilities, size_t view);

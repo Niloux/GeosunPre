@@ -11,6 +11,8 @@ LOMA_COMMIT = '8fb59c458f2a2ef44314f462467b229c27786bf0'
 SEGMENTATION_REVISION = 'de01bae28967510f9ddd496c60a969357195400c'
 MOGE_COMMIT = '74fbce054ebed49800de42d0ad0e83495065719a'
 GEOMETRY_REVISION = 'cb0e8bbd6b1e243589717c78e750b1ba4c093acf'
+# facebook/sam3 is gated on Hugging Face, so the checkpoint is supplied as a local file.
+GROUNDING_SHA256 = '9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e'
 TORCH_RESOURCES = {
     'dad.pth': ('https://github.com/Parskatt/dad/releases/download/v0.1.0/dad.pth',
                 '7d827844649faf5213ba97e7adb43e16b936dd3d11ab2d0fc0d602c67fae781f'),
@@ -86,6 +88,16 @@ def geometry_weights():
     return resource(Path('huggingface/hub/models--Ruicheng--moge-2-vitl-normal/snapshots') / GEOMETRY_REVISION / 'model.pt',
                     f'https://huggingface.co/Ruicheng/moge-2-vitl-normal/resolve/{GEOMETRY_REVISION}/model.pt',
                     '280741fd09bc3f403ccff9967784c2a391b52d2c0742ae3efdb21d9f90cc1a01')
+
+
+def grounding_weights(path):
+    cached = CACHE / 'source' / 'sam3.pt'
+    path = Path(path) if path else cached
+    if not path.is_file():
+        raise RuntimeError('The grounding model needs the SAM3 checkpoint: pass -Sam3 sam3.pt (facebook/sam3)')
+    if sha256(path) != GROUNDING_SHA256:
+        raise RuntimeError(f'SAM3 checkpoint checksum differs: {path}')
+    return path
 
 
 def torch_weights():

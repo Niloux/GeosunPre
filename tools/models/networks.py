@@ -144,3 +144,44 @@ class Geometry(nn.Module):
     def forward(self, image):
         output = self.model(image, self.tokens)
         return tuple(output[key].float() for key in ('points', 'normal', 'mask', 'metric_scale'))
+
+
+def real_rotary(xq, xk, freqs_cis, repeat_freqs_k=False):
+    """Upstream rotary encoding on (real, imaginary) pairs; ONNX has no complex tensors."""
+    cos, sin = freqs_cis.real.to(xq.dtype), freqs_cis.imag.to(xq.dtype)
+
+    def rotate(x, c, s):
+        x = x.unflatten(-1, (-1, 2))
+        a, b = x[..., 0], x[..., 1]
+        return torch.stack([a * c - b * s, a * s + b * c], -1).flatten(-2)
+
+    if xk.shape[-2] == 0:
+        return rotate(xq, cos, sin), xk
+    c, s = cos, sin
+    if repeat_freqs_k and xk.shape[-2] != xq.shape[-2]:
+        r = xk.shape[-2] // xq.shape[-2]
+        c, s = c.repeat(*([1] * (c.ndim - 2)), r, 1), s.repeat(*([1] * (s.ndim - 2)), r, 1)
+    return rotate(xq, cos, sin), rotate(xk, c, s)
+
+
+class Grounding(nn.Module):
+    """SAM3 concept detection for fixed prompts whose text embeddings are baked into the graph.
+
+    Per prompt: the top-k joint scores (query score times presence), their normalized cxcywh
+    boxes and mask logits, and the semantic logits of the prompt."""
+    def __init__(self, model, prompts, top_k):
+        super().__init__()
+        self.model = model
+        self.top_k = top_k
+        self.register_buffer('text_ids', torch.arange(len(prompts)))
+
+    def forward(self, image):
+        features = self.model.backbone.forward_image(image)
+        features.pop('sam2_backbone_out', None)
+        out = self.model.forward_grounding(features, self.text_ids)
+        scores = out['pred_logits'].sigmoid().squeeze(-1) * out['presence_logit_dec'].sigmoid()
+        scores, index = scores.topk(self.top_k, dim=1)
+        boxes = out['pred_boxes'].gather(1, index[..., None].expand(-1, -1, 4))
+        masks = out['pred_masks']
+        masks = masks.gather(1, index[..., None, None].expand(-1, -1, *masks.shape[-2:]))
+        return scores.float(), boxes.float(), masks.float(), out['semantic_seg'].float()
