@@ -17,7 +17,7 @@
 | 步骤 | 默认行为 |
 | --- | --- |
 | `build.ps1` | 使用 Ninja 编译 Release 程序到 `build/ninja/bin/geosunpre.exe`，自动应用 Ceres Schur 回代修复 |
-| `prepare-models.ps1` | 为 GPU 0 准备 `models/`，匹配器默认 FP16，检测器支持动态宽高 |
+| `prepare-models.ps1` | 为 GPU 0 准备 `models/`（含 SAM3 grounding，首次需 `-Sam3 sam3.pt`），匹配器默认 FP16，检测器支持动态宽高 |
 | `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准、卷帘快门校正、独立稀疏点清理及 COLMAP/PLY、深度和法向监督导出；原图精修默认关闭 |
 
 构建统一使用单配置 Ninja Release。脚本自动加载 x64 MSVC 环境，优先使用 PATH 中的 Ninja，否则使用 Visual Studio 自带的 Ninja。首次构建下载固定依赖到 `build/ninja/_deps/` 并编译，此后复用缓存。日常构建只编译变化影响到的文件，CMake 文件变化由 Ninja 自动重新配置；修改 preset 后自动重新配置，也可用 `build.ps1 -Configure` 显式重新配置，`-Jobs` 控制并行数（默认 8）。构建版本与时间单独生成，不会使全部源码因时间变化而重编。
@@ -138,12 +138,11 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 ```text
 models/
   manifest.json
-  engines/{detector,descriptor,matcher,segmentation,geometry}.engine
-  engines/grounding.engine      仅 version=4（-Sam3）
+  engines/{detector,descriptor,matcher,segmentation,geometry,grounding}.engine
   runtime/nvinfer_10.dll
 ```
 
-匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32。原图按最长边 1536 缩放后送入动态检测器，横图、竖图及不同分辨率共用同一模型包。geometry 为 MoGe-2 ViT-L normal（FP16，644×644 透视子图），供默认的 MoGe 监督使用。模型准备后自动用真实照片验证动态宽高、五模型输出、动态描述子数量和匹配补零行为。输入范围、设备和精度参数见[模型文档](docs/models.md)。
+匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32。原图按最长边 1536 缩放后送入动态检测器，横图、竖图及不同分辨率共用同一模型包。geometry 为 MoGe-2 ViT-L normal（FP16，644×644 透视子图），供默认的 MoGe 监督使用；grounding 为 SAM3（FP16，1008×1008 整幅照片），供掩码阶段区分人物、影子与人形展品。模型准备后自动用真实照片验证动态宽高、六模型输出、动态描述子数量和匹配补零行为。输入范围、设备和精度参数见[模型文档](docs/models.md)。
 
 模型目录中完整且兼容的包会校验后复用。更换 GPU 或匹配精度时使用新模型目录，并用 `--models` 指定；更换图像分辨率不需要重建。已有固定尺寸包可执行 `.\prepare-models.ps1 -Models models/dynamic -OnnxFrom models`，只重建检测器，然后使用 `--models models/dynamic`。新生成的目录同时保留 ONNX 和准备元数据，模型资源不进入 Git。
 
@@ -161,7 +160,7 @@ models/
 .\package.ps1
 ```
 
-`package.ps1` 默认读取 `models-ampere-plus/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 及同名 `.zip`、`.zip.sha256`。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行五模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
+`package.ps1` 默认读取 `models-ampere-plus/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 及同名 `.zip`、`.zip.sha256`。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行六模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
 
 将 zip 复制到目标 Windows 机器解压，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
 

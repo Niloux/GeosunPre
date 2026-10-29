@@ -10,7 +10,7 @@
 .\prepare-models.ps1
 ```
 
-默认向 `models/` 准备五个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）为 FP16，输入为 644×644 方形透视图、固定 2116 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。传入 `-Sam3 sam3.pt`（[facebook/sam3](https://huggingface.co/facebook/sam3) 检查点，Hugging Face 需登录申请，按 SHA256 校验）时另建 grounding 引擎，包为 version=4，见下文。`run.ps1` 默认使用这个目录；交付打包默认使用 `models-ampere-plus/`，见 README。
+默认向 `models/` 准备六个引擎（version=4），检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）为 FP16，输入为 644×644 方形透视图、固定 2116 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。grounding（SAM3）为掩码阶段检测人物、影子和人形展品，见下文。SAM3 检查点 [facebook/sam3](https://huggingface.co/facebook/sam3) 在 Hugging Face 需登录申请，无法自动下载：首次准备传入 `-Sam3 sam3.pt`，按 SHA256 校验后复制到 `.cache/model-prepare/source/sam3.pt`，以后不再需要该参数。`-NoGrounding` 准备不含 grounding 的 version=3 包。`run.ps1` 默认使用这个目录；交付打包默认使用 `models-ampere-plus/`，见 README。
 
 首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。同 GPU 上更换照片分辨率、横竖方向或宽高比不需要重建模型。更换 GPU、模型协议或精度时需指定新的输出目录。
 
@@ -59,7 +59,7 @@ grounding 为 SAM3 概念检测，三个提示 person、shadow、robot 的文本
 .\prepare-models.ps1 -Models models/other-gpu -OnnxFrom packages/onnx-bundle-v1
 ```
 
-`-OnnxBundle` 总是从固定权重重新导出，不接受 `-Models`、`-OnnxFrom`、`-Sam3`、`-MatcherPrecision`；发布包只含五个基础模型，grounding 在目标机器上由 `-Sam3` 导出；输出目录已存在时报错。包内含 `onnx/` 五个单文件 ONNX、`references/` 导出时的 PyTorch 输入输出、`images/` 两张验证照片及 `onnx-bundle.json`（version=2、来源版本、检测器范围、max_features、geometry 输入尺寸与 token 数及全部文件 SHA256）。version=1 的四模型发布包仍可作为 `-OnnxFrom`，geometry 由固定 MoGe 权重导出，原包保持只读。导出同样经 `.pending` 目录校验后发布。
+`-OnnxBundle` 总是从固定权重重新导出，不接受 `-Models`、`-OnnxFrom`、`-Sam3`、`-MatcherPrecision`；发布包只含五个基础模型，以它为 `-OnnxFrom` 构建时 grounding 由目标机器缓存的 SAM3 检查点导出（或传 `-Sam3`）；输出目录已存在时报错。包内含 `onnx/` 五个单文件 ONNX、`references/` 导出时的 PyTorch 输入输出、`images/` 两张验证照片及 `onnx-bundle.json`（version=2、来源版本、检测器范围、max_features、geometry 输入尺寸与 token 数及全部文件 SHA256）。version=1 的四模型发布包仍可作为 `-OnnxFrom`，geometry 由固定 MoGe 权重导出，原包保持只读。导出同样经 `.pending` 目录校验后发布。
 
 `-OnnxFrom` 指向发布包时先校验清单与全部 SHA256，默认用包内照片验证，并用包内参考数据完成 PyTorch/TensorRT 逐模型比较，门限与首次导出相同。构建仍需项目内 Python、PyTorch 与 TensorRT 环境，但不需要原始权重。
 
@@ -78,7 +78,7 @@ grounding 为 SAM3 概念检测，三个提示 person、shadow、robot 的文本
 - `-HardwareCompatibility`：`none`（默认）或 `ampere_plus`。`none` 引擎只用于构建 GPU 同型号；`ampere_plus` 使用 TensorRT AMPERE_PLUS 兼容级别，一套引擎可在任意算力 ≥ 8.0 的 GPU（RTX 30/40/50、A 系列等）上运行，代价是部分优化策略不可用。构建 GPU 本身须算力 ≥ 8.0。修改级别时使用新目录，并在真实场景比较耗时与几何质量。
 - `-MatcherPrecision`：`fp16`（默认）、`fp32` 或 `tf32`，用于显式调整匹配引擎的计算精度。TF32 允许 Tensor Core 矩阵乘法。模型清单保存该选择；未声明 `matcher_precision` 的清单按 FP32 解析。修改精度时使用新目录，并用真实场景检查最终几何质量。
 - version=2 的四模型包升级到 version=3 时使用新目录，例如 `-Models models-v3 -OnnxFrom models`：复用四个 ONNX 与引擎，只导出并构建 geometry。
-- `-Sam3`：SAM3 检查点路径，加入 grounding 引擎，生成 version=4 包。由 version=3 包升级时使用新目录，例如 `-Models models-v4 -OnnxFrom models -Sam3 sam3.pt`：复用五个 ONNX 与引擎，只导出并构建 grounding（ONNX 约 1.9 GB）。grounding 在两张验证照片上比较 PyTorch FP32 与 TensorRT：全部查询分数差 < 0.05，PyTorch 分数 > 0.3 的每个检测与引擎同提示最接近掩码的 IoU ≥ 0.95；验证照片应含人物或影子，例如 `-Images` 指定两张展厅照片。真实推理另检查形状、分数范围与降序、框归一化。
+- `-Sam3`：SAM3 检查点路径，只在缓存中还没有时需要。`-NoGrounding`：不建 grounding，生成 version=3 包，与 `-Sam3` 冲突。由 version=3 包升级时使用新目录，例如 `-Models models-new -OnnxFrom models-v3`：复用五个 ONNX 与引擎，只导出并构建 grounding（ONNX 约 1.9 GB）。项目中原 version=3 包保留为 `models-v3/` 与 `models-ampere-plus-v3/`，记录它们的工作目录续跑时须 `--models` 指定原目录。grounding 在两张验证照片上比较 PyTorch FP32 与 TensorRT：全部查询分数差 < 0.05，PyTorch 分数 > 0.3 的每个检测与引擎同提示最接近掩码的 IoU ≥ 0.95；验证照片应含人物或影子，例如 `-Images` 指定两张展厅照片。真实推理另检查形状、分数范围与降序、框归一化。
 - 当 `-OnnxFrom` 指向同 GPU、TensorRT 版本的完整模型包时，复用未改变接口和精度且清单及校验通过的引擎；升级固定尺寸包只需重建 detector，切换匹配精度只需重建 matcher。
 - 旧 FP16 模型未保留最终评分的 FP32 精度时，使用新目录和 `-OnnxFrom` 升级；复用 ONNX 和其他引擎，只重建 matcher。置信度仍按原有相对误差 `<0.005` 验收，不放宽门限。
 - `-Images`：两张真实验证照片；默认使用固定 LoMa 源码包中的 `0015_A.jpg` / `0015_B.jpg`。验证包括检测器动态宽高及边界、四模型有限输出及形状、描述子数量 32 / 127 / 3072、匹配有效数量不等、补零值变化不影响有效结果、同图匹配和语义概率范围。新导出的检测图在横图、竖图、方图及短边边界上比较 PyTorch 与 TensorRT 输出。geometry 在两张照片上比较 PyTorch FP32 与 TensorRT：PyTorch 掩码有效处对数深度差 p99 < 0.01、法向夹角 p99 < 1°、掩码差 p99 < 0.05、metric_scale 相对差 < 0.5%；真实推理还检查有效掩码过半、有效深度为正、法向为单位长度。

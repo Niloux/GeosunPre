@@ -91,13 +91,23 @@ def geometry_weights():
 
 
 def grounding_weights(path):
+    """The pinned SAM3 checkpoint; a supplied file is copied into the source cache for later runs."""
     cached = CACHE / 'source' / 'sam3.pt'
-    path = Path(path) if path else cached
-    if not path.is_file():
-        raise RuntimeError('The grounding model needs the SAM3 checkpoint: pass -Sam3 sam3.pt (facebook/sam3)')
+    if cached.is_file():
+        if sha256(cached) != GROUNDING_SHA256:
+            raise RuntimeError(f'Source checksum differs: {cached}')
+        print(f'Reuse source: {cached.name}', flush=True)
+        return cached
+    if not path or not Path(path).is_file():
+        raise RuntimeError('Model packages include SAM3 grounding: pass -Sam3 sam3.pt (facebook/sam3, gated on '
+                           'Hugging Face) once, or -NoGrounding for a version 3 package')
     if sha256(path) != GROUNDING_SHA256:
         raise RuntimeError(f'SAM3 checkpoint checksum differs: {path}')
-    return path
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cached.with_name(cached.name + '.pending')
+    shutil.copyfile(path, temporary)
+    temporary.replace(cached)
+    return cached
 
 
 def torch_weights():

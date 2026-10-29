@@ -742,14 +742,15 @@ def main():
                         help='TensorRT engine hardware compatibility (default: %(default)s)')
     parser.add_argument('--onnx-from', type=Path)
     parser.add_argument('--images', type=Path, nargs=2)
-    parser.add_argument('--sam3', type=Path, help='SAM3 checkpoint (facebook/sam3 sam3.pt); adds the grounding model')
+    parser.add_argument('--sam3', type=Path, help='SAM3 checkpoint (facebook/sam3 sam3.pt), cached for later runs')
+    parser.add_argument('--no-grounding', action='store_true', help='prepare a version 3 package without SAM3')
     args = parser.parse_args()
     if bool(args.models) == bool(args.bundle) or (args.bundle and args.onnx_from):
         raise RuntimeError('Use either --models (optionally with --onnx-from) or --bundle')
-    if args.bundle and args.sam3:
-        raise RuntimeError('ONNX bundles hold the five base graphs; --sam3 needs --models')
-    if args.sam3:
-        args.sam3 = grounding_weights(args.sam3.resolve())
+    if (args.bundle or args.no_grounding) and args.sam3:
+        raise RuntimeError('--sam3 adds the grounding model; ONNX bundles and --no-grounding packages hold the five base graphs')
+    # Model packages include SAM3 grounding by default; bundles stay GPU- and checkpoint-independent.
+    args.sam3 = None if args.bundle or args.no_grounding else grounding_weights(args.sam3 and args.sam3.resolve())
     if trt.__version__ != TRT_VERSION:
         raise RuntimeError(f'Requires TensorRT {TRT_VERSION}, found {trt.__version__}')
     if not torch.cuda.is_available():
