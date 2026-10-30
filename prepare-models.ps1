@@ -6,14 +6,12 @@ param(
     [string]$OnnxFrom,
     [string]$OnnxBundle,
     [string[]]$Images,
-    [string]$Sam3,
-    [switch]$NoGrounding
+    [string]$Sam3
 )
 $ErrorActionPreference = 'Stop'
 if ($Images -and $Images.Count -ne 2) { throw '-Images requires two real image paths.' }
-if ($Sam3 -and $NoGrounding) { throw '-Sam3 adds the grounding model; it cannot be combined with -NoGrounding.' }
-if ($OnnxBundle -and ($Sam3 -or $NoGrounding -or $OnnxFrom -or $PSBoundParameters.ContainsKey('Models') -or $PSBoundParameters.ContainsKey('MatcherPrecision') -or $PSBoundParameters.ContainsKey('HardwareCompatibility'))) {
-    throw '-OnnxBundle exports GPU-independent ONNX only; it cannot be combined with -Models, -OnnxFrom, -Sam3, -NoGrounding, -MatcherPrecision or -HardwareCompatibility.'
+if ($OnnxBundle -and ($Sam3 -or $OnnxFrom -or $PSBoundParameters.ContainsKey('Models') -or $PSBoundParameters.ContainsKey('MatcherPrecision') -or $PSBoundParameters.ContainsKey('HardwareCompatibility'))) {
+    throw '-OnnxBundle exports GPU-independent ONNX only; it cannot be combined with -Models, -OnnxFrom, -Sam3, -MatcherPrecision or -HardwareCompatibility.'
 }
 
 function Invoke-Tool([string]$Program, [string[]]$Arguments) {
@@ -68,7 +66,6 @@ try {
     else { $arguments += @('--models', $modelRoot, '--matcher-precision', $MatcherPrecision, '--hardware-compatibility', $HardwareCompatibility) }
     if ($OnnxFrom) { $arguments += @('--onnx-from', $OnnxFrom) }
     if ($Sam3) { $arguments += @('--sam3', $Sam3) }
-    if ($NoGrounding) { $arguments += '--no-grounding' }
     if ($Images) {
         $arguments += @('--images') + $Images
     }

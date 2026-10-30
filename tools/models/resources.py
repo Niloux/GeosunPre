@@ -8,7 +8,6 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[2]
 CACHE = ROOT / '.cache' / 'model-prepare'
 LOMA_COMMIT = '8fb59c458f2a2ef44314f462467b229c27786bf0'
-SEGMENTATION_REVISION = 'de01bae28967510f9ddd496c60a969357195400c'
 MOGE_COMMIT = '74fbce054ebed49800de42d0ad0e83495065719a'
 GEOMETRY_REVISION = 'cb0e8bbd6b1e243589717c78e750b1ba4c093acf'
 # facebook/sam3 is gated on Hugging Face, so the checkpoint is supplied as a local file.
@@ -21,11 +20,6 @@ TORCH_RESOURCES = {
     'dinov2_vitl14_pretrain.pth': (
         'https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth',
         'd5383ea8f4877b2472eb973e0fd72d557c7da5d3611bd527ceeb1d7162cbf428'),
-}
-SEGMENTATION_HASHES = {
-    'config.json': 'ee7400840fdb1e5045f0b2eba78bf053df8e33a309c4acec31705a48c8cc5c00',
-    'preprocessor_config.json': '8039d1d210abaa7117ad78e58cdfd6141a2ec72c03dae891b3cd76737e422c6c',
-    'pytorch_model.bin': '187ca07bea003a5717c63d04ea90b07f33cd033c0ebf44b4b89fce5070d6c8f3',
 }
 
 
@@ -100,7 +94,7 @@ def grounding_weights(path):
         return cached
     if not path or not Path(path).is_file():
         raise RuntimeError('Model packages include SAM3 grounding: pass -Sam3 sam3.pt (facebook/sam3, gated on '
-                           'Hugging Face) once, or -NoGrounding for a version 3 package')
+                           'Hugging Face) once')
     if sha256(path) != GROUNDING_SHA256:
         raise RuntimeError(f'SAM3 checkpoint checksum differs: {path}')
     cached.parent.mkdir(parents=True, exist_ok=True)
@@ -113,19 +107,3 @@ def grounding_weights(path):
 def torch_weights():
     return {name: resource(Path('torch/hub/checkpoints') / name, url, digest)
             for name, (url, digest) in TORCH_RESOURCES.items()}
-
-
-def segmentation_source():
-    relative = Path('huggingface/hub/models--nvidia--segformer-b2-finetuned-ade-512-512/snapshots') / SEGMENTATION_REVISION
-    paths = [resource(relative / name,
-                      f'https://huggingface.co/nvidia/segformer-b2-finetuned-ade-512-512/resolve/{SEGMENTATION_REVISION}/{name}',
-                      digest) for name, digest in SEGMENTATION_HASHES.items()]
-    # A complete snapshot is required; mixed caches are copied into one local directory.
-    if len({path.parent for path in paths}) == 1:
-        return paths[0].parent
-    destination = CACHE / 'source' / relative
-    destination.mkdir(parents=True, exist_ok=True)
-    for path in paths:
-        if path.parent != destination:
-            shutil.copy2(path, destination / path.name)
-    return destination

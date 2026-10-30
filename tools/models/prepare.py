@@ -15,10 +15,9 @@ import torch
 import onnx
 import tensorrt as trt
 
-from resources import (CACHE, GEOMETRY_REVISION, GROUNDING_SHA256, LOMA_COMMIT, MOGE_COMMIT, SEGMENTATION_REVISION,
-                       geometry_weights, grounding_weights, loma_source, moge_source, segmentation_source, sha256,
-                       torch_weights)
-from networks import (Detector, Descriptor, Geometry, Grounding, Matcher, Segmentation, fix_descriptor_positions,
+from resources import (CACHE, GEOMETRY_REVISION, GROUNDING_SHA256, LOMA_COMMIT, MOGE_COMMIT, geometry_weights,
+                       grounding_weights, loma_source, moge_source, sha256, torch_weights)
+from networks import (Detector, Descriptor, Geometry, Grounding, Matcher, fix_descriptor_positions,
                       fix_geometry_positions, real_rotary)
 
 TRT_VERSION = '10.13.3.9'
@@ -32,21 +31,22 @@ GEOMETRY_TOKENS = 2116
 # SAM3 runs on the whole photo stretched to its native square input; prompts are baked in.
 GROUNDING_SIZE = 1008
 GROUNDING_MASK_SIZE = 288
-GROUNDING_PROMPTS = ['person', 'shadow', 'robot']
+GROUNDING_PROMPTS = ['person', 'shadow', 'robot', 'sky']
 GROUNDING_TOP_K = 20
 LOGGER = trt.Logger(trt.Logger.WARNING)
 CONTRACTS = {
     'detector': (['image'], ['logits']),
     'descriptor': (['image', 'keypoints'], ['descriptors']),
     'matcher': (['ka', 'kb', 'da', 'db', 'mask_a', 'mask_b'], ['matches', 'confidence']),
-    'segmentation': (['image'], ['probabilities']),
     'geometry': (['image'], ['points', 'normal', 'mask', 'metric_scale']),
     'grounding': (['image'], ['scores', 'boxes', 'masks', 'semantic']),
 }
-# Version 3 packages hold the first five models; version 4 adds the optional SAM3 grounding model.
+# Version 5 packages hold these five models: SAM3 grounding also finds the sky, so the SegFormer
+# segmentation model of earlier packages is gone. Bundles hold the checkpoint-independent four.
 BASE_MODELS = [name for name in CONTRACTS if name != 'grounding']
 # Version 1 ONNX bundles predate the geometry model; it is exported from the pinned weights.
-BUNDLE_MODELS = {1: [name for name in BASE_MODELS if name != 'geometry'], 2: BASE_MODELS}
+# Segmentation graphs in version 1 and 2 bundles are ignored.
+BUNDLE_MODELS = {1: [name for name in BASE_MODELS if name != 'geometry'], 2: BASE_MODELS, 3: BASE_MODELS}
 BUNDLE = 'onnx-bundle.json'
 RECIPE_FILES = ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt', 'requirements-nodeps.txt')
 # Hardware compatibility trades some tactics for one engine set on every Ampere+ GPU.
@@ -172,7 +172,6 @@ def expected_shapes():
         'matcher': [[1, MAX_FEATURES, 2], [1, MAX_FEATURES, 2],
                     [1, MAX_FEATURES, 256], [1, MAX_FEATURES, 256],
                     [1, MAX_FEATURES], [1, MAX_FEATURES]],
-        'segmentation': [[1, 3, 512, 512]],
         'geometry': [[1, 3, GEOMETRY_SIZE, GEOMETRY_SIZE]],
         'grounding': [[1, 3, GROUNDING_SIZE, GROUNDING_SIZE]],
     }
@@ -273,16 +272,6 @@ def export_models(directory, names, shapes, source, images, references, sam3=Non
                                      input0=pixels.cpu().numpy(), output0=logits.cpu().numpy())
                     del pixels, logits
         del model, module, inputs, detector_image, descriptor_image, ka, da
-        gc.collect()
-        torch.cuda.empty_cache()
-    if 'segmentation' in required:
-        from transformers import SegformerForSemanticSegmentation
-        model = SegformerForSemanticSegmentation.from_pretrained(segmentation_source(), local_files_only=True).eval().cuda()
-        mean = torch.tensor([.485, .456, .406], device='cuda')[None, :, None, None]
-        std = torch.tensor([.229, .224, .225], device='cuda')[None, :, None, None]
-        pixels = (image_tensor(images[0], 512, 512) - mean) / std
-        export_graph('segmentation', Segmentation(model), (pixels,), directory, shapes['segmentation'], references)
-        del model, pixels
         gc.collect()
         torch.cuda.empty_cache()
     if 'geometry' in required:
@@ -523,9 +512,6 @@ def compare_reference(root, name, shapes, references):
                 if not expected.is_floating_point():
                     passed = torch.equal(expected, actual)
                     error = int((expected != actual).sum())
-                elif name == 'segmentation':
-                    error = float((expected - actual).abs().max())
-                    passed = error < .03
                 else:
                     error = float((expected - actual).norm() / expected.norm().clamp_min(1e-8))
                     passed = error < (.005 if name == 'matcher' else .02)
@@ -595,14 +581,6 @@ def verify(root, shapes, images):
         if not valid.any() or not torch.equal(identity[0, valid].long(), torch.arange(MAX_FEATURES, device='cuda')[valid]):
             raise RuntimeError('Matcher failed real-image identity matching')
         del matcher
-        segmentation = Engine(root, 'segmentation', shapes['segmentation'])
-        mean = torch.tensor([.485, .456, .406], device='cuda')[None, :, None, None]
-        std = torch.tensor([.229, .224, .225], device='cuda')[None, :, None, None]
-        for path in images:
-            probabilities, = segmentation((image_tensor(path, 512, 512) - mean) / std)
-            if tuple(probabilities.shape) != (1, 2, 512, 512) or (probabilities < 0).any() or (probabilities > 1.00001).any() or (probabilities.sum(1) > 1.00001).any():
-                raise RuntimeError('Segmentation output contract differs')
-        del segmentation
         geometry = Engine(root, 'geometry', shapes['geometry'])
         size = GEOMETRY_SIZE
         for path in images:
@@ -616,9 +594,6 @@ def verify(root, shapes, images):
             if ((normal.norm(dim=-1) - 1).abs() > 1e-3).any() or (mask < 0).any() or (mask > 1).any():
                 raise RuntimeError('Geometry normals or mask are out of range')
         del geometry
-        if not (root / 'engines' / 'grounding.engine').is_file():
-            print(f'Verified: five engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}; geometry point maps', flush=True)
-            return
         grounding = Engine(root, 'grounding', shapes['grounding'])
         prompts, k, size = len(GROUNDING_PROMPTS), GROUNDING_TOP_K, GROUNDING_MASK_SIZE
         for path in images:
@@ -630,7 +605,7 @@ def verify(root, shapes, images):
                 raise RuntimeError('Grounding scores are out of range or unsorted')
             if (boxes < 0).any() or (boxes > 1).any():
                 raise RuntimeError('Grounding boxes are not normalized')
-    print(f'Verified: six engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}; geometry point maps; grounding detections', flush=True)
+    print(f'Verified: five engines; dynamic detector shapes; descriptor N=32/127/3072; matcher unequal counts and padding; real pair matches={matched}; geometry point maps; grounding detections', flush=True)
 
 
 def matcher_precisions(manifest):
@@ -649,15 +624,13 @@ def same_target(manifest, settings):
     return settings['hardware_compatibility'] != 'none' or manifest.get('gpu') == settings['gpu']
 
 
-def package_models(settings):
-    return BASE_MODELS + (['grounding'] if settings['grounding'] else [])
+PACKAGE_MODELS = BASE_MODELS + ['grounding']
 
 
 def verify_package(root, settings, shapes, images):
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
-    names = package_models(settings)
-    version = 4 if settings['grounding'] else 3
-    if manifest.get('version') != version or not same_target(manifest, settings) or manifest.get('detector_profile') != settings['detector_profile']:
+    names = PACKAGE_MODELS
+    if manifest.get('version') != 5 or manifest.get('grounding_prompts') != GROUNDING_PROMPTS or not same_target(manifest, settings) or manifest.get('detector_profile') != settings['detector_profile']:
         raise RuntimeError('Existing model GPU/hardware level/version/profile differs. Choose a new -Models directory; use -OnnxFrom to upgrade a static package.')
     if matcher_precisions(manifest) != matcher_precisions(settings):
         raise RuntimeError('Existing matcher calculation/scoring precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
@@ -679,7 +652,7 @@ def read_bundle(root):
     bundle = json.loads((root / BUNDLE).read_text(encoding='utf-8'))
     if bundle.get('version') not in BUNDLE_MODELS or bundle.get('detector_profile') != DETECTOR_PROFILE or bundle.get('max_features') != MAX_FEATURES:
         raise RuntimeError(f'ONNX bundle version/profile differs from this preparation tool: {root}')
-    if bundle['version'] == 2 and (bundle.get('geometry_size') != GEOMETRY_SIZE or bundle.get('geometry_tokens') != GEOMETRY_TOKENS):
+    if bundle['version'] >= 2 and (bundle.get('geometry_size') != GEOMETRY_SIZE or bundle.get('geometry_tokens') != GEOMETRY_TOKENS):
         raise RuntimeError(f'ONNX bundle geometry input differs from this preparation tool: {root}')
     models = BUNDLE_MODELS[bundle['version']]
     references = [name for name in REFERENCES if name.split('_')[0].split('.')[0] in models]
@@ -722,8 +695,7 @@ def export_bundle(root, shapes, source, images):
         shutil.copy2(path, pending / names[-1])
     files = [f'onnx/{name}.onnx' for name in BASE_MODELS] + [f'references/{name}' for name in REFERENCES] + names
     write_json(pending / BUNDLE, {
-        'version': 2, 'recipe': settings['recipe'], 'loma_commit': LOMA_COMMIT,
-        'segmentation_revision': SEGMENTATION_REVISION, 'moge_commit': MOGE_COMMIT,
+        'version': 3, 'recipe': settings['recipe'], 'loma_commit': LOMA_COMMIT, 'moge_commit': MOGE_COMMIT,
         'geometry_revision': GEOMETRY_REVISION, 'detector_profile': DETECTOR_PROFILE,
         'max_features': MAX_FEATURES, 'geometry_size': GEOMETRY_SIZE,
         'geometry_tokens': GEOMETRY_TOKENS, 'images': names,
@@ -743,14 +715,13 @@ def main():
     parser.add_argument('--onnx-from', type=Path)
     parser.add_argument('--images', type=Path, nargs=2)
     parser.add_argument('--sam3', type=Path, help='SAM3 checkpoint (facebook/sam3 sam3.pt), cached for later runs')
-    parser.add_argument('--no-grounding', action='store_true', help='prepare a version 3 package without SAM3')
     args = parser.parse_args()
     if bool(args.models) == bool(args.bundle) or (args.bundle and args.onnx_from):
         raise RuntimeError('Use either --models (optionally with --onnx-from) or --bundle')
-    if (args.bundle or args.no_grounding) and args.sam3:
-        raise RuntimeError('--sam3 adds the grounding model; ONNX bundles and --no-grounding packages hold the five base graphs')
-    # Model packages include SAM3 grounding by default; bundles stay GPU- and checkpoint-independent.
-    args.sam3 = None if args.bundle or args.no_grounding else grounding_weights(args.sam3 and args.sam3.resolve())
+    if args.bundle and args.sam3:
+        raise RuntimeError('--sam3 adds the grounding model; ONNX bundles hold the four base graphs')
+    # Model packages include SAM3 grounding; bundles stay GPU- and checkpoint-independent.
+    args.sam3 = None if args.bundle else grounding_weights(args.sam3 and args.sam3.resolve())
     if trt.__version__ != TRT_VERSION:
         raise RuntimeError(f'Requires TensorRT {TRT_VERSION}, found {trt.__version__}')
     if not torch.cuda.is_available():
@@ -775,8 +746,8 @@ def main():
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': 'fp32' if args.matcher_precision == 'fp16' else args.matcher_precision,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest(),
-                'grounding': GROUNDING_SHA256 if args.sam3 else None}
-    names = package_models(settings)
+                'grounding': GROUNDING_SHA256, 'grounding_prompts': GROUNDING_PROMPTS}
+    names = PACKAGE_MODELS
     reuse_manifest = bundle = None
     if args.onnx_from:
         origin = args.onnx_from.resolve()
@@ -784,11 +755,15 @@ def main():
             origin = origin / 'onnx'
         if (origin.parent / BUNDLE).is_file():
             bundle = read_bundle(origin.parent)
-        # Packages and bundles from before the geometry model supply the other four graphs.
-        settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in names
-                                 if name not in ('geometry', 'grounding') or (origin / f'{name}.onnx').is_file()}
         if (origin.parent / 'manifest.json').is_file():
             reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
+        # Packages and bundles from before the geometry model supply the detector, descriptor and
+        # matcher; a grounding graph is reused only with the same baked prompts.
+        prompts = (reuse_manifest or {}).get('grounding_prompts')
+        settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in names
+                                 if (name == 'geometry' and (origin / f'{name}.onnx').is_file()) or
+                                 (name == 'grounding' and prompts == GROUNDING_PROMPTS) or
+                                 name not in ('geometry', 'grounding')}
     # A bundle carries its own validation images; no upstream source download is needed.
     source = None if args.images or bundle else loma_source()
     if args.images:
@@ -878,25 +853,23 @@ def main():
     for name in names:
         compare_reference(pending, name, shapes, references)
     verify(pending, shapes, images)
-    manifest = {'version': 4 if args.sam3 else 3, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
+    manifest = {'version': 5, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
                 'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': settings['matcher_score_precision'],
                 'detector_profile': DETECTOR_PROFILE, 'descriptor_size': [784, 784],
                 'max_features': MAX_FEATURES, 'descriptor_dimension': 256,
-                'segmentation_mean': [.485, .456, .406], 'segmentation_std': [.229, .224, .225],
                 'geometry_size': GEOMETRY_SIZE, 'geometry_tokens': GEOMETRY_TOKENS,
                 'geometry_source': {'moge_commit': MOGE_COMMIT, 'model': 'Ruicheng/moge-2-vitl-normal',
                                     'revision': GEOMETRY_REVISION},
                 'models': {name: {'inputs': CONTRACTS[name][0], 'outputs': CONTRACTS[name][1],
                                   'shapes': shapes[name],
                                   'sha256': sha256(pending / 'engines' / f'{name}.engine')}
-                           for name in names}}
-    if args.sam3:
-        manifest.update({'grounding_size': GROUNDING_SIZE, 'grounding_mask_size': GROUNDING_MASK_SIZE,
-                         'grounding_prompts': GROUNDING_PROMPTS, 'grounding_top_k': GROUNDING_TOP_K,
-                         'grounding_source': {'model': 'facebook/sam3', 'checkpoint_sha256': GROUNDING_SHA256,
-                                              'ultralytics': importlib.metadata.version('ultralytics')}})
+                           for name in names},
+                'grounding_size': GROUNDING_SIZE, 'grounding_mask_size': GROUNDING_MASK_SIZE,
+                'grounding_prompts': GROUNDING_PROMPTS, 'grounding_top_k': GROUNDING_TOP_K,
+                'grounding_source': {'model': 'facebook/sam3', 'checkpoint_sha256': GROUNDING_SHA256,
+                                     'ultralytics': importlib.metadata.version('ultralytics')}}
     write_json(pending / 'manifest.json', manifest)
     # Publish in PowerShell after this process releases any Windows file handles.
     print(f'Model package verified: {pending}', flush=True)

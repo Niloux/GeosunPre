@@ -1,4 +1,4 @@
-"""Adapters for the pinned LoMa and SegFormer native tensor contracts."""
+"""Adapters for the pinned LoMa, MoGe and SAM3 native tensor contracts."""
 from types import MethodType
 
 import torch
@@ -106,18 +106,6 @@ class Matcher(nn.Module):
         mutual = reverse.gather(1, index) == torch.arange(ka.shape[1], device=ka.device)[None]
         valid = mutual & (confidence > .1) & (mask_a > 0) & (mask_b.gather(1, index) > 0)
         return torch.where(valid, index, -1).to(torch.int32), torch.where(mutual, confidence, 0.).float()
-
-
-class Segmentation(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        labels = {v: int(k) for k, v in model.config.id2label.items()}
-        self.labels = [labels['sky'], labels['person']]
-
-    def forward(self, image):
-        probability = self.model(image, return_dict=False)[0].softmax(1)[:, self.labels]
-        return F.interpolate(probability, (512, 512), mode='bilinear', align_corners=False).float()
 
 
 def fix_geometry_positions(model, size):

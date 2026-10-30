@@ -53,64 +53,40 @@ std::vector<uint32_t> NavigationRevisitCandidates(const Scene& scene,
       candidates.push_back(nearby[k].second);
   return candidates;
 }
-struct Fusion {
-  std::vector<MaskView> views;
-  cv::Mat weight;
-};
-Fusion VirtualViews(const Camera& camera) {
+// Cells of a 900x1200 grid over the photo seen by one of the five 512x512, 100 degree pinhole
+// views (forward and tilted 45 degrees) that segmented the sky before version 5 model packages.
+// The mask domain keeps this coverage so masks stay comparable with earlier work directories.
+cv::Mat ViewCoverage(const Camera& camera) {
   constexpr int w = 900, h = 1200;
-  const double focal = 512 / (2 * std::tan(50 * Pi / 180)), cosine = std::cos(80 * Pi / 180);
-  Fusion out;
-  out.weight = cv::Mat::zeros(h, w, CV_32FC1);
-  std::vector<Eigen::Vector3d> rays;
-  rays.reserve(w * h);
-  const double valid_radius = camera.Radius();
+  const double focal = 512 / (2 * std::tan(50 * Pi / 180)), radius = camera.Radius();
+  cv::Mat covered = cv::Mat::zeros(h, w, CV_8UC1);
+  std::vector<Eigen::Matrix3d> rotations;
+  for (const Eigen::Vector3d& angle :
+       std::vector<Eigen::Vector3d>{{0, 0, 0}, {0, 45, 0}, {0, -45, 0}, {45, 0, 0}, {-45, 0, 0}}) {
+    const double length = angle.norm() * Pi / 180;
+    rotations.push_back(length == 0
+                            ? Eigen::Matrix3d::Identity().eval()
+                            : Eigen::AngleAxisd(length, angle.normalized()).toRotationMatrix());
+  }
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x) {
       const Eigen::Vector2d pixel((x + .5) * camera.width / w, (y + .5) * camera.height / h);
       const double dx = (pixel.x() - camera.params[2]) / camera.params[0],
                    dy = (pixel.y() - camera.params[3]) / camera.params[1];
-      if (dx * dx + dy * dy <= valid_radius * valid_radius)
-        rays.push_back(camera.Ray(pixel));
-      else
-        rays.push_back(Eigen::Vector3d::Zero());
-    }
-  for (const Eigen::Vector3d& angle :
-       std::vector<Eigen::Vector3d>{{0, 0, 0}, {0, 45, 0}, {0, -45, 0}, {45, 0, 0}, {-45, 0, 0}}) {
-    const double length = angle.norm() * Pi / 180;
-    const Eigen::Matrix3d R =
-        length == 0 ? Eigen::Matrix3d::Identity().eval()
-                    : Eigen::AngleAxisd(length, angle.normalized()).toRotationMatrix();
-    MaskView v{cv::Mat(512, 512, CV_32FC2), cv::Mat(h, w, CV_32FC1), cv::Mat(h, w, CV_32FC1),
-               cv::Mat(h, w, CV_32FC1)};
-    for (int y = 0; y < 512; ++y)
-      for (int x = 0; x < 512; ++x) {
-        const Eigen::Vector3d ray =
-            R * Eigen::Vector3d((x + .5 - 256) / focal, (y + .5 - 256) / focal, 1);
-        const auto xy = camera.Project(ray);
-        v.source.at<cv::Vec2f>(y, x) = ray.normalized().z() >= cosine
-                                           ? cv::Vec2f(float(xy.x() - .5), float(xy.y() - .5))
-                                           : cv::Vec2f(-10, -10);
-      }
-    const double radius = camera.Radius();
-    for (int y = 0; y < h; ++y)
-      for (int x = 0; x < w; ++x) {
-        const Eigen::Vector3d local = R.transpose() * rays[y * w + x];
+      if (dx * dx + dy * dy > radius * radius)
+        continue;
+      const Eigen::Vector3d ray = camera.Ray(pixel);
+      for (const auto& R : rotations) {
+        const Eigen::Vector3d local = R.transpose() * ray;
         const double xx = local.x() / std::max(local.z(), 1e-6) * focal + 255.5,
                      yy = local.y() / std::max(local.z(), 1e-6) * focal + 255.5;
-        const double dx = ((x + .5) * camera.width / w - camera.params[2]) / camera.params[0],
-                     dy = ((y + .5) * camera.height / h - camera.params[3]) / camera.params[1];
-        const bool valid = dx * dx + dy * dy <= radius * radius && local.z() > .1 && xx >= 0 &&
-                           yy >= 0 && xx < 511 && yy < 511;
-        const float weight = valid ? float(std::pow(std::max(local.z(), 0.), 8)) : 0;
-        v.x.at<float>(y, x) = float(xx);
-        v.y.at<float>(y, x) = float(yy);
-        v.weight.at<float>(y, x) = weight;
-        out.weight.at<float>(y, x) += weight;
+        if (local.z() > .1 && xx >= 0 && yy >= 0 && xx < 511 && yy < 511) {
+          covered.at<uint8_t>(y, x) = 255;
+          break;
+        }
       }
-    out.views.push_back(std::move(v));
-  }
-  return out;
+    }
+  return covered;
 }
 struct FrontendTiming {
   size_t computed = 0, reused = 0;
@@ -133,18 +109,16 @@ struct FrontendTiming {
 struct PreparedImage {
   uint32_t id;
   cv::Mat rgb, mask, grounding;
-  std::vector<cv::Mat> views;
   double decode = 0, preprocess = 0;
 };
 class ImageReader {
   const std::vector<Exposure>& images;
   const fs::path work;
-  const std::array<Fusion, 2>* fusion;
-  const int grounding;  // square side of the whole-photo grounding input, 0 without grounding
+  // Square side of the whole-photo grounding input for the masks; 0 reads the masks instead.
+  const int grounding;
   size_t next = 0;
   std::deque<std::future<PreparedImage>> ready;
-  // Decoding and the five mask views take longer than the GPU's share of an image; four in
-  // flight keep the GPU fed with a few full-size photos in memory.
+  // Four photos in flight keep the GPU fed with a few full-size photos in memory.
   void Fill() {
     while (ready.size() < 4 && next < images.size()) {
       const auto record = images[next++];
@@ -156,15 +130,8 @@ class ImageReader {
         image.decode = Seconds(started);
         started = Clock::now();
         cv::cvtColor(image.rgb, image.rgb, cv::COLOR_BGR2RGB);
-        if (fusion) {
-          if (grounding)
-            cv::resize(image.rgb, image.grounding, {grounding, grounding}, 0, 0, cv::INTER_AREA);
-          for (const auto& view : (*fusion)[record.camera].views) {
-            cv::Mat sampled;
-            cv::remap(image.rgb, sampled, view.source, cv::Mat(), cv::INTER_LINEAR,
-                      cv::BORDER_CONSTANT);
-            image.views.push_back(std::move(sampled));
-          }
+        if (grounding) {
+          cv::resize(image.rgb, image.grounding, {grounding, grounding}, 0, 0, cv::INTER_AREA);
           image.rgb.release();
         } else
           image.mask = ReadImage(MaskPath(work, record.id), cv::IMREAD_GRAYSCALE);
@@ -175,9 +142,8 @@ class ImageReader {
   }
 
  public:
-  ImageReader(const std::vector<Exposure>& records, fs::path path,
-              const std::array<Fusion, 2>* maps = nullptr, int grounding_size = 0)
-      : images(records), work(std::move(path)), fusion(maps), grounding(grounding_size) {
+  ImageReader(const std::vector<Exposure>& records, fs::path path, int grounding_size = 0)
+      : images(records), work(std::move(path)), grounding(grounding_size) {
     Fill();
   }
   PreparedImage Next() {
@@ -305,25 +271,32 @@ class FeatureCache {
     return entries.emplace(id, std::move(entry)).first->second;
   }
 };
-// SAM3 grounding of the whole photo (version 4 packages), prompts person, shadow and robot.
+// SAM3 grounding of the whole photo (version 5 packages), prompts person, shadow, robot and sky.
 constexpr float kGroundingScore = .5f;
 // A shadow is transient only within this many mask cells (about 8% of the photo side) of a
 // person: static furniture and exhibit shadows are seen in every view and stay static.
 constexpr int kShadowReach = 24;
 struct GroundingCounts {
-  size_t persons = 0, robots = 0, shadows = 0, distant_shadows = 0;
+  size_t persons = 0, robots = 0, shadows = 0, distant_shadows = 0, skies = 0, sky_images = 0;
 };
 int GroundingSize(const Json& manifest) {
-  if (manifest.at("grounding_prompts") != Json{"person", "shadow", "robot"} ||
+  if (manifest.at("version") != 5 || !manifest.at("models").contains("grounding") ||
+      manifest.at("grounding_prompts") != Json{"person", "shadow", "robot", "sky"} ||
       manifest.at("models").at("grounding").at("outputs") !=
           Json{"scores", "boxes", "masks", "semantic"})
-    throw std::runtime_error("Grounding model contract differs from person/shadow/robot");
+    throw std::runtime_error(
+        "Masks need a version 5 model package with SAM3 grounding of person/shadow/robot/sky; "
+        "prepare one with prepare-models.ps1");
   return manifest.at("grounding_size");
 }
-// Full-size 255 where people and the shadows next to them are. A person detection mostly
-// covered by an at least as confident robot detection is a humanoid exhibit and stays static.
-cv::Mat GroundingMask(const std::vector<Tensor>& outputs, int width, int height,
-                      GroundingCounts& counts) {
+struct GroundingResult {
+  cv::Mat transient, sky;
+};
+// Full-size 255 where people and the shadows next to them are, and where the sky is. A person
+// detection mostly covered by an at least as confident robot detection is a humanoid exhibit and
+// stays static.
+GroundingResult GroundingMask(const std::vector<Tensor>& outputs, int width, int height,
+                              GroundingCounts& counts) {
   const int k = int(outputs[0].shape[1]), size = int(outputs[2].shape[3]);
   const float *scores = outputs[0].Floats(), *logits = outputs[2].Floats();
   auto detections = [&](int prompt) {
@@ -336,7 +309,8 @@ cv::Mat GroundingMask(const std::vector<Tensor>& outputs, int width, int height,
     }
     return found;
   };
-  const auto persons = detections(0), shadows = detections(1), robots = detections(2);
+  const auto persons = detections(0), shadows = detections(1), robots = detections(2),
+             skies = detections(3);
   cv::Mat people = cv::Mat::zeros(size, size, CV_8UC1);
   for (const auto& [score, mask] : persons) {
     const int area = cv::countNonZero(mask);
@@ -366,9 +340,19 @@ cv::Mat GroundingMask(const std::vector<Tensor>& outputs, int width, int height,
   }
   // One cell of margin covers the coarse mask boundary and the soft shadow edge.
   cv::dilate(transient, transient, cv::Mat::ones(3, 3, CV_8UC1));
-  cv::Mat full;
-  cv::resize(transient, full, {width, height}, 0, 0, cv::INTER_LINEAR);
-  return full >= 128;
+  // Sky is the union of its detections without margin: indoors a bright ceiling panel or a
+  // printed sky occasionally qualifies and is accepted.
+  cv::Mat sky = cv::Mat::zeros(size, size, CV_8UC1);
+  for (const auto& [score, mask] : skies)
+    sky |= mask;
+  counts.skies += skies.size();
+  counts.sky_images += !skies.empty();
+  GroundingResult result;
+  cv::resize(transient, result.transient, {width, height}, 0, 0, cv::INTER_LINEAR);
+  cv::resize(sky, result.sky, {width, height}, 0, 0, cv::INTER_LINEAR);
+  result.transient = result.transient >= 128;
+  result.sky = result.sky >= 128;
+  return result;
 }
 }  // namespace
 Json CheckModels(const fs::path& root, const fs::path& image) {
@@ -443,23 +427,6 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
     report["identity_matches"] = identities;
     report["inference"]["matcher"] = models.Profile().at("matcher");
   }
-  {
-    Models models(root);
-    ImagePreprocessor pixels(models.Stream());
-    pixels.Upload(rgb);
-    const auto mean = manifest.at("segmentation_mean").get<std::array<float, 3>>();
-    const auto deviation = manifest.at("segmentation_std").get<std::array<float, 3>>();
-    const auto probabilities =
-        models.Predict("segmentation", {pixels.Normalize(512, 512, mean, deviation)})[0];
-    check(probabilities, {1, 2, 512, 512});
-    for (size_t i = 0; i < 512 * 512; ++i) {
-      const auto* values = probabilities.Floats();
-      if (values[i] < 0 || values[i + 512 * 512] < 0 ||
-          values[i] + values[i + 512 * 512] > 1.00001f)
-        throw std::runtime_error("Model verification: invalid semantic probability");
-    }
-    report["inference"]["segmentation"] = models.Profile().at("segmentation");
-  }
   // Version 3 packages add the monocular geometry model used by supervision export.
   if (manifest.at("models").contains("geometry")) {
     Models models(root);
@@ -491,12 +458,14 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
     report["geometry_valid_pixels"] = valid;
     report["inference"]["geometry"] = models.Profile().at("geometry");
   }
-  // Version 4 packages add SAM3 grounding of people, shadows and robots for the masks.
+  // Version 4 packages add SAM3 grounding of people, shadows and robots; version 5 adds the sky
+  // and drops the segmentation model. Masks need version 5.
   if (manifest.at("models").contains("grounding")) {
     Models models(root);
     ImagePreprocessor pixels(models.Stream());
     pixels.Upload(rgb);
-    const int64_t size = GroundingSize(manifest), prompts = 3,
+    const int64_t size = manifest.at("grounding_size"),
+                  prompts = int64_t(manifest.at("grounding_prompts").size()),
                   k = manifest.at("grounding_top_k"), cells = manifest.at("grounding_mask_size");
     const auto outputs =
         models.Predict("grounding", {pixels.Normalize(int(size), int(size), {.5f, .5f, .5f},
@@ -524,12 +493,12 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
   return report;
 }
 cv::Mat MaskDomain(const Camera& camera) {
-  const auto weight = VirtualViews(camera).weight;
+  const auto covered = ViewCoverage(camera);
   auto domain = camera.Mask();
   for (int y = 0; y < domain.rows; ++y) {
-    const int yy = int(y * (double(weight.rows) / domain.rows));
+    const int yy = int(y * (double(covered.rows) / domain.rows));
     for (int x = 0; x < domain.cols; ++x)
-      if (weight.at<float>(yy, int(x * (double(weight.cols) / domain.cols))) <= 0)
+      if (!covered.at<uint8_t>(yy, int(x * (double(covered.cols) / domain.cols))))
         domain.at<uint8_t>(y, x) = 0;
   }
   return domain;
@@ -553,19 +522,12 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
     return timing.Report(started);
   Models models(root);
   ImagePreprocessor pixels(models.Stream());
-  const std::array<Fusion, 2> fusion{VirtualViews(scene.cameras[0]),
-                                     VirtualViews(scene.cameras[1])};
-  // With grounding, SAM3 decides people and their shadows and the segmentation keeps only sky.
-  const bool grounding = models.Manifest().at("models").contains("grounding");
-  const int grounding_size = grounding ? GroundingSize(models.Manifest()) : 0;
+  // SAM3 decides the sky, people and the shadows next to them; the rest of the domain is static.
+  const int grounding_size = GroundingSize(models.Manifest());
+  const std::array<cv::Mat, 2> domains{MaskDomain(scene.cameras[0]),
+                                       MaskDomain(scene.cameras[1])};
   GroundingCounts counts;
-  std::array<std::unique_ptr<MaskFusion>, 2> masks;
-  for (int c = 0; c < 2; ++c)
-    masks[c] = std::make_unique<MaskFusion>(fusion[c].views, fusion[c].weight,
-                                            scene.cameras[c].Mask(), models.Stream(), !grounding);
-  const auto mean = models.Manifest().at("segmentation_mean").get<std::array<float, 3>>(),
-             deviation = models.Manifest().at("segmentation_std").get<std::array<float, 3>>();
-  ImageReader reader(pending, work, &fusion, grounding_size);
+  ImageReader reader(pending, work, grounding_size);
   AsyncWriter writer;
   for (const auto& record : pending) {
     auto phase = Clock::now();
@@ -573,24 +535,19 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
     timing.wait += Seconds(phase);
     timing.decode += image.decode;
     timing.preprocess += image.preprocess;
-    auto& fusion_gpu = *masks[record.camera];
     phase = Clock::now();
-    fusion_gpu.Begin();
-    for (size_t view = 0; view < image.views.size(); ++view) {
-      pixels.Upload(image.views[view]);
-      const auto output =
-          models.Predict("segmentation", {pixels.Normalize(512, 512, mean, deviation)}, true)[0];
-      fusion_gpu.Add(output, view);
-    }
-    auto mask = fusion_gpu.Finish();
-    if (grounding) {
-      pixels.Upload(image.grounding);
-      const auto outputs = models.Predict(
-          "grounding", {pixels.Normalize(grounding_size, grounding_size, {.5f, .5f, .5f},
-                                         {.5f, .5f, .5f})});
-      mask.setTo(0, GroundingMask(outputs, mask.cols, mask.rows, counts));
-    }
+    pixels.Upload(image.grounding);
+    const auto outputs = models.Predict(
+        "grounding",
+        {pixels.Normalize(grounding_size, grounding_size, {.5f, .5f, .5f}, {.5f, .5f, .5f})});
     timing.gpu_pipeline += Seconds(phase);
+    phase = Clock::now();
+    const auto& domain = domains[record.camera];
+    const auto found = GroundingMask(outputs, domain.cols, domain.rows, counts);
+    cv::Mat mask = domain.clone();
+    mask.setTo(128, found.sky & domain);
+    mask.setTo(0, found.transient);
+    timing.postprocess += Seconds(phase);
     const auto path = MaskPath(work, record.id);
     writer.Submit([path, mask = std::move(mask)] {
       const auto temporary = path.parent_path() / (path.stem().u8string() + ".writing.png");
@@ -604,13 +561,14 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
   writer.Finish();
   timing.write = writer.seconds;
   auto report = timing.Report(started, &models);
-  if (grounding)
-    report["grounding"] = {{"score_threshold", kGroundingScore},
-                           {"shadow_reach_cells", kShadowReach},
-                           {"persons", counts.persons},
-                           {"persons_kept_as_robots", counts.robots},
-                           {"shadows", counts.shadows},
-                           {"shadows_far_from_persons", counts.distant_shadows}};
+  report["grounding"] = {{"score_threshold", kGroundingScore},
+                         {"shadow_reach_cells", kShadowReach},
+                         {"persons", counts.persons},
+                         {"persons_kept_as_robots", counts.robots},
+                         {"shadows", counts.shadows},
+                         {"shadows_far_from_persons", counts.distant_shadows},
+                         {"skies", counts.skies},
+                         {"images_with_sky", counts.sky_images}};
   return report;
 }
 Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root) {

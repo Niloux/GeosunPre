@@ -72,7 +72,7 @@
 | 阶段 | 主要工作 | 主要产物 |
 | --- | --- | --- |
 | `prepare` 输入准备 | 绑定 L/R 照片与 CameraPos，核对尺寸、标定、LAS 和导航坐标转换；按 `.pro` 建立鱼眼内参，冻结输入及配置 | `scene.json`、`state.json` |
-| `masks` 语义掩码 | 在虚拟透视视图中分割天空和人物，融合回鱼眼图，并限制镜头有效域；区分静态、天空与忽略区域。version=4 模型包改由 SAM3 在整幅照片上检测人物及其附近影子，人形展品保持静态 | `cache/masks/` |
+| `masks` 语义掩码 | SAM3 在整幅照片上检测天空、人物及其附近影子，人形展品保持静态，并限制镜头有效域；区分静态、天空与忽略区域。需 version=5 模型包 | `cache/masks/` |
 | `features` 特征提取 | 在静态有效区域检测关键点，提取描述子、检索向量和原图颜色，保留空间覆盖 | `cache/features/` |
 | `matches` 图像匹配 | 合并时间近邻、导航回访及外观检索候选，执行 LoMa 匹配，缓存对应关系；鱼眼几何验证在下一阶段执行 | `cache/pairs.json`、`cache/matches/` |
 | `sfm` 视觉重建 | 鱼眼几何验证、建立轨迹、增量注册相机和三角化；注册照片的导航位置展开后转入导航坐标系，此后注册受导航门限约束、BA 带导航先验；BA 联合优化位姿、点和共享内参，补全轨迹，最后固定相机恢复未分配观测形成的有效点，并做几何验收 | `cache/visual.bin`、`cache/sfm.json` |
@@ -138,11 +138,11 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 ```text
 models/
   manifest.json
-  engines/{detector,descriptor,matcher,segmentation,geometry,grounding}.engine
+  engines/{detector,descriptor,matcher,geometry,grounding}.engine
   runtime/nvinfer_10.dll
 ```
 
-匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32。原图按最长边 1536 缩放后送入动态检测器，横图、竖图及不同分辨率共用同一模型包。geometry 为 MoGe-2 ViT-L normal（FP16，644×644 透视子图），供默认的 MoGe 监督使用；grounding 为 SAM3（FP16，1008×1008 整幅照片），供掩码阶段区分人物、影子与人形展品。模型准备后自动用真实照片验证动态宽高、六模型输出、动态描述子数量和匹配补零行为。输入范围、设备和精度参数见[模型文档](docs/models.md)。
+匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32。原图按最长边 1536 缩放后送入动态检测器，横图、竖图及不同分辨率共用同一模型包。geometry 为 MoGe-2 ViT-L normal（FP16，644×644 透视子图），供默认的 MoGe 监督使用；grounding 为 SAM3（FP16，1008×1008 整幅照片），供掩码阶段区分天空、人物、影子与人形展品。模型准备后自动用真实照片验证动态宽高、五模型输出、动态描述子数量和匹配补零行为。输入范围、设备和精度参数见[模型文档](docs/models.md)。
 
 模型目录中完整且兼容的包会校验后复用。更换 GPU 或匹配精度时使用新模型目录，并用 `--models` 指定；更换图像分辨率不需要重建。已有固定尺寸包可执行 `.\prepare-models.ps1 -Models models/dynamic -OnnxFrom models`，只重建检测器，然后使用 `--models models/dynamic`。新生成的目录同时保留 ONNX 和准备元数据，模型资源不进入 Git。
 
@@ -160,7 +160,7 @@ models/
 .\package.ps1
 ```
 
-`package.ps1` 默认读取 `models-ampere-plus/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 及同名 `.zip`、`.zip.sha256`。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行六模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
+`package.ps1` 默认读取 `models-ampere-plus/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 及同名 `.zip`、`.zip.sha256`。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行五模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
 
 将 zip 复制到目标 Windows 机器解压，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
 
