@@ -23,6 +23,13 @@ int Main(const std::vector<std::string>& argv) {
     else if (args.command == "check") {
       args.Validate({"--output"});
       std::cout << CheckBundle(args.Path("--output")).dump(2) << '\n';
+    } else if (args.command == "check-supervision") {
+      args.Validate({"--output", "--compare"});
+      std::cout << MeasureSupervision(args.Path("--output"), args.Get("--compare").empty()
+                                                                 ? fs::path()
+                                                                 : args.Path("--compare"))
+                       .dump(2)
+                << '\n';
     } else if (args.command == "info") {
       args.Validate({});
       auto info = BuildInfo();
@@ -88,6 +95,8 @@ int Main(const std::vector<std::string>& argv) {
              "the JPEG MCU grid; --no-crop-valid-domain delivers full frames\n"
              "    --crop-valid-domain explicitly enables it; conflicts with --no-crop-valid-domain\n"
              "  geosunpre check --output DIR\n"
+             "  geosunpre check-supervision --output DIR [--compare DIR]\n"
+             "    measures depth and normal maps against SfM tracks and neighbouring views\n"
              "  geosunpre info\n"
              "  geosunpre check-models --image FILE [--models MODELS]\n"
              "  geosunpre check-monocular --input INPUT --image NAME --output DIR "

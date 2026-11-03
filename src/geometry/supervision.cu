@@ -20,7 +20,7 @@ namespace geosun {
 namespace {
 constexpr int Version = 8;
 // Monocular supervision (source moge) is published as version 10; LAS maps keep version 8.
-constexpr int MonocularVersion = 11;
+constexpr int MonocularVersion = 12;
 constexpr const char* MonocularSource = "moge2_faces_las_scaled";
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
@@ -1195,10 +1195,10 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   struct LoadedMask {
     cv::Mat pixels;
     int count;
-    std::vector<cv::Mat> faces;  // MoGe faces of the photo for monocular supervision
+    std::vector<cv::Mat> faces, normal_faces;  // MoGe faces of the photo for monocular supervision
   };
   // Lens plans outlive their camera's loop: the monocular fits run with the pending writes.
-  std::array<std::optional<MonocularLens>, 2> lens_plans;
+  std::array<std::optional<MonocularLens>, 2> lens_plans, normal_plans;
   for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
     std::vector<uint32_t> images;
     for (uint32_t i = 0; i < model.images.size(); ++i)
@@ -1209,9 +1209,14 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     const auto camera = MapCamera(model.cameras[cid], options.max_size);
     const int w = camera.width, h = camera.height, size = w * h, blocks = (size + 255) / 256;
     auto& lens = lens_plans.at(cid);
+    auto& normal_lens = normal_plans.at(cid);
     if (monocular) {
-      lens = PlanMonocularLens(model.cameras[cid], camera, estimator->FaceSize());
-      lenses.push_back({{"camera", cid}, {"plan", lens->ToJson()}});
+      lens = PlanMonocularLens(model.cameras[cid], camera, estimator->FaceSize(),
+                               DepthFaceHalfDegrees);
+      normal_lens = PlanMonocularLens(model.cameras[cid], camera, estimator->FaceSize(),
+                                      NormalFaceHalfDegrees);
+      lenses.push_back(
+          {{"camera", cid}, {"plan", lens->ToJson()}, {"normal_plan", normal_lens->ToJson()}});
     }
     const size_t batch = std::min<size_t>(
         32, std::max<size_t>(1, DepthBudget / (size * (sizeof(float) + sizeof(Blend)))));
@@ -1241,7 +1246,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         masks.push_back(std::async(std::launch::async, [&, id = images[requested]] {
           auto pixels = StaticMask(scene, masks_dir, id, camera, options);
           const int count = cv::countNonZero(pixels);
-          LoadedMask loaded{std::move(pixels), count, {}};
+          LoadedMask loaded{std::move(pixels), count, {}, {}};
           if (lens) {
             auto photo = ReadImage(scene.images[id].source, cv::IMREAD_COLOR);
             if (options.crop) {
@@ -1250,6 +1255,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
             }
             cv::cvtColor(photo, photo, cv::COLOR_BGR2RGB);
             loaded.faces = MonocularEstimator::Faces(*lens, photo);
+            loaded.normal_faces = MonocularEstimator::Faces(*normal_lens, photo);
           }
           return loaded;
         }));
@@ -1338,14 +1344,16 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         CudaCheck(cudaStreamSynchronize(stream));
         // MoGe faces replace the maps; the LAS depth only scales them and gates their depth. The
         // GPU estimates the faces here; the fit and encoding run with the write on the CPU.
-        std::vector<FaceEstimate> estimates;
+        std::vector<FaceEstimate> estimates, normal_estimates;
         cv::Mat allowed;
         if (monocular) {
           allowed = static_mask.pixels.clone();
           allowed.setTo(0, semantic);
           estimates = estimator->Estimate(*lens, static_mask.faces);
+          normal_estimates = estimator->Estimate(*normal_lens, static_mask.normal_faces);
         }
         const MonocularLens* plan = monocular ? &*lens : nullptr;
+        const MonocularLens* normal_plan = monocular ? &*normal_lens : nullptr;
         const auto& name = scene.images[id].name;
         const auto dp = output / "depths" / fs::u8path(name + ".png"),
                    np = output / "normals" / fs::u8path(name + ".png");
@@ -1354,6 +1362,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         if (writes.size() >= Lookahead)
           finish();
         writes.push_back(std::async(std::launch::async, [=, estimates = std::move(estimates),
+                                                         normal_estimates = std::move(normal_estimates),
                                                          static_pixels = static_mask.count]() mutable {
           Json monocular_row;
           if (plan) {
@@ -1361,14 +1370,20 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
             const auto maps = GatherFaces(*plan, estimates, [&](const FaceSample& sample) {
               return fit.LogScale(sample, plan->size);
             });
+            const auto detail = GatherFaces(*normal_plan, normal_estimates,
+                                            [](const FaceSample&) { return 0.; });
             cv::Mat monocular_depth, monocular_normal;
-            monocular_row = EncodeMonocular(*plan, maps, depth, normal, allowed, fit.accepted,
-                                            MinIncidence, monocular_depth, monocular_normal);
-            Json faces = Json::array();
+            monocular_row =
+                EncodeMonocular(*plan, maps, detail.normal, depth, normal, allowed, fit.accepted,
+                                MinIncidence, monocular_depth, monocular_normal);
+            Json faces = Json::array(), normal_faces = Json::array();
             for (const auto& estimate : estimates)
               faces.push_back(estimate.ToJson());
+            for (const auto& estimate : normal_estimates)
+              normal_faces.push_back(estimate.ToJson());
             monocular_row["fit"] = fit.ToJson();
             monocular_row["faces"] = faces;
+            monocular_row["normal_faces"] = normal_faces;
             depth = monocular_depth;
             normal = monocular_normal;
           }

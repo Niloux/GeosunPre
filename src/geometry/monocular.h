@@ -20,7 +20,7 @@ struct MonocularLens {
   static constexpr int MaxSamples = 3;
   Camera source, grid;
   int size = 0;
-  double focal = 0, prefilter = 1;
+  double half_degrees = 0, focal = 0, prefilter = 1;
   std::vector<double> ring_tilts;  // degrees
   std::vector<MonocularFace> faces;
   // Up to MaxSamples faces per grid pixel by descending weight; count 0 outside the domain.
@@ -29,9 +29,14 @@ struct MonocularLens {
   cv::Mat rays;  // CV_32FC3 unit grid ray per pixel, zero outside the valid domain
   Json ToJson() const;
 };
-// Faces of size x size pixels and 60 degree field of view covering every valid ray of the grid
+// Half field of view of the faces of each map. Wide faces hold enough of the scene for consistent
+// depth between faces and views; narrow ones give the fixed face size about the angular resolution
+// of a 1600 pixel supervision map of a 160 degree lens, which the normals of thin structures need.
+constexpr double DepthFaceHalfDegrees = 45, NormalFaceHalfDegrees = 30;
+// Faces of size x size pixels and the given field of view covering every valid ray of the grid
 // camera with at least 5 degrees to a face edge; source is the photo calibration.
-MonocularLens PlanMonocularLens(const Camera& source, const Camera& grid, int size);
+MonocularLens PlanMonocularLens(const Camera& source, const Camera& grid, int size,
+                                double half_degrees);
 struct FaceEstimate {
   cv::Mat distance;  // CV_32F distance along the lens ray in MoGe's metric scale, 0 where invalid
   cv::Mat normal;    // CV_32FC3 unit normal in the lens camera frame, facing the camera
@@ -78,7 +83,7 @@ MonocularMaps GatherFaces(const MonocularLens& lens, const std::vector<FaceEstim
 // first difference. The iteratively reweighted Cauchy least squares in log distance starts from one
 // scale per face. The LAS sets the low frequencies of the depth; MoGe keeps its detail.
 struct FaceFit {
-  static constexpr int Cells = 12;  // 5 degrees per cell
+  static constexpr int Cells = 12;
   std::vector<double> scales;  // exp of each field's mean, for reports
   std::vector<std::vector<double>> fields;  // (Cells + 1)^2 log-scale nodes per face, row-major
   Json faces;  // per face: LAS anchors, inlier fraction, residual median and MAD, field range
@@ -91,14 +96,16 @@ struct FaceFit {
 FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
                       const cv::Mat& las, const cv::Mat& las_normal);
 // Supervision maps of one photo in the LAS supervision encoding: uint16 millimetre ray distance
-// and RGB8 normals (B, G, R = z, y, x), zero where invalid. allowed (CV_8U, nonzero valid) holds
+// from maps and RGB8 normals (B, G, R = z, y, x) from detail_normal (CV_32FC3 on the same grid),
+// zero where invalid; the LAS trust uses the normals of maps. allowed (CV_8U, nonzero valid) holds
 // the static mask with its semantic margin removed. Depth drops MoGe's blended depth steps and
 // needs an accepted fit, the 0.05-65.535 m range and agreement with the LAS where the LAS is
 // trusted (as in FitFaceScales, against the gathered normal); untrusted LAS depth never vetoes.
 // Normals need an incidence of at least min_incidence. Returns per-photo statistics.
-Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps, const cv::Mat& las,
-                     const cv::Mat& las_normal, const cv::Mat& allowed, bool depth,
-                     double min_incidence, cv::Mat& depth_mm, cv::Mat& normal_rgb);
+Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps,
+                     const cv::Mat& detail_normal, const cv::Mat& las, const cv::Mat& las_normal,
+                     const cv::Mat& allowed, bool depth, double min_incidence, cv::Mat& depth_mm,
+                     cv::Mat& normal_rgb);
 // Writes the faces and gathered maps of one photo into a new directory for inspection.
 Json CheckMonocular(const fs::path& input, const fs::path& models, const std::string& image,
                     const fs::path& output, int max_size);

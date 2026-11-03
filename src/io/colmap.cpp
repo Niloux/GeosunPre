@@ -4,6 +4,13 @@
 #include "io/las.h"
 #include "frontend/frontend.h"
 #include "sfm/shutter.h"
+#include <opencv2/imgcodecs.hpp>
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <fstream>
+#include <future>
+#include <iterator>
 #include <set>
 #include <thread>
 #include <unordered_map>
@@ -486,5 +493,375 @@ Json CheckBundle(const fs::path& output) {
                                {"normal_pixels", supervision.at("normal_pixels")}};
   }
   return checked;
+}
+namespace {
+// Tracks used as a ruler: enough views and parallax to fix the point without the supervision.
+constexpr size_t RulerTrackViews = 3;
+constexpr double RulerTrackPixels = 1, RulerTrackParallaxDegrees = 3;
+// Each image is compared with the views sharing most tracks, on a lattice of its map pixels.
+constexpr size_t RulerNeighbours = 3, RulerSharedTracks = 30;
+constexpr int RulerLattice = 4;
+constexpr double RulerBaselineMetres = .05, RulerFieldOfViewDegrees = 160;
+// Log distance beyond which two views see different surfaces, and within which normals compare.
+constexpr double RulerDifferentSurface = .1, RulerSameSurface = .03;
+constexpr std::array<double, 3> RulerBandMetres{2, 5, 15};
+// Fixed bins keep the measurements of a whole scene in bounded memory.
+struct Histogram {
+  double lowest, width;
+  std::vector<uint64_t> bins;
+  uint64_t total = 0;
+  Histogram(double low, double high, int count)
+      : lowest(low), width((high - low) / count), bins(size_t(count)) {}
+  void Add(double value) {
+    ++bins[size_t(std::clamp(int(std::floor((value - lowest) / width)), 0, int(bins.size()) - 1))];
+    ++total;
+  }
+  void Merge(const Histogram& other) {
+    for (size_t i = 0; i < bins.size(); ++i)
+      bins[i] += other.bins[i];
+    total += other.total;
+  }
+  double Quantile(double fraction) const {
+    uint64_t seen = 0;
+    for (size_t i = 0; i < bins.size(); ++i)
+      if ((seen += bins[i]) >= uint64_t(std::ceil(fraction * total)) && seen)
+        return lowest + (i + .5) * width;
+    return lowest + bins.size() * width;
+  }
+  double Share(double limit) const {
+    uint64_t seen = 0;
+    for (size_t i = 0; i < bins.size() && lowest + (i + 1) * width <= limit; ++i)
+      seen += bins[i];
+    return total ? double(seen) / total : 0.;
+  }
+};
+struct LogErrors {
+  Histogram signed_log{-.5, .5, 5000}, absolute{0, .5, 2500};
+  void Add(double value) {
+    signed_log.Add(value);
+    absolute.Add(std::abs(value));
+  }
+  void Merge(const LogErrors& other) {
+    signed_log.Merge(other.signed_log);
+    absolute.Merge(other.absolute);
+  }
+  Json ToJson() const {
+    if (!absolute.total)
+      return {{"samples", 0}};
+    return {{"samples", absolute.total},
+            {"signed_median", signed_log.Quantile(.5)},
+            {"absolute_p50", absolute.Quantile(.5)},
+            {"absolute_p90", absolute.Quantile(.9)},
+            {"absolute_p95", absolute.Quantile(.95)},
+            {"within_1_percent", absolute.Share(std::log1p(.01))},
+            {"within_3_percent", absolute.Share(std::log1p(.03))},
+            {"within_10_percent", absolute.Share(std::log1p(.1))}};
+  }
+};
+struct ViewCheck {
+  double error = 0, normal_degrees = -1;
+};
+struct RulerCounts {
+  uint64_t observations = 0, covered = 0, sampled = 0, in_front = 0, behind = 0;
+  LogErrors tracks, views;
+  std::array<LogErrors, RulerBandMetres.size() + 1> track_bands;
+  Histogram normals{0, 180, 1800};
+  void AddTrack(double metres, double error) {
+    tracks.Add(error);
+    size_t band = 0;
+    while (band < RulerBandMetres.size() && metres >= RulerBandMetres[band])
+      ++band;
+    track_bands[band].Add(error);
+  }
+  void AddView(const ViewCheck& check) {
+    views.Add(check.error);
+    in_front += check.error > RulerDifferentSurface;
+    behind += check.error < -RulerDifferentSurface;
+    if (check.normal_degrees >= 0)
+      normals.Add(check.normal_degrees);
+  }
+  void Merge(const RulerCounts& other) {
+    observations += other.observations;
+    covered += other.covered;
+    sampled += other.sampled;
+    in_front += other.in_front;
+    behind += other.behind;
+    tracks.Merge(other.tracks);
+    views.Merge(other.views);
+    for (size_t b = 0; b < track_bands.size(); ++b)
+      track_bands[b].Merge(other.track_bands[b]);
+    normals.Merge(other.normals);
+  }
+  Json ToJson() const {
+    Json bands = Json::array();
+    for (size_t b = 0; b < track_bands.size(); ++b) {
+      auto row = track_bands[b].ToJson();
+      row["from_metres"] = b ? RulerBandMetres[b - 1] : 0.;
+      bands.push_back(row);
+    }
+    Json report = {{"track_observations", observations},
+                   {"track_coverage", observations ? double(covered) / observations : 0.},
+                   {"tracks", tracks.ToJson()},
+                   {"track_bands", bands},
+                   {"view_samples", sampled},
+                   {"view_coverage", sampled ? double(views.absolute.total) / sampled : 0.},
+                   {"views", views.ToJson()},
+                   {"other_view_surface_nearer",
+                    views.absolute.total ? double(in_front) / views.absolute.total : 0.},
+                   {"other_view_surface_farther",
+                    views.absolute.total ? double(behind) / views.absolute.total : 0.}};
+    if (normals.total)
+      report["normals_degrees"] = {{"samples", normals.total},
+                                   {"p50", normals.Quantile(.5)},
+                                   {"p90", normals.Quantile(.9)},
+                                   {"within_10", normals.Share(10)},
+                                   {"within_15", normals.Share(15)}};
+    return report;
+  }
+};
+struct RulerMaps {
+  cv::Mat depth, normal;
+};
+RulerMaps ReadRulerMaps(const fs::path& output, const std::string& name) {
+  const auto relative = fs::u8path(name + ".png");
+  RulerMaps maps{ReadImage(output / "depths" / relative, cv::IMREAD_UNCHANGED),
+                 ReadImage(output / "normals" / relative, cv::IMREAD_UNCHANGED)};
+  if (maps.depth.type() != CV_16UC1 || maps.normal.type() != CV_8UC3)
+    throw std::runtime_error("Unexpected supervision map type: " + name);
+  return maps;
+}
+// World normal of a map pixel, zero where the map has none (B, G, R = z, y, x).
+Eigen::Vector3d RulerNormal(const cv::Mat& normal, int x, int y, const Eigen::Matrix3d& rotation) {
+  const auto& code = normal.at<cv::Vec3b>(y, x);
+  if (!code[0] && !code[1] && !code[2])
+    return Eigen::Vector3d::Zero();
+  return rotation.transpose() *
+         Eigen::Vector3d(code[2] / 127.5 - 1, code[1] / 127.5 - 1, code[0] / 127.5 - 1).normalized();
+}
+std::string RulerFileBytes(const fs::path& path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream)
+    throw std::runtime_error("Cannot read " + path.u8string());
+  return std::string(std::istreambuf_iterator<char>(stream), {});
+}
+}  // namespace
+Json MeasureSupervision(const fs::path& output, const fs::path& compare) {
+  std::vector<fs::path> outputs{output};
+  if (!compare.empty()) {
+    outputs.push_back(compare);
+    for (const char* file : {"cameras.bin", "images.bin", "points3D.bin"})
+      if (RulerFileBytes(output / "sparse/0" / file) != RulerFileBytes(compare / "sparse/0" / file))
+        throw std::runtime_error("Compared deliveries must share one model; export both from one work");
+  }
+  std::vector<Json> summaries;
+  for (const auto& path : outputs) {
+    summaries.push_back(ReadJson(path / "supervision.json"));
+    if (summaries.back().at("depth_type") != "ray_distance" ||
+        summaries.back().at("request").at("max_size") != summaries[0].at("request").at("max_size"))
+      throw std::runtime_error("Compared supervision maps differ in kind or size");
+  }
+  Scene scene;
+  ShutterMotion motion;
+  const bool rolling = fs::exists(output / "rolling_shutter.json");
+  Json shutter;
+  if (rolling)
+    shutter = ReadJson(output / "rolling_shutter.json");
+  const auto model = ReadColmap(output / "sparse/0", scene, rolling ? &shutter : nullptr, motion);
+  const size_t n = model.images.size();
+  const std::array<Camera, 2> grids{MapCamera(model.cameras[0], summaries[0].at("request").at("max_size")),
+                                    MapCamera(model.cameras[1], summaries[0].at("request").at("max_size"))};
+  std::vector<Eigen::Matrix3d> rotations(n);
+  std::vector<Eigen::Vector3d> translations(n), centers(n);
+  for (size_t i = 0; i < n; ++i) {
+    rotations[i] = model.images[i].pose.Rotation().toRotationMatrix();
+    translations[i] = model.images[i].pose.Translation();
+    centers[i] = model.images[i].pose.Center();
+  }
+  std::vector<uint8_t> ruler_point(model.points.size());
+  std::vector<uint32_t> shared(n * n);
+  size_t ruler_points = 0;
+  for (size_t id = 0; id < model.points.size(); ++id) {
+    const auto& point = model.points[id];
+    double parallax = 0;
+    const Eigen::Vector3d first = (point.xyz - centers[point.track[0].image]).normalized();
+    for (const auto& a : point.track) {
+      parallax = std::max(parallax, std::acos(std::clamp(
+                                        first.dot((point.xyz - centers[a.image]).normalized()), -1., 1.)));
+      for (const auto& b : point.track)
+        if (a.image != b.image)
+          ++shared[a.image * n + b.image];
+    }
+    ruler_point[id] = point.track.size() >= RulerTrackViews && point.error <= RulerTrackPixels &&
+                      parallax >= RulerTrackParallaxDegrees * Pi / 180;
+    ruler_points += ruler_point[id];
+  }
+  std::vector<std::vector<uint32_t>> neighbours(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    std::vector<uint32_t> others;
+    for (uint32_t j = 0; j < n; ++j)
+      if (i != j && shared[i * n + j] >= RulerSharedTracks &&
+          (centers[i] - centers[j]).norm() >= RulerBaselineMetres)
+        others.push_back(j);
+    std::sort(others.begin(), others.end(), [&](uint32_t a, uint32_t b) {
+      return std::make_pair(shared[i * n + a], b) > std::make_pair(shared[i * n + b], a);
+    });
+    others.resize(std::min(others.size(), RulerNeighbours));
+    neighbours[i] = std::move(others);
+  }
+  std::array<std::vector<Eigen::Vector3d>, 2> rays;
+  for (int c = 0; c < 2; ++c) {
+    const auto& grid = grids[c];
+    const double radius = grid.Radius();
+    rays[c].assign(size_t(grid.width) * grid.height, Eigen::Vector3d::Zero());
+    for (int y = 0; y < grid.height; y += RulerLattice)
+      for (int x = 0; x < grid.width; x += RulerLattice) {
+        const double dx = (x + .5 - grid.params[2]) / grid.params[0],
+                     dy = (y + .5 - grid.params[3]) / grid.params[1];
+        if (dx * dx + dy * dy <= radius * radius)
+          rays[c][size_t(y) * grid.width + x] = grid.Ray({x + .5, y + .5});
+      }
+  }
+  const double view_limit = std::cos(RulerFieldOfViewDegrees * Pi / 360);
+  auto view_check = [&](uint32_t i, uint32_t j, const RulerMaps& a, const RulerMaps& b, int x, int y,
+                        ViewCheck& check) {
+    const uint32_t ci = model.images[i].camera, cj = model.images[j].camera;
+    const auto& grid_i = grids[ci];
+    const auto& grid_j = grids[cj];
+    const auto millimetres = a.depth.at<uint16_t>(y, x);
+    const Eigen::Vector3d& ray = rays[ci][size_t(y) * grid_i.width + x];
+    if (!millimetres || ray.isZero())
+      return false;
+    const Eigen::Vector3d seen = millimetres / 1000. * ray;
+    const Eigen::Vector3d reference =
+        rolling ? motion.Reference(i, ci, motion.Fraction(grid_i, {x + .5, y + .5}), seen) : seen;
+    const Eigen::Vector3d world = rotations[i].transpose() * (reference - translations[i]);
+    const Eigen::Vector3d other = rotations[j] * world + translations[j];
+    Eigen::Vector3d moved = other;
+    Eigen::Vector2d pixel;
+    double s = 0;
+    for (int k = 0; k < 4; ++k) {
+      if (rolling)
+        moved = motion.Apply(j, cj, s, other);
+      if (moved.z() < view_limit * moved.norm())
+        return false;
+      pixel = grid_j.Project(moved);
+      s = motion.Fraction(grid_j, pixel);
+    }
+    const int u = int(std::floor(pixel.x())), v = int(std::floor(pixel.y()));
+    if (u < 0 || v < 0 || u >= b.depth.cols || v >= b.depth.rows || !b.depth.at<uint16_t>(v, u))
+      return false;
+    check.error = std::log(moved.norm() * 1000 / b.depth.at<uint16_t>(v, u));
+    check.normal_degrees = -1;
+    if (std::abs(check.error) <= RulerSameSurface) {
+      const Eigen::Vector3d na = RulerNormal(a.normal, x, y, rotations[i]),
+                            nb = RulerNormal(b.normal, u, v, rotations[j]);
+      if (!na.isZero() && !nb.isZero())
+        check.normal_degrees = std::acos(std::clamp(na.dot(nb), -1., 1.)) * 180 / Pi;
+    }
+    return true;
+  };
+  struct Totals {
+    std::vector<RulerCounts> own, common;
+  };
+  std::atomic<size_t> next{0};
+  auto work = [&] {
+    Totals totals{std::vector<RulerCounts>(outputs.size()), std::vector<RulerCounts>(outputs.size())};
+    const size_t packages = outputs.size();
+    std::vector<double> values(packages);
+    std::vector<ViewCheck> checks(packages);
+    for (size_t i; (i = next++) < n;) {
+      const auto& image = model.images[i];
+      const uint32_t c = image.camera;
+      const auto& camera = model.cameras[c];
+      const auto& grid = grids[c];
+      std::vector<RulerMaps> maps;
+      for (const auto& path : outputs)
+        maps.push_back(ReadRulerMaps(path, scene.images[i].name));
+      for (size_t k = 0; k < image.points.size(); ++k) {
+        if (image.points[k] == NoPoint || !ruler_point[image.points[k]])
+          continue;
+        const Eigen::Vector2d& feature = image.pixels[k];
+        const Eigen::Vector3d reference = image.pose.Apply(model.points[image.points[k]].xyz);
+        const double metres =
+            (rolling ? motion.Apply(uint32_t(i), c, motion.Fraction(camera, feature), reference)
+                     : reference)
+                .norm();
+        const int x = int(feature.x() * grid.width / camera.width),
+                  y = int(feature.y() * grid.height / camera.height);
+        if (x < 0 || y < 0 || x >= grid.width || y >= grid.height)
+          continue;
+        bool all = true;
+        for (size_t p = 0; p < packages; ++p) {
+          const auto millimetres = maps[p].depth.at<uint16_t>(y, x);
+          ++totals.own[p].observations;
+          ++totals.common[p].observations;
+          all &= millimetres != 0;
+          if (millimetres) {
+            values[p] = std::log(metres * 1000 / millimetres);
+            ++totals.own[p].covered;
+            totals.own[p].AddTrack(metres, values[p]);
+          }
+        }
+        for (size_t p = 0; all && p < packages; ++p) {
+          ++totals.common[p].covered;
+          totals.common[p].AddTrack(metres, values[p]);
+        }
+      }
+      for (const uint32_t j : neighbours[i]) {
+        std::vector<RulerMaps> others;
+        for (const auto& path : outputs)
+          others.push_back(ReadRulerMaps(path, scene.images[j].name));
+        for (int y = 0; y < grid.height; y += RulerLattice)
+          for (int x = 0; x < grid.width; x += RulerLattice) {
+            bool all = true;
+            for (size_t p = 0; p < packages; ++p) {
+              totals.own[p].sampled += maps[p].depth.at<uint16_t>(y, x) != 0;
+              totals.common[p].sampled += maps[p].depth.at<uint16_t>(y, x) != 0;
+              const bool ok = view_check(uint32_t(i), j, maps[p], others[p], x, y, checks[p]);
+              all &= ok;
+              if (ok)
+                totals.own[p].AddView(checks[p]);
+            }
+            for (size_t p = 0; all && p < packages; ++p)
+              totals.common[p].AddView(checks[p]);
+          }
+      }
+    }
+    return totals;
+  };
+  std::vector<std::future<Totals>> workers;
+  for (unsigned t = 0; t < std::clamp(std::thread::hardware_concurrency(), 1u, 8u); ++t)
+    workers.push_back(std::async(std::launch::async, work));
+  std::vector<RulerCounts> own(outputs.size()), common(outputs.size());
+  for (auto& worker : workers) {
+    const auto totals = worker.get();
+    for (size_t p = 0; p < outputs.size(); ++p) {
+      own[p].Merge(totals.own[p]);
+      common[p].Merge(totals.common[p]);
+    }
+  }
+  Json deliveries = Json::array();
+  for (size_t p = 0; p < outputs.size(); ++p) {
+    Json row = {{"output", outputs[p].u8string()},
+                {"version", summaries[p].at("version")},
+                {"source", summaries[p].at("source")},
+                {"own_pixels", own[p].ToJson()}};
+    if (outputs.size() > 1)
+      row["pixels_valid_in_both"] = common[p].ToJson();
+    deliveries.push_back(row);
+  }
+  return {{"images", n},
+          {"ruler_points", ruler_points},
+          {"track_filter",
+           {{"minimum_views", RulerTrackViews},
+            {"maximum_error_px", RulerTrackPixels},
+            {"minimum_parallax_degrees", RulerTrackParallaxDegrees}}},
+          {"views",
+           {{"neighbours", RulerNeighbours},
+            {"lattice_pixels", RulerLattice},
+            {"different_surface_log", RulerDifferentSurface},
+            {"same_surface_log", RulerSameSurface}}},
+          {"errors", "log(ruler distance / map distance); depth of 0 is not compared"},
+          {"deliveries", deliveries}};
 }
 }  // namespace geosun
