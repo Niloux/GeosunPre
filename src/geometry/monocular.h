@@ -4,8 +4,8 @@
 #include <functional>
 
 namespace geosun {
-// MoGe-2 runs on square pinhole faces of a fisheye lens: a front face and, for a wide lens, a
-// ring of tilted faces. Each face is estimated on its own and gathered onto the supervision grid.
+// MoGe-2 runs on square pinhole faces of a fisheye lens: a front face and, for a wide lens, rings
+// of tilted faces. Each face is estimated on its own and gathered onto the supervision grid.
 struct MonocularFace {
   Eigen::Matrix3d rotation;  // lens camera ray -> face frame
   cv::Mat source;            // CV_32FC2 face pixel -> prefiltered photo pixel
@@ -20,7 +20,8 @@ struct MonocularLens {
   static constexpr int MaxSamples = 3;
   Camera source, grid;
   int size = 0;
-  double focal = 0, tilt_degrees = 0, prefilter = 1;
+  double focal = 0, prefilter = 1;
+  std::vector<double> ring_tilts;  // degrees
   std::vector<MonocularFace> faces;
   // Up to MaxSamples faces per grid pixel by descending weight; count 0 outside the domain.
   std::vector<std::array<FaceSample, MaxSamples>> samples;
@@ -28,7 +29,7 @@ struct MonocularLens {
   cv::Mat rays;  // CV_32FC3 unit grid ray per pixel, zero outside the valid domain
   Json ToJson() const;
 };
-// Faces of size x size pixels and 90 degree field of view covering every valid ray of the grid
+// Faces of size x size pixels and 60 degree field of view covering every valid ray of the grid
 // camera with at least 5 degrees to a face edge; source is the photo calibration.
 MonocularLens PlanMonocularLens(const Camera& source, const Camera& grid, int size);
 struct FaceEstimate {
@@ -77,7 +78,7 @@ MonocularMaps GatherFaces(const MonocularLens& lens, const std::vector<FaceEstim
 // first difference. The iteratively reweighted Cauchy least squares in log distance starts from one
 // scale per face. The LAS sets the low frequencies of the depth; MoGe keeps its detail.
 struct FaceFit {
-  static constexpr int Cells = 12;
+  static constexpr int Cells = 12;  // 5 degrees per cell
   std::vector<double> scales;  // exp of each field's mean, for reports
   std::vector<std::vector<double>> fields;  // (Cells + 1)^2 log-scale nodes per face, row-major
   Json faces;  // per face: LAS anchors, inlier fraction, residual median and MAD, field range
@@ -91,10 +92,10 @@ FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>
                       const cv::Mat& las, const cv::Mat& las_normal);
 // Supervision maps of one photo in the LAS supervision encoding: uint16 millimetre ray distance
 // and RGB8 normals (B, G, R = z, y, x), zero where invalid. allowed (CV_8U, nonzero valid) holds
-// the static mask with its semantic margin removed. Both maps drop MoGe's blended depth steps;
-// depth further needs an accepted fit, the 0.05-65.535 m range and agreement with the LAS where
-// the LAS is trusted (as in FitFaceScales, against the gathered normal); untrusted LAS depth never
-// vetoes. Normals need an incidence of at least min_incidence. Returns per-photo statistics.
+// the static mask with its semantic margin removed. Depth drops MoGe's blended depth steps and
+// needs an accepted fit, the 0.05-65.535 m range and agreement with the LAS where the LAS is
+// trusted (as in FitFaceScales, against the gathered normal); untrusted LAS depth never vetoes.
+// Normals need an incidence of at least min_incidence. Returns per-photo statistics.
 Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps, const cv::Mat& las,
                      const cv::Mat& las_normal, const cv::Mat& allowed, bool depth,
                      double min_incidence, cv::Mat& depth_mm, cv::Mat& normal_rgb);

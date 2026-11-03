@@ -20,7 +20,7 @@ namespace geosun {
 namespace {
 constexpr int Version = 8;
 // Monocular supervision (source moge) is published as version 10; LAS maps keep version 8.
-constexpr int MonocularVersion = 10;
+constexpr int MonocularVersion = 11;
 constexpr const char* MonocularSource = "moge2_faces_las_scaled";
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
@@ -1439,8 +1439,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         "accepted face fit, static mask off the semantic margin, no blended depth step, "
         "agreement with trusted LAS depth";
     summary["normal_estimator"] = "moge2_vitl_faces";
-    summary["normal_validity"] =
-        "static mask off the semantic margin, no blended depth step, incidence";
+    summary["normal_validity"] = "static mask off the semantic margin, incidence";
     summary["monocular"] = {{"fit", "per-face 12 x 12 bilinear log-scale field, Cauchy IRLS in log "
                                     "distance, scale 0.03, inliers within 0.05, overlap weight 0.25, "
                                     "node first difference 0.1 x mean anchors per node, lattice 2 px"},
