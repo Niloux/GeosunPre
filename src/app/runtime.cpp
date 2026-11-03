@@ -73,7 +73,7 @@ Arguments::Arguments(const std::vector<std::string>& args) {
   for (size_t i = 2; i < args.size(); ++i) {
     const auto& name = args[i];
     if (name == "--no-ply" || name == "--las-supervision" || name == "--no-las-supervision" ||
-        name == "--refine" || name == "--debug" || name == "--crop-valid-domain" ||
+        name == "--debug" || name == "--crop-valid-domain" ||
         name == "--no-crop-valid-domain") {
       if (!values.emplace(name, "true").second)
         throw std::invalid_argument("Repeated option: " + name);

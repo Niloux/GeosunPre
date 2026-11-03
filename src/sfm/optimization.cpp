@@ -341,9 +341,7 @@ bool RigExtrinsic(const Reconstruction& m, const std::vector<std::array<uint32_t
 Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std::string& stage,
               int workers, int iterations, const std::set<uint32_t>& variable_images,
               const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav,
-              const std::set<uint64_t>& selected_points,
-              const std::vector<std::vector<uint8_t>>& precise_observations,
-              const Reconstruction* reference, ShutterMotion* shutter,
+              const std::set<uint64_t>& selected_points, ShutterMotion* shutter,
               const std::vector<std::array<uint32_t, 2>>& frames) {
   const auto started = Clock::now();
   ceres::Problem problem;
@@ -351,7 +349,6 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   auto* loss = new ceres::HuberLoss(2.);
   std::set<uint32_t> used_images, used_cameras;
   size_t observations = 0;
-  size_t precise_count = 0, reference_count = 0;
   const bool metric = !nav.empty();
   size_t variable_count = 0;
   for (auto& p : m.points)
@@ -368,17 +365,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         const double depth = image.pose.Apply(p.xyz).z();
         if (depth <= 0)
           throw std::runtime_error("BA requires positive initial depth");
-        const bool precise = !precise_observations.empty() && precise_observations[o.image][o.feature];
-        precise_count += precise;
-        Eigen::Vector2d pixel = image.pixels[o.feature];
-        if (reference && !precise) {
-          // Refine relative to the accepted geometry instead of fitting the
-          // detector noise again on a different subset of its observations.
-          const auto& original = reference->images[o.image];
-          pixel = reference->cameras[original.camera].Project(
-              original.pose.Apply(reference->points[&p - m.points.data()].xyz));
-          ++reference_count;
-        }
+        const Eigen::Vector2d pixel = image.pixels[o.feature];
         if (shutter)
           problem.AddResidualBlock(
               new ShutterReprojection(pixel, shutter->velocity[o.image],
@@ -542,8 +529,6 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"rig_frames", rig_frames},
           {"rolling_shutter", shutter != nullptr},
           {"observations", observations},
-          {"precise_observations", precise_count},
-          {"reference_observations", reference_count},
           {"solver", ceres::LinearSolverTypeToString(summary.linear_solver_type_used)},
           {"explicit_schur", options.use_explicit_schur_complement},
           {"build_seconds", build_seconds},

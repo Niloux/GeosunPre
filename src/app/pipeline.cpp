@@ -6,7 +6,6 @@
 #include "frontend/frontend.h"
 #include "frontend/inference.h"
 #include "sfm/reconstruction.h"
-#include "sfm/photometric.h"
 #include "sfm/structure.h"
 #include "sfm/shutter.h"
 #include "alignment/alignment.h"
@@ -76,12 +75,12 @@ Json Settings(const fs::path& file) {
   if (!result.at("sfm_repair_rounds").is_number_integer() || result.at("sfm_repair_rounds") < 0 ||
       result.at("sfm_repair_rounds") > 2)
     throw std::runtime_error("sfm_repair_rounds must be an integer from 0 to 2");
-  for (const auto* key : {"refine", "rolling_shutter", "enhanced_photos"})
+  for (const auto* key : {"rolling_shutter", "enhanced_photos"})
     if (!result.at(key).is_boolean())
       throw std::runtime_error(std::string(key) + " must be a boolean");
   for (const auto& [key, value] : result.items())
     if (key != "workers" && key != "calibration_tracks" && key != "sfm_repair_rounds" &&
-        key != "refine" && key != "rolling_shutter" && key != "enhanced_photos" &&
+        key != "rolling_shutter" && key != "enhanced_photos" &&
         (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() <= 0))
       throw std::runtime_error("Expected positive numeric setting: " + key);
   if (result.at("calibration_tracks") != "all" && result.at("calibration_tracks") != "stable")
@@ -97,7 +96,7 @@ AlignmentLimits Limits(const Json& settings) {
           settings.at("las_p90_m"), settings.at("quality_median_px"),
           settings.at("quality_p90_px")};
 }
-// Delivery options shared by run, export, refine and cleanup.
+// Delivery options shared by run, export and cleanup.
 struct Delivery {
   bool ply;
   double voxel;
@@ -245,37 +244,9 @@ std::vector<fs::path> AlignVisual(const Scene& scene, const fs::path& work, cons
   WriteJson(work / "cache/alignment.json", result);
   return {work / "cache/aligned.bin", work / "cache/alignment.json"};
 }
-std::vector<fs::path> RefineAligned(const Scene& scene, const fs::path& work,
-                                    const Json& settings) {
-  const auto model = ReadModel(work / "cache/aligned.bin");
-  const auto original = ReadJson(work / "cache/alignment.json");
-  auto refinement = RefinePhotometric(scene, model, settings.at("workers"), Limits(settings),
-                                      settings.at("ba_workers"));
-  refinement.report["enabled"] = true;
-  const auto& selected = refinement.accepted ? refinement.candidate : model;
-  auto result = PostprocessResult(scene, selected, original, "refined");
-  result["refinement"] = refinement.report;
-  WriteModel(work / "cache/refinement_candidate.bin", refinement.candidate);
-  WriteModel(work / "cache/refined.bin", selected);
-  WriteJson(work / "cache/refinement.json", refinement.report);
-  WriteJson(work / "cache/refinement_result.json", result);
-  Log("Photometric refinement " + refinement.report.at("reason").get<std::string>());
-  return {work / "cache/refinement_candidate.bin", work / "cache/refined.bin",
-          work / "cache/refinement.json", work / "cache/refinement_result.json"};
-}
-// Result of the camera stages before rolling-shutter correction: alignment or refinement.
-Json CameraResult(const fs::path& work, const Json& settings) {
-  const bool photo = settings.at("refine");
-  auto original =
-      ReadJson(work / (photo ? "cache/refinement_result.json" : "cache/alignment.json"));
-  if (!photo)
-    original["refinement"] = {
-        {"enabled", false}, {"accepted", false}, {"reason", "disabled by configuration"}};
-  return original;
-}
 std::vector<fs::path> CorrectShutter(const Scene& scene, const fs::path& work,
                                      const Json& settings) {
-  const auto original = CameraResult(work, settings);
+  const auto original = ReadJson(work / "cache/alignment.json");
   const auto model = ReadModel(SelectedModelPath(work, original));
   auto correction = CorrectRollingShutter(scene, model, settings.at("workers"), Limits(settings),
                                           settings.at("ba_workers"));
@@ -300,7 +271,7 @@ std::vector<fs::path> CleanSelected(const Scene& scene, const fs::path& work, co
                                     WorkState& state) {
   auto original = settings.at("rolling_shutter").get<bool>()
                       ? ReadJson(work / "cache/shutter_result.json")
-                      : CameraResult(work, settings);
+                      : ReadJson(work / "cache/alignment.json");
   if (!original.contains("shutter"))
     original["shutter"] = {{"enabled", false}, {"used", false},
                            {"reason", "disabled by configuration"}};
@@ -343,8 +314,6 @@ std::vector<fs::path> RunStage(const std::string& stage, const Scene& scene, con
     return ReconstructVisual(scene, work, root, settings, state);
   if (stage == "align")
     return AlignVisual(scene, work, settings);
-  if (stage == "refine")
-    return RefineAligned(scene, work, settings);
   if (stage == "shutter")
     return CorrectShutter(scene, work, settings);
   if (stage == "cleanup")
@@ -354,10 +323,6 @@ std::vector<fs::path> RunStage(const std::string& stage, const Scene& scene, con
 }
 std::vector<std::string> Stages(const Json& settings, const std::string& requested) {
   std::vector<std::string> stages = {"prepare", "masks", "features", "matches", "sfm", "align"};
-  if (settings.at("refine").get<bool>())
-    stages.push_back("refine");
-  else if (requested == "refine")
-    throw std::runtime_error("Refinement is disabled; enable --refine in a new work directory");
   if (settings.at("rolling_shutter").get<bool>())
     stages.push_back("shutter");
   else if (requested == "shutter")
@@ -378,7 +343,7 @@ fs::path ProductionWork(const fs::path& output) {
 }  // namespace
 void Run(const Arguments& args) {
   args.Validate(WithDeliveryOptions({"--input", "--work", "--models", "--config", "--stage",
-                                     "--output", "--las", "--refine", "--debug"}));
+                                     "--output", "--las", "--debug"}));
   const auto delivery = ParseDelivery(args);
   // Without --input, an existing work directory supplies the input and output.
   auto output = args.Get("--output").empty() ? fs::path() : args.Path("--output");
@@ -428,8 +393,6 @@ void Run(const Arguments& args) {
     auto settings = args.Get("--config").empty()
                         ? (state.value.empty() ? Settings({}) : state.value.at("settings"))
                         : Settings(args.Path("--config"));
-    if (args.Get("--refine") == "true")
-      settings["refine"] = true;
     const auto las = args.Get("--las").empty()
                          ? (state.value.empty()
                                 ? fs::path()
@@ -476,7 +439,7 @@ void Run(const Arguments& args) {
           const auto& previous = *(std::find(stages.begin(), stages.end(), stage) - 1);
           if (!completed.contains(previous))
             throw std::runtime_error("Run prerequisite stage: " + previous);
-          if (stage == "refine" || stage == "shutter" || stage == "cleanup" || stage == "export")
+          if (stage == "shutter" || stage == "cleanup" || stage == "export")
             Verify(work, completed.at(previous).at("files"));
           // SfM repair rounds run the matcher again with the recorded models.
           if (stage == "masks" || stage == "features" || stage == "matches" ||
@@ -551,7 +514,6 @@ void Postprocess(const Arguments& args) {
   args.Validate(
       WithDeliveryOptions({"--work", "--output", "--workers", "--new-work", "--debug"}));
   const auto delivery = ParseDelivery(args);
-  const bool photo = args.command == "refine";
   const bool debug = args.Get("--debug") == "true";
   const auto source = args.Path("--work"), delivery_output = args.Path("--output");
   // Like run: the new work directory is kept only with --debug.
@@ -583,10 +545,6 @@ void Postprocess(const Arguments& args) {
   const auto original = ReadJson(source / "result.json");
   const bool corrected =
       original.contains("shutter") && original.at("shutter").value("used", false);
-  if (photo && corrected)
-    throw std::runtime_error(
-        "Photometric refinement needs the original photo geometry; the source model is "
-        "rolling-shutter corrected");
   const auto model = ReadModel(SelectedModelPath(source, original));
   AlignmentLimits limits;
   if (original.contains("alignment")) {
@@ -595,6 +553,7 @@ void Postprocess(const Arguments& args) {
     limits.median_m = saved.at("median_m");
     limits.p90_m = saved.at("p90_m");
   } else if (original.contains("refinement") && original.at("refinement").contains("limits")) {
+    // Results of older versions that delivered a photometrically refined model.
     const auto& saved = original.at("refinement").at("limits");
     limits.support_fraction = saved.at("las_support_fraction");
     limits.median_m = saved.at("las_median_m");
@@ -603,35 +562,19 @@ void Postprocess(const Arguments& args) {
   limits.median_px = original.at("quality").at("limits").at("median_px");
   limits.p90_px = original.at("quality").at("limits").at("p90_px");
   fs::create_directories(output / "cache");
-  Reconstruction selected;
-  Json report;
-  const std::string selected_name = photo ? "refined" : "cleaned";
-  const std::string report_name = photo ? "refinement" : "cleanup";
-  bool accepted;
-  if (photo) {
-    auto refinement = RefinePhotometric(scene, model, workers, limits);
-    accepted = refinement.accepted;
-    report = std::move(refinement.report);
-    report["enabled"] = true;
-    selected = accepted ? refinement.candidate : model;
-    WriteModel(output / "cache/refinement_candidate.bin", refinement.candidate);
-  } else {
-    auto cleanup = CleanSparseStructure(scene, model, workers, limits);
-    accepted = cleanup.accepted;
-    report = std::move(cleanup.report);
-    report["source_model"] = original.value("selected_model", std::string("aligned"));
-    selected = accepted ? cleanup.candidate : model;
-    WriteModel(output / "cache/cleanup_candidate.bin", cleanup.candidate);
-  }
+  auto cleanup = CleanSparseStructure(scene, model, workers, limits);
+  const bool accepted = cleanup.accepted;
+  auto& report = cleanup.report;
+  report["source_model"] = original.value("selected_model", std::string("aligned"));
+  const auto& selected = accepted ? cleanup.candidate : model;
+  WriteModel(output / "cache/cleanup_candidate.bin", cleanup.candidate);
   report["source_work"] = source.u8string();
-  auto result = PostprocessResult(scene, selected, original, selected_name);
-  if (photo)
-    result.erase("cleanup");
-  result[report_name] = report;
+  auto result = PostprocessResult(scene, selected, original, "cleaned");
+  result["cleanup"] = report;
   WriteModel(output / "cache/aligned.bin", model);
   WriteJson(output / "cache/alignment.json", original);
-  WriteModel(output / "cache" / (selected_name + ".bin"), selected);
-  WriteJson(output / "cache" / (report_name + ".json"), report);
+  WriteModel(output / "cache/cleaned.bin", selected);
+  WriteJson(output / "cache/cleanup.json", report);
   WriteJson(output / "scene.json", scene.ToJson());
   WriteJson(output / "result.json", result);
   // Rolling-shutter corrected models carry their readout motion.

@@ -3,7 +3,6 @@
   "ba_workers": 8,
   "sfm_repair_rounds": 0,
   "calibration_tracks": "all",
-  "refine": false,
   "rolling_shutter": true,
   "enhanced_photos": false,
   "quality_median_px": 2.0,
