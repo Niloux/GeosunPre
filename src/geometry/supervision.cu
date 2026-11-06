@@ -20,7 +20,7 @@ namespace geosun {
 namespace {
 constexpr int Version = 8;
 // Monocular supervision (source moge) is published as version 10; LAS maps keep version 8.
-constexpr int MonocularVersion = 12;
+constexpr int MonocularVersion = 13;
 constexpr const char* MonocularSource = "moge2_faces_las_scaled";
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
@@ -1015,7 +1015,9 @@ cv::Mat StaticMask(const Scene& scene, const fs::path& masks, uint32_t image, co
   if (options.crop) {
     const auto& w = (*options.crop)[scene.images[image].camera];
     if (w.x + w.width > mask.cols || w.y + w.height > mask.rows)
-      throw std::runtime_error("Crop window lies outside the static mask");
+      throw std::runtime_error("Crop window " + w.ToJson().dump() + " lies outside the " +
+                               std::to_string(mask.cols) + "x" + std::to_string(mask.rows) +
+                               " static mask of " + scene.images[image].name);
     mask = mask(cv::Rect(w.x, w.y, w.width, w.height)).clone();
   }
   // A map pixel is valid only when its whole footprint is. The invalid indicator is resampled,
@@ -1199,6 +1201,10 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   };
   // Lens plans outlive their camera's loop: the monocular fits run with the pending writes.
   std::array<std::optional<MonocularLens>, 2> lens_plans, normal_plans;
+  // Cells of each photo whose MoGe depth the trusted LAS confirmed, for the cross-view check; each
+  // pending write fills its own image.
+  std::vector<cv::Mat> verified_cells(model.images.size());
+  auto* verified_out = &verified_cells;
   for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
     std::vector<uint32_t> images;
     for (uint32_t i = 0; i < model.images.size(); ++i)
@@ -1372,10 +1378,11 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
             });
             const auto detail = GatherFaces(*normal_plan, normal_estimates,
                                             [](const FaceSample&) { return 0.; });
-            cv::Mat monocular_depth, monocular_normal;
+            cv::Mat monocular_depth, monocular_normal, confirmed;
             monocular_row =
                 EncodeMonocular(*plan, maps, detail.normal, depth, normal, allowed, fit.accepted,
-                                MinIncidence, monocular_depth, monocular_normal);
+                                MinIncidence, monocular_depth, monocular_normal, confirmed);
+            (*verified_out)[id] = ConflictCells(confirmed);
             Json faces = Json::array(), normal_faces = Json::array();
             for (const auto& estimate : estimates)
               faces.push_back(estimate.ToJson());
@@ -1403,6 +1410,16 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   }
   while (!writes.empty())
     finish();
+  Json view_conflicts;
+  if (monocular) {
+    view_conflicts =
+        FilterViewConflicts(output, scene, model, motion, options.max_size, verified_cells, rows);
+    depth_pixels = 0;
+    for (const auto& row : rows)
+      if (!row.is_null())
+        depth_pixels += row.at("depth_pixels").get<uint64_t>();
+    Log("MoGe view conflicts: " + view_conflicts.dump());
+  }
   if (!depth_pixels || !normal_pixels)
     throw std::runtime_error("LAS supervision has no reliable depth or normal pixels");
   Json images = Json::array();
@@ -1452,7 +1469,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         "moge2 faces scaled per face to the LAS depth, blended in log distance";
     summary["depth_validity"] =
         "accepted face fit, static mask off the semantic margin, no blended depth step, "
-        "agreement with trusted LAS depth";
+        "agreement with trusted LAS depth, no free-space conflict with neighbouring views";
     summary["normal_estimator"] = "moge2_vitl_faces";
     summary["normal_validity"] = "static mask off the semantic margin, incidence";
     summary["monocular"] = {{"fit", "per-face 12 x 12 bilinear log-scale field, Cauchy IRLS in log "
@@ -1464,6 +1481,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                             {"depth_step_log", .04},
                             {"las_agreement", "within max(3%, 0.03 m)"},
                             {"normals_need_depth", false},
+                            {"view_conflicts", view_conflicts},
                             {"inference", geometry->Profile()}};
   }
   return summary;

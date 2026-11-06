@@ -5,7 +5,11 @@
 #include <opencv2/imgcodecs.hpp>
 #include <Eigen/SparseCholesky>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <mutex>
+#include <thread>
 
 namespace geosun {
 namespace {
@@ -36,6 +40,13 @@ constexpr double StepLog = .04, AgreementFraction = .03, AgreementMetres = .03;
 // returns and silhouette spread rarely agree, so they neither shape the fit nor veto MoGe.
 constexpr double TrustedNormalDegrees = 15;
 constexpr double MinimumDepth = .05, MaximumDepth = 65.535;
+// Cross-view free-space check: views sharing most tracks, lattice step in grid pixels, and the log
+// distance by which a point must lie in front of the other view's depth to contradict it.
+constexpr size_t ConflictNeighbours = 12, ConflictSharedTracks = 30;
+constexpr double ConflictBaselineMetres = .05, ConflictFieldOfViewDegrees = 160;
+constexpr int ConflictLattice = 4;
+constexpr double ConflictLog = .05;
+constexpr int ConflictMinimumViews = 2;
 
 double Radians(double degrees) { return degrees * Pi / 180; }
 void AddRing(std::vector<Eigen::Matrix3d>& rotations, int ring, double tilt) {
@@ -673,7 +684,7 @@ FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>
 Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps,
                      const cv::Mat& detail_normal, const cv::Mat& las, const cv::Mat& las_normal,
                      const cv::Mat& allowed, bool depth, double min_incidence, cv::Mat& depth_mm,
-                     cv::Mat& normal_rgb) {
+                     cv::Mat& normal_rgb, cv::Mat& verified) {
   const int w = lens.grid.width, h = lens.grid.height;
   if (las.size() != cv::Size(w, h) || allowed.size() != las.size() || allowed.type() != CV_8UC1 ||
       maps.distance.size() != las.size() || las_normal.size() != las.size() ||
@@ -702,6 +713,7 @@ Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps,
   cv::dilate(step, blended, cv::Mat::ones(3, 3, CV_8UC1));
   depth_mm = cv::Mat::zeros(h, w, CV_16UC1);
   normal_rgb = cv::Mat::zeros(h, w, CV_8UC3);
+  verified = cv::Mat::zeros(h, w, CV_8UC1);
   std::vector<double> agreement;
   size_t disagreeing = 0, untrusted = 0, untrusted_disagreeing = 0;
   for (int y = 0; y < h; ++y)
@@ -723,21 +735,23 @@ Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps,
       // Only trusted LAS depth vetoes MoGe; elsewhere the disagreement is only counted.
       const auto& n = maps.normal.at<cv::Vec3f>(y, x);
       const double target = las.at<uint16_t>(y, x) / 1000.;
-      bool agrees = true;
+      bool agrees = true, confirmed = false;
       if (target > 0) {
         const double ratio = std::abs(std::log(d / target));
         const bool within = ratio <= std::log1p(std::max(AgreementFraction, AgreementMetres / target));
         if (Trusted(las_normal, x, y, Eigen::Vector3d(n[0], n[1], n[2]))) {
           agreement.push_back(ratio);
-          agrees = within;
+          agrees = confirmed = within;
           disagreeing += !within;
         } else {
           ++untrusted;
           untrusted_disagreeing += !within;
         }
       }
-      if (depth && agrees && d >= MinimumDepth && d <= MaximumDepth)
+      if (depth && agrees && d >= MinimumDepth && d <= MaximumDepth) {
         depth_mm.at<uint16_t>(y, x) = uint16_t(std::clamp<long>(std::lround(d * 1000.), 1, 65535));
+        verified.at<uint8_t>(y, x) = confirmed ? 255 : 0;
+      }
     }
   Json stats = {{"las_compared_pixels", agreement.size()},
                 {"las_disagreeing_pixels", disagreeing},
@@ -840,5 +854,263 @@ Json CheckMonocular(const fs::path& input, const fs::path& root, const std::stri
                  {"inference", models.Profile()}};
   WriteJson(output / "monocular.json", report);
   return report;
+}
+cv::Mat ConflictCells(const cv::Mat& pixels) {
+  cv::Mat cells = cv::Mat::zeros((pixels.rows + ConflictLattice - 1) / ConflictLattice,
+                                 (pixels.cols + ConflictLattice - 1) / ConflictLattice, CV_8UC1);
+  for (int y = 0; y < pixels.rows; ++y)
+    for (int x = 0; x < pixels.cols; ++x)
+      if (pixels.at<uint8_t>(y, x))
+        cells.at<uint8_t>(y / ConflictLattice, x / ConflictLattice) = 255;
+  return cells;
+}
+Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Reconstruction& model,
+                         const ShutterMotion* motion, int max_size,
+                         const std::vector<cv::Mat>& verified, std::vector<Json>& rows) {
+  const auto started = std::chrono::steady_clock::now();
+  const size_t n = model.images.size();
+  const std::array<Camera, 2> grids{MapCamera(model.cameras[0], max_size),
+                                    MapCamera(model.cameras[1], max_size)};
+  std::vector<Eigen::Matrix3d> rotations(n);
+  std::vector<Eigen::Vector3d> translations(n), centers(n);
+  for (size_t i = 0; i < n; ++i) {
+    rotations[i] = model.images[i].pose.Rotation().toRotationMatrix();
+    translations[i] = model.images[i].pose.Translation();
+    centers[i] = model.images[i].pose.Center();
+  }
+  std::vector<uint32_t> shared(n * n);
+  for (const auto& point : model.points)
+    for (const auto& a : point.track)
+      for (const auto& b : point.track)
+        if (a.image != b.image)
+          ++shared[a.image * n + b.image];
+  std::vector<std::vector<uint8_t>> paired(n, std::vector<uint8_t>(n));
+  for (uint32_t i = 0; i < n; ++i) {
+    if (!model.images[i].registered)
+      continue;
+    std::vector<uint32_t> others;
+    for (uint32_t j = 0; j < n; ++j)
+      if (i != j && model.images[j].registered && shared[i * n + j] >= ConflictSharedTracks &&
+          (centers[i] - centers[j]).norm() >= ConflictBaselineMetres)
+        others.push_back(j);
+    std::sort(others.begin(), others.end(), [&](uint32_t a, uint32_t b) {
+      return std::make_pair(shared[i * n + a], b) > std::make_pair(shared[i * n + b], a);
+    });
+    others.resize(std::min(others.size(), ConflictNeighbours));
+    for (const uint32_t j : others)
+      paired[i][j] = paired[j][i] = 1;
+  }
+  std::array<std::vector<Eigen::Vector3d>, 2> rays;
+  for (int c = 0; c < 2; ++c) {
+    const auto& grid = grids[c];
+    const double radius = grid.Radius();
+    rays[c].assign(size_t(grid.width) * grid.height, Eigen::Vector3d::Zero());
+    for (int y = 0; y < grid.height; y += ConflictLattice)
+      for (int x = 0; x < grid.width; x += ConflictLattice) {
+        const double dx = (x + .5 - grid.params[2]) / grid.params[0],
+                     dy = (y + .5 - grid.params[3]) / grid.params[1];
+        if (dx * dx + dy * dy <= radius * radius)
+          rays[c][size_t(y) * grid.width + x] = grid.Ray({x + .5, y + .5});
+      }
+  }
+  auto cells_of = [&](uint32_t i) {
+    const auto& grid = grids[model.images[i].camera];
+    return std::make_pair((grid.width + ConflictLattice - 1) / ConflictLattice,
+                          (grid.height + ConflictLattice - 1) / ConflictLattice);
+  };
+  // Per cell, the number of views contradicting it.
+  std::vector<std::vector<uint8_t>> conflicts(n);
+  std::vector<std::mutex> locks(n);
+  for (uint32_t i = 0; i < n; ++i)
+    if (model.images[i].registered) {
+      const auto [cw, ch] = cells_of(i);
+      conflicts[i].assign(size_t(cw) * ch, 0);
+      if (verified.at(i).type() != CV_8UC1 || verified[i].cols != cw || verified[i].rows != ch)
+        throw std::runtime_error("LAS-verified cells differ from the conflict lattice");
+    }
+  auto read_depth = [&](uint32_t i) {
+    const auto depth = ReadImage(output / "depths" / fs::u8path(scene.images[i].name + ".png"),
+                                 cv::IMREAD_UNCHANGED);
+    const auto& grid = grids[model.images[i].camera];
+    if (depth.type() != CV_16UC1 || depth.cols != grid.width || depth.rows != grid.height)
+      throw std::runtime_error("Unexpected supervision depth map: " + scene.images[i].name);
+    return depth;
+  };
+  const double view_limit = std::cos(ConflictFieldOfViewDegrees * Pi / 360),
+               tolerance = std::exp(ConflictLog);
+  std::atomic<uint64_t> tested{0}, conflicting{0};
+  // Flags the cells of a, and the cells of b its points land on, where a's depth lies in front of
+  // b's.
+  auto check = [&](uint32_t a, uint32_t b, const cv::Mat& da, const cv::Mat& db,
+                   std::vector<uint8_t>& own, std::vector<uint8_t>& other) {
+    const uint32_t ca = model.images[a].camera, cb = model.images[b].camera;
+    const auto& ga = grids[ca];
+    const auto& gb = grids[cb];
+    const int cells_a = (ga.width + ConflictLattice - 1) / ConflictLattice,
+              cells_b = (gb.width + ConflictLattice - 1) / ConflictLattice;
+    uint64_t local_tested = 0, local_conflicting = 0;
+    for (int y = 0; y < ga.height; y += ConflictLattice)
+      for (int x = 0; x < ga.width; x += ConflictLattice) {
+        const auto millimetres = da.at<uint16_t>(y, x);
+        const Eigen::Vector3d& ray = rays[ca][size_t(y) * ga.width + x];
+        if (!millimetres || ray.isZero())
+          continue;
+        const Eigen::Vector3d seen = millimetres / 1000. * ray;
+        const Eigen::Vector3d reference =
+            motion ? motion->Reference(a, ca, motion->Fraction(ga, {x + .5, y + .5}), seen) : seen;
+        const Eigen::Vector3d world = rotations[a].transpose() * (reference - translations[a]);
+        const Eigen::Vector3d there = rotations[b] * world + translations[b];
+        Eigen::Vector3d moved = there;
+        Eigen::Vector2d pixel;
+        double s = 0;
+        bool visible = true;
+        for (int k = 0; k < (motion ? 4 : 1); ++k) {
+          if (motion)
+            moved = motion->Apply(b, cb, s, there);
+          if (moved.z() < view_limit * moved.norm()) {
+            visible = false;
+            break;
+          }
+          pixel = gb.Project(moved);
+          if (motion)
+            s = motion->Fraction(gb, pixel);
+        }
+        if (!visible)
+          continue;
+        const int u = int(std::floor(pixel.x())), v = int(std::floor(pixel.y()));
+        if (u < 1 || v < 1 || u >= gb.width - 1 || v >= gb.height - 1)
+          continue;
+        // The nearest depth of b's 3 x 3 neighbourhood, all of which must hold depth: a point near
+        // a depth edge of b or off its valid depth is no evidence.
+        uint16_t nearest = 65535;
+        for (int k = 0; k < 9 && nearest; ++k) {
+          const auto value = db.at<uint16_t>(v + k / 3 - 1, u + k % 3 - 1);
+          nearest = value ? std::min(nearest, value) : uint16_t(0);
+        }
+        if (!nearest)
+          continue;
+        ++local_tested;
+        const size_t cell_a = size_t(y / ConflictLattice) * cells_a + x / ConflictLattice,
+                     cell_b = size_t(v / ConflictLattice) * cells_b + u / ConflictLattice;
+        const double metres = moved.norm();
+        if (metres * 1000 * tolerance < nearest) {
+          ++local_conflicting;
+          own[cell_a] = other[cell_b] = 1;
+        }
+      }
+    tested += local_tested;
+    conflicting += local_conflicting;
+  };
+  auto merge = [&](uint32_t i, const std::vector<uint8_t>& local) {
+    std::lock_guard<std::mutex> guard(locks[i]);
+    for (size_t k = 0; k < local.size(); ++k)
+      if (local[k] && conflicts[i][k] < 255)
+        ++conflicts[i][k];
+  };
+  std::atomic<uint32_t> next{0};
+  std::exception_ptr failure;
+  std::mutex failure_lock;
+  auto work = [&] {
+    try {
+      for (uint32_t i; (i = next++) < n;) {
+        if (!model.images[i].registered)
+          continue;
+        const auto di = read_depth(i);
+        std::vector<uint8_t> own(conflicts[i].size());
+        for (uint32_t j = i + 1; j < n; ++j) {
+          if (!paired[i][j])
+            continue;
+          const auto dj = read_depth(j);
+          std::vector<uint8_t> other(conflicts[j].size());
+          check(i, j, di, dj, own, other);
+          check(j, i, dj, di, other, own);
+          merge(j, other);
+        }
+        merge(i, own);
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> guard(failure_lock);
+      if (!failure)
+        failure = std::current_exception();
+      next = uint32_t(n);
+    }
+  };
+  const unsigned workers = std::max(1u, std::thread::hardware_concurrency());
+  {
+    std::vector<std::thread> threads;
+    for (unsigned k = 0; k < workers; ++k)
+      threads.emplace_back(work);
+    for (auto& thread : threads)
+      thread.join();
+  }
+  if (failure)
+    std::rethrow_exception(failure);
+  // A cell loses its depth when it is not LAS-verified and at least ConflictMinimumViews views
+  // contradict it. Agreeing views do not outvote them: in a LAS hole two groups of views can each
+  // agree among themselves, and nothing tells which group is right.
+  next = 0;
+  std::atomic<uint64_t> dropped_total{0};
+  auto rewrite = [&] {
+    try {
+      for (uint32_t i; (i = next++) < n;) {
+        if (!model.images[i].registered)
+          continue;
+        auto depth = read_depth(i);
+        const auto [cw, ch] = cells_of(i);
+        uint64_t dropped = 0;
+        for (int y = 0; y < depth.rows; ++y) {
+          auto* d = depth.ptr<uint16_t>(y);
+          for (int x = 0; x < depth.cols; ++x) {
+            if (!d[x])
+              continue;
+            const size_t k = size_t(y / ConflictLattice) * cw + x / ConflictLattice;
+            if (!verified[i].data[k] && conflicts[i][k] >= ConflictMinimumViews) {
+              d[x] = 0;
+              ++dropped;
+            }
+          }
+        }
+        auto& row = rows.at(i);
+        if (dropped) {
+          const auto path = output / "depths" / fs::u8path(scene.images[i].name + ".png");
+          WriteImage(path, depth);
+          row["depth_size"] = fs::file_size(path);
+        }
+        row["depth_pixels"] = row.at("depth_pixels").get<uint64_t>() - dropped;
+        row["monocular"]["view_conflict_pixels"] = dropped;
+        dropped_total += dropped;
+      }
+    } catch (...) {
+      std::lock_guard<std::mutex> guard(failure_lock);
+      if (!failure)
+        failure = std::current_exception();
+      next = uint32_t(n);
+    }
+  };
+  {
+    std::vector<std::thread> threads;
+    for (unsigned k = 0; k < workers; ++k)
+      threads.emplace_back(rewrite);
+    for (auto& thread : threads)
+      thread.join();
+  }
+  if (failure)
+    std::rethrow_exception(failure);
+  size_t pairs = 0;
+  for (uint32_t i = 0; i < n; ++i)
+    for (uint32_t j = i + 1; j < n; ++j)
+      pairs += paired[i][j];
+  return {{"neighbours", ConflictNeighbours},
+          {"shared_tracks", ConflictSharedTracks},
+          {"baseline_m", ConflictBaselineMetres},
+          {"lattice_pixels", ConflictLattice},
+          {"in_front_log", ConflictLog},
+          {"drop", "cell not LAS-verified with at least 2 contradicting views"},
+          {"neighbourhood", "3 x 3 nearest depth of the other view, all valid"},
+          {"pairs", pairs},
+          {"tested_samples", tested.load()},
+          {"conflicting_samples", conflicting.load()},
+          {"dropped_depth_pixels", dropped_total.load()},
+          {"seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()}};
 }
 }  // namespace geosun

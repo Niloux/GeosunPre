@@ -1,6 +1,7 @@
 #pragma once
 #include "frontend/preprocessing.h"
 #include "geometry/camera.h"
+#include "geometry/model.h"
 #include <functional>
 
 namespace geosun {
@@ -105,7 +106,20 @@ FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>
 Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps,
                      const cv::Mat& detail_normal, const cv::Mat& las, const cv::Mat& las_normal,
                      const cv::Mat& allowed, bool depth, double min_incidence, cv::Mat& depth_mm,
-                     cv::Mat& normal_rgb);
+                     cv::Mat& normal_rgb, cv::Mat& verified);
+// The 4 x 4 cells of the cross-view check holding any nonzero pixel (CV_8U in, CV_8U cells out).
+cv::Mat ConflictCells(const cv::Mat& pixels);
+// Free-space check between views of the delivered MoGe depth under output/depths. Each photo is
+// paired with the views sharing most tracks (the relation made symmetric). On a 4-pixel lattice a
+// depth point of one view that lies clearly in front of the depth the other view sees along the
+// same ray contradicts one of the two maps, and both cells count the contradicting view. A cell
+// whose depth the trusted LAS confirmed (verified, from ConflictCells, by image index) keeps it;
+// any other loses it when at least two views contradict it. rows (by image index, null if
+// unregistered) get the rewritten file size, depth count and the dropped pixels. Returns the
+// parameters and totals.
+Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Reconstruction& model,
+                         const ShutterMotion* motion, int max_size,
+                         const std::vector<cv::Mat>& verified, std::vector<Json>& rows);
 // Writes the faces and gathered maps of one photo into a new directory for inspection.
 Json CheckMonocular(const fs::path& input, const fs::path& models, const std::string& image,
                     const fs::path& output, int max_size);
