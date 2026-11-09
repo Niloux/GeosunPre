@@ -76,6 +76,7 @@ grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的
 - `-HardwareCompatibility`：`none`（默认）或 `ampere_plus`。`none` 引擎只用于构建 GPU 同型号；`ampere_plus` 使用 TensorRT AMPERE_PLUS 兼容级别，一套引擎可在任意算力 ≥ 8.0 的 GPU（RTX 30/40/50、A 系列等）上运行，代价是部分优化策略不可用。构建 GPU 本身须算力 ≥ 8.0。修改级别时使用新目录，并在真实场景比较耗时与几何质量。
 - `-MatcherPrecision`：`fp16`（默认）、`fp32` 或 `tf32`，用于显式调整匹配引擎的计算精度。TF32 允许 Tensor Core 矩阵乘法。模型清单保存该选择；未声明 `matcher_precision` 的清单按 FP32 解析。修改精度时使用新目录，并用真实场景检查最终几何质量。
 - version=4 包升级到 version=5 时使用新目录，例如 `-Models models-v5 -OnnxFrom models`：复用 detector、descriptor、matcher、geometry 的 ONNX 与引擎，按四个提示重新导出并构建 grounding（ONNX 约 1.9 GB）；提示不同的旧 grounding 图不复用。更早的包同样升级，缺少的 geometry 一并导出。
+- grounding 的注意力 logits 固定 FP32，TensorRT 无法融合注意力，会物化完整的 5184×5184 logit 矩阵。导出时 trunk 和 DETR encoder 的自注意力按 648 行 query 分块，清单记录 `grounding_attention_block`；RTX 4090 上激活内存由 5.4 GB 降到 2.3 GB，Mask 阶段显存峰值约少 3 GB。未记录该值的旧 grounding ONNX 不复用：`-Models models-<新目录> -OnnxFrom models` 只重新导出并构建 grounding。
 - `-Sam3`：SAM3 检查点路径，只在缓存中还没有时需要。记录旧包的工作目录续跑时须 `--models` 指定原包目录。grounding 在两张验证照片上比较 PyTorch FP32 与 TensorRT：全部查询分数差 < 0.05，PyTorch 分数 > 0.3 的每个检测与引擎同提示最接近掩码的 IoU ≥ 0.95；验证照片应含人物或影子，例如 `-Images` 指定两张展厅照片。真实推理另检查形状、分数范围与降序、框归一化。
 - 当 `-OnnxFrom` 指向同 GPU、TensorRT 版本的完整模型包时，复用未改变接口和精度且清单及校验通过的引擎；升级固定尺寸包只需重建 detector，切换匹配精度只需重建 matcher。
 - 旧 FP16 模型未保留最终评分的 FP32 精度时，使用新目录和 `-OnnxFrom` 升级；复用 ONNX 和其他引擎，只重建 matcher。置信度仍按原有相对误差 `<0.005` 验收，不放宽门限。

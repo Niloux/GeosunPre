@@ -152,6 +152,72 @@ def real_rotary(xq, xk, freqs_cis, repeat_freqs_k=False):
     return rotate(xq, cos, sin), rotate(xk, c, s)
 
 
+# TensorRT keeps SAM3 attention logits in FP32 and so cannot fuse attention: each global attention
+# over the 72x72 image tokens materializes its full logit square (3.3 GB in the DETR encoder).
+# Query blocks of this size bound that scratch to one block of rows.
+ATTENTION_BLOCK = 648
+
+
+def blocked_attention(q, k, v):
+    """softmax(q k^T / sqrt(d)) v computed over query blocks."""
+    k = k.transpose(-2, -1) * q.shape[-1] ** -.5
+
+    def rows(block):
+        return torch.softmax(block @ k, -1) @ v
+
+    if q.shape[-2] <= ATTENTION_BLOCK:
+        return rows(q)
+    return torch.cat([rows(block) for block in q.split(ATTENTION_BLOCK, -2)], -2)
+
+
+def blocked_sdpa(q, k, v, **options):
+    if options:
+        raise RuntimeError(f'Blocked attention supports plain attention only: {sorted(options)}')
+    return blocked_attention(q, k, v)
+
+
+class BlockedSelfAttention(nn.Module):
+    """nn.MultiheadAttention without masks, through blocked attention."""
+    def __init__(self, attention):
+        super().__init__()
+        if (not attention._qkv_same_embed_dim or attention.in_proj_bias is None or
+                attention.bias_k is not None):
+            raise RuntimeError('Blocked attention expects packed self-attention with input bias')
+        self.attention = attention
+
+    def forward(self, query, key, value, attn_mask=None, key_padding_mask=None, need_weights=True, **_):
+        if attn_mask is not None or key_padding_mask is not None:
+            raise RuntimeError('Blocked attention does not support attention masks')
+        a = self.attention
+        w, b = a.in_proj_weight.chunk(3), a.in_proj_bias.chunk(3)
+
+        # (batch, heads, length, channels) from batch-first or sequence-first inputs.
+        def split(x, i):
+            x = F.linear(x if a.batch_first else x.transpose(0, 1), w[i], b[i])
+            return x.unflatten(-1, (a.num_heads, -1)).transpose(1, 2)
+
+        x = a.out_proj(blocked_attention(split(query, 0), split(key, 1), split(value, 2))
+                       .transpose(1, 2).flatten(2))
+        return (x if a.batch_first else x.transpose(0, 1)), None
+
+
+def block_grounding_attention(model, vitdet, encoder):
+    """Route the SAM3 trunk and DETR encoder self-attention through blocked attention."""
+    class Functional:
+        scaled_dot_product_attention = staticmethod(blocked_sdpa)
+
+        def __getattr__(self, name):
+            return getattr(F, name)
+
+    vitdet.F = Functional()
+    layers = [m for m in model.modules() if isinstance(m, encoder.TransformerEncoderLayer)
+              and isinstance(m.self_attn, nn.MultiheadAttention)]
+    if not layers:
+        raise RuntimeError('SAM3 has no encoder self-attention to block')
+    for layer in layers:
+        layer.self_attn = BlockedSelfAttention(layer.self_attn)
+
+
 class Grounding(nn.Module):
     """SAM3 concept detection for fixed prompts whose text embeddings are baked into the graph.
 

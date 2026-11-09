@@ -17,8 +17,9 @@ import tensorrt as trt
 
 from resources import (CACHE, GEOMETRY_REVISION, GROUNDING_SHA256, LOMA_COMMIT, MOGE_COMMIT, geometry_weights,
                        grounding_weights, loma_source, moge_source, sha256, torch_weights)
-from networks import (Detector, Descriptor, Geometry, Grounding, Matcher, fix_descriptor_positions,
-                      fix_geometry_positions, real_rotary)
+from networks import (ATTENTION_BLOCK, Detector, Descriptor, Geometry, Grounding, Matcher,
+                      block_grounding_attention, fix_descriptor_positions, fix_geometry_positions,
+                      real_rotary)
 
 TRT_VERSION = '10.13.3.9'
 MAX_FEATURES = 3072
@@ -136,6 +137,7 @@ def load_geometry():
 def load_grounding(weights):
     """SAM3 with baked prompt embeddings and the real-valued rotary encoding used for export."""
     from ultralytics.models.sam.build_sam3 import build_sam3_image_model
+    import ultralytics.models.sam.sam3.encoder as encoder
     import ultralytics.models.sam.sam3.vitdet as vitdet
     model = build_sam3_image_model(str(weights)).float().eval().cuda().requires_grad_(False)
     with torch.no_grad():
@@ -146,11 +148,12 @@ def load_grounding(weights):
     with torch.no_grad():
         upstream = module(image)
         vitdet.apply_rotary_enc = real_rotary
+        block_grounding_attention(model, vitdet, encoder)
         exported = module(image)
     # Mask logits are unbounded; scores and boxes carry the detections.
     for before, after, tolerance in zip(upstream, exported, (1e-4, 1e-3, .5, .5)):
         if before.shape != after.shape or (before - after).abs().max() > tolerance:
-            raise RuntimeError('Real-valued rotary encoding differs from upstream SAM3 inference')
+            raise RuntimeError('Export-mode SAM3 (real rotary, blocked attention) differs from upstream inference')
     return module
 
 
@@ -340,7 +343,7 @@ def build_engine(path, name, shapes, matcher_precision='fp16', hardware='none'):
     onnx_path = path.parent.parent / 'onnx' / f'{name}.onnx'
     builder, network, parser = parse_network(onnx_path)
     config = builder.create_builder_config()
-    # One fused SAM3 attention block needs about 5.3 GB of scratch memory.
+    # SAM3 tactics get a large scratch cap; its activation memory is bounded by blocked attention.
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, (12 if name == 'grounding' else 2) << 30)
     if name != 'matcher':
         config.set_flag(trt.BuilderFlag.FP16)
@@ -758,11 +761,13 @@ def main():
         if (origin.parent / 'manifest.json').is_file():
             reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
         # Packages and bundles from before the geometry model supply the detector, descriptor and
-        # matcher; a grounding graph is reused only with the same baked prompts.
+        # matcher; a grounding graph is reused only with the same baked prompts and attention blocks.
         prompts = (reuse_manifest or {}).get('grounding_prompts')
+        blocks = (reuse_manifest or {}).get('grounding_attention_block')
         settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in names
                                  if (name == 'geometry' and (origin / f'{name}.onnx').is_file()) or
-                                 (name == 'grounding' and prompts == GROUNDING_PROMPTS) or
+                                 (name == 'grounding' and prompts == GROUNDING_PROMPTS and
+                                  blocks == ATTENTION_BLOCK) or
                                  name not in ('geometry', 'grounding')}
     # A bundle carries its own validation images; no upstream source download is needed.
     source = None if args.images or bundle else loma_source()
@@ -868,6 +873,7 @@ def main():
                            for name in names},
                 'grounding_size': GROUNDING_SIZE, 'grounding_mask_size': GROUNDING_MASK_SIZE,
                 'grounding_prompts': GROUNDING_PROMPTS, 'grounding_top_k': GROUNDING_TOP_K,
+                'grounding_attention_block': ATTENTION_BLOCK,
                 'grounding_source': {'model': 'facebook/sam3', 'checkpoint_sha256': GROUNDING_SHA256,
                                      'ultralytics': importlib.metadata.version('ultralytics')}}
     write_json(pending / 'manifest.json', manifest)
