@@ -16,8 +16,10 @@ bool KeepLasPoint(const LasPoint& p) {
   return !(p.classification & 128) && (p.classification & 31) != 7;
 }
 Eigen::Vector3d LasCoordinates(const LasHeader& h, const LasPoint& p) {
-  const Eigen::Vector3d point =
+  Eigen::Vector3d point =
       Eigen::Vector3d(p.raw[0], p.raw[1], p.raw[2]).cwiseProduct(h.scale) + h.origin;
+  if (h.converted)
+    point = h.frame.Apply(point);
   if (!point.allFinite())
     throw std::runtime_error("Nonfinite LAS coordinates");
   return point;
@@ -188,7 +190,30 @@ LasHeader ReadLasHeader(const fs::path& path) {
                 {"bounds_max", vector(h.upper)},
                 {"crs", vlrs ? "not_parsed" : "absent"},
                 {"coordinate_units", "unverified; registration thresholds assume metres"}};
+  h.file_lower = h.lower;
+  h.file_upper = h.upper;
   return h;
+}
+void ConvertLasFrame(LasHeader& h, const Similarity& frame, const std::string& name) {
+  if (h.converted || !frame.translation.allFinite() || std::abs(frame.scale - 1) > .001)
+    throw std::runtime_error("Invalid LAS frame conversion");
+  h.frame = frame;
+  h.converted = true;
+  h.lower = Eigen::Vector3d::Constant(INFINITY);
+  h.upper = Eigen::Vector3d::Constant(-INFINITY);
+  for (int corner = 0; corner < 8; ++corner) {
+    Eigen::Vector3d p;
+    for (int k = 0; k < 3; ++k)
+      p[k] = (corner >> k & 1) ? h.file_upper[k] : h.file_lower[k];
+    p = frame.Apply(p);
+    h.lower = h.lower.cwiseMin(p);
+    h.upper = h.upper.cwiseMax(p);
+  }
+  auto vector = [](const Eigen::Vector3d& v) { return std::vector<double>{v.x(), v.y(), v.z()}; };
+  h.metadata["frame"] = name;
+  h.metadata["frame_from_input"] = frame.ToJson();
+  h.metadata["frame_bounds_min"] = vector(h.lower);
+  h.metadata["frame_bounds_max"] = vector(h.upper);
 }
 void ScanLas(const fs::path& path, const LasHeader& h,
              const std::function<void(uint64_t, const std::vector<LasPoint>&)>& consume) {
@@ -276,15 +301,14 @@ void VerifyInitializationPly(const fs::path& path, uint64_t points) {
       }
   }
 }
-Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel) {
+Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& output, double voxel) {
   if (!std::isfinite(voxel) || voxel <= 0 || fs::absolute(las) == fs::absolute(output))
     throw std::runtime_error("Invalid PLY voxel size or output");
   if (fs::exists(output))
     throw std::runtime_error("PLY output already exists");
   fs::create_directories(output.parent_path());
   const auto source = FileMetadata(las);
-  const auto h = ReadLasHeader(las);
-  // PLY stores float32 XYZ. Keep its rounding within 1 mm of the input LAS coordinates.
+  // PLY stores float32 XYZ. Keep its rounding within 1 mm of the working-frame coordinates.
   constexpr double float32_limit_m = 16777.216;
   if (std::max(h.lower.cwiseAbs().maxCoeff(), h.upper.cwiseAbs().maxCoeff()) > float32_limit_m)
     throw std::runtime_error("LAS coordinates exceed 16777 m; float32 PLY would lose millimetre "
@@ -369,8 +393,13 @@ Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel) {
   for (unsigned i = 0; i < 128; ++i)
     MergeBucket(workspace / (Number(i) + ".bin"), workspace, [&](const Aggregate& v) {
       std::array<uint8_t, 27> vertex{};
+      Eigen::Vector3d mean;
+      for (int j = 0; j < 3; ++j)
+        mean[j] = double(v.xyz[j]) / v.count * h.scale[j] + h.origin[j];
+      if (h.converted)
+        mean = h.frame.Apply(mean);
       for (int j = 0; j < 3; ++j) {
-        const float xyz = float(double(v.xyz[j]) / v.count * h.scale[j] + h.origin[j]);
+        const float xyz = float(mean[j]);
         std::memcpy(vertex.data() + j * 4, &xyz, 4);
         minimum[j] = std::min(minimum[j], double(xyz));
         maximum[j] = std::max(maximum[j], double(xyz));
@@ -412,7 +441,7 @@ Json ExportLasPly(const fs::path& las, const fs::path& output, double voxel) {
           {"sampling", "all non-withheld, non-class-7 LAS records; one centroid per voxel"},
           {"color", "voxel mean of LAS RGB; auto-detect 8/16-bit range; gray if absent"},
           {"normals", "zero"},
-          {"coordinate_frame", "input_las_xyz"},
+          {"coordinate_frame", h.converted ? h.metadata.at("frame") : Json("input_las_xyz")},
           {"rgb_encoding",
            rgb ? (rgb_max > 255 ? "uint16_0_65535" : "uint16_0_255") : "absent_gray_127"},
           {"bounds_min", {minimum.x(), minimum.y(), minimum.z()}},

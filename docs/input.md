@@ -39,6 +39,6 @@ LAS 对齐后默认执行卷帘快门校正和独立稀疏点清理。
 
 LAS 支持未压缩 1.2、点格式 0–3；默认读取 `ResultOut/场景.las`，其他文件使用 `--las` 选择。排除 withheld 和 class-7 噪声，RGB 支持 uint16 中的 8-bit/16-bit 范围，无 RGB 时灰色 127。
 
-配准继承 `LAS XYZ ≈ ENH 减首个 ENH 位置` 假设，单位按米解释；拟合不能确认绝对 CRS 或独立地理精度。计算使用局部原点，输出恢复输入 LAS 坐标。
+配准继承 `LAS XYZ ≈ ENH 减首个 ENH 位置` 假设，单位按米解释；拟合不能确认绝对 CRS 或独立地理精度。LAS 头部范围（外扩 2 m）包含过半照片的 CameraPos ECEF 位置时，按 ECEF LAS 处理：读取时以导航的同一 ECEF→ENH 转换换到上述局部坐标，头部范围取转换后八个角点的包围盒，各阶段报告的 LAS 元数据记录 `frame: ecef_to_navigation_enh` 及 `frame_from_input` 变换；否则按局部 LAS 原样读取。计算使用局部原点，输出恢复局部 LAS 坐标（局部 LAS 即输入坐标）。
 
 LAS 附色可能存在纹理错位，仅作为交付 PLY 的初始颜色。相机优化、质量验收和点清理只使用 LAS 几何与有效点分类，照片对应来自原始图像，不以 LAS 附色作为相机标定或纹理对齐参照。

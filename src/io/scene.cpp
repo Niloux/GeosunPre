@@ -474,6 +474,24 @@ std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene) {
     positions.push_back(navigation.conversion.Apply(image.navigation_raw - navigation.center));
   return positions;
 }
+LasHeader ReadSceneLas(const Scene& scene) {
+  auto header = ReadLasHeader(scene.las);
+  // A LAS whose bounds hold most raw (ECEF) exposure positions is in ECEF; it takes the same
+  // conversion as the navigation, into the frame a local LAS is already in.
+  const Eigen::Vector3d margin = Eigen::Vector3d::Constant(2);
+  size_t inside = 0;
+  for (const auto& image : scene.images)
+    inside += ((image.navigation_raw - (header.file_lower - margin)).array() >= 0).all() &&
+              (((header.file_upper + margin) - image.navigation_raw).array() >= 0).all();
+  if (2 * inside <= scene.images.size())
+    return header;
+  const auto navigation = ReadNavigation(scene);
+  Similarity frame = navigation.conversion;
+  frame.translation -= frame.scale * (frame.rotation * navigation.center);
+  ConvertLasFrame(header, frame, "ecef_to_navigation_enh");
+  header.metadata["frame_exposures_inside"] = inside;
+  return header;
+}
 std::vector<std::array<uint32_t, 2>> SynchronousFrames(const Scene& scene) {
   std::map<int, std::array<uint32_t, 2>> lenses;
   for (uint32_t i = 0; i < scene.images.size(); ++i)

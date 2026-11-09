@@ -371,7 +371,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   std::future<Json> initialization_job;
   if (include_ply)
     initialization_job = std::async(std::launch::async, [&] {
-      return ExportLasPly(scene.las, pending / "sparse/0/points3D.ply", voxel);
+      return ExportLasPly(scene.las, ReadSceneLas(scene), pending / "sparse/0/points3D.ply", voxel);
     });
   Json supervision = nullptr;
   if (options.enabled) {

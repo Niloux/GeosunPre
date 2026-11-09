@@ -609,13 +609,16 @@ class LasPointCache {
     const auto started = Clock::now();
     // Kept coordinates go to a compact file with a histogram along the longest axis, which
     // splits normal estimation into slabs that fit the device together with their halo.
-    const Eigen::Vector3d extent = header.upper - header.lower;
+    // Slabs split the file's integer coordinates, before any frame conversion.
+    const Eigen::Vector3d extent = header.file_upper - header.file_lower;
     int axis = 0;
     for (int k = 1; k < 3; ++k)
       if (extent[k] > extent[axis])
         axis = k;
-    const double lower = std::floor((header.lower[axis] - header.origin[axis]) / header.scale[axis]),
-                 upper = std::ceil((header.upper[axis] - header.origin[axis]) / header.scale[axis]),
+    const double lower = std::floor((header.file_lower[axis] - header.origin[axis]) /
+                                    header.scale[axis]),
+                 upper = std::ceil((header.file_upper[axis] - header.origin[axis]) /
+                                   header.scale[axis]),
                  bin_width = std::max(1., (upper - lower + 1) / SlabBins);
     std::vector<uint64_t> histogram(SlabBins);
     auto bin = [&](int raw) {
@@ -1163,7 +1166,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                           const fs::path& masks_dir, const fs::path& output,
                           const SupervisionOptions& options, const ShutterMotion* motion) {
   const auto started = Clock::now();
-  const auto header = ReadLasHeader(scene.las);
+  const auto header = ReadSceneLas(scene);
   const auto request = SupervisionRequest(scene, model, masks_dir, options, motion != nullptr);
   std::vector<Json> rows(model.images.size());
   const bool monocular = options.source == "moge";
@@ -1273,8 +1276,12 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
       for (size_t j = 0; j < count; ++j) {
         auto& p = projection[j];
         const auto& pose = model.images[images[first + j]].pose;
-        const Eigen::Matrix3d rotation = pose.Rotation().toRotationMatrix();
-        const Eigen::Vector3d translation = rotation * header.origin + pose.Translation();
+        // The LAS frame conversion folds into each camera, which projects file coordinates.
+        const Eigen::Matrix3d frame = header.frame.scale * header.frame.rotation.toRotationMatrix(),
+                              rotation = pose.Rotation().toRotationMatrix() * frame;
+        const Eigen::Vector3d translation =
+            pose.Rotation().toRotationMatrix() * (frame * header.origin + header.frame.translation) +
+            pose.Translation();
         for (int r = 0; r < 3; ++r) {
           p.translation[r] = translation[r];
           p.scales[r] = header.scale[r];

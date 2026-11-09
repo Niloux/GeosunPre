@@ -55,7 +55,8 @@ int Main(const std::vector<std::string>& argv) {
                 << '\n';
     } else if (args.command == "las-ply") {
       args.Validate({"--las", "--output", "--voxel"});
-      std::cout << ExportLasPly(args.Path("--las"), args.Path("--output"),
+      std::cout << ExportLasPly(args.Path("--las"), ReadLasHeader(args.Path("--las")),
+                                args.Path("--output"),
                                 args.Number("--voxel", .05))
                        .dump(2)
                 << '\n';

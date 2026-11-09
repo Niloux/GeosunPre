@@ -496,7 +496,7 @@ Json FailedChecks(const Json& checks) {
 }
 std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Reconstruction& model,
                                                  int workers) {
-  const auto header = ReadLasHeader(scene.las);
+  const auto header = ReadSceneLas(scene);
   const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
   Json sampling;
   auto target = SampleLas(scene.las, header, sampling);
@@ -525,7 +525,7 @@ Json FilterSparseStructure(const Scene& scene, Reconstruction& model,
   // seed 3DGS when parallax, depth precision and LAS support pass.
   constexpr size_t minimum_track_length = 2;
   constexpr double minimum_parallax_degrees = 1.5;
-  const auto header = ReadLasHeader(scene.las);
+  const auto header = ReadSceneLas(scene);
   const double max_error = std::min(3., limits.p90_px),
                max_sigma = std::max(.5 * limits.median_m, 3 * header.scale.maxCoeff()),
                max_distance = std::max(limits.median_m, 3 * header.scale.maxCoeff());
@@ -719,7 +719,7 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
            int ba_workers) {
   if (!ba_workers)
     ba_workers = workers;
-  const auto header = ReadLasHeader(scene.las);
+  const auto header = ReadSceneLas(scene);
   Json sampling;
   const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
   auto target = SampleLas(scene.las, header, sampling);
@@ -839,7 +839,7 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
     if (model.images[i].registered)
       nav_errors.push_back((model.images[i].pose.Center() - navigation[i]).norm());
   return {
-      {"coordinate_frame", "input_las_xyz"},
+      {"coordinate_frame", header.converted ? header.metadata.at("frame") : Json("input_las_xyz")},
       {"navigation_frame_assumption", "ENH minus first ENH position; vendor convention unverified"},
       {"navigation_error_m", Statistics(nav_errors)},
       {"transform", transform.ToJson()},

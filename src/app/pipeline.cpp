@@ -401,7 +401,7 @@ void Run(const Arguments& args) {
     // Work directories frozen before this setting existed read as original photos and
     // fail the scene comparison below if they had used enhanced copies.
     const Scene scene = ReadScene(input, las, settings.value("enhanced_photos", false));
-    ReadLasHeader(scene.las);
+    ReadSceneLas(scene);
     const auto prepared = scene.ToJson();
     if (state.value.empty()) {
       state.value = {{"version", 1},
