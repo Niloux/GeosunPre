@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Models = (Join-Path $PSScriptRoot 'models-ampere-plus'),
+    [string]$Models = (Join-Path $PSScriptRoot 'models-ampere-plus-blocked'),
     [string]$Output,
     [string]$Image
 )
