@@ -30,6 +30,13 @@ int Main(const std::vector<std::string>& argv) {
                                                                  : args.Path("--compare"))
                        .dump(2)
                 << '\n';
+    } else if (args.command == "static-masks") {
+      args.Validate({"--output", "--input", "--las", "--new-masks", "--enhanced-photos"});
+      std::cout << RefineStaticMasks(args.Path("--output"), args.Path("--input"),
+                                      args.Path("--las"), args.Get("--enhanced-photos") == "true",
+                                      args.Path("--new-masks"))
+                       .dump(2)
+                << '\n';
     } else if (args.command == "info") {
       args.Validate({});
       auto info = BuildInfo();
@@ -77,12 +84,18 @@ int Main(const std::vector<std::string>& argv) {
              "    original Image/L and Image/R photos are used; config enhanced_photos=true "
              "prefers Image/enhanced\n"
              "  geosunpre prepare --input INPUT [--output OUT] [--work WORK] [--debug]\n"
+             "  geosunpre static-masks --output DELIVERY --input INPUT --las LAS --new-masks DIR "
+             "[--enhanced-photos]\n"
+             "    masks of an existing delivery with persistent people (pictures, posters, "
+             "seated) made static, into a new DIR\n"
              "  geosunpre export --work WORK --output OUT [--no-ply] [--ply-voxel METRES] "
              "[--no-las-supervision]\n"
              "  geosunpre cleanup --work WORK --output OUT [--new-work NEW_WORK] [--debug] "
              "[--workers N] [--no-ply] [--ply-voxel METRES] [--no-las-supervision]\n"
              "    export and cleanup read the cache of a --debug work directory\n"
              "    depth/normal supervision is enabled for run/export/cleanup\n"
+             "    with it, masks make persistent people static again (pictures, posters, seated); "
+             "--no-static-masks keeps the SAM3 masks as they are\n"
              "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS] "
              "[--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"
              "    --supervision-source moge|las: MoGe-2 maps scaled per face to the LAS (default) "

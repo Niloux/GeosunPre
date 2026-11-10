@@ -22,7 +22,7 @@ cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用
 
 `cache/{visual,aligned}.bin`：标记 `GEOSUN_RECONSTRUCTION`；相机 JSON 字符串；uint32 gauge_image、scale_image；float64 gauge_baseline；uint64 图像数、点数。图像为 uint32 camera、uint8 registered、7 个 float64 `qx qy qz qw tx ty tz`、uint64 N、N 对 float64 像素坐标。点为 3 个 float64 XYZ、3 个 uint8 RGB、float64 error、uint64 轨迹长度及 `(uint32 image,feature)` 列表。点引用由轨迹重建；空轨迹保留内部编号，导出时省略。
 
-掩码为 `cache/masks/索引.png`。阶段完成后才提交状态，中断时保留完成的单图/单对缓存；`.writing` 不作为完成依据。残留交付 `.pending` 在重试时改名保留，再重新生成。
+掩码为 `cache/masks/索引.png`。导出时持续人物改回静态后的掩码为 `cache/static_masks/索引.png`，其身份（LAS、所选模型、卷帘运动、来源掩码及判定规则）和报告在 `cache/static_masks.json`；身份相同时复用，否则重算并替换，不改动 `cache/masks`。阶段完成后才提交状态，中断时保留完成的单图/单对缓存；`.writing` 不作为完成依据。残留交付 `.pending` 在重试时改名保留，再重新生成。
 
 `cache/incremental.bin` 使用同一重建格式，保存 SfM 的部分注册结果，每次局部优化后原子更新。补匹配及中断恢复会重新验证匹配几何、重建候选关联，保留已有位姿、三维点和观测身份；该文件不作为视觉验收或导出依据。
 

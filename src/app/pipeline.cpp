@@ -108,7 +108,8 @@ std::vector<std::string> WithDeliveryOptions(std::vector<std::string> options) {
   for (const auto* option :
        {"--no-ply", "--ply-voxel", "--no-las-supervision", "--supervision-max-size",
         "--supervision-boundary", "--supervision-mask-dir", "--supervision-cache-mb",
-        "--supervision-source", "--supervision-models", "--no-crop-valid-domain"})
+        "--supervision-source", "--supervision-models", "--no-crop-valid-domain",
+        "--no-static-masks"})
     options.push_back(option);
   return options;
 }

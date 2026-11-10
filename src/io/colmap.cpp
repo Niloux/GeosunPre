@@ -2,6 +2,7 @@
 #include "io/cache.h"
 #include "io/crop.h"
 #include "io/las.h"
+#include "geometry/static_masks.h"
 #include "frontend/frontend.h"
 #include "sfm/shutter.h"
 #include <opencv2/imgcodecs.hpp>
@@ -261,6 +262,39 @@ Reconstruction ReadColmap(const fs::path& path, Scene& scene, const Json* shutte
   }
   return m;
 }
+// Masks with the people that are persistent in the scene made static again (see StaticMasks),
+// cached in the work directory beside the masks they come from.
+fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
+                          const ShutterMotion* motion, const fs::path& work, const Json& report) {
+  const auto source = work / "cache/masks", target = work / "cache/static_masks";
+  Json inputs = Json::object();
+  for (const auto& image : scene.images)
+    if (selected.images[image.id].registered)
+      inputs[image.name] = FileMetadata(source / (std::to_string(image.id) + ".png"));
+  Json request = {{"las_file", FileMetadata(scene.las)},
+                  {"model_file", FileMetadata(SelectedModelPath(work, report))},
+                  {"rules", StaticMaskRules()},
+                  {"masks", inputs}};
+  if (motion)
+    request["motion_file"] = FileMetadata(work / "cache/shutter.json");
+  if (fs::is_regular_file(target / "static_masks.json") &&
+      ReadJson(target / "static_masks.json").at("request") == request)
+    return target;
+  if (FileMetadata(scene.las) != scene.sources.at("las"))
+    throw std::runtime_error("LAS changed since reconstruction; choose a new work directory");
+  auto pending = target;
+  pending += ".pending";
+  ArchiveInterrupted(pending);
+  fs::create_directories(pending);
+  const auto result =
+      StaticMasks(scene, selected, motion, ReadSceneLas(scene), scene.las,
+                  [&](uint32_t id) { return source / (std::to_string(id) + ".png"); },
+                  [&](uint32_t id) { return pending / (std::to_string(id) + ".png"); }, pending);
+  WriteJson(pending / "static_masks.json", {{"request", request}, {"result", result}});
+  fs::remove_all(target);
+  fs::rename(pending, target);
+  return target;
+}
 }  // namespace
 void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
@@ -268,7 +302,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   // A rolling-shutter corrected model describes photos at its reference poses; they are delivered
   // original, with the readout motion beside the model.
   const bool rolling = report.contains("shutter") && report.at("shutter").value("used", false);
-  const auto masks = work / "cache/masks";
+  auto masks = work / "cache/masks";
   auto step = Clock::now();
   const auto timed = [&](const char* name) {
     Log(std::string("Export ") + name + ": " + std::to_string(Seconds(step)) + " s");
@@ -281,6 +315,14 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   // A cropped delivery keeps each lens's valid domain: photos are cut losslessly on the JPEG MCU
   // grid and the readout motion is rescaled to the cropped readout axis.
   auto options = supervision_options;
+  // Static masks need the LAS, like the supervision maps they make consistent with the masks.
+  Json static_request = nullptr;
+  if (options.enabled && options.static_masks) {
+    masks = BuildStaticMasks(scene, selected, rolling ? &motion : nullptr, work, report);
+    static_request = {{"rules", StaticMaskRules()},
+                      {"file", FileMetadata(masks / "static_masks.json")}};
+    timed("static masks");
+  }
   // Photos and masks are independent files; their decoding and writing run on all cores.
   const int workers = std::clamp(int(std::thread::hardware_concurrency()), 1, 16);
   std::vector<const Exposure*> registered;
@@ -299,7 +341,8 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     options.crop = windows;
     timed("crop windows");
   }
-  Json request = {{"scene_file", FileMetadata(work / "scene.json")},
+  Json request = {{"static_masks", static_request},
+                  {"scene_file", FileMetadata(work / "scene.json")},
                   {"model_file", FileMetadata(SelectedModelPath(work, report))},
                   {"include_ply", include_ply},
                   {"voxel", voxel}};
@@ -641,6 +684,40 @@ std::string RulerFileBytes(const fs::path& path) {
   return std::string(std::istreambuf_iterator<char>(stream), {});
 }
 }  // namespace
+Json RefineStaticMasks(const fs::path& delivery, const fs::path& input, const fs::path& las,
+                       bool enhanced, const fs::path& output) {
+  const auto inside = [](const fs::path& parent, const fs::path& child) {
+    const auto relative = fs::weakly_canonical(child).lexically_relative(fs::weakly_canonical(parent));
+    return !relative.empty() && *relative.begin() != "..";
+  };
+  if (fs::exists(output) || inside(delivery, output) || inside(output, delivery))
+    throw std::runtime_error("Output must be a new directory outside the delivery");
+  const auto manifest = ReadJson(delivery / "manifest.json");
+  const bool rolling = manifest.contains("rolling_shutter");
+  Json shutter;
+  if (rolling)
+    shutter = ReadJson(delivery / "rolling_shutter.json");
+  Scene scene;
+  ShutterMotion motion;
+  const auto model = ReadColmap(delivery / "sparse/0", scene, rolling ? &shutter : nullptr, motion);
+  if (manifest.at("images").size() != scene.images.size())
+    throw std::runtime_error("Delivery exposure count differs");
+  // The LAS header (frame conversion included) comes from the scene the delivery was made from.
+  const Scene source = ReadScene(input, las, enhanced);
+  auto pending = output;
+  pending += ".pending";
+  ArchiveInterrupted(pending);
+  fs::create_directories(pending / "masks");
+  auto report = StaticMasks(
+      scene, model, rolling ? &motion : nullptr, ReadSceneLas(source), source.las,
+      [&](uint32_t id) { return delivery / "masks" / fs::u8path(scene.images[id].name + ".png"); },
+      [&](uint32_t id) { return pending / "masks" / fs::u8path(scene.images[id].name + ".png"); },
+      pending);
+  WriteJson(pending / "static_masks.json", report);
+  fs::rename(pending, output);
+  report.erase("component_rows");
+  return report;
+}
 Json MeasureSupervision(const fs::path& output, const fs::path& compare) {
   std::vector<fs::path> outputs{output};
   if (!compare.empty()) {

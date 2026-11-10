@@ -1085,6 +1085,7 @@ Camera MapCamera(const Camera& source, int max_size) {
 SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   SupervisionOptions options;
   options.enabled = args.Get("--no-las-supervision") != "true";
+  options.static_masks = args.Get("--no-static-masks") != "true";
   options.max_size = args.Integer("--supervision-max-size", 1600);
   options.boundary = args.Integer("--supervision-boundary", 6);
   options.cache_mb = args.Integer("--supervision-cache-mb", 2048);
@@ -1151,6 +1152,96 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
     request["geometry"] = GeometryIdentity(options.geometry_models);
   }
   return request;
+}
+namespace {
+Projection MakeProjection(const LasHeader& header, const Reconstruction& model,
+                          const ShutterMotion* motion, uint32_t id, uint32_t cid,
+                          const Camera& camera) {
+  Projection p{};
+  const auto& pose = model.images[id].pose;
+  // The LAS frame conversion folds into each camera, which projects file coordinates.
+  const Eigen::Matrix3d frame = header.frame.scale * header.frame.rotation.toRotationMatrix(),
+                        rotation = pose.Rotation().toRotationMatrix() * frame;
+  const Eigen::Vector3d translation =
+      pose.Rotation().toRotationMatrix() * (frame * header.origin + header.frame.translation) +
+      pose.Translation();
+  for (int r = 0; r < 3; ++r) {
+    p.translation[r] = translation[r];
+    p.scales[r] = header.scale[r];
+    for (int c = 0; c < 3; ++c)
+      p.rotation[r * 3 + c] = rotation(r, c);
+  }
+  std::copy(camera.params.begin(), camera.params.end(), p.params);
+  if (motion) {
+    const Eigen::Vector3d moved = motion->readout[cid] * motion->velocity[id];
+    for (int k = 0; k < 3; ++k) {
+      p.motion[k] = motion->rotation[id][k];
+      p.motion[3 + k] = moved[k];
+    }
+    p.rolling = 1;
+    p.axis = motion->axis;
+  }
+  return p;
+}
+}  // namespace
+void ProjectLasDepths(const fs::path& las, const LasHeader& header, const Reconstruction& model,
+                      const ShutterMotion* motion, int max_size, int cache_mb,
+                      const fs::path& scratch,
+                      const std::function<void(uint32_t, cv::Mat&&)>& consume) {
+  LasPointCache points(las, header, scratch, cache_mb);
+  const auto stream = points.StreamHandle();
+  for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
+    std::vector<uint32_t> images;
+    for (uint32_t i = 0; i < model.images.size(); ++i)
+      if (model.images[i].registered && model.images[i].camera == cid)
+        images.push_back(i);
+    if (images.empty())
+      continue;
+    const auto camera = MapCamera(model.cameras[cid], max_size);
+    const int w = camera.width, h = camera.height, size = w * h, blocks = (size + 255) / 256;
+    const size_t batch = std::min<size_t>(
+        32, std::max<size_t>(1, DepthBudget / (size * (sizeof(float) + sizeof(Blend)))));
+    std::vector<float3> ray_host(size);
+    const double valid_radius = camera.Radius();
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        const double dx = (x + .5 - camera.params[2]) / camera.params[0],
+                     dy = (y + .5 - camera.params[3]) / camera.params[1];
+        const Eigen::Vector3d ray = dx * dx + dy * dy <= valid_radius * valid_radius
+                                       ? camera.Ray({x + .5, y + .5}) : Eigen::Vector3d::Zero();
+        ray_host[y * w + x] = make_float3(float(ray.x()), float(ray.y()), float(ray.z()));
+      }
+    DeviceBuffer nearest(batch * size * sizeof(float)), blends(batch * size * sizeof(Blend)),
+        cameras(batch * sizeof(Projection)), rays(size * sizeof(float3)),
+        depth(size * sizeof(float)), codes(size * sizeof(unsigned));
+    CudaCheck(
+        cudaMemcpyAsync(rays.data, ray_host.data(), rays.bytes, cudaMemcpyHostToDevice, stream));
+    for (size_t first = 0; first < images.size(); first += batch) {
+      const size_t count = std::min(batch, images.size() - first);
+      std::vector<Projection> projection(count);
+      for (size_t j = 0; j < count; ++j)
+        projection[j] = MakeProjection(header, model, motion, images[first + j], cid, camera);
+      CudaCheck(cudaMemcpyAsync(cameras.data, projection.data(), count * sizeof(Projection),
+                                cudaMemcpyHostToDevice, stream));
+      CudaCheck(cudaMemsetAsync(nearest.data, 0x7f, count * size * sizeof(float), stream));
+      CudaCheck(cudaMemsetAsync(blends.data, 0, count * size * sizeof(Blend), stream));
+      points.Project(static_cast<const Projection*>(cameras.data),
+                     static_cast<const float3*>(rays.data), static_cast<float*>(nearest.data),
+                     static_cast<Blend*>(blends.data), w, h, count);
+      CudaCheck(cudaStreamSynchronize(stream));
+      for (size_t j = 0; j < count; ++j) {
+        Resolve<<<blocks, 256, 0, stream>>>(static_cast<const Blend*>(blends.data) + j * size,
+                                            static_cast<float*>(depth.data),
+                                            static_cast<unsigned*>(codes.data), size);
+        cv::Mat result(h, w, CV_32FC1);
+        CudaCheck(cudaMemcpyAsync(result.data, depth.data, depth.bytes, cudaMemcpyDeviceToHost,
+                                  stream));
+        CudaCheck(cudaStreamSynchronize(stream));
+        consume(images[first + j], std::move(result));
+      }
+    }
+  }
+  points.Finish();
 }
 Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                           const fs::path& masks_dir, const fs::path& output,
@@ -1267,33 +1358,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
       load_masks();
       const size_t count = std::min(batch, images.size() - first);
       std::vector<Projection> projection(count);
-      for (size_t j = 0; j < count; ++j) {
-        auto& p = projection[j];
-        const auto& pose = model.images[images[first + j]].pose;
-        // The LAS frame conversion folds into each camera, which projects file coordinates.
-        const Eigen::Matrix3d frame = header.frame.scale * header.frame.rotation.toRotationMatrix(),
-                              rotation = pose.Rotation().toRotationMatrix() * frame;
-        const Eigen::Vector3d translation =
-            pose.Rotation().toRotationMatrix() * (frame * header.origin + header.frame.translation) +
-            pose.Translation();
-        for (int r = 0; r < 3; ++r) {
-          p.translation[r] = translation[r];
-          p.scales[r] = header.scale[r];
-          for (int c = 0; c < 3; ++c)
-            p.rotation[r * 3 + c] = rotation(r, c);
-        }
-        std::copy(camera.params.begin(), camera.params.end(), p.params);
-        if (motion) {
-          const uint32_t id = images[first + j];
-          const Eigen::Vector3d moved = motion->readout[cid] * motion->velocity[id];
-          for (int k = 0; k < 3; ++k) {
-            p.motion[k] = motion->rotation[id][k];
-            p.motion[3 + k] = moved[k];
-          }
-          p.rolling = 1;
-          p.axis = motion->axis;
-        }
-      }
+      for (size_t j = 0; j < count; ++j)
+        projection[j] = MakeProjection(header, model, motion, images[first + j], cid, camera);
       CudaCheck(cudaMemcpyAsync(cameras.data, projection.data(), count * sizeof(Projection),
                                 cudaMemcpyHostToDevice, stream));
       CudaCheck(cudaMemsetAsync(nearest.data, 0x7f, count * size * sizeof(float), stream));

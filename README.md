@@ -41,7 +41,7 @@
 
 **调试模式**（`--debug`）：工作目录（默认 `work/<输入目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`、`cleanup`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。
 
-交付包含照片（卷帘校正采用时为校正到参考位姿的照片，否则为原图）、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及深度和法向监督图：默认由 MoGe-2 在各镜头透视子图上估计，按法向与之一致的可信 LAS 定尺度；`--supervision-source las` 改为 LAS 投影监督。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。完整结构见[输出约定](docs/output.md)。
+交付包含照片（卷帘校正采用时为校正到参考位姿的照片，否则为原图）、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及深度和法向监督图：默认由 MoGe-2 在各镜头透视子图上估计，按法向与之一致的可信 LAS 定尺度；`--supervision-source las` 改为 LAS 投影监督。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着 LAS 监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人）在掩码里改回静态，`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
 
 `run` 的导出阶段及独立 `export`、`cleanup` 默认从原始有效 LAS 给已注册照片生成定制 LFS 直接读取的深度和法向图。已有工作目录可以直接导出到新目录，无需重跑重建：
 
