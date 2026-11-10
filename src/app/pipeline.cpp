@@ -119,15 +119,21 @@ Delivery ParseDelivery(const Arguments& args) {
   return {args.Get("--no-ply") != "true", args.Number("--ply-voxel", .05),
           ParseSupervisionOptions(args), args.Get("--no-crop-valid-domain") != "true"};
 }
+// Key of a product: relative to the work directory, or absolute when no relative path exists
+// (another drive). Verify resolves both, since work / absolute is the absolute path.
+std::string InventoryKey(const fs::path& work, const fs::path& path) {
+  const auto relative = fs::relative(path, work);
+  return (relative.empty() ? path : relative).generic_u8string();
+}
 Json Inventory(const fs::path& work, const std::vector<fs::path>& products) {
   Json result = Json::object();
   for (const auto& path : products) {
     if (fs::is_directory(path)) {
       for (const auto& row : fs::recursive_directory_iterator(path))
         if (row.is_regular_file())
-          result[fs::relative(row.path(), work).generic_u8string()] = FileMetadata(row.path());
+          result[InventoryKey(work, row.path())] = FileMetadata(row.path());
     } else
-      result[fs::relative(path, work).generic_u8string()] = FileMetadata(path);
+      result[InventoryKey(work, path)] = FileMetadata(path);
   }
   return result;
 }
@@ -492,6 +498,8 @@ void Export(const Arguments& args) {
   args.Validate(WithDeliveryOptions({"--work", "--output"}));
   const auto delivery = ParseDelivery(args);
   const auto work = args.Path("--work");
+  if (!fs::is_regular_file(work / "scene.json"))
+    throw std::runtime_error("Not a work directory (no scene.json): " + work.u8string());
   Lock lock(work);
   if (fs::exists(work / "state.json")) {
     const auto state = ReadJson(work / "state.json");
@@ -529,6 +537,8 @@ void Postprocess(const Arguments& args) {
     throw std::runtime_error("workers must be 1-32");
   if (fs::exists(final_output))
     throw std::runtime_error("Postprocessing output already exists; choose a new work directory");
+  if (!fs::is_regular_file(source / "scene.json"))
+    throw std::runtime_error("Not a work directory (no scene.json): " + source.u8string());
   Lock lock(source);
   const auto scene = Scene::FromJson(ReadJson(source / "scene.json"));
   if (Contains(source, final_output) || Contains(scene.input, final_output))

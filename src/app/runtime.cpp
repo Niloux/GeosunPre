@@ -219,6 +219,7 @@ void ArchiveInterrupted(const fs::path& pending) {
   archived += ".interrupted-" +
               std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
   fs::rename(pending, archived);
+  Log("Interrupted run kept as " + archived.u8string() + "; delete it when no longer needed");
 }
 void Log(const std::string& message) {
   // Concurrent stages log whole lines.

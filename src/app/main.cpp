@@ -88,7 +88,7 @@ int Main(const std::vector<std::string>& argv) {
              "    --supervision-source moge|las: MoGe-2 maps scaled per face to the LAS (default) "
              "or LAS-projected maps; moge uses the geometry engine of --supervision-models "
              "MODELS (default: --models, else the default models), a version 3-5 package\n"
-             "    LAS coordinate GPU cache limit defaults to 1024 MiB (1-4096)\n"
+             "    LAS coordinate GPU cache limit defaults to 2048 MiB (1-4096)\n"
              "    --las-supervision explicitly enables it; conflicts with --no-las-supervision\n"
              "    rolling-shutter corrected models are delivered with the original photos and "
              "rolling_shutter.json\n"

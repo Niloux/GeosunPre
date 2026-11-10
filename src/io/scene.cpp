@@ -19,7 +19,6 @@ double Cubic(double x) {
 }
 struct ImageMetadata {
   int width = 0, height = 0, orientation = 1;
-  Json exposure = nullptr;
 };
 ImageMetadata ReadJpegMetadata(const fs::path& path) {
   std::ifstream stream(path, std::ios::binary);
@@ -76,15 +75,6 @@ ImageMetadata ReadJpegMetadata(const fs::path& path) {
         const auto tag = integer(entry, 2), type = integer(entry + 2, 2), n = integer(entry + 4, 4);
         if (tag == 274 && type == 3 && n == 1)
           result.orientation = int(integer(entry + 8, 2));
-        if (tag == 33434 && type == 5 && n == 1) {
-          const size_t value = integer(entry + 8, 4);
-          const auto denominator = integer(value + 4, 4);
-          if (!denominator)
-            throw std::runtime_error("Invalid exposure time");
-          const double exposure = double(integer(value, 4)) / denominator;
-          if (exposure)
-            result.exposure = exposure;
-        }
       }
     }
   }
@@ -126,8 +116,7 @@ Json ImageHeader(const fs::path& path) {
   const auto image = ReadJpegMetadata(path);
   return {{"width", image.width},
           {"height", image.height},
-          {"orientation", image.orientation},
-          {"exposure_seconds", image.exposure}};
+          {"orientation", image.orientation}};
 }
 cv::Mat ReadImage(const fs::path& path, int mode) {
   std::ifstream stream(path, std::ios::binary);
