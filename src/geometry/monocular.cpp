@@ -8,6 +8,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <deque>
+#include <future>
 #include <mutex>
 #include <thread>
 
@@ -306,10 +308,9 @@ std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens
   if (lens.size != size_ || images.size() != lens.faces.size())
     throw std::runtime_error("Monocular faces differ from the geometry engine or lens plan");
   const int size = size_;
-  std::vector<FaceEstimate> estimates;
-  for (size_t f = 0; f < images.size(); ++f) {
-    pixels_.Upload(images[f]);
-    const auto outputs = models_.Predict("geometry", {pixels_.Normalize(size, size)});
+  // The CPU half of a face (shift solve, distance and normal maps) runs beside the GPU inference
+  // of the following faces; a few in flight bound the memory of their host-side outputs.
+  auto process = [&lens, size](size_t f, const std::vector<Tensor>& outputs) {
     const std::vector<int64_t> map{1, size, size, 3};
     if (outputs.size() != 4 || outputs[0].shape != map || outputs[1].shape != map ||
         outputs[2].shape != std::vector<int64_t>{1, size, size} ||
@@ -346,7 +347,25 @@ std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens
           ++estimate.valid;
         }
     }
-    estimates.push_back(std::move(estimate));
+    return estimate;
+  };
+  constexpr size_t InFlight = 4;
+  std::vector<FaceEstimate> estimates;
+  std::deque<std::future<FaceEstimate>> pending;
+  for (size_t f = 0; f < images.size(); ++f) {
+    pixels_.Upload(images[f]);
+    auto outputs = models_.Predict("geometry", {pixels_.Normalize(size, size)});
+    pending.push_back(std::async(std::launch::async, [process, f, outputs = std::move(outputs)] {
+      return process(f, outputs);
+    }));
+    if (pending.size() >= InFlight) {
+      estimates.push_back(pending.front().get());
+      pending.pop_front();
+    }
+  }
+  while (!pending.empty()) {
+    estimates.push_back(pending.front().get());
+    pending.pop_front();
   }
   return estimates;
 }

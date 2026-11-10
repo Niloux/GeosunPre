@@ -1186,8 +1186,12 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     Json row;
   };
   std::deque<std::future<Written>> writes;
+  // Where the export waits: projecting the LAS batches, MoGe inference and CPU-side result writes.
+  double project_seconds = 0, estimate_seconds = 0, write_wait_seconds = 0, face_load_wait_seconds = 0;
   auto finish = [&] {
+    const auto waiting = Clock::now();
     auto written = writes.front().get();
+    write_wait_seconds += Seconds(waiting);
     writes.pop_front();
     depth_pixels += written.row.at("depth_pixels").get<uint64_t>();
     normal_pixels += written.row.at("normal_pixels").get<uint64_t>();
@@ -1304,12 +1308,17 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                                 cudaMemcpyHostToDevice, stream));
       CudaCheck(cudaMemsetAsync(nearest.data, 0x7f, count * size * sizeof(float), stream));
       CudaCheck(cudaMemsetAsync(blends.data, 0, count * size * sizeof(Blend), stream));
+      const auto projecting = Clock::now();
       points.Project(static_cast<const Projection*>(cameras.data),
                      static_cast<const float3*>(rays.data), static_cast<float*>(nearest.data),
                      static_cast<Blend*>(blends.data), w, h, count);
+      CudaCheck(cudaStreamSynchronize(stream));
+      project_seconds += Seconds(projecting);
       for (size_t j = 0; j < count; ++j) {
         const uint32_t id = images[first + j];
+        const auto loading = Clock::now();
         const auto static_mask = masks.front().get();
+        face_load_wait_seconds += Seconds(loading);
         masks.pop_front();
         load_masks();
         CudaCheck(cudaMemcpyAsync(mask.data, static_mask.pixels.data, size, cudaMemcpyHostToDevice,
@@ -1362,8 +1371,10 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         if (monocular) {
           allowed = static_mask.pixels.clone();
           allowed.setTo(0, semantic);
+          const auto estimating = Clock::now();
           estimates = estimator->Estimate(*lens, static_mask.faces);
           normal_estimates = estimator->Estimate(*normal_lens, static_mask.normal_faces);
+          estimate_seconds += Seconds(estimating);
         }
         const MonocularLens* plan = monocular ? &*lens : nullptr;
         const MonocularLens* normal_plan = monocular ? &*normal_lens : nullptr;
@@ -1465,6 +1476,11 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"depth_pixels", depth_pixels},
           {"normal_pixels", normal_pixels},
           {"images", images},
+          {"timing",
+           {{"las_project_seconds", project_seconds},
+            {"moge_estimate_seconds", estimate_seconds},
+            {"photo_and_mask_wait_seconds", face_load_wait_seconds},
+            {"result_write_wait_seconds", write_wait_seconds}}},
           {"seconds", Seconds(started)}};
   if (monocular) {
     summary["version"] = MonocularVersion;
