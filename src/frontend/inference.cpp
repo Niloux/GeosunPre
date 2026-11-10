@@ -25,6 +25,14 @@ DeviceBuffer::~DeviceBuffer() {
   if (data)
     cudaFree(data);
 }
+HostBuffer::HostBuffer(size_t n) : bytes(n) {
+  if (n)
+    CudaCheck(cudaHostAlloc(&data, n, cudaHostAllocDefault));
+}
+HostBuffer::~HostBuffer() {
+  if (data)
+    cudaFreeHost(data);
+}
 size_t Tensor::Count() const {
   size_t n = 1;
   for (auto d : shape) {
@@ -35,19 +43,19 @@ size_t Tensor::Count() const {
   return n;
 }
 const float* Tensor::Floats() const {
-  if (type != 0 || bytes.size() != Count() * sizeof(float))
+  if (type != 0 || HostSize() != Count() * sizeof(float))
     throw std::runtime_error("Expected host float32 tensor");
-  return reinterpret_cast<const float*>(bytes.data());
+  return reinterpret_cast<const float*>(HostData());
 }
 int64_t Tensor::Index(size_t i) const {
   if (i >= Count())
     throw std::runtime_error("Tensor index out of range");
-  if (bytes.size() != Count() * (type == 1 ? 8 : 4))
+  if (HostSize() != Count() * (type == 1 ? 8 : 4))
     throw std::runtime_error("Expected host integer tensor");
   if (type == 1)
-    return reinterpret_cast<const int64_t*>(bytes.data())[i];
+    return reinterpret_cast<const int64_t*>(HostData())[i];
   if (type == 2)
-    return reinterpret_cast<const int32_t*>(bytes.data())[i];
+    return reinterpret_cast<const int32_t*>(HostData())[i];
   throw std::runtime_error("Expected integer tensor");
 }
 Tensor Tensor::Float(std::vector<int64_t> dims, const float* data, size_t count) {
@@ -84,6 +92,22 @@ struct Engine {
   std::unique_ptr<nvinfer1::ICudaEngine> engine;
   std::unique_ptr<nvinfer1::IExecutionContext> context;
   std::map<std::string, std::shared_ptr<DeviceBuffer>> buffers;
+  // Host copies of the outputs by name. One still held by a caller is not reused, so an output
+  // stays valid for as long as its tensor lives.
+  std::map<std::string, std::vector<std::shared_ptr<HostBuffer>>> host_outputs;
+  std::shared_ptr<HostBuffer> HostOutput(const std::string& name, size_t size) {
+    auto& pool = host_outputs[name];
+    for (auto& p : pool)
+      if (p.use_count() == 1 && p->bytes >= size)
+        return p;
+    for (auto& p : pool)
+      if (p.use_count() == 1) {
+        p = std::make_shared<HostBuffer>(size);
+        return p;
+      }
+    pool.push_back(std::make_shared<HostBuffer>(size));
+    return pool.back();
+  }
   void* Buffer(const std::string& name, size_t size) {
     auto& p = buffers[name];
     if (!p || p->bytes < size || p.use_count() > 1)
@@ -295,8 +319,10 @@ std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<T
       throw std::runtime_error("Cannot bind model output");
     if (device_output)
       t.device = e.buffers.at(label);
-    else
-      t.bytes.resize(bytes);
+    else {
+      t.host = e.HostOutput(label, bytes);
+      t.host_bytes = bytes;
+    }
     outputs.push_back(std::move(t));
   }
   auto measurement = std::make_unique<Measurement>(name);
@@ -308,7 +334,7 @@ std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<T
   for (size_t i = 0; !device_output && i < outputs.size(); ++i) {
     const auto label = spec.at("outputs")[i].get<std::string>();
     auto& t = outputs[i];
-    CudaCheck(cudaMemcpyAsync(t.bytes.data(), e.buffers.at(label)->data, t.bytes.size(),
+    CudaCheck(cudaMemcpyAsync(t.host->data, e.buffers.at(label)->data, t.host_bytes,
                               cudaMemcpyDeviceToHost, impl_->stream));
   }
   if (!device_output)

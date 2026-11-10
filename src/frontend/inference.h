@@ -14,12 +14,24 @@ struct DeviceBuffer {
   ~DeviceBuffer();
   DeviceBuffer(const DeviceBuffer&) = delete;
 };
+// Page-locked host memory; model outputs are copied into reusable ones.
+struct HostBuffer {
+  void* data = nullptr;
+  size_t bytes = 0;
+  explicit HostBuffer(size_t bytes);
+  ~HostBuffer();
+  HostBuffer(const HostBuffer&) = delete;
+};
 struct Tensor {
   std::vector<int64_t> shape;
-  std::vector<uint8_t> bytes;
+  std::vector<uint8_t> bytes;  // host inputs made by Float
+  std::shared_ptr<HostBuffer> host;  // host outputs of Predict, valid for host_bytes
+  size_t host_bytes = 0;
   std::shared_ptr<DeviceBuffer> device;
   int type = 0;  // 0=float32, 1=int64, 2=int32
   size_t Count() const;
+  const uint8_t* HostData() const { return host ? static_cast<const uint8_t*>(host->data) : bytes.data(); }
+  size_t HostSize() const { return host ? host_bytes : bytes.size(); }
   const float* Floats() const;
   int64_t Index(size_t i) const;
   static Tensor Float(std::vector<int64_t> shape, const float* data, size_t count);
