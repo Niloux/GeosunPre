@@ -10,12 +10,12 @@ INPUT/
   Image/R/**/*.JPG
   Image/*.JPG               无 L、R 目录时的平铺原图
   Image/enhanced/**/*.JPG   可选
-  ResultOut/场景.las
+  ResultOut/场景.las        无 ResultOut 时为 INPUT/场景.las
 ```
 
 输入目录须且仅有一份 `.pro`（PCC 解算项目），其文件名即场景名：CameraPos、两份导航表和默认 LAS 均按该名称读取，不按目录中其他同类文件推断；`--las` 可显式改选。
 
-仅使用 `.pro` 中 L/R 相机及 CameraPos 有精确同名记录的 JPEG，M 不参与。照片默认只从 `Image/L`、`Image/R`（各自只能放对应镜头）读取原图；两者都不存在时改读 `Image/` 根目录下的平铺原图，不递归子目录；忽略 `Image/enhanced`：enhanced 是逐图不同的非线性增强，原图曝光固定、颜色一致，更适合 3DGS 外观建模。配置 `"enhanced_photos": true` 时另读 `Image/enhanced`，同名时优先使用 enhanced，交付图像名仍按 L/R 原图的相对路径，原图缺失时为 `镜头/文件名`。各目录内图像名和各镜头帧号须唯一，Pose 绑定图像在所读目录中都缺失时报错。照片来源随配置冻结并记入 scene.json 的 `photos`，改变须使用新工作目录。所用照片尺寸须等于 `.pro`，EXIF orientation 须为 1。按 GPS 周、文件名时间、镜头和图像名排序；L/R 同帧号本身不表示同步：只有同时具有 L、R 的全部帧号的文件名时间都相差不超过 2 ms 时，才按同步刚性 rig 处理（室内、展厅为同步，生产车间 R 先于 L 约 65 ms，为异步）。
+仅使用 `.pro` 中 L/R 相机及 CameraPos 有精确同名记录的 JPEG，M 不参与。照片默认只从 `Image/L`、`Image/R`（各自只能放对应镜头）读取原图；两者都不存在时改读 `Image/` 根目录下的平铺原图，不递归子目录；忽略 `Image/enhanced`：enhanced 是逐图不同的非线性增强，原图曝光固定、颜色一致，更适合 3DGS 外观建模。配置 `"enhanced_photos": true` 时另读 `Image/enhanced`，同名时优先使用 enhanced，交付图像名仍按 L/R 原图的相对路径，原图缺失时为 `镜头/文件名`。输入中完全没有原图（`Image/L`、`Image/R` 和平铺的 `Image/` 都没有所用的 JPEG）时，自动改读 `Image/enhanced`，并记入 `photos`，日志给出提示；部分原图缺失仍按上述规则报错。各目录内图像名和各镜头帧号须唯一，Pose 绑定图像在所读目录中都缺失时报错。照片来源随配置冻结并记入 scene.json 的 `photos`，改变须使用新工作目录。所用照片尺寸须等于 `.pro`，EXIF orientation 须为 1。按 GPS 周、文件名时间、镜头和图像名排序；L/R 同帧号本身不表示同步：只有同时具有 L、R 的全部帧号的文件名时间都相差不超过 2 ms 时，才按同步刚性 rig 处理（室内、展厅为同步，生产车间 R 先于 L 约 65 ms，为异步）。
 
 文件名为 `GPS周-秒-毫秒_帧号-L或R.JPG`。CameraPos 每行 11 字段：文件名、设备编号、GPS 周、秒、XYZ、四元数四分量。仅使用位置，四元数不用于视觉初始化；不改写时间戳。
 
@@ -37,7 +37,7 @@ LAS 对齐后默认执行卷帘快门校正和独立稀疏点清理。
 
 相机优化的三视图要求不作为初始化点云的最低轨迹长度。稀疏点清理允许双视图点，但仍须通过重投影、至少 1.5° 视差、固定相机下的深度不确定度及 LAS 距离检查；抽样 LAS 判远的点在删除前须按 50 万记录分块复核完整有效 LAS，距离门限不变，不要求点属于平面。SfM 最终标定后还会对已验证匹配分量中未分配的观测单独三角化，保留通过几何过滤的独立轨迹。
 
-LAS 支持未压缩 1.2、点格式 0–3；默认读取 `ResultOut/场景.las`，其他文件使用 `--las` 选择。排除 withheld 和 class-7 噪声，RGB 支持 uint16 中的 8-bit/16-bit 范围，无 RGB 时灰色 127。
+LAS 支持未压缩 1.2、点格式 0–3；默认读取 `ResultOut/场景.las`，该文件不存在而 `INPUT/场景.las` 存在时读取后者，其他文件使用 `--las` 选择。排除 withheld 和 class-7 噪声，RGB 支持 uint16 中的 8-bit/16-bit 范围，无 RGB 时灰色 127。
 
 配准继承 `LAS XYZ ≈ ENH 减首个 ENH 位置` 假设，单位按米解释；拟合不能确认绝对 CRS 或独立地理精度。LAS 头部范围（外扩 2 m）包含过半照片的 CameraPos ECEF 位置时，按 ECEF LAS 处理：读取时以导航的同一 ECEF→ENH 转换换到上述局部坐标，头部范围取转换后八个角点的包围盒，各阶段报告的 LAS 元数据记录 `frame: ecef_to_navigation_enh` 及 `frame_from_input` 变换；否则按局部 LAS 原样读取。计算使用局部原点，输出恢复局部 LAS 坐标（局部 LAS 即输入坐标）。
 

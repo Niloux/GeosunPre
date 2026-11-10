@@ -212,7 +212,6 @@ Scene Scene::FromJson(const Json& v) {
 Scene ReadScene(const fs::path& input, const fs::path& chosen_las, bool enhanced_photos) {
   Scene s;
   s.input = fs::weakly_canonical(input);
-  s.enhanced = enhanced_photos;
   for (const auto& row : fs::directory_iterator(input))
     if (row.path().extension() == ".pro") {
       if (!s.project.empty())
@@ -328,8 +327,12 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las, bool enhanced
     files.merge(index(input / "Image/R", "R"));
     return files;
   }();
-  const auto enhanced = enhanced_photos ? index(input / "Image/enhanced", "")
-                                        : std::map<std::string, fs::path>{};
+  // Without any original photo the enhanced ones are the only source.
+  s.enhanced = enhanced_photos || originals.empty();
+  if (s.enhanced && !enhanced_photos)
+    Log("No original photos in " + (input / "Image").u8string() + "; using Image/enhanced");
+  const auto enhanced = s.enhanced ? index(input / "Image/enhanced", "")
+                                   : std::map<std::string, fs::path>{};
   std::set<std::pair<std::string, int>> frames;
   for (const auto& [name, position] : positions) {
     int frame;
@@ -365,7 +368,13 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las, bool enhanced
   });
   for (uint32_t i = 0; i < s.images.size(); ++i)
     s.images[i].id = i;
-  s.las = chosen_las.empty() ? input / "ResultOut" / fs::u8path(stem + ".las") : chosen_las;
+  if (chosen_las.empty()) {
+    const auto nested = input / "ResultOut" / fs::u8path(stem + ".las"),
+               flat = input / fs::u8path(stem + ".las");
+    s.las = !fs::is_regular_file(nested) && fs::is_regular_file(flat) ? flat : nested;
+  } else {
+    s.las = chosen_las;
+  }
   if (!fs::is_regular_file(s.las))
     throw std::runtime_error("Missing LAS: " + s.las.u8string());
   s.las = fs::absolute(s.las);
