@@ -183,12 +183,11 @@ struct Models::Implementation {
 Models::Models(const fs::path& root) : impl_(std::make_unique<Implementation>()) {
   impl_->root = root;
   impl_->manifest = ReadJson(root / "manifest.json");
-  const int version = impl_->manifest.at("version");
-  if (version < 1 || version > 5 ||impl_->manifest.at("tensorrt") != "10.13.3.9")
+  if (impl_->manifest.at("tensorrt") != "10.13.3.9")
     throw std::runtime_error("Models require the pinned TensorRT 10.13.3.9 runtime");
   CudaCheck(cudaSetDevice(0));
   const auto gpu = GpuInfo();
-  const auto hardware = impl_->manifest.value("hardware_compatibility", std::string("none"));
+  const auto hardware = impl_->manifest.at("hardware_compatibility").get<std::string>();
   if (hardware == "ampere_plus") {
     if (gpu.at("compute_capability").get<std::array<int, 2>>() < std::array<int, 2>{8, 0})
       throw std::runtime_error("ampere_plus models require a GPU with compute capability >= 8.0");
@@ -226,20 +225,13 @@ std::array<int, 2> Models::DetectorSize(int width, int height) const {
   const int longest = std::max(width, height);
   const std::array<int, 2> size{int(int64_t(width) * 1536 / longest) / 8 * 8,
                                 int(int64_t(height) * 1536 / longest) / 8 * 8};
-  if (impl_->manifest.at("version") == 1) {
-    if (size != impl_->manifest.at("detector_size").get<std::array<int, 2>>())
-      throw std::runtime_error(
-          "Static detector resolution differs; upgrade the model package with prepare-models.ps1 "
-          "-Models models/dynamic -OnnxFrom models");
-  } else {
-    const auto& profile = impl_->manifest.at("detector_profile");
-    const auto minimum = profile.at("min").get<std::array<int, 2>>(),
-               maximum = profile.at("max").get<std::array<int, 2>>();
-    for (size_t axis = 0; axis < size.size(); ++axis)
-      if (size[axis] < minimum[axis] || size[axis] > maximum[axis])
-        throw std::runtime_error("Resized detector input is outside the model profile: " +
-                                 std::to_string(size[0]) + "x" + std::to_string(size[1]));
-  }
+  const auto& profile = impl_->manifest.at("detector_profile");
+  const auto minimum = profile.at("min").get<std::array<int, 2>>(),
+             maximum = profile.at("max").get<std::array<int, 2>>();
+  for (size_t axis = 0; axis < size.size(); ++axis)
+    if (size[axis] < minimum[axis] || size[axis] > maximum[axis])
+      throw std::runtime_error("Resized detector input is outside the model profile: " +
+                               std::to_string(size[0]) + "x" + std::to_string(size[1]));
   return size;
 }
 cudaStream_t Models::Stream() const { return impl_->stream; }

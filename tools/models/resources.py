@@ -33,13 +33,11 @@ def sha256(path):
 
 def resource(relative, url, expected):
     cached = CACHE / 'source' / relative
-    legacy = ROOT / 'models' / 'source' / relative
-    for path in (cached, legacy):
-        if path.is_file():
-            if sha256(path) != expected:
-                raise RuntimeError(f'Source checksum differs: {path}')
-            print(f'Reuse source: {path.name}', flush=True)
-            return path
+    if cached.is_file():
+        if sha256(cached) != expected:
+            raise RuntimeError(f'Source checksum differs: {cached}')
+        print(f'Reuse source: {cached.name}', flush=True)
+        return cached
     cached.parent.mkdir(parents=True, exist_ok=True)
     temporary = cached.with_name(cached.name + '.pending')
     print(f'Download source: {cached.name}', flush=True)

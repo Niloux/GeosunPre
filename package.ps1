@@ -59,7 +59,6 @@ function Get-PackageFiles([string]$Root) {
 $files = Get-PackageFiles $pending
 $record = [ordered]@{
     version = $info.version; revision = $info.revision; built_utc = $info.built_utc
-    pipeline_version = $info.pipeline_version
     models = [ordered]@{ hardware_compatibility = $hardware; build_gpu = $manifest.gpu; tensorrt = $manifest.tensorrt }
     files = $files
 }

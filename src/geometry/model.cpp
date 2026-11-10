@@ -204,7 +204,7 @@ Json Reconstruction::Quality(const Scene& scene, double median_limit, double p90
 }
 void WriteModel(const fs::path& path, const Reconstruction& model) {
   BinaryWriter out(path);
-  out.String("GEOSUN_RECONSTRUCTION_1");
+  out.String("GEOSUN_RECONSTRUCTION");
   out.String(Json({model.cameras[0].ToJson(), model.cameras[1].ToJson()}).dump());
   out.Value(model.gauge_image);
   out.Value(model.scale_image);
@@ -236,7 +236,7 @@ void WriteModel(const fs::path& path, const Reconstruction& model) {
 }
 Reconstruction ReadModel(const fs::path& path) {
   BinaryReader in(path);
-  if (in.String() != "GEOSUN_RECONSTRUCTION_1")
+  if (in.String() != "GEOSUN_RECONSTRUCTION")
     throw std::runtime_error("Unsupported reconstruction cache");
   Reconstruction m;
   const auto c = Json::parse(in.String());

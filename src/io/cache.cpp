@@ -5,8 +5,7 @@
 namespace geosun {
 fs::path SelectedModelPath(const fs::path& work, const Json& result) {
   const auto selected = result.value("selected_model", std::string("aligned"));
-  if (selected != "aligned" && selected != "refined" && selected != "shutter" &&
-      selected != "cleaned")
+  if (selected != "aligned" && selected != "shutter" && selected != "cleaned")
     throw std::runtime_error("Unknown selected reconstruction cache: " + selected);
   return work / "cache" / (selected + ".bin");
 }
@@ -81,7 +80,7 @@ fs::path MatchPath(const fs::path& work, uint32_t a, uint32_t b) {
 }
 void WriteFeatures(const fs::path& path, const FeatureSet& f) {
   BinaryWriter out(path);
-  out.String("GEOSUN_FEATURES_2");
+  out.String("GEOSUN_FEATURES");
   out.Value(f.image);
   out.Value(f.dimension);
   out.Value(uint64_t(f.pixels.size()));
@@ -97,7 +96,7 @@ void WriteFeatures(const fs::path& path, const FeatureSet& f) {
 }
 FeatureSet ReadFeatures(const fs::path& path) {
   BinaryReader in(path);
-  if (in.String() != "GEOSUN_FEATURES_2")
+  if (in.String() != "GEOSUN_FEATURES")
     throw std::runtime_error("Unsupported feature cache");
   FeatureSet f;
   f.image = in.Value<uint32_t>();
@@ -131,7 +130,7 @@ FeatureSet ReadFeatures(const fs::path& path) {
 }
 void WriteMatches(const fs::path& path, const MatchSet& m) {
   BinaryWriter out(path);
-  out.String("GEOSUN_MATCHES_1");
+  out.String("GEOSUN_MATCHES");
   out.Value(m.a);
   out.Value(m.b);
   out.Value(uint64_t(m.matches.size()));
@@ -144,7 +143,7 @@ void WriteMatches(const fs::path& path, const MatchSet& m) {
 }
 MatchSet ReadMatches(const fs::path& path) {
   BinaryReader in(path);
-  if (in.String() != "GEOSUN_MATCHES_1")
+  if (in.String() != "GEOSUN_MATCHES")
     throw std::runtime_error("Unsupported match cache");
   MatchSet m;
   m.a = in.Value<uint32_t>();

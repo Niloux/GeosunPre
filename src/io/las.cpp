@@ -430,8 +430,7 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
   if (fs::weakly_canonical(workspace).parent_path() != fs::weakly_canonical(output.parent_path()))
     throw std::runtime_error("Unexpected voxel workspace location");
   fs::remove_all(workspace);
-  return {{"version", 1},
-          {"source", "las"},
+  return {{"source", "las"},
           {"source_las_file", source},
           {"source_point_count", h.count},
           {"accepted_records", accepted},

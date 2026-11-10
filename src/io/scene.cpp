@@ -180,8 +180,7 @@ Json Scene::ToJson() const {
          {"pose_seconds", e.pose_seconds},
          {"navigation_raw", {e.navigation_raw.x(), e.navigation_raw.y(), e.navigation_raw.z()}},
          {"source_file", e.source_file}});
-  return {{"version", 1},
-          {"input", input.u8string()},
+  return {{"input", input.u8string()},
           {"project", project.u8string()},
           {"las", las.u8string()},
           {"cameras", {cameras[0].ToJson(), cameras[1].ToJson()}},
@@ -190,15 +189,12 @@ Json Scene::ToJson() const {
           {"sources", sources}};
 }
 Scene Scene::FromJson(const Json& v) {
-  if (v.at("version") != 1)
-    throw std::runtime_error("Unsupported scene version");
   Scene s;
   s.input = fs::u8path(v.at("input").get<std::string>());
   s.project = fs::u8path(v.at("project").get<std::string>());
   s.las = fs::u8path(v.at("las").get<std::string>());
   s.sources = v.at("sources");
-  // Scenes written before the choice existed always preferred enhanced copies.
-  const auto photos = v.value("photos", "enhanced");
+  const auto photos = v.at("photos").get<std::string>();
   if (photos != "enhanced" && photos != "original")
     throw std::runtime_error("Unknown scene photos: " + photos);
   s.enhanced = photos == "enhanced";

@@ -54,7 +54,6 @@ Json BuildInfo() {
   return {{"version", std::string(BuildVersion)},
           {"revision", std::string(BuildRevision)},
           {"built_utc", std::string(BuildTime)},
-          {"pipeline_version", PipelineVersion},
           {"executable", ExecutablePath().u8string()}};
 }
 double Seconds(Clock::time_point started) {
@@ -72,8 +71,7 @@ Arguments::Arguments(const std::vector<std::string>& args) {
   }
   for (size_t i = 2; i < args.size(); ++i) {
     const auto& name = args[i];
-    if (name == "--no-ply" || name == "--las-supervision" || name == "--no-las-supervision" ||
-        name == "--debug" || name == "--crop-valid-domain" ||
+    if (name == "--no-ply" || name == "--no-las-supervision" || name == "--debug" ||
         name == "--no-crop-valid-domain") {
       if (!values.emplace(name, "true").second)
         throw std::invalid_argument("Repeated option: " + name);

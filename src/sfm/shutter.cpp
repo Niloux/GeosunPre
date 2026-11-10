@@ -409,7 +409,6 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   auto& report = best.report;
   report["method"] = "per-image readout rotation and per-lens readout time with the navigation "
                      "velocity, jointly with cameras, points and intrinsics, along rows and columns";
-  report["version"] = 1;
   report["holdout_rule"] = "whole tracks of at least three views with IDs divisible by five";
   report["training_tracks"] = inputs.training.size();
   report["validation_tracks"] = inputs.validation.size();
@@ -480,8 +479,7 @@ Json DeliveryShutterJson(const Scene& scene, const Reconstruction& model,
                         {"velocity_m_s", {v.x(), v.y(), v.z()}},
                         {"translation_m", {moved.x(), moved.y(), moved.z()}}});
     }
-  return {{"version", 1},
-          {"model", "linear rolling shutter about the reference pose"},
+  return {{"model", "linear rolling shutter about the reference pose"},
           {"readout_axis", motion.axis ? "rows" : "columns"},
           {"readout_fraction",
            "s = (c - N / 2) / N, c the pixel coordinate along the readout axis with the top-left "
@@ -500,8 +498,6 @@ Json DeliveryShutterJson(const Scene& scene, const Reconstruction& model,
 }
 ShutterMotion DeliveryShutterFromJson(const Json& value, const Scene& scene,
                                       const Reconstruction& model) {
-  if (value.at("version") != 1)
-    throw std::runtime_error("Unsupported rolling-shutter delivery version");
   ShutterMotion motion;
   const auto axis = value.at("readout_axis").get<std::string>();
   if (axis != "rows" && axis != "columns")

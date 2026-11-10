@@ -18,9 +18,6 @@
 
 namespace geosun {
 namespace {
-constexpr int Version = 8;
-// Monocular supervision (source moge) is published as version 10; LAS maps keep version 8.
-constexpr int MonocularVersion = 13;
 constexpr const char* MonocularSource = "moge2_faces_las_scaled";
 constexpr double MaxDepth = 65.535, MinIncidence = .3;
 // Half of FieldOfViewDegrees in radians, kept as the published constant.
@@ -1065,8 +1062,7 @@ std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal
 Json GeometryIdentity(const fs::path& root) {
   const auto manifest = ReadJson(root / "manifest.json");
   if (!manifest.at("models").contains("geometry"))
-    throw std::runtime_error(
-        "Supervision models have no geometry engine; prepare a version 3 model package");
+    throw std::runtime_error("Supervision models have no geometry engine");
   return {{"models", root.u8string()},
           {"manifest", FileMetadata(root / "manifest.json")},
           {"engine", FileMetadata(root / "engines/geometry.engine")},
@@ -1088,8 +1084,6 @@ Camera MapCamera(const Camera& source, int max_size) {
 }
 SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   SupervisionOptions options;
-  if (args.values.count("--las-supervision") && args.values.count("--no-las-supervision"))
-    throw std::runtime_error("--las-supervision conflicts with --no-las-supervision");
   options.enabled = args.Get("--no-las-supervision") != "true";
   options.max_size = args.Integer("--supervision-max-size", 1600);
   options.boundary = args.Integer("--supervision-boundary", 6);
@@ -1124,9 +1118,8 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   if (options.source == "moge" &&
       !ReadJson(options.geometry_models / "manifest.json").at("models").contains("geometry"))
     throw std::runtime_error(
-        "MoGe supervision needs a version 3 model package with the geometry engine: " +
-        options.geometry_models.u8string() +
-        "; prepare one with prepare-models.ps1, pass --supervision-models, or use "
+        "MoGe supervision needs the geometry engine: " + options.geometry_models.u8string() +
+        "; prepare it with prepare-models.ps1, pass --supervision-models, or use "
         "--supervision-source las");
   return options;
 }
@@ -1145,15 +1138,12 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
       masks[image.name] = FileMetadata(ExtraMask(options, image.name));
   }
   const bool monocular = options.source == "moge";
-  Json request = {{"version", monocular ? MonocularVersion : Version},
-                  {"max_size", options.max_size},
+  Json request = {{"max_size", options.max_size},
                   {"boundary_pixels", options.boundary},
                   {"las_file", FileMetadata(scene.las)},
                   {"exclusion_mask_dir", options.mask_dir.u8string()},
                   {"static_masks", static_masks},
                   {"exclusion_masks", masks}};
-  if (rolling)
-    request["readout_normals_version"] = 2;
   if (options.crop)
     request["crop_windows"] = {(*options.crop)[0].ToJson(), (*options.crop)[1].ToJson()};
   if (monocular) {
@@ -1447,8 +1437,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   if (request != SupervisionRequest(scene, model, masks_dir, options, motion != nullptr))
     throw std::runtime_error("LAS or geometry exclusion masks changed during supervision export");
   points.Finish();
-  Json summary = {{"version", Version},
-          {"request", request},
+  Json summary = {{"request", request},
           {"source", "valid original LAS records"},
           {"projection", motion ? "rolling_shutter_readout_line" : "global_shutter"},
           {"accepted_records", points.Count()},
@@ -1483,7 +1472,6 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
             {"result_write_wait_seconds", write_wait_seconds}}},
           {"seconds", Seconds(started)}};
   if (monocular) {
-    summary["version"] = MonocularVersion;
     summary["source"] = MonocularSource;
     summary["anchor_source"] = "valid original LAS records";
     summary["geometry_model"] = request.at("geometry");
@@ -1512,9 +1500,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
 void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
                          const Json& photos, const Json& summary) {
   const bool monocular = summary.value("source", std::string()) == MonocularSource;
-  if (summary.at("version") < 1 ||
-      summary.at("version") > (monocular ? MonocularVersion : Version) ||
-      summary.at("depth_type") != "ray_distance" ||
+  if (summary.at("depth_type") != "ray_distance" ||
       summary.at("depth_format") != "uint16_png_mm" || summary.at("normal_format") != "rgb8_png" ||
       summary.at("normal_frame") != "opencv_camera_facing_camera" ||
       summary.at("images").size() != photos.size())

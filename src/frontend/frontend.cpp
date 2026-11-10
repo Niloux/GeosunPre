@@ -54,8 +54,7 @@ std::vector<uint32_t> NavigationRevisitCandidates(const Scene& scene,
   return candidates;
 }
 // Cells of a 900x1200 grid over the photo seen by one of the five 512x512, 100 degree pinhole
-// views (forward and tilted 45 degrees) that segmented the sky before version 5 model packages.
-// The mask domain keeps this coverage so masks stay comparable with earlier work directories.
+// views (forward and tilted 45 degrees). The mask domain keeps the cells these views cover.
 cv::Mat ViewCoverage(const Camera& camera) {
   constexpr int w = 900, h = 1200;
   const double focal = 512 / (2 * std::tan(50 * Pi / 180)), radius = camera.Radius();
@@ -271,7 +270,7 @@ class FeatureCache {
     return entries.emplace(id, std::move(entry)).first->second;
   }
 };
-// SAM3 grounding of the whole photo (version 5 packages), prompts person, shadow, robot and sky.
+// SAM3 grounding of the whole photo, prompts person, shadow, robot and sky.
 constexpr float kGroundingScore = .5f;
 // A shadow is transient only within this many mask cells (about 8% of the photo side) of a
 // person: static furniture and exhibit shadows are seen in every view and stay static.
@@ -280,13 +279,12 @@ struct GroundingCounts {
   size_t persons = 0, robots = 0, shadows = 0, distant_shadows = 0, skies = 0, sky_images = 0;
 };
 int GroundingSize(const Json& manifest) {
-  if (manifest.at("version") != 5 || !manifest.at("models").contains("grounding") ||
-      manifest.at("grounding_prompts") != Json{"person", "shadow", "robot", "sky"} ||
+  if (manifest.at("grounding_prompts") != Json{"person", "shadow", "robot", "sky"} ||
       manifest.at("models").at("grounding").at("outputs") !=
           Json{"scores", "boxes", "masks", "semantic"})
     throw std::runtime_error(
-        "Masks need a version 5 model package with SAM3 grounding of person/shadow/robot/sky; "
-        "prepare one with prepare-models.ps1");
+        "Masks need SAM3 grounding of person/shadow/robot/sky; prepare the models with "
+        "prepare-models.ps1");
   return manifest.at("grounding_size");
 }
 struct GroundingResult {
@@ -372,9 +370,7 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
   Tensor descriptors;
   {
     Models models(root);
-    const auto size = manifest.at("version") == 1
-                          ? manifest.at("detector_size").get<std::array<int, 2>>()
-                          : models.DetectorSize(rgb.cols, rgb.rows);
+    const auto size = models.DetectorSize(rgb.cols, rgb.rows);
     report["detector_size"] = size;
     ImagePreprocessor pixels(models.Stream());
     pixels.Upload(rgb);
@@ -427,8 +423,8 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
     report["identity_matches"] = identities;
     report["inference"]["matcher"] = models.Profile().at("matcher");
   }
-  // Version 3 packages add the monocular geometry model used by supervision export.
-  if (manifest.at("models").contains("geometry")) {
+  // MoGe-2 monocular geometry, used by supervision export.
+  {
     Models models(root);
     ImagePreprocessor pixels(models.Stream());
     pixels.Upload(rgb);
@@ -458,9 +454,8 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
     report["geometry_valid_pixels"] = valid;
     report["inference"]["geometry"] = models.Profile().at("geometry");
   }
-  // Version 4 packages add SAM3 grounding of people, shadows and robots; version 5 adds the sky
-  // and drops the segmentation model. Masks need version 5.
-  if (manifest.at("models").contains("grounding")) {
+  // SAM3 grounding of people, shadows, robots and the sky, used by the masks.
+  {
     Models models(root);
     ImagePreprocessor pixels(models.Stream());
     pixels.Upload(rgb);
@@ -810,7 +805,7 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
     ++degrees[a];
     ++degrees[b];
   }
-  WriteJson(work / "cache/pairs.json", {{"version", 1}, {"pairs", list}});
+  WriteJson(work / "cache/pairs.json", {{"pairs", list}});
   report["pairs"] = pairs.size();
   report["navigation_added_pairs"] = navigation_added_pairs;
   report["pair_degree"] = Statistics(degrees);

@@ -42,13 +42,9 @@ CONTRACTS = {
     'geometry': (['image'], ['points', 'normal', 'mask', 'metric_scale']),
     'grounding': (['image'], ['scores', 'boxes', 'masks', 'semantic']),
 }
-# Version 5 packages hold these five models: SAM3 grounding also finds the sky, so the SegFormer
-# segmentation model of earlier packages is gone. Bundles hold the checkpoint-independent four.
+# A package holds all five models. Bundles hold the checkpoint-independent four.
 BASE_MODELS = [name for name in CONTRACTS if name != 'grounding']
-# Version 1 ONNX bundles predate the geometry model; it is exported from the pinned weights.
-# Segmentation graphs in version 1 and 2 bundles are ignored.
-BUNDLE_MODELS = {1: [name for name in BASE_MODELS if name != 'geometry'], 2: BASE_MODELS, 3: BASE_MODELS}
-BUNDLE = 'onnx-bundle.json'
+BUNDLE ='onnx-bundle.json'
 RECIPE_FILES = ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt', 'requirements-nodeps.txt')
 # Hardware compatibility trades some tactics for one engine set on every Ampere+ GPU.
 HARDWARE_LEVELS = {'none': None, 'ampere_plus': (8, 0)}
@@ -612,12 +608,11 @@ def verify(root, shapes, images):
 
 
 def matcher_precisions(manifest):
-    precision = manifest.get('matcher_precision', 'fp32')
-    return precision, manifest.get('matcher_score_precision', precision)
+    return manifest['matcher_precision'], manifest['matcher_score_precision']
 
 
 def hardware_level(manifest):
-    return manifest.get('hardware_compatibility', 'none')
+    return manifest['hardware_compatibility']
 
 
 def same_target(manifest, settings):
@@ -633,8 +628,8 @@ PACKAGE_MODELS = BASE_MODELS + ['grounding']
 def verify_package(root, settings, shapes, images):
     manifest = json.loads((root / 'manifest.json').read_text(encoding='utf-8'))
     names = PACKAGE_MODELS
-    if manifest.get('version') != 5 or manifest.get('grounding_prompts') != GROUNDING_PROMPTS or not same_target(manifest, settings) or manifest.get('detector_profile') != settings['detector_profile']:
-        raise RuntimeError('Existing model GPU/hardware level/version/profile differs. Choose a new -Models directory; use -OnnxFrom to upgrade a static package.')
+    if manifest.get('grounding_prompts') != GROUNDING_PROMPTS or not same_target(manifest, settings) or manifest.get('detector_profile') != settings['detector_profile']:
+        raise RuntimeError('Existing model GPU/hardware level/profile differs. Choose a new -Models directory.')
     if matcher_precisions(manifest) != matcher_precisions(settings):
         raise RuntimeError('Existing matcher calculation/scoring precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
     if sorted(manifest['models']) != sorted(names):
@@ -653,13 +648,11 @@ def verify_package(root, settings, shapes, images):
 
 def read_bundle(root):
     bundle = json.loads((root / BUNDLE).read_text(encoding='utf-8'))
-    if bundle.get('version') not in BUNDLE_MODELS or bundle.get('detector_profile') != DETECTOR_PROFILE or bundle.get('max_features') != MAX_FEATURES:
-        raise RuntimeError(f'ONNX bundle version/profile differs from this preparation tool: {root}')
-    if bundle['version'] >= 2 and (bundle.get('geometry_size') != GEOMETRY_SIZE or bundle.get('geometry_tokens') != GEOMETRY_TOKENS):
+    if bundle.get('detector_profile') != DETECTOR_PROFILE or bundle.get('max_features') != MAX_FEATURES:
+        raise RuntimeError(f'ONNX bundle profile differs from this preparation tool: {root}')
+    if bundle.get('geometry_size') != GEOMETRY_SIZE or bundle.get('geometry_tokens') != GEOMETRY_TOKENS:
         raise RuntimeError(f'ONNX bundle geometry input differs from this preparation tool: {root}')
-    models = BUNDLE_MODELS[bundle['version']]
-    references = [name for name in REFERENCES if name.split('_')[0].split('.')[0] in models]
-    required = [f'onnx/{name}.onnx' for name in models] + [f'references/{name}' for name in references] + bundle['images']
+    required = [f'onnx/{name}.onnx' for name in BASE_MODELS] + [f'references/{name}' for name in REFERENCES] + bundle['images']
     files = bundle['files']
     if len(bundle['images']) != 2 or any(name not in files for name in required):
         raise RuntimeError(f'ONNX bundle is incomplete: {root}')
@@ -698,7 +691,7 @@ def export_bundle(root, shapes, source, images):
         shutil.copy2(path, pending / names[-1])
     files = [f'onnx/{name}.onnx' for name in BASE_MODELS] + [f'references/{name}' for name in REFERENCES] + names
     write_json(pending / BUNDLE, {
-        'version': 3, 'recipe': settings['recipe'], 'loma_commit': LOMA_COMMIT, 'moge_commit': MOGE_COMMIT,
+        'recipe': settings['recipe'], 'loma_commit': LOMA_COMMIT, 'moge_commit': MOGE_COMMIT,
         'geometry_revision': GEOMETRY_REVISION, 'detector_profile': DETECTOR_PROFILE,
         'max_features': MAX_FEATURES, 'geometry_size': GEOMETRY_SIZE,
         'geometry_tokens': GEOMETRY_TOKENS, 'images': names,
@@ -760,15 +753,12 @@ def main():
             bundle = read_bundle(origin.parent)
         if (origin.parent / 'manifest.json').is_file():
             reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
-        # Packages and bundles from before the geometry model supply the detector, descriptor and
-        # matcher; a grounding graph is reused only with the same baked prompts and attention blocks.
+        # A grounding graph is reused only with the same baked prompts and attention blocks.
         prompts = (reuse_manifest or {}).get('grounding_prompts')
         blocks = (reuse_manifest or {}).get('grounding_attention_block')
         settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in names
-                                 if (name == 'geometry' and (origin / f'{name}.onnx').is_file()) or
-                                 (name == 'grounding' and prompts == GROUNDING_PROMPTS and
-                                  blocks == ATTENTION_BLOCK) or
-                                 name not in ('geometry', 'grounding')}
+                                 if name != 'grounding' or
+                                 (prompts == GROUNDING_PROMPTS and blocks == ATTENTION_BLOCK)}
     # A bundle carries its own validation images; no upstream source download is needed.
     source = None if args.images or bundle else loma_source()
     if args.images:
@@ -803,14 +793,11 @@ def main():
     if settings_path.is_file() and json.loads(settings_path.read_text(encoding='utf-8')) != settings:
         raise RuntimeError(f'Unfinished conversion has different settings: {pending}. Choose a new -Models directory.')
     write_json(settings_path, settings)
-    if bundle and bundle['version'] == 2:
-        references = origin.parent / 'references'
-    else:
-        references = CACHE / 'references' / sha256(settings_path)
-        references.mkdir(parents=True, exist_ok=True)
-        # A version 1 bundle stays read-only; its references join the new geometry ones.
-        for path in (origin.parent / 'references').glob('*.npz') if bundle else ():
-            shutil.copy2(path, references / path.name)
+    references = CACHE / 'references' / sha256(settings_path)
+    references.mkdir(parents=True, exist_ok=True)
+    # A bundle stays read-only; its references join the ones exported for the new graphs.
+    for path in (origin.parent / 'references').glob('*.npz') if bundle else ():
+        shutil.copy2(path, references / path.name)
     for directory in ('onnx', 'engines', 'runtime'):
         (pending / directory).mkdir(exist_ok=True)
     copied = set()
@@ -820,10 +807,6 @@ def main():
             origin = origin / 'onnx'
         for name in settings['onnx_from']:
             candidate = origin / f'{name}.onnx'
-            if name == 'detector' and (reuse_manifest or {}).get('version') == 1:
-                check_onnx(candidate, name, reuse_manifest['models'][name]['shapes'])
-                print('Upgrade static detector: re-export with dynamic height/width', flush=True)
-                continue
             check_onnx(candidate, name, shapes[name])
             destination = pending / 'onnx' / candidate.name
             if not destination.exists():
@@ -858,7 +841,7 @@ def main():
     for name in names:
         compare_reference(pending, name, shapes, references)
     verify(pending, shapes, images)
-    manifest = {'version': 5, 'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
+    manifest = {'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
                 'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': settings['matcher_score_precision'],

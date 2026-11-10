@@ -399,8 +399,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   Json sizes = Json::object();
   for (const auto* file : {"cameras.bin", "images.bin", "points3D.bin", "rigs.bin", "frames.bin"})
     sizes[file] = fs::file_size(pending / "sparse/0" / file);
-  Json manifest = {{"version", 1},
-                   {"request", request},
+  Json manifest = {{"request", request},
                    {"registration", registration},
                    {"images", photos},
                    {"model_files", sizes},
@@ -418,8 +417,6 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
 }
 Json CheckBundle(const fs::path& output) {
   const auto manifest = ReadJson(output / "manifest.json");
-  if (manifest.at("version") != 1)
-    throw std::runtime_error("Unsupported bundle manifest");
   const auto sparse = output / "sparse/0";
   for (const auto& [name, size] : manifest.at("model_files").items())
     if (fs::file_size(sparse / fs::u8path(name)) != size.get<uint64_t>())
@@ -468,13 +465,12 @@ Json CheckBundle(const fs::path& output) {
     CheckLasSupervision(output, model, manifest.at("images"), manifest.at("supervision"));
   }
   const auto saved = ReadJson(output / "quality.json");
-  const auto registration = manifest.value("registration", model.Registration(scene));
-  if (manifest.contains("registration") &&
-      (registration != saved.at("registration") ||
-       registration.at("registered_images") != model.Registered() ||
-       registration.at("selected_images").get<size_t>() !=
-           model.Registered() + registration.at("unregistered_images").size() ||
-       registration.at("complete") != registration.at("unregistered_images").empty()))
+  const auto registration = manifest.at("registration");
+  if (registration != saved.at("registration") ||
+      registration.at("registered_images") != model.Registered() ||
+      registration.at("selected_images").get<size_t>() !=
+          model.Registered() + registration.at("unregistered_images").size() ||
+      registration.at("complete") != registration.at("unregistered_images").empty())
     throw std::runtime_error("Bundle registration summary differs");
   const auto quality =
       model.Quality(scene, saved.at("limits").at("median_px"), saved.at("limits").at("p90_px"),
@@ -843,7 +839,6 @@ Json MeasureSupervision(const fs::path& output, const fs::path& compare) {
   Json deliveries = Json::array();
   for (size_t p = 0; p < outputs.size(); ++p) {
     Json row = {{"output", outputs[p].u8string()},
-                {"version", summaries[p].at("version")},
                 {"source", summaries[p].at("source")},
                 {"own_pixels", own[p].ToJson()}};
     if (outputs.size() > 1)

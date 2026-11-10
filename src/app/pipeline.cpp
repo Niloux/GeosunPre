@@ -106,16 +106,13 @@ struct Delivery {
 // The options ParseDelivery reads, accepted by every command that writes a delivery.
 std::vector<std::string> WithDeliveryOptions(std::vector<std::string> options) {
   for (const auto* option :
-       {"--no-ply", "--ply-voxel", "--las-supervision", "--no-las-supervision",
-        "--supervision-max-size", "--supervision-boundary", "--supervision-mask-dir",
-        "--supervision-cache-mb", "--supervision-source", "--supervision-models",
-        "--crop-valid-domain", "--no-crop-valid-domain"})
+       {"--no-ply", "--ply-voxel", "--no-las-supervision", "--supervision-max-size",
+        "--supervision-boundary", "--supervision-mask-dir", "--supervision-cache-mb",
+        "--supervision-source", "--supervision-models", "--no-crop-valid-domain"})
     options.push_back(option);
   return options;
 }
 Delivery ParseDelivery(const Arguments& args) {
-  if (args.values.count("--crop-valid-domain") && args.values.count("--no-crop-valid-domain"))
-    throw std::runtime_error("--crop-valid-domain conflicts with --no-crop-valid-domain");
   return {args.Get("--no-ply") != "true", args.Number("--ply-voxel", .05),
           ParseSupervisionOptions(args), args.Get("--no-crop-valid-domain") != "true"};
 }
@@ -386,11 +383,6 @@ void Run(const Arguments& args) {
     WorkState state{work / "state.json", Json::object()};
     if (fs::exists(state.path))
       state.value = ReadJson(state.path);
-    if (!state.value.empty() && state.value.at("version") != 1)
-      throw std::runtime_error("Unsupported work format; choose a new work directory");
-    if (!state.value.empty() && state.value.value("pipeline_version", 0) != PipelineVersion)
-      throw std::runtime_error(
-          "Reconstruction implementation changed; choose a new work directory");
     const auto input = args.Get("--input").empty()
                            ? fs::u8path(state.value.at("input").get<std::string>())
                            : args.Path("--input");
@@ -404,15 +396,11 @@ void Run(const Arguments& args) {
                                 ? fs::path()
                                 : fs::u8path(state.value.at("scene").at("las").get<std::string>()))
                          : args.Path("--las");
-    // Work directories frozen before this setting existed read as original photos and
-    // fail the scene comparison below if they had used enhanced copies.
-    const Scene scene = ReadScene(input, las, settings.value("enhanced_photos", false));
+    const Scene scene = ReadScene(input, las, settings.at("enhanced_photos"));
     ReadSceneLas(scene);
     const auto prepared = scene.ToJson();
     if (state.value.empty()) {
-      state.value = {{"version", 1},
-                     {"pipeline_version", PipelineVersion},
-                     {"input", scene.input.u8string()},
+      state.value = {{"input", scene.input.u8string()},
                      {"settings", settings},
                      {"scene", prepared},
                      {"stages", Json::object()}};
@@ -428,8 +416,7 @@ void Run(const Arguments& args) {
     const auto stages = Stages(settings, requested);
     if (Contains(input, output) || Contains(output, input))
       throw std::runtime_error("Output must be separate from input");
-    // Work directories from before this option kept their cache; they stay debug runs.
-    debug = args.Get("--debug") == "true" || (!fresh && state.value.value("debug", true));
+    debug = args.Get("--debug") == "true" || (!fresh && state.value.at("debug").get<bool>());
     state.value["debug"] = debug;
     state.value["output"] = output.u8string();
     state.value["status"] = "running";
@@ -501,14 +488,10 @@ void Export(const Arguments& args) {
   if (!fs::is_regular_file(work / "scene.json"))
     throw std::runtime_error("Not a work directory (no scene.json): " + work.u8string());
   Lock lock(work);
-  if (fs::exists(work / "state.json")) {
-    const auto state = ReadJson(work / "state.json");
-    if (state.value("pipeline_version", 0) == PipelineVersion) {
-      if (!state.at("stages").contains("cleanup"))
-        throw std::runtime_error("Run prerequisite stage: cleanup");
-      Verify(work, state.at("stages").at("cleanup").at("files"));
-    }
-  }
+  const auto state = ReadJson(work / "state.json");
+  if (!state.at("stages").contains("cleanup"))
+    throw std::runtime_error("Run prerequisite stage: cleanup");
+  Verify(work, state.at("stages").at("cleanup").at("files"));
   const auto scene = Scene::FromJson(ReadJson(work / "scene.json"));
   const auto output = args.Path("--output");
   if (Contains(scene.input, output) || Contains(output, scene.input))
@@ -557,18 +540,10 @@ void Postprocess(const Arguments& args) {
       original.contains("shutter") && original.at("shutter").value("used", false);
   const auto model = ReadModel(SelectedModelPath(source, original));
   AlignmentLimits limits;
-  if (original.contains("alignment")) {
-    const auto& saved = original.at("alignment").at("limits");
-    limits.support_fraction = saved.at("support_fraction");
-    limits.median_m = saved.at("median_m");
-    limits.p90_m = saved.at("p90_m");
-  } else if (original.contains("refinement") && original.at("refinement").contains("limits")) {
-    // Results of older versions that delivered a photometrically refined model.
-    const auto& saved = original.at("refinement").at("limits");
-    limits.support_fraction = saved.at("las_support_fraction");
-    limits.median_m = saved.at("las_median_m");
-    limits.p90_m = saved.at("las_p90_m");
-  }
+  const auto& saved = original.at("alignment").at("limits");
+  limits.support_fraction = saved.at("support_fraction");
+  limits.median_m = saved.at("median_m");
+  limits.p90_m = saved.at("p90_m");
   limits.median_px = original.at("quality").at("limits").at("median_px");
   limits.p90_px = original.at("quality").at("limits").at("p90_px");
   fs::create_directories(output / "cache");

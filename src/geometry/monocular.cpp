@@ -284,9 +284,7 @@ MonocularEstimator::MonocularEstimator(Models& models)
     : models_(models), pixels_(models.Stream()) {
   const auto& manifest = models.Manifest();
   if (!manifest.at("models").contains("geometry"))
-    throw std::runtime_error(
-        "Model package has no geometry engine; prepare a version 3 package with "
-        "prepare-models.ps1");
+    throw std::runtime_error("Model package has no geometry engine; run prepare-models.ps1");
   size_ = manifest.at("geometry_size");
   // Load the engine now, so device memory budgets measured afterwards see it.
   pixels_.Upload(cv::Mat::zeros(size_, size_, CV_8UC3));

@@ -19,7 +19,7 @@ INPUT/
 
 文件名为 `GPS周-秒-毫秒_帧号-L或R.JPG`。CameraPos 每行 11 字段：文件名、设备编号、GPS 周、秒、XYZ、四元数四分量。仅使用位置，四元数不用于视觉初始化；不改写时间戳。
 
-鱼眼参数为 `fx fy cx cy k1 k2 k3 k4`。初值：`fx=fy=focalLength/pixelSize`，`cx=width/2+principalX/pixelSize`，`cy=height/2+principalY/pixelSize`，`k4=p3`。主点偏移与 G203 参考流程采用相同的图像坐标方向；p3 含义尚未独立核对。旧版本对 principalY 使用减号，已有 scene.json 和特征缓存不能直接视为修正后的结果，须使用新工作目录。
+鱼眼参数为 `fx fy cx cy k1 k2 k3 k4`。初值：`fx=fy=focalLength/pixelSize`，`cx=width/2+principalX/pixelSize`，`cy=height/2+principalY/pixelSize`，`k4=p3`。主点偏移与 G203 参考流程采用相同的图像坐标方向；p3 含义尚未独立核对。
 
 左上像素中心为 `(0.5,0.5)`。`theta=atan2(sqrt(X²+Y²),Z)`，径向多项式为 `theta*(1+k1*theta²+k2*theta⁴+k3*theta⁶+k4*theta⁸)`。有效域为完整视场 160°，多项式须单调。L/R 内参各共享一组，每次曝光有独立位姿；同步数据在卷帘 BA 中另以全局 L→R 外参软约束同帧两参考位姿（见 README）。
 

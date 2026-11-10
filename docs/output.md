@@ -26,7 +26,7 @@ points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重
 
 相机和稀疏点已在局部 LAS 坐标（局部 LAS 即输入坐标，ECEF LAS 为其转换后的导航 ENH 局部坐标，见[输入约定](input.md)），下游不再应用配准变换。BIN 是视觉稀疏点及轨迹；PLY 是完整有效 LAS 的体素均值，点身份相互独立。默认体素 0.05 m，二进制小端，每点 float32 XYZ、零法向量 XYZ、uint8 RGB，共 27 字节。PLY 与相机同一坐标，`initialization.coordinate_frame` 为 `input_las_xyz` 或 `ecef_to_navigation_enh`。LAS 头部范围（ECEF LAS 为转换后范围）的坐标绝对值须不超过 16777 m，使 float32 舍入不超过 1 mm，否则明确报错。下游需明确选择此 PLY 初始化 3DGS。
 
-掩码为与交付照片同尺寸的单通道 PNG：静态 255、天空 128、人物及有效域外 0。version=5 模型包由 SAM3 grounding 在整幅照片上决定人物与天空：person、shadow、robot、sky 检测分数 ≥ 0.5 时有效；人物检测有一半以上被分数不低于它的机器人检测覆盖时视为人形展品，保持静态；影子与保留的人物在 288 格掩码上相距不超过 24 格时才置 0，远离人物的家具和展品阴影保持静态；人物与影子的并集外扩 1 格后放大到原图。天空为 sky 检测掩码的并集，不外扩，放大到原图后在有效域内置 128，人物与影子优先置 0；室内明亮的灯箱、天花或印有天空的展板偶尔被判为天空，这类误检被接受。SfM 只提取 255 区域；有效域按初始标定冻结，并去掉早期五个 100° 虚拟透视视图（正前方及上下左右各倾斜 45°）都覆盖不到的格子，与旧工作目录一致；独立清理复制旧掩码时同步屏蔽这些像素。version=4 及更早的包由 SegFormer 在这五个视图中分割天空（version=3 及更早还分割人物），判定更保守，会漏掉过曝的白色天空。
+掩码为与交付照片同尺寸的单通道 PNG：静态 255、天空 128、人物及有效域外 0。SAM3 grounding 在整幅照片上决定人物与天空：person、shadow、robot、sky 检测分数 ≥ 0.5 时有效；人物检测有一半以上被分数不低于它的机器人检测覆盖时视为人形展品，保持静态；影子与保留的人物在 288 格掩码上相距不超过 24 格时才置 0，远离人物的家具和展品阴影保持静态；人物与影子的并集外扩 1 格后放大到原图。天空为 sky 检测掩码的并集，不外扩，放大到原图后在有效域内置 128，人物与影子优先置 0；室内明亮的灯箱、天花或印有天空的展板偶尔被判为天空，这类误检被接受。SfM 只提取 255 区域；有效域按初始标定冻结，并去掉早期五个 100° 虚拟透视视图（正前方及上下左右各倾斜 45°）都覆盖不到的格子；独立清理复制来源掩码时同步屏蔽这些像素。
 
 深度和法向监督默认在导出阶段生成，默认来源为下节的 MoGe 单目监督；`--supervision-source las` 选用本节的 LAS 投影监督。`run`、独立 `export`、`cleanup` 均可用 `--no-las-supervision` 关闭全部监督。监督使用最终所选相机和原始有效 LAS：先在点云上为每点估计法向与面元足迹，再以 50 万记录分块、GPU 有界批次投影面元，位姿与投影为双精度；不读取初始化 PLY。监督图默认最长边 1600，不放大原图，相机内参按输出尺寸缩放。深度是沿视线距离，uint16 毫米，0 表示无效，0.05 m 以下及 65.535 m 以上留空。法向是 OpenCV 相机坐标下朝向相机的单位向量，RGB 为 `round(127.5*(n+1))`，黑色无效。定制 LFS 按 `supervision.json` 的 `depth_type`、`depth_format`、`normal_frame` 自动选择米制深度和相机坐标法向，沿视线深度须用其 GUT 光栅化（`--gut`）训练；图像仍保留原始鱼眼畸变。
 
@@ -40,7 +40,7 @@ points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重
 
 ### MoGe 单目监督
 
-默认的 `--supervision-source moge` 由 MoGe-2 ViT-L normal 生成深度和法向图，LAS 只用来定尺度，并在 LAS 有深度处检查深度。文件、编码、尺寸与上述 LAS 监督相同，定制 LFS 不需修改。几何引擎取自 `--supervision-models` 的 version=3 模型包；未指定时 `run` 用 `--models`，否则用默认模型目录。它与工作目录绑定的重建模型包无关，已有工作目录可直接 `export`。缺少 geometry 引擎时在解析参数时即报错，不等到导出。
+默认的 `--supervision-source moge` 由 MoGe-2 ViT-L normal 生成深度和法向图，LAS 只用来定尺度，并在 LAS 有深度处检查深度。文件、编码、尺寸与上述 LAS 监督相同，定制 LFS 不需修改。几何引擎取自 `--supervision-models` 的模型包；未指定时 `run` 用 `--models`，否则用默认模型目录。它与工作目录绑定的重建模型包无关，已有工作目录可直接 `export`。缺少 geometry 引擎时在解析参数时即报错，不等到导出。
 
 每个镜头按监督图相机规划两组 644×644 的方形透视子图，都由一张前向子图和按镜头最大离轴角加的若干圈倾斜子图组成（最外圈子图的边缘超出最大离轴角 15°，160° 鱼眼为下述张数），每条有效视线离某张子图边缘至少 5°。深度来自 90° 视场的一组（7 张，一圈倾斜 50°），子图带有足够的场景上下文；`check-supervision` 实测 60° 子图的跨视角深度一致性明显更差。法向来自 60° 视场的一组（15 张，两圈倾斜 42.5° 和 65°），子图中心的角分辨率与最长边 1600 的监督图相当，杆件等细结构因此可分辨；普通表面上其跨视角法向一致性略差于 90°。`lenses` 的 `plan` 与 `normal_plan` 分别记录两组规划。原图先按面积缩小到子图中心像素密度的 2 倍，再双线性重采样到各子图。MoGe 逐张推理，按已知焦距像其自身推理那样恢复 z 偏移，换算成沿视线距离；法向转到镜头相机坐标并朝向相机。卷帘快门照片按整幅照片推理，与按像素读出线投影的 LAS 深度对比。
 
@@ -48,13 +48,13 @@ MoGe 的误差在一张子图内也不一致（近处设备与其后的房间需
 
 深度有效须满足：拟合被接受；静态掩码有效且不在语义边界余量内（同 `--supervision-boundary`）；3×3 邻域内无对数距离跳变超过 0.04 的像素，再外扩 1 像素，以去掉跨遮挡混合的深度；0.05–65.535 m；可信 LAS（同上，对比融合后的 MoGe 法向）在该像素有深度时两者相差不超过 max(3%, 3 cm)，不可信 LAS 的差异只计数、不剔除。法向有效须满足同样的掩码条件，且与视线夹角余弦至少 0.3，不要求对应深度有效，也不因深度跳变留空：跨遮挡混合的深度是悬空的错误点，而杆件、线缆等细结构处处都有跳变，留空会把它们整片删掉，因此这些像素有法向而无深度，其法向可能混有背景。LAS 可信判断、深度筛选和尺度场都用 90° 子图的法向与距离，60° 子图只提供交付的法向。
 
-全部照片写出后再做跨视角自由空间检查：LAS 空洞里的深度只由尺度场外推，不同照片可能把同一表面放在相差约 10% 的位置，训练时会被拉成凹陷，而没有 LAS 能判断哪张对。每张照片与共享轨迹最多的 12 个视角配对（共享轨迹至少 30、基线至少 5 cm，关系取对称），在 4 像素格点上把深度点按卷帘读出线投到对方：落在对方 160° 视场内、对方 3×3 邻域都有深度时，若该点距离乘以 e^0.05 仍小于对方邻域最近深度，说明对方的视线穿过了这个点，两图至少一张错误，两侧所在的 4×4 格子各记一个矛盾视角。对方表面更近的情况可能是遮挡，不计入。可信 LAS 确认过深度的格子保留深度；其余格子有至少 2 个矛盾视角时去掉深度，法向保留。一致的视角不抵消矛盾：LAS 空洞里两组视角可能各自一致，却没有依据判断哪组对。这样一张错误的邻图不会抹掉经 LAS 核验的正确深度，单次零散矛盾也不会留下空洞。`supervision.json` 的 version 为 13，`source` 为 `moge2_faces_las_scaled`，另含 `geometry_model`（模型包、引擎 SHA256 与文件身份、来源、子图尺寸、token 数）、各镜头子图规划及 `monocular` 参数；每图的 `monocular` 记录各子图尺度、锚点与内点、残差、z 偏移和 MoGe 自身 metric_scale，以及与可信 LAS 的对数比分位数、不一致像素数、不可信 LAS 像素及其中不一致的数量和 `view_conflict_pixels`（跨视角检查去掉的深度像素）；`monocular.view_conflicts` 记录检查参数、配对数、检验与矛盾样本数及去掉的像素总数。监督请求另含 `source: "moge"` 与几何引擎身份。
+全部照片写出后再做跨视角自由空间检查：LAS 空洞里的深度只由尺度场外推，不同照片可能把同一表面放在相差约 10% 的位置，训练时会被拉成凹陷，而没有 LAS 能判断哪张对。每张照片与共享轨迹最多的 12 个视角配对（共享轨迹至少 30、基线至少 5 cm，关系取对称），在 4 像素格点上把深度点按卷帘读出线投到对方：落在对方 160° 视场内、对方 3×3 邻域都有深度时，若该点距离乘以 e^0.05 仍小于对方邻域最近深度，说明对方的视线穿过了这个点，两图至少一张错误，两侧所在的 4×4 格子各记一个矛盾视角。对方表面更近的情况可能是遮挡，不计入。可信 LAS 确认过深度的格子保留深度；其余格子有至少 2 个矛盾视角时去掉深度，法向保留。一致的视角不抵消矛盾：LAS 空洞里两组视角可能各自一致，却没有依据判断哪组对。这样一张错误的邻图不会抹掉经 LAS 核验的正确深度，单次零散矛盾也不会留下空洞。`supervision.json` 的 `source` 为 `moge2_faces_las_scaled`，另含 `geometry_model`（模型包、引擎 SHA256 与文件身份、来源、子图尺寸、token 数）、各镜头子图规划及 `monocular` 参数；每图的 `monocular` 记录各子图尺度、锚点与内点、残差、z 偏移和 MoGe 自身 metric_scale，以及与可信 LAS 的对数比分位数、不一致像素数、不可信 LAS 像素及其中不一致的数量和 `view_conflict_pixels`（跨视角检查去掉的深度像素）；`monocular.view_conflicts` 记录检查参数、配对数、检验与矛盾样本数及去掉的像素总数。监督请求另含 `source: "moge"` 与几何引擎身份。
 
-manifest 的 request.supervision 记录算法版本、LAS、静态及额外排除掩码身份和导出参数；当前 LAS 监督算法版本为 8，MoGe 单目监督为 13（版本 12 没有跨视角自由空间检查，版本 11 深度和法向都用 60° 子图，版本 10 都用 90° 子图且法向因深度跳变留空，版本 9 对全部 LAS 深度拟合并以其否决 MoGe 深度，均可回读），版本 1–7 的旧交付仍可回读，各版本改动见[缓存约定](cache.md)。supervision 字段与 `supervision.json` 相同，保存按已注册照片原顺序排列的尺寸、文件字节数及有效像素数量。`check` 逐图回读，核对类型、尺寸、身份、有效数量、法向单位长度及其深度支撑（MoGe 单目监督的法向不要求深度）。关闭监督时不生成这些字段和文件，旧包仍可回读。
+manifest 的 request.supervision 记录 LAS、静态及额外排除掩码身份和导出参数。supervision 字段与 `supervision.json` 相同，保存按已注册照片原顺序排列的尺寸、文件字节数及有效像素数量。`check` 逐图回读，核对类型、尺寸、身份、有效数量、法向单位长度及其深度支撑（MoGe 单目监督的法向不要求深度）。关闭监督时不生成这些字段和文件。
 
-manifest 协议版本 1，保存请求、已注册图像身份、文件大小、初始化参数。卷帘校正被采用时 request 另含 `rolling_shutter`：`cache/shutter.json` 的文件身份与 `photos: "original"`。图像条目的 image_index 是原输入的 0 起始索引。quality 保存所选模型拟合验收和限值。省略 PLY 时不生成 initialization.json，清单中的 initialization 为 null。
+manifest 保存请求、已注册图像身份、文件大小、初始化参数。卷帘校正被采用时 request 另含 `rolling_shutter`：`cache/shutter.json` 的文件身份与 `photos: "original"`。图像条目的 image_index 是原输入的 0 起始索引。quality 保存所选模型拟合验收和限值。省略 PLY 时不生成 initialization.json，清单中的 initialization 为 null。
 
-manifest 和 quality 的 registration 保存 complete、selected_images、registered_images，以及 unregistered_images 名单（image_index、name、0 起始 camera）。默认首次停滞就处理已注册部分；可配置 `sfm_repair_rounds=1` 或 `2`，在补匹配轮数用完后处理已注册部分。子集收尾还会排除末尾标定可靠支撑不足的曝光，其原始索引和支撑记录保存在 sfm.calibration_selection。只有通过支撑检查的已注册照片参与后续优化、几何验收及配准；原有验收门限不变。quality.images 保留全部输入的顺序与 registered 标记，未注册条目的观测数为 0、误差统计为空。quality.passed 表示已重建部分通过验收，不表示全部照片注册成功；check 同时返回 registration。旧版完整包可以没有 registration。
+manifest 和 quality 的 registration 保存 complete、selected_images、registered_images，以及 unregistered_images 名单（image_index、name、0 起始 camera）。默认首次停滞就处理已注册部分；可配置 `sfm_repair_rounds=1` 或 `2`，在补匹配轮数用完后处理已注册部分。子集收尾还会排除末尾标定可靠支撑不足的曝光，其原始索引和支撑记录保存在 sfm.calibration_selection。只有通过支撑检查的已注册照片参与后续优化、几何验收及配准；原有验收门限不变。quality.images 保留全部输入的顺序与 registered 标记，未注册条目的观测数为 0、误差统计为空。quality.passed 表示已重建部分通过验收，不表示全部照片注册成功；check 同时返回 registration。
 
 quality.calibration 保存两镜头的初始与最终内参、主点偏移，以及每 20° 入射角区间的重投影误差。角度按初始标定计算，便于比较镜头中心与边缘；这些统计是拟合诊断，不代表独立精度。
 
@@ -74,9 +74,9 @@ quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 
 
 ## 卷帘快门交付
 
-卷帘校正被采用的模型交付原图与原掩码（默认按有效域无损裁剪），特征坐标为交付图像像素，位姿为参考位姿；`rolling_shutter.json` 给出每幅照片的读出运动。按全局快门读取时视图间仍有卷帘偏差，下游须使用该文件（定制 LFS 在 `--gut` 且未开启 undistort 时按卷帘相机训练，否则告警并按全局快门处理）。照片不做重采样：读出平移的像素偏移随深度变化，按 LAS 距离重采样会在近处动态物体和 LAS 空洞处错位。旧版按参考位姿重采样照片的 `rectified` 交付不再生成，仍可 `check` 回读。points3D.bin 的 error、quality.json 与 `check` 均按卷帘投影计算；深度和法向监督按每个像素自身读出线的相机投影 LAS；面元法向随位姿及面元中心所在读出线的转动变换到该读出相机（与覆盖像素的读出线相差不超过足迹的几个像素）。supervision.json 的 projection 为 `rolling_shutter_readout_line`，normal_estimator 为 `las_knn_pca_surfel_readout_line`，监督请求另含 `readout_normals_version`。
+卷帘校正被采用的模型交付原图与原掩码（默认按有效域无损裁剪），特征坐标为交付图像像素，位姿为参考位姿；`rolling_shutter.json` 给出每幅照片的读出运动。按全局快门读取时视图间仍有卷帘偏差，下游须使用该文件（定制 LFS 在 `--gut` 且未开启 undistort 时按卷帘相机训练，否则告警并按全局快门处理）。照片不做重采样：读出平移的像素偏移随深度变化，按 LAS 距离重采样会在近处动态物体和 LAS 空洞处错位。points3D.bin 的 error、quality.json 与 `check` 均按卷帘投影计算；深度和法向监督按每个像素自身读出线的相机投影 LAS；面元法向随位姿及面元中心所在读出线的转动变换到该读出相机（与覆盖像素的读出线相差不超过足迹的几个像素）。supervision.json 的 projection 为 `rolling_shutter_readout_line`，normal_estimator 为 `las_knn_pca_surfel_readout_line`。
 
-`rolling_shutter.json`（version 1）是卷帘交付的相机接口：
+`rolling_shutter.json` 是卷帘交付的相机接口：
 
 ```text
 readout_axis   "rows" 或 "columns"，两镜头共用
@@ -86,10 +86,10 @@ images         [{image_id, camera_id, name, rotation_rad[3], velocity_m_s[3], tr
 
 读出比例 `s = (c - N/2)/N`，c 为像素沿读出轴的坐标（左上像素中心为 0.5），N 为该轴的图像尺寸。参考位姿为 images.bin 的 world-to-camera `R, t`（s = 0）。三维点 X 在读出比例 s 处的相机坐标为 `p(s) = (I + s[rotation_rad]×)(R X + t - s·translation_m)`，`translation_m = readout_s · velocity_m_s`；rotation_rad、velocity_m_s、translation_m 均在 OpenCV 参考相机坐标中，rotation_rad 与 translation_m 对应整帧读出。X 的像素 x 满足 `x = fisheye(p(s(x)))`，从 s = 0 起不动点迭代 3–4 次即收敛。该一阶模型在读出期间转动不超过约 3° 时足够精确。
 
-原图交付的法向在世界坐标的 LAS 点云上估计，投影时变换到面元中心读出线的相机。监督请求的 `readout_normals_version=2` 区分此几何约定（版本 1 为按参考相机拟合的图像邻域法向）；旧交付仍可回读，新导出使用新目录。
+原图交付的法向在世界坐标的 LAS 点云上估计，投影时变换到面元中心读出线的相机。
 
 ## 有效域裁剪交付
 
-`run`、`export`、`cleanup` 默认把每个镜头的照片、掩码与模型裁到该镜头有效域的外接窗口；`--no-crop-valid-domain` 交付整幅原图，`--crop-valid-domain` 显式开启，二者冲突。裁剪使下游少处理鱼眼圆外恒为 0 的像素。窗口取该镜头全部已注册照片静态掩码非零像素的外接框，四周各留 16 px（不超出原图）；左上角对齐照片 JPEG 的 MCU 网格，照片按 DCT 系数无损裁剪，不重新编码，EXIF 等标记原样保留（EXIF 中记录的像素尺寸不改写）。掩码按窗口精确裁剪。窗口沿读出轴以图像中心对称，读出比例只按 `N'/N` 缩放（N、N' 为裁剪前后沿读出轴的尺寸）：`rolling_shutter.json` 的 `rotation_rad`、`translation_m` 与 `readout_s` 同乘 `N'/N`，`velocity_m_s` 与参考位姿不变，交付在裁剪后图像上按同一公式 `s = (c - N/2)/N` 使用。
+`run`、`export`、`cleanup` 默认把每个镜头的照片、掩码与模型裁到该镜头有效域的外接窗口；`--no-crop-valid-domain` 交付整幅原图。裁剪使下游少处理鱼眼圆外恒为 0 的像素。窗口取该镜头全部已注册照片静态掩码非零像素的外接框，四周各留 16 px（不超出原图）；左上角对齐照片 JPEG 的 MCU 网格，照片按 DCT 系数无损裁剪，不重新编码，EXIF 等标记原样保留（EXIF 中记录的像素尺寸不改写）。掩码按窗口精确裁剪。窗口沿读出轴以图像中心对称，读出比例只按 `N'/N` 缩放（N、N' 为裁剪前后沿读出轴的尺寸）：`rolling_shutter.json` 的 `rotation_rad`、`translation_m` 与 `readout_s` 同乘 `N'/N`，`velocity_m_s` 与参考位姿不变，交付在裁剪后图像上按同一公式 `s = (c - N/2)/N` 使用。
 
 `cameras.bin` 的宽高为窗口尺寸，主点减去窗口原点，畸变参数不变；`images.bin` 的特征坐标减去窗口原点，`points3D.bin` 的 error 按裁剪后的投影重新计算。深度、法向监督按裁剪后的相机生成，静态及额外排除掩码先裁到窗口再缩放到监督图；监督图像素只有在其原图面积内全部有效时才有效（对无效像素做面积缩放，结果须严格为 0）。`manifest.json` 的 request 另含 `crop`（`mode: "valid_domain"` 与两镜头窗口），监督请求另含 `crop_windows`，因此裁剪与未裁剪交付不会被视为同一请求。`check` 对裁剪交付按同样规则回读。
