@@ -1111,18 +1111,20 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
     if (options.source != "moge")
       throw std::runtime_error("--supervision-models requires --supervision-source moge");
     options.geometry_models = args.Path("--supervision-models");
-  } else if (options.source == "moge") {
-    // The reconstruction package of run, else the default one.
-    options.geometry_models = args.Get("--models").empty() ? DefaultModels() : args.Path("--models");
   }
-  // Fail before reconstruction, not at the export hours later.
-  if (options.source == "moge" &&
-      !ReadJson(options.geometry_models / "manifest.json").at("models").contains("geometry"))
+  return options;
+}
+void ResolveSupervisionModels(SupervisionOptions& options, const fs::path& package) {
+  if (!options.enabled || options.source != "moge")
+    return;
+  // Without --supervision-models, the model package of the reconstruction.
+  if (options.geometry_models.empty())
+    options.geometry_models = package;
+  if (!ReadJson(options.geometry_models / "manifest.json").at("models").contains("geometry"))
     throw std::runtime_error(
         "MoGe supervision needs the geometry engine: " + options.geometry_models.u8string() +
         "; prepare it with prepare-models.ps1, pass --supervision-models, or use "
         "--supervision-source las");
-  return options;
 }
 Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const fs::path& masks_dir,
                         const SupervisionOptions& options, bool rolling) {
@@ -1271,9 +1273,11 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   double project_seconds = 0, estimate_seconds = 0, write_wait_seconds = 0, face_load_wait_seconds = 0;
   auto finish = [&] {
     const auto waiting = Clock::now();
-    auto written = writes.front().get();
-    write_wait_seconds += Seconds(waiting);
+    // Leave the queue before get(): a throwing task must not leave an invalid future behind.
+    auto pending = std::move(writes.front());
     writes.pop_front();
+    auto written = pending.get();
+    write_wait_seconds += Seconds(waiting);
     depth_pixels += written.row.at("depth_pixels").get<uint64_t>();
     normal_pixels += written.row.at("normal_pixels").get<uint64_t>();
     rows[written.id] = std::move(written.row);
@@ -1293,6 +1297,16 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   // pending write fills its own image.
   std::vector<cv::Mat> verified_cells(model.images.size());
   auto* verified_out = &verified_cells;
+  // Pending writes use the lens plans and verified cells above, which are destroyed before the
+  // queue itself; on an exception, wait for the tasks first (their results are discarded).
+  struct DrainWrites {
+    std::deque<std::future<Written>>& queue;
+    ~DrainWrites() {
+      for (auto& write : queue)
+        if (write.valid())
+          write.wait();
+    }
+  } drain_writes{writes};
   for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
     std::vector<uint32_t> images;
     for (uint32_t i = 0; i < model.images.size(); ++i)

@@ -1033,17 +1033,18 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
         if (!model.images[i].registered)
           continue;
         const auto di = read_depth(i);
-        std::vector<uint8_t> own(conflicts[i].size());
         for (uint32_t j = i + 1; j < n; ++j) {
           if (!paired[i][j])
             continue;
           const auto dj = read_depth(j);
-          std::vector<uint8_t> other(conflicts[j].size());
+          // One vote per neighbouring view: flags are collected per pair, so two views that
+          // contradict the same cell count twice on either side of the pair.
+          std::vector<uint8_t> own(conflicts[i].size()), other(conflicts[j].size());
           check(i, j, di, dj, own, other);
           check(j, i, dj, di, other, own);
+          merge(i, own);
           merge(j, other);
         }
-        merge(i, own);
       }
     } catch (...) {
       std::lock_guard<std::mutex> guard(failure_lock);

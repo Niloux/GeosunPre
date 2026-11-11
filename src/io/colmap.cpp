@@ -706,6 +706,9 @@ Json RefineStaticMasks(const fs::path& delivery, const fs::path& input, const fs
   const Scene source = ReadScene(input, las, enhanced);
   auto pending = output;
   pending += ".pending";
+  // The interrupted-run archive renames this directory: it must not be the delivery itself.
+  if (inside(delivery, pending) || inside(pending, delivery))
+    throw std::runtime_error("Output .pending directory overlaps the delivery");
   ArchiveInterrupted(pending);
   fs::create_directories(pending / "masks");
   auto report = StaticMasks(

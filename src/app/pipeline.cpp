@@ -337,6 +337,11 @@ std::vector<std::string> Stages(const Json& settings, const std::string& request
     throw std::runtime_error("Unknown stage: " + requested);
   return stages;
 }
+// The model package a work directory was reconstructed with, else the default package.
+fs::path RecordedModels(const Json& state) {
+  return state.contains("models") ? fs::u8path(state.at("models").get<std::string>())
+                                  : DefaultModels();
+}
 // Production runs keep only the delivery: their work directory sits beside it and is removed
 // once the delivery is published. --debug keeps the work directory and its cache.
 fs::path ProductionWork(const fs::path& output) {
@@ -348,7 +353,7 @@ fs::path ProductionWork(const fs::path& output) {
 void Run(const Arguments& args) {
   args.Validate(WithDeliveryOptions({"--input", "--work", "--models", "--config", "--stage",
                                      "--output", "--las", "--debug"}));
-  const auto delivery = ParseDelivery(args);
+  auto delivery = ParseDelivery(args);
   // Without --input, an existing work directory supplies the input and output.
   auto output = args.Get("--output").empty() ? fs::path() : args.Path("--output");
   fs::path work;
@@ -415,6 +420,9 @@ void Run(const Arguments& args) {
                           : args.Path("--models");
     const auto requested = args.Get("--stage", args.command == "prepare" ? "prepare" : "all");
     const auto stages = Stages(settings, requested);
+    // Only runs that reach the export need the geometry engine; fail before reconstruction.
+    if (requested == "all" || requested == "export")
+      ResolveSupervisionModels(delivery.supervision, root);
     if (Contains(input, output) || Contains(output, input))
       throw std::runtime_error("Output must be separate from input");
     debug = args.Get("--debug") == "true" || (!fresh && state.value.at("debug").get<bool>());
@@ -433,7 +441,7 @@ void Run(const Arguments& args) {
           const auto& previous = *(std::find(stages.begin(), stages.end(), stage) - 1);
           if (!completed.contains(previous))
             throw std::runtime_error("Run prerequisite stage: " + previous);
-          if (stage == "shutter" || stage == "cleanup" || stage == "export")
+          if (stage == "align" || stage == "shutter" || stage == "cleanup" || stage == "export")
             Verify(work, completed.at(previous).at("files"));
           // SfM repair rounds run the matcher again with the recorded models.
           if (stage == "masks" || stage == "features" || stage == "matches" ||
@@ -484,16 +492,20 @@ void Run(const Arguments& args) {
 }
 void Export(const Arguments& args) {
   args.Validate(WithDeliveryOptions({"--work", "--output"}));
-  const auto delivery = ParseDelivery(args);
+  auto delivery = ParseDelivery(args);
   const auto work = args.Path("--work");
   if (!fs::is_regular_file(work / "scene.json"))
     throw std::runtime_error("Not a work directory (no scene.json): " + work.u8string());
   Lock lock(work);
   const auto state = ReadJson(work / "state.json");
+  ResolveSupervisionModels(delivery.supervision, RecordedModels(state));
   if (!state.at("stages").contains("cleanup"))
     throw std::runtime_error("Run prerequisite stage: cleanup");
   Verify(work, state.at("stages").at("cleanup").at("files"));
   const auto scene = Scene::FromJson(ReadJson(work / "scene.json"));
+  // The ECEF frame conversion is refitted from the navigation file: it must be the one reconstructed.
+  if (ReadScene(scene.input, scene.las, scene.enhanced).ToJson() != scene.ToJson())
+    throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
   const auto output = args.Path("--output");
   if (Contains(scene.input, output) || Contains(output, scene.input))
     throw std::runtime_error("Output must be separate from input");
@@ -505,7 +517,7 @@ void Export(const Arguments& args) {
 void Postprocess(const Arguments& args) {
   args.Validate(
       WithDeliveryOptions({"--work", "--output", "--workers", "--new-work", "--debug"}));
-  const auto delivery = ParseDelivery(args);
+  auto delivery = ParseDelivery(args);
   const bool debug = args.Get("--debug") == "true";
   const auto source = args.Path("--work"), delivery_output = args.Path("--output");
   // Like run: the new work directory is kept only with --debug.
@@ -524,6 +536,10 @@ void Postprocess(const Arguments& args) {
   if (!fs::is_regular_file(source / "scene.json"))
     throw std::runtime_error("Not a work directory (no scene.json): " + source.u8string());
   Lock lock(source);
+  // Work directories kept by an older cleanup --debug have no state.json.
+  const auto source_state =
+      fs::exists(source / "state.json") ? ReadJson(source / "state.json") : Json::object();
+  ResolveSupervisionModels(delivery.supervision, RecordedModels(source_state));
   const auto scene = Scene::FromJson(ReadJson(source / "scene.json"));
   if (Contains(source, final_output) || Contains(scene.input, final_output))
     throw std::runtime_error("Postprocessing output must be outside source work and input");
@@ -581,9 +597,29 @@ void Postprocess(const Arguments& args) {
     throw std::runtime_error("Output must be separate from input");
   ExportBundle(scene, selected, output, delivery_output, delivery.ply, delivery.voxel, result,
                delivery.supervision, delivery.crop);
-  if (debug)
+  if (debug) {
+    // A kept work directory must be exportable again: it records the cleanup as its last stage.
+    WorkState state{output / "state.json", Json::object()};
+    state.value = {{"input", scene.input.u8string()},
+                   {"scene", scene.ToJson()},
+                   {"stages",
+                    {{"cleanup",
+                      {{"files", Inventory(output, {output / "cache/cleanup_candidate.bin",
+                                                    output / "cache/cleaned.bin",
+                                                    output / "cache/cleanup.json",
+                                                    output / "result.json"})}}}}},
+                   {"debug", true},
+                   {"output", delivery_output.u8string()},
+                   {"status", "completed"},
+                   {"build", BuildInfo()},
+                   {"error", nullptr},
+                   {"registration", result.at("quality").at("registration")}};
+    for (const auto* key : {"settings", "models"})
+      if (source_state.contains(key))
+        state.value[key] = source_state.at(key);
+    state.Save();
     fs::rename(output, final_output);
-  else
+  } else
     fs::remove_all(output);
   Log(args.command + ": " + report.at("reason").get<std::string>());
   std::cout << Json({{"output", delivery_output.u8string()},

@@ -19,6 +19,9 @@ struct SupervisionOptions {
   std::optional<std::array<CropWindow, 2>> crop;
 };
 SupervisionOptions ParseSupervisionOptions(const Arguments& args);
+// Settles the MoGe model package once the command knows its models (given, recorded by the work
+// directory, or the default) and checks that it holds the geometry engine.
+void ResolveSupervisionModels(SupervisionOptions& options, const fs::path& package);
 // Supervision-map camera: the longest side reduced to max_size, never enlarged.
 Camera MapCamera(const Camera& source, int max_size);
 // masks is the directory of the selected model's static masks, named by image index.
