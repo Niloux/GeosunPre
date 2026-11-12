@@ -471,7 +471,7 @@ def grounding_errors(expected, actual):
     return {'score_max': error, 'mask_iou_min': iou, 'detections': int((expected[0] > .3).sum())}
 
 
-def compare_reference(root, name, shapes, references, geometry_precision):
+def compare_reference(root, name, shapes, references, matcher_precision, geometry_precision):
     if name in ('detector', 'geometry', 'grounding'):
         paths = sorted(references.glob(f'{name}*.npz'))
     else:
@@ -515,7 +515,10 @@ def compare_reference(root, name, shapes, references, geometry_precision):
                     error = int((expected != actual).sum())
                 else:
                     error = float((expected - actual).norm() / expected.norm().clamp_min(1e-8))
-                    passed = error < (.005 if name == 'matcher' else .02)
+                    limit = .02
+                    if name == 'matcher':
+                        limit = .01 if matcher_precision == 'fp16' else .005
+                    passed = error < limit
                 if not passed:
                     raise RuntimeError(f'TensorRT output differs from PyTorch: {path.stem}/{i}: error={error}')
                 print(f'PyTorch/TensorRT comparison: {path.stem}/{i}: error={error:.6g}', flush=True)
@@ -848,7 +851,7 @@ def main():
         license_file = next(file for file in distribution.files if file.name.lower() in ('license.txt', 'license'))
         shutil.copy2(distribution.locate_file(license_file), pending / 'runtime' / name)
     for name in names:
-        compare_reference(pending, name, shapes, references, args.geometry_precision)
+        compare_reference(pending, name, shapes, references, args.matcher_precision, args.geometry_precision)
     verify(pending, shapes, images)
     manifest = {'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
                 'hardware_compatibility': args.hardware_compatibility,

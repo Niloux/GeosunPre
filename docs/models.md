@@ -77,7 +77,7 @@ grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的
 - `-GeometryPrecision`：`fp16`（默认）或 `fp32`，用于选择 MoGe 引擎的内部计算精度。浮点输入输出保持 float32，模型清单记录所选精度。
 - grounding 的注意力 logits 固定 FP32，TensorRT 无法融合注意力，会物化完整的 5184×5184 logit 矩阵。导出时 trunk 和 DETR encoder 的自注意力按 648 行 query 分块，清单记录 `grounding_attention_block`；RTX 4090 上激活内存由 5.4 GB 降到 2.3 GB，Mask 阶段显存峰值约少 3 GB。`-OnnxFrom` 遇到分块或提示不同的 grounding 时重新导出并构建 grounding。
 - `-Sam3`：SAM3 检查点路径，只在缓存中还没有时需要。grounding 在两张验证照片上比较 PyTorch FP32 与 TensorRT：全部查询分数差 < 0.05，PyTorch 分数 > 0.3 的每个检测与引擎同提示最接近掩码的 IoU ≥ 0.95；验证照片应含人物或影子，例如 `-Images` 指定两张展厅照片。真实推理另检查形状、分数范围与降序、框归一化。
-- 当 `-OnnxFrom` 指向同 GPU、TensorRT 版本的完整模型包时，复用接口、精度及校验值匹配的引擎。matcher 精度变化时重建 matcher，置信度按相对误差 `<0.005` 验收。源清单缺少 `geometry_precision` 或精度不同时，复用 geometry ONNX 并重建引擎。
+- 当 `-OnnxFrom` 指向同 GPU、TensorRT 版本的完整模型包时，复用接口、精度及校验值匹配的引擎。matcher 精度变化时重建 matcher。有 PyTorch 参考输出时，匹配索引必须完全一致，置信度相对 L2 误差在 FP16 下 < 1%，在 FP32 和 TF32 下 < 0.5%。源清单缺少 `geometry_precision` 或精度不同时，复用 geometry ONNX 并重建引擎。
 - `-Images`：两张真实验证照片；默认使用固定 LoMa 源码包中的 `0015_A.jpg` / `0015_B.jpg`。验证包括检测器动态宽高及边界、四模型有限输出及形状、描述子数量 32 / 127 / 3072、匹配有效数量不等、补零值变化不影响有效结果、同图匹配。新导出的检测图在横图、竖图、方图及短边边界上比较 PyTorch 与 TensorRT 输出。geometry 在两张照片上比较 PyTorch FP32 与 TensorRT：PyTorch 掩码有效处对数深度差 p99 < 0.01、法向夹角 p99 < 1°、掩码差 p99 < 0.05、metric_scale 相对差在 FP16 下 < 1%，在 FP32 下 < 0.5%；真实推理还检查有效掩码过半、有效深度为正、法向为单位长度。
 
 使用自定义目录时，运行指定 `--models`，打包指定 `-Models`。复用 ONNX 可以省去权重导出；更换 GPU 时仍需在目标 GPU 上重新构建并校验引擎。
