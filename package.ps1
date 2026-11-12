@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Models = (Join-Path $PSScriptRoot 'models-ampere-plus-blocked'),
+    [string]$Models = (Join-Path $PSScriptRoot 'models'),
     [string]$Output,
     [string]$Image
 )
@@ -12,8 +12,9 @@ $manifestPath = Join-Path $Models 'manifest.json'
 if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Model package has no manifest: $Models" }
 $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
 $hardware = if ($manifest.hardware_compatibility) { $manifest.hardware_compatibility } else { 'none' }
-$info = (& $program info) -join "`n" | ConvertFrom-Json
+$infoJson = & $program info
 if ($LASTEXITCODE) { throw 'geosunpre.exe info failed.' }
+$info = ($infoJson -join "`n") | ConvertFrom-Json
 # A delivery must be reproducible from a commit.
 if ($info.revision -like '*-dirty' -or $info.revision -eq 'unknown') {
     throw "Executable was built from uncommitted sources ($($info.revision)). Commit, run build.ps1, then package."
@@ -74,12 +75,4 @@ if (($after.Keys -join "`n") -ne ($files.Keys -join "`n") -or
 }
 [IO.Directory]::Move($pending, $destination)
 
-$archive = $destination + '.zip'
-if (Test-Path -LiteralPath $archive) { throw "Archive already exists: $archive" }
-& "$env:SystemRoot\System32\tar.exe" --format zip -c -f ($archive + '.pending') -C (Split-Path $destination) (Split-Path $destination -Leaf)
-if ($LASTEXITCODE) { throw "Cannot create archive for $destination" }
-Move-Item -LiteralPath ($archive + '.pending') -Destination $archive
-$digest = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-[IO.File]::WriteAllText($archive + '.sha256', "$digest  $(Split-Path $archive -Leaf)`n", [Text.UTF8Encoding]::new($false))
 Write-Host "Package: $destination"
-Write-Host "Archive: $archive"

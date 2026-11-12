@@ -10,7 +10,7 @@
 .\prepare-models.ps1
 ```
 
-默认向 `models/` 准备五个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）为 FP32，输入为 644×644 方形透视图、固定 2116 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。grounding（SAM3）为掩码阶段检测人物、影子、人形展品和天空，见下文。SAM3 检查点 [facebook/sam3](https://huggingface.co/facebook/sam3) 在 Hugging Face 需登录申请，无法自动下载：首次准备传入 `-Sam3 sam3.pt`，按 SHA256 校验后复制到 `.cache/model-prepare/source/sam3.pt`，以后不再需要该参数。`run.ps1` 默认使用这个目录；交付打包默认使用 `models-ampere-plus-blocked/`，见 README。
+默认向 `models/` 准备五个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）为 FP32，输入为 644×644 方形透视图、固定 2116 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。grounding（SAM3）为掩码阶段检测人物、影子、人形展品和天空，见下文。SAM3 检查点 [facebook/sam3](https://huggingface.co/facebook/sam3) 在 Hugging Face 需登录申请，无法自动下载：首次准备传入 `-Sam3 sam3.pt`，按 SHA256 校验后复制到 `.cache/model-prepare/source/sam3.pt`，以后不再需要该参数。`run.ps1` 默认使用这个目录；通用交付打包时用 `-Models models-ampere-plus-blocked` 指定跨 GPU 模型包，见 README。
 
 首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。同 GPU 上更换照片分辨率、横竖方向或宽高比不需要重建模型。更换 GPU、模型协议或精度时需指定新的输出目录。
 

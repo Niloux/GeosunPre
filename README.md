@@ -141,12 +141,12 @@ models/
 ```powershell
 .\prepare-models.ps1 -Models models-ampere-plus-blocked -OnnxFrom packages/onnx-bundle-v1 -HardwareCompatibility ampere_plus
 .\build.ps1
-.\package.ps1
+.\package.ps1 -Models models-ampere-plus-blocked
 ```
 
-`package.ps1` 默认读取 `models-ampere-plus-blocked/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 及同名 `.zip`、`.zip.sha256`。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行五模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
+`package.ps1` 默认读取 `models/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 目录。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行五模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
 
-将 zip 复制到目标 Windows 机器解压，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
+独立部署时，将整个包目录复制到目标 Windows 机器，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
 
 预处理和训练作为整体交付时，训练配置以 `configs/trainer.json` 为准。提交后在同级 LFS 仓库执行 `scripts\package-windows-trainer.cmd`，它默认读取这份配置并记录当前 GeosunPre 提交；再组装整体包：
 
