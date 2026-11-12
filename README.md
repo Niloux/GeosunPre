@@ -148,4 +148,12 @@ models/
 
 将 zip 复制到目标 Windows 机器解压，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
 
+预处理和训练作为整体交付时，训练配置以 `configs/trainer.json` 为准。提交后在同级 LFS 仓库执行 `scripts\package-windows-trainer.cmd`，它默认读取这份配置并记录当前 GeosunPre 提交；再组装整体包：
+
+```powershell
+.\package-bundle.ps1 -Preprocess packages/GeosunPre-版本-提交-引擎级别 -Trainer ..\LichtFeld-Studio\build-delivery\Geosun-3DGS-Trainer-sm80-时间
+```
+
+`package-bundle.ps1` 原样复制两个子包到 `preprocess/`、`trainer/`，从预处理包所属提交取出 `bundle/geosun.ps1` 和 `bundle/README.md`。组装前核对两个子包全部文件哈希、两者均来自提交、训练器配对的 GeosunPre 提交及其配置与该提交一致；组装后回读，执行五模型检查和训练器启动检查，输出 `packages/Geosun-…-trainer-提交/` 及同名 `.zip`、`.zip.sha256`。整体包用法见 [bundle/README.md](bundle/README.md)。
+
 构建依赖使用固定版本；Ceres 使用轻量日志和 Eigen 稀疏求解，OpenCV 只构建图像处理所需模块。Ceres 回代补丁由 CMake 自动应用，清空 `build/` 后重新构建同样生效。
