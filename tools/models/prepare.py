@@ -29,6 +29,7 @@ DETECTOR_CHECK_SIZES = ((1152, 1536), (1536, 1152), (1536, 864), (1000, 1536),
 # MoGe-2 runs on square pinhole faces: 46x46 ViT tokens, inside the suggested 1200-2500.
 GEOMETRY_SIZE = 644
 GEOMETRY_TOKENS = 2116
+GEOMETRY_PRECISION = 'fp32'
 # SAM3 runs on the whole photo stretched to its native square input; prompts are baked in.
 GROUNDING_SIZE = 1008
 GROUNDING_MASK_SIZE = 288
@@ -341,7 +342,8 @@ def build_engine(path, name, shapes, matcher_precision='fp16', hardware='none'):
     config = builder.create_builder_config()
     # SAM3 tactics get a large scratch cap; its activation memory is bounded by blocked attention.
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, (12 if name == 'grounding' else 2) << 30)
-    if name != 'matcher':
+    # Keep MoGe's metric scale within the reference tolerance.
+    if name not in ('matcher', 'geometry'):
         config.set_flag(trt.BuilderFlag.FP16)
     config.clear_flag(trt.BuilderFlag.TF32)
     if name == 'matcher' and matcher_precision == 'tf32':
@@ -608,7 +610,7 @@ def verify(root, shapes, images):
 
 
 def matcher_precisions(manifest):
-    return manifest['matcher_precision'], manifest['matcher_score_precision']
+    return manifest.get('matcher_precision'), manifest.get('matcher_score_precision')
 
 
 def hardware_level(manifest):
@@ -741,6 +743,7 @@ def main():
                 'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': 'fp32' if args.matcher_precision == 'fp16' else args.matcher_precision,
+                'geometry_precision': GEOMETRY_PRECISION,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest(),
                 'grounding': GROUNDING_SHA256, 'grounding_prompts': GROUNDING_PROMPTS}
     names = PACKAGE_MODELS
@@ -821,8 +824,9 @@ def main():
     for name in names:
         check_onnx(pending / 'onnx' / f'{name}.onnx', name, shapes[name])
         destination = pending / 'engines' / f'{name}.engine'
-        same_precision = name != 'matcher' or matcher_precisions(reuse_manifest or {}) == matcher_precisions(settings)
-        if reuse_manifest and name in copied and same_precision and not destination.exists():
+        if (reuse_manifest and name in copied and not destination.exists() and
+                (name != 'matcher' or matcher_precisions(reuse_manifest) == matcher_precisions(settings)) and
+                (name != 'geometry' or reuse_manifest.get('geometry_precision') == GEOMETRY_PRECISION)):
             spec = reuse_manifest['models'][name]
             candidate = origin.parent / 'engines' / f'{name}.engine'
             if spec['shapes'] != shapes[name] or sha256(candidate) != spec['sha256']:
@@ -845,6 +849,7 @@ def main():
                 'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': settings['matcher_score_precision'],
+                'geometry_precision': GEOMETRY_PRECISION,
                 'detector_profile': DETECTOR_PROFILE, 'descriptor_size': [784, 784],
                 'max_features': MAX_FEATURES, 'descriptor_dimension': 256,
                 'geometry_size': GEOMETRY_SIZE, 'geometry_tokens': GEOMETRY_TOKENS,
