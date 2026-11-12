@@ -154,6 +154,13 @@ models/
 .\package-bundle.ps1 -Preprocess packages/GeosunPre-版本-提交-引擎级别 -Trainer ..\LichtFeld-Studio\build-delivery\Geosun-3DGS-Trainer-sm80-时间
 ```
 
-`package-bundle.ps1` 原样复制两个子包到 `preprocess/`、`trainer/`，从预处理包所属提交取出 `bundle/geosun.ps1` 和 `bundle/README.md`。组装前核对两个子包全部文件哈希、两者均来自提交、训练器配对的 GeosunPre 提交及其配置与该提交一致；组装后回读，执行五模型检查和训练器启动检查，输出 `packages/Geosun-…-trainer-提交/` 及同名 `.zip`、`.zip.sha256`。整体包用法见 [bundle/README.md](bundle/README.md)。
+`package-bundle.ps1` 原样复制两个子包到 `preprocess/`、`trainer/`，使用 `build.ps1` 构建的 `geosun.exe` 和当前的 `bundle/README.md`。组装前核对两个子包全部文件哈希、两者均来自提交、训练器配对的 GeosunPre 提交及其配置与该提交一致；组装后回读，执行启动器、五模型和训练器检查，输出 `packages/Geosun-…-trainer-提交-exe/` 及同名 `.zip`、`.zip.sha256`。整体包用法见 [bundle/README.md](bundle/README.md)。
+
+发给使用不同显卡的人时，用已有的 ONNX 构建兼容引擎并打出对应的预处理子包。
+
+```powershell
+.\prepare-models.ps1 -Models build/models-ampere-plus -OnnxFrom models -HardwareCompatibility ampere_plus
+.\package.ps1 -Models build/models-ampere-plus
+```
 
 构建依赖使用固定版本；Ceres 使用轻量日志和 Eigen 稀疏求解，OpenCV 只构建图像处理所需模块。Ceres 回代补丁由 CMake 自动应用，清空 `build/` 后重新构建同样生效。
