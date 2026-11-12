@@ -6,12 +6,13 @@ param(
     [string]$OnnxFrom,
     [string]$OnnxBundle,
     [string[]]$Images,
-    [string]$Sam3
+    [string]$Sam3,
+    [ValidateSet('fp16', 'fp32')][string]$GeometryPrecision = 'fp16'
 )
 $ErrorActionPreference = 'Stop'
 if ($Images -and $Images.Count -ne 2) { throw '-Images requires two real image paths.' }
-if ($OnnxBundle -and ($Sam3 -or $OnnxFrom -or $PSBoundParameters.ContainsKey('Models') -or $PSBoundParameters.ContainsKey('MatcherPrecision') -or $PSBoundParameters.ContainsKey('HardwareCompatibility'))) {
-    throw '-OnnxBundle exports GPU-independent ONNX only; it cannot be combined with -Models, -OnnxFrom, -Sam3, -MatcherPrecision or -HardwareCompatibility.'
+if ($OnnxBundle -and ($Sam3 -or $OnnxFrom -or $PSBoundParameters.ContainsKey('Models') -or $PSBoundParameters.ContainsKey('MatcherPrecision') -or $PSBoundParameters.ContainsKey('GeometryPrecision') -or $PSBoundParameters.ContainsKey('HardwareCompatibility'))) {
+    throw '-OnnxBundle exports GPU-independent ONNX only; it cannot be combined with -Models, -OnnxFrom, -Sam3, -MatcherPrecision, -GeometryPrecision or -HardwareCompatibility.'
 }
 
 function Invoke-Tool([string]$Program, [string[]]$Arguments) {
@@ -63,7 +64,7 @@ try {
     $modelRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($target).TrimEnd([char[]]'\/')
     $arguments = @('-B', '-X', 'utf8', (Join-Path $PSScriptRoot 'tools\models\prepare.py'))
     if ($OnnxBundle) { $arguments += @('--bundle', $modelRoot) }
-    else { $arguments += @('--models', $modelRoot, '--matcher-precision', $MatcherPrecision, '--hardware-compatibility', $HardwareCompatibility) }
+    else { $arguments += @('--models', $modelRoot, '--matcher-precision', $MatcherPrecision, '--geometry-precision', $GeometryPrecision, '--hardware-compatibility', $HardwareCompatibility) }
     if ($OnnxFrom) { $arguments += @('--onnx-from', $OnnxFrom) }
     if ($Sam3) { $arguments += @('--sam3', $Sam3) }
     if ($Images) {

@@ -29,7 +29,6 @@ DETECTOR_CHECK_SIZES = ((1152, 1536), (1536, 1152), (1536, 864), (1000, 1536),
 # MoGe-2 runs on square pinhole faces: 46x46 ViT tokens, inside the suggested 1200-2500.
 GEOMETRY_SIZE = 644
 GEOMETRY_TOKENS = 2116
-GEOMETRY_PRECISION = 'fp32'
 # SAM3 runs on the whole photo stretched to its native square input; prompts are baked in.
 GROUNDING_SIZE = 1008
 GROUNDING_MASK_SIZE = 288
@@ -332,7 +331,7 @@ def pin_attention_logits(network):
                 layer.set_output_type(output, trt.float32)
 
 
-def build_engine(path, name, shapes, matcher_precision='fp16', hardware='none'):
+def build_engine(path, name, shapes, matcher_precision, geometry_precision, hardware):
     if path.is_file():
         print(f'Reuse engine: {name}', flush=True)
         return
@@ -342,8 +341,8 @@ def build_engine(path, name, shapes, matcher_precision='fp16', hardware='none'):
     config = builder.create_builder_config()
     # SAM3 tactics get a large scratch cap; its activation memory is bounded by blocked attention.
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, (12 if name == 'grounding' else 2) << 30)
-    # Keep MoGe's metric scale within the reference tolerance.
-    if name not in ('matcher', 'geometry'):
+    if (name not in ('matcher', 'geometry') or
+            (name == 'geometry' and geometry_precision == 'fp16')):
         config.set_flag(trt.BuilderFlag.FP16)
     config.clear_flag(trt.BuilderFlag.TF32)
     if name == 'matcher' and matcher_precision == 'tf32':
@@ -472,7 +471,7 @@ def grounding_errors(expected, actual):
     return {'score_max': error, 'mask_iou_min': iou, 'detections': int((expected[0] > .3).sum())}
 
 
-def compare_reference(root, name, shapes, references):
+def compare_reference(root, name, shapes, references, geometry_precision):
     if name in ('detector', 'geometry', 'grounding'):
         paths = sorted(references.glob(f'{name}*.npz'))
     else:
@@ -490,7 +489,8 @@ def compare_reference(root, name, shapes, references):
                 if [value.shape for value in expected] != [value.shape for value in outputs]:
                     raise RuntimeError(f'Engine output differs from the export reference: {path.stem}')
                 errors = geometry_errors(expected, outputs)
-                limits = {'log_depth_p99': .01, 'normal_degrees_p99': 1., 'mask_p99': .05, 'scale': .005}
+                scale_limit = .01 if geometry_precision == 'fp16' else .005
+                limits = {'log_depth_p99': .01, 'normal_degrees_p99': 1., 'mask_p99': .05, 'scale': scale_limit}
                 if any(errors[key] >= limit for key, limit in limits.items()):
                     raise RuntimeError(f'TensorRT geometry differs from PyTorch: {path.stem}: {errors}')
                 print(f'PyTorch/TensorRT comparison: {path.stem}: ' +
@@ -634,6 +634,8 @@ def verify_package(root, settings, shapes, images):
         raise RuntimeError('Existing model GPU/hardware level/profile differs. Choose a new -Models directory.')
     if matcher_precisions(manifest) != matcher_precisions(settings):
         raise RuntimeError('Existing matcher calculation/scoring precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
+    if manifest.get('geometry_precision') != settings['geometry_precision']:
+        raise RuntimeError('Existing geometry precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
     if sorted(manifest['models']) != sorted(names):
         raise RuntimeError('Existing model package holds different models. Choose a new -Models directory.')
     for name in names:
@@ -708,6 +710,8 @@ def main():
     parser.add_argument('--bundle', type=Path, help='export a GPU-independent ONNX bundle instead of engines')
     parser.add_argument('--matcher-precision', choices=('fp32', 'tf32', 'fp16'), default='fp16',
                         help='matcher engine precision (default: %(default)s)')
+    parser.add_argument('--geometry-precision', choices=('fp32', 'fp16'), default='fp16',
+                        help='MoGe engine precision (default: %(default)s)')
     parser.add_argument('--hardware-compatibility', choices=tuple(HARDWARE_LEVELS), default='none',
                         help='TensorRT engine hardware compatibility (default: %(default)s)')
     parser.add_argument('--onnx-from', type=Path)
@@ -743,7 +747,7 @@ def main():
                 'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': 'fp32' if args.matcher_precision == 'fp16' else args.matcher_precision,
-                'geometry_precision': GEOMETRY_PRECISION,
+                'geometry_precision': args.geometry_precision,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest(),
                 'grounding': GROUNDING_SHA256, 'grounding_prompts': GROUNDING_PROMPTS}
     names = PACKAGE_MODELS
@@ -826,13 +830,14 @@ def main():
         destination = pending / 'engines' / f'{name}.engine'
         if (reuse_manifest and name in copied and not destination.exists() and
                 (name != 'matcher' or matcher_precisions(reuse_manifest) == matcher_precisions(settings)) and
-                (name != 'geometry' or reuse_manifest.get('geometry_precision') == GEOMETRY_PRECISION)):
+                (name != 'geometry' or reuse_manifest.get('geometry_precision') == settings['geometry_precision'])):
             spec = reuse_manifest['models'][name]
             candidate = origin.parent / 'engines' / f'{name}.engine'
             if spec['shapes'] != shapes[name] or sha256(candidate) != spec['sha256']:
                 raise RuntimeError(f'Source engine contract/checksum differs: {name}')
             shutil.copy2(candidate, destination)
-        build_engine(destination, name, shapes[name], args.matcher_precision, args.hardware_compatibility)
+        build_engine(destination, name, shapes[name], args.matcher_precision,
+                     args.geometry_precision, args.hardware_compatibility)
         gc.collect()
         torch.cuda.empty_cache()
     runtime = installed_runtime()
@@ -843,13 +848,13 @@ def main():
         license_file = next(file for file in distribution.files if file.name.lower() in ('license.txt', 'license'))
         shutil.copy2(distribution.locate_file(license_file), pending / 'runtime' / name)
     for name in names:
-        compare_reference(pending, name, shapes, references)
+        compare_reference(pending, name, shapes, references, args.geometry_precision)
     verify(pending, shapes, images)
     manifest = {'tensorrt': TRT_VERSION, 'gpu': settings['gpu'],
                 'hardware_compatibility': args.hardware_compatibility,
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': settings['matcher_score_precision'],
-                'geometry_precision': GEOMETRY_PRECISION,
+                'geometry_precision': settings['geometry_precision'],
                 'detector_profile': DETECTOR_PROFILE, 'descriptor_size': [784, 784],
                 'max_features': MAX_FEATURES, 'descriptor_dimension': 256,
                 'geometry_size': GEOMETRY_SIZE, 'geometry_tokens': GEOMETRY_TOKENS,
