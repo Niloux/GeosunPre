@@ -1,5 +1,4 @@
 #include "geometry/static_masks.h"
-#include "frontend/frontend.h"
 #include "geometry/supervision.h"
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -12,7 +11,7 @@
 
 namespace geosun {
 namespace {
-constexpr int MapSize = 1600, MinArea = 40, MinSamples = 30;
+constexpr int MapSize = 1024, MinArea = 16, MinSamples = 12;
 // Masks of all images are kept at 1/ThumbScale of the photo to look up what each view masked.
 constexpr int ThumbScale = 6;
 // A candidate is static when the place it covers is flagged transient in a sizeable share of the
@@ -41,6 +40,7 @@ struct Candidate {
 struct Context {
   const Scene& scene;
   const Reconstruction& model;
+  const ShutterMotion* motion = nullptr;
   const std::function<fs::path(uint32_t)> &source, &destination;
   std::array<cv::Mat, 2> domains;
   std::vector<Eigen::Matrix3d> rotations;
@@ -99,9 +99,16 @@ void Collect(Context& context, uint32_t id, const cv::Mat& depth) {
       const double d = depth.at<float>(p.y + box.y, p.x + box.x);
       if (d <= 0)
         continue;
-      const auto ray = camera.Ray({(p.x + box.x + .5) * scale_x, (p.y + box.y + .5) * scale_y});
+      const Eigen::Vector2d pixel{(p.x + box.x + .5) * scale_x, (p.y + box.y + .5) * scale_y};
+      const auto ray = camera.Ray(pixel);
+      const Eigen::Vector3d moved = ray * d;
+      const Eigen::Vector3d cam_point =
+          context.motion ? context.motion->Reference(
+                               id, model.images[id].camera,
+                               context.motion->Fraction(camera, pixel), moved)
+                         : moved;
       const Eigen::Vector3d world =
-          context.rotations[id].transpose() * (ray * d - context.translations[id]);
+          context.rotations[id].transpose() * (cam_point - context.translations[id]);
       for (int a = 0; a < 3; ++a)
         coordinates[a].push_back(world[a]);
     }
@@ -211,15 +218,15 @@ Json StaticMaskRules() {
           {"shadow_reach", ShadowReach}};
 }
 Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterMotion* motion,
-                 const LasHeader& header, const fs::path& las,
+                 const LasHeader& header, LasSurfelCache& cache,
                  const std::function<fs::path(uint32_t)>& source,
-                 const std::function<fs::path(uint32_t)>& destination, const fs::path& scratch) {
+                 const std::function<fs::path(uint32_t)>& destination) {
   const auto started = Clock::now();
-  Context context{scene, model, source, destination, {}, {}, {}, {}, {}, {}, {}};
+  Context context{scene, model, motion, source, destination, {}, {}, {}, {}, {}, {}, {}};
   context.thumbs.resize(model.images.size());
   context.candidates.resize(model.images.size());
   for (int c = 0; c < 2; ++c) {
-    cv::Mat domain = MaskDomain(model.cameras[c]);
+    cv::Mat domain = model.cameras[c].Mask();
     cv::erode(domain, domain, cv::getStructuringElement(cv::MORPH_ELLIPSE, {31, 31}));
     context.domains[c] = domain;
   }
@@ -239,7 +246,7 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
   // Pass 1: every image's candidates and their places, while the LAS is projected.
   std::deque<std::future<void>> jobs;
   size_t images = 0;
-  ProjectLasDepths(las, header, model, motion, MapSize, 2048, scratch,
+  ProjectLasDepths(cache, header, model, motion, MapSize,
                    [&](uint32_t id, cv::Mat&& depth) {
                      if (jobs.size() >= 6) {
                        jobs.front().get();

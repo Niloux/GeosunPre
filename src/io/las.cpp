@@ -1,4 +1,5 @@
 #include "io/las.h"
+#include "geometry/model.h"
 
 #include <algorithm>
 #include <cmath>
@@ -301,7 +302,8 @@ void VerifyInitializationPly(const fs::path& path, uint64_t points) {
       }
   }
 }
-Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& output, double voxel) {
+Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& output, double voxel,
+                  const Reconstruction* model) {
   if (!std::isfinite(voxel) || voxel <= 0 || fs::absolute(las) == fs::absolute(output))
     throw std::runtime_error("Invalid PLY voxel size or output");
   if (fs::exists(output))
@@ -318,6 +320,7 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
   if (fs::exists(workspace))
     throw std::runtime_error("Unfinished LAS initialization exists: " + workspace.u8string());
   fs::create_directories(workspace);
+  constexpr uint64_t MaxLinearGrid = (uint64_t(1) << 60) - 1;
   std::array<int64_t, 3> lower, shape;
   uint64_t grid = 1;
   for (int j = 0; j < 3; ++j) {
@@ -327,14 +330,132 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
       throw std::runtime_error("LAS voxel grid exceeds supported extent");
     lower[j] = int64_t(lo);
     shape[j] = int64_t(hi - lo + 1);
-    if (uint64_t(shape[j]) > uint64_t(INT64_MAX) / grid)
+    if (uint64_t(shape[j]) > MaxLinearGrid / grid)
       throw std::runtime_error("LAS voxel grid is too large");
     grid *= uint64_t(shape[j]);
   }
+  constexpr double MaxPlyRange = 50.0;
+  constexpr uint64_t MaxPlyPoints = 2500000;
+  struct View {
+    Eigen::Matrix3d rotation;
+    Eigen::Vector3d translation;
+    uint32_t camera = 0;
+  };
+  std::vector<View> views;
+  Eigen::Vector3d vis_lo = Eigen::Vector3d::Zero(), vis_hi = Eigen::Vector3d::Zero();
+  bool vis_empty = false;
+  double cell_m = 0.5, half_diag = 0;
+  std::array<int64_t, 3> vis_shape{};
+  std::vector<uint8_t> coarse;
+  if (model) {
+    if (!model->Registered())
+      throw std::runtime_error("Cannot filter initialization PLY without registered cameras");
+    views.reserve(model->Registered());
+    Eigen::Vector3d cam_min = Eigen::Vector3d::Constant(INFINITY),
+                    cam_max = Eigen::Vector3d::Constant(-INFINITY);
+    for (const auto& img : model->images) {
+      if (!img.registered)
+        continue;
+      const Eigen::Vector3d center = img.pose.Center();
+      cam_min = cam_min.cwiseMin(center);
+      cam_max = cam_max.cwiseMax(center);
+      views.push_back({img.pose.Rotation().toRotationMatrix(), img.pose.Translation(), img.camera});
+    }
+    vis_lo = (cam_min.array() - MaxPlyRange).matrix().cwiseMax(h.lower);
+    vis_hi = (cam_max.array() + MaxPlyRange).matrix().cwiseMin(h.upper);
+    if ((vis_hi - vis_lo).minCoeff() < 0)
+      vis_empty = true;
+    else {
+      constexpr uint64_t MaxCoarseCells = 16ULL * 1024 * 1024;
+      uint64_t vis_cells = 0;
+      while (true) {
+        uint64_t total = 1;
+        bool fits = true;
+        for (int j = 0; j < 3; ++j) {
+          const int64_t count =
+              std::max<int64_t>(1, int64_t(std::ceil((vis_hi[j] - vis_lo[j]) / cell_m)) + 1);
+          vis_shape[j] = count;
+          if (uint64_t(count) > MaxCoarseCells / total) {
+            fits = false;
+            break;
+          }
+          total *= uint64_t(count);
+        }
+        if (fits) {
+          vis_cells = total;
+          break;
+        }
+        cell_m *= 2.0;
+      }
+      coarse.assign(size_t(vis_cells), uint8_t(0xFF));
+      half_diag = 0.5 * std::sqrt(3.0) * cell_m;
+    }
+  }
+  const double half_fov = FieldOfViewDegrees * Pi / 360.0;
+  const double sin_half_fov = std::sin(half_fov), cos_half_fov = std::cos(half_fov);
+  auto classify = [&](const Eigen::Vector3d& xyz) -> int {
+    if (!model)
+      return 0;
+    if (vis_empty || (xyz.array() < vis_lo.array()).any() ||
+        (xyz.array() > vis_hi.array()).any())
+      return -1;
+    std::array<int64_t, 3> cell{};
+    for (int j = 0; j < 3; ++j)
+      cell[j] = std::clamp<int64_t>(int64_t(std::floor((xyz[j] - vis_lo[j]) / cell_m)), 0,
+                                      vis_shape[j] - 1);
+    const size_t idx = size_t((cell[0] * vis_shape[1] + cell[1]) * vis_shape[2] + cell[2]);
+    uint8_t state = coarse[idx];
+    if (state == 0xFF) {
+      const Eigen::Vector3d c_world(vis_lo.x() + (cell[0] + .5) * cell_m,
+                                    vis_lo.y() + (cell[1] + .5) * cell_m,
+                                    vis_lo.z() + (cell[2] + .5) * cell_m);
+      double best_dist = MaxPlyRange + 1.0;
+      for (const auto& view : views) {
+        const Eigen::Vector3d v = view.rotation * c_world + view.translation;
+        const double dist = v.norm();
+        const double eff_dist = std::max(0.0, dist - half_diag);
+        if (eff_dist > MaxPlyRange || eff_dist >= best_dist)
+          continue;
+        if (dist > half_diag) {
+          const double rho = std::hypot(v.x(), v.y());
+          const double theta = std::atan2(rho, v.z());
+          const double alpha = std::asin(std::min(1.0, half_diag / dist));
+          if (theta - alpha > half_fov)
+            continue;
+          Eigen::Vector3d probe = v;
+          if (theta > half_fov && rho > 1e-12)
+            probe = Eigen::Vector3d(v.x() / rho * sin_half_fov, v.y() / rho * sin_half_fov,
+                                    cos_half_fov);
+          const auto& cam = model->cameras[view.camera];
+          const Eigen::Vector2d px = cam.Project(probe);
+          const double margin_px =
+              std::max(cam.params[0], cam.params[1]) * half_diag / std::max(0.2, v.z());
+          if (px.x() + margin_px < 0 || px.x() - margin_px >= cam.width ||
+              px.y() + margin_px < 0 || px.y() - margin_px >= cam.height)
+            continue;
+        }
+        best_dist = eff_dist;
+        if (best_dist <= 10.0)
+          break;
+      }
+      if (best_dist <= 10.0)
+        state = 1;
+      else if (best_dist <= 20.0)
+        state = 2;
+      else if (best_dist <= 40.0)
+        state = 3;
+      else if (best_dist <= MaxPlyRange)
+        state = 4;
+      else
+        state = 0;
+      coarse[idx] = state;
+    }
+    return state ? int(state) - 1 : -1;
+  };
   std::vector<std::ofstream> buckets;
   for (unsigned i = 0; i < 128; ++i)
     buckets.emplace_back(workspace / (Number(i) + ".bin"), std::ios::binary);
-  uint64_t accepted = 0, rejected = 0, rgb_max = 0, vertices = 0;
+  uint64_t accepted = 0, rejected = 0, culled = 0, rgb_max = 0, vertices = 0;
   ScanLas(las, h, [&](uint64_t start, const std::vector<LasPoint>& block) {
     std::vector<Aggregate> values;
     values.reserve(block.size());
@@ -343,17 +464,22 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
         ++rejected;
         continue;
       }
-      ++accepted;
       const auto xyz = LasCoordinates(h, p);
-      uint64_t key = 0;
+      const int level = classify(xyz);
+      if (level < 0) {
+        ++culled;
+        continue;
+      }
+      ++accepted;
+      uint64_t linear_key = 0;
       for (int j = 0; j < 3; ++j) {
         const int64_t cell = int64_t(std::floor(xyz[j] / voxel)) - lower[j];
         if (cell < 0 || cell >= shape[j])
           throw std::runtime_error("LAS coordinates exceed declared bounds");
-        key = key * uint64_t(shape[j]) + uint64_t(cell);
+        linear_key = linear_key * uint64_t(shape[j]) + (uint64_t(cell) >> level);
       }
       Aggregate a{};
-      a.key = key;
+      a.key = (uint64_t(level) << 60) | linear_key;
       a.count = 1;
       for (int j = 0; j < 3; ++j) {
         a.xyz[j] = p.raw[j];
@@ -414,11 +540,42 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
     throw std::runtime_error("Incomplete PLY vertex write");
   if (source != FileMetadata(las))
     throw std::runtime_error("LAS changed during initialization");
+  const uint64_t voxel_vertices = vertices;
   const auto pending = workspace / "points3D.ply";
   std::ofstream final(pending, std::ios::binary);
-  final << Header(vertices);
-  std::ifstream data(payload, std::ios::binary);
-  final << data.rdbuf();
+  if (model && voxel_vertices > MaxPlyPoints) {
+    final << Header(MaxPlyPoints);
+    std::ifstream data(payload, std::ios::binary);
+    minimum = Eigen::Vector3d::Constant(INFINITY);
+    maximum = Eigen::Vector3d::Constant(-INFINITY);
+    uint64_t acc = 0, emitted = 0;
+    std::array<uint8_t, 27> vertex{};
+    for (uint64_t i = 0; i < voxel_vertices; ++i) {
+      if (!data.read(reinterpret_cast<char*>(vertex.data()), vertex.size()))
+        throw std::runtime_error("Truncated PLY vertex cache");
+      acc += MaxPlyPoints;
+      if (acc >= voxel_vertices) {
+        acc -= voxel_vertices;
+        float xyz[3];
+        std::memcpy(xyz, vertex.data(), sizeof(xyz));
+        for (int j = 0; j < 3; ++j) {
+          minimum[j] = std::min(minimum[j], double(xyz[j]));
+          maximum[j] = std::max(maximum[j], double(xyz[j]));
+        }
+        final.write(reinterpret_cast<const char*>(vertex.data()), vertex.size());
+        ++emitted;
+      }
+    }
+    data.close();
+    if (emitted != MaxPlyPoints)
+      throw std::runtime_error("Unexpected PLY subsample count");
+    vertices = emitted;
+  } else {
+    final << Header(vertices);
+    std::ifstream data(payload, std::ios::binary);
+    final << data.rdbuf();
+    data.close();
+  }
   final.close();
   if (!final)
     throw std::runtime_error("Incomplete PLY write");
@@ -426,26 +583,35 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
   fs::rename(pending, output);
   // Only this invocation's newly created scratch directory is removed after
   // publication.
-  data.close();
   if (fs::weakly_canonical(workspace).parent_path() != fs::weakly_canonical(output.parent_path()))
     throw std::runtime_error("Unexpected voxel workspace location");
   fs::remove_all(workspace);
-  return {{"source", "las"},
-          {"source_las_file", source},
-          {"source_point_count", h.count},
-          {"accepted_records", accepted},
-          {"excluded_withheld_or_noise", rejected},
-          {"points", vertices},
-          {"voxel_size_m", voxel},
-          {"sampling", "all non-withheld, non-class-7 LAS records; one centroid per voxel"},
-          {"color", "voxel mean of LAS RGB; auto-detect 8/16-bit range; gray if absent"},
-          {"normals", "zero"},
-          {"coordinate_frame", h.converted ? h.metadata.at("frame") : Json("input_las_xyz")},
-          {"rgb_encoding",
-           rgb ? (rgb_max > 255 ? "uint16_0_65535" : "uint16_0_255") : "absent_gray_127"},
-          {"bounds_min", {minimum.x(), minimum.y(), minimum.z()}},
-          {"bounds_max", {maximum.x(), maximum.y(), maximum.z()}},
-          {"ply_size_bytes", fs::file_size(output)}};
+  Json result = {{"source", "las"},
+                 {"source_las_file", source},
+                 {"source_point_count", h.count},
+                 {"accepted_records", accepted},
+                 {"excluded_withheld_or_noise", rejected},
+                 {"points", vertices},
+                 {"voxel_size_m", voxel},
+                 {"sampling",
+                  model ? "registered camera frustums (<=50 m), distance-tiered voxels "
+                          "(1x/2x/4x/8x at 10/20/40/50 m), capped at 2500000"
+                        : "all non-withheld, non-class-7 LAS records; one centroid per voxel"},
+                 {"color", "voxel mean of LAS RGB; auto-detect 8/16-bit range; gray if absent"},
+                 {"normals", "zero"},
+                 {"coordinate_frame", h.converted ? h.metadata.at("frame") : Json("input_las_xyz")},
+                 {"rgb_encoding",
+                  rgb ? (rgb_max > 255 ? "uint16_0_65535" : "uint16_0_255") : "absent_gray_127"},
+                 {"bounds_min", {minimum.x(), minimum.y(), minimum.z()}},
+                 {"bounds_max", {maximum.x(), maximum.y(), maximum.z()}},
+                 {"ply_size_bytes", fs::file_size(output)}};
+  if (model) {
+    result["culled_out_of_view"] = culled;
+    result["voxel_points_before_cap"] = voxel_vertices;
+    result["max_range_m"] = MaxPlyRange;
+    result["max_points"] = MaxPlyPoints;
+  }
+  return result;
 }
 
 }  // namespace geosun

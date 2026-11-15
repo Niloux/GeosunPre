@@ -4,7 +4,6 @@
 #include "io/las.h"
 #include "frontend/inference.h"
 #include "frontend/frontend.h"
-#include "geometry/monocular.h"
 #include <opencv2/core.hpp>
 #include <iostream>
 
@@ -33,33 +32,10 @@ const Command Commands[] = {
     {"prepare", "--input INPUT [--output OUT] [--work WORK] [--debug]", RunCommand},
     {"export", "--work WORK --output OUT [--no-ply] [--ply-voxel METRES] [--no-las-supervision]",
      Export},
-    {"cleanup",
-     "--work WORK --output OUT [--new-work NEW_WORK] [--debug] [--workers N] "
-     "[--no-ply] [--ply-voxel METRES] [--no-las-supervision]",
-     Postprocess},
     {"check", "--output DIR",
      [](const Arguments& args) {
        args.Validate({"--output"});
        std::cout << CheckBundle(args.Path("--output")).dump(2) << '\n';
-     }},
-    {"check-supervision", "--output DIR [--compare DIR]",
-     [](const Arguments& args) {
-       args.Validate({"--output", "--compare"});
-       std::cout << MeasureSupervision(args.Path("--output"), args.Get("--compare").empty()
-                                                                  ? fs::path()
-                                                                  : args.Path("--compare"))
-                        .dump(2)
-                 << '\n';
-     }},
-    {"static-masks",
-     "--output DELIVERY --input INPUT --las LAS --new-masks DIR [--enhanced-photos]",
-     [](const Arguments& args) {
-       args.Validate({"--output", "--input", "--las", "--new-masks", "--enhanced-photos"});
-       std::cout << RefineStaticMasks(args.Path("--output"), args.Path("--input"),
-                                      args.Path("--las"), args.Get("--enhanced-photos") == "true",
-                                      args.Path("--new-masks"))
-                        .dump(2)
-                 << '\n';
      }},
     {"info", "",
      [](const Arguments& args) {
@@ -76,18 +52,6 @@ const Command Commands[] = {
        std::cout << CheckModels(
                         args.Get("--models").empty() ? DefaultModels() : args.Path("--models"),
                         args.Path("--image"))
-                        .dump(2)
-                 << '\n';
-     }},
-    {"check-monocular",
-     "--input INPUT --image NAME --output DIR [--models MODELS] [--supervision-max-size PIXELS]",
-     [](const Arguments& args) {
-       args.Validate({"--input", "--image", "--output", "--models", "--supervision-max-size"});
-       std::cout << CheckMonocular(
-                        args.Path("--input"),
-                        args.Get("--models").empty() ? DefaultModels() : args.Path("--models"),
-                        args.Get("--image"), args.Path("--output"),
-                        args.Integer("--supervision-max-size", 1600))
                         .dump(2)
                  << '\n';
      }},
@@ -110,7 +74,7 @@ void Help(const Arguments&) {
       std::cout << "  geosunpre " << command.name << (*command.usage ? " " : "") << command.usage
                 << '\n';
   }
-  std::cout << "  Use --debug to keep the work directory for export or cleanup.\n"
+  std::cout << "  Use --debug to keep the work directory for stage resume or export.\n"
                "  Delivery options: [--supervision-source moge|las] [--supervision-models MODELS]\n"
                "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS]\n"
                "    [--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"

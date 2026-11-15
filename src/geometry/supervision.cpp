@@ -58,16 +58,28 @@ class LasPointCache {
   std::array<std::unique_ptr<PointTransfer>, 2> transfers_;
   // Drain both streams before releasing any buffers, including constructor failure.
   Stream compute_, upload_;
-  fs::path file_;
+  fs::path coordinates_file_, file_;
   uint64_t count_ = 0, excluded_ = 0, uploaded_bytes_ = 0;
   size_t budget_ = 0, batches_ = 0, slabs_ = 0;
   double prepare_seconds_ = 0, surfel_seconds_ = 0;
   SurfelStats stats_;
 
  public:
+  ~LasPointCache() {
+    if (compute_.value)
+      cudaStreamSynchronize(compute_.value);
+    if (upload_.value)
+      cudaStreamSynchronize(upload_.value);
+    std::error_code ec;
+    if (!coordinates_file_.empty())
+      fs::remove(coordinates_file_, ec);
+    if (!file_.empty())
+      fs::remove(file_, ec);
+  }
   LasPointCache(const fs::path& las, const LasHeader& header, const fs::path& output,
                 int cache_mb) {
     const auto started = Clock::now();
+    fs::create_directories(output);
     // Kept coordinates go to a compact file with a histogram along the longest axis, which
     // splits normal estimation into slabs that fit the device together with their halo.
     // Slabs split the file's integer coordinates, before any frame conversion.
@@ -85,7 +97,8 @@ class LasPointCache {
     auto bin = [&](int raw) {
       return std::clamp(int(std::floor((raw - lower) / bin_width)), 0, SlabBins - 1);
     };
-    const auto coordinates = output / "las-coordinates.cache";
+    coordinates_file_ = output / "las-coordinates.cache";
+    const auto& coordinates = coordinates_file_;
     {
       std::ofstream packed(coordinates, std::ios::binary);
       if (!packed)
@@ -192,7 +205,8 @@ class LasPointCache {
       stored += result.size();
       ++slabs_;
     }
-    fs::remove(coordinates);
+    fs::remove(coordinates_file_);
+    coordinates_file_.clear();
     if (stored != count_)
       throw std::runtime_error("LAS normal slabs do not cover every kept point");
     if (!resident_) {
@@ -258,8 +272,10 @@ class LasPointCache {
   void Finish() {
     CudaCheck(cudaStreamSynchronize(compute_.value));
     CudaCheck(cudaStreamSynchronize(upload_.value));
-    if (!file_.empty())
+    if (!file_.empty()) {
       fs::remove(file_);
+      file_.clear();
+    }
   }
   Json Surfels() const {
     auto median = [](std::vector<float> values) {
@@ -388,8 +404,8 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   SupervisionOptions options;
   options.enabled = args.Get("--no-las-supervision") != "true";
   options.static_masks = args.Get("--no-static-masks") != "true";
-  options.max_size = args.Integer("--supervision-max-size", 1600);
-  options.boundary = args.Integer("--supervision-boundary", 6);
+  options.max_size = args.Integer("--supervision-max-size", 1024);
+  options.boundary = args.Integer("--supervision-boundary", 4);
   options.cache_mb = args.Integer("--supervision-cache-mb", 2048);
   if (!args.Get("--supervision-mask-dir").empty())
     options.mask_dir = args.Path("--supervision-mask-dir");
@@ -488,11 +504,18 @@ Projection MakeProjection(const LasHeader& header, const Reconstruction& model,
   return p;
 }
 }  // namespace
-void ProjectLasDepths(const fs::path& las, const LasHeader& header, const Reconstruction& model,
-                      const ShutterMotion* motion, int max_size, int cache_mb,
-                      const fs::path& scratch,
+struct LasSurfelCache::Implementation : LasPointCache {
+  using LasPointCache::LasPointCache;
+};
+LasSurfelCache::LasSurfelCache(const fs::path& las, const LasHeader& header, const fs::path& scratch,
+                               int cache_mb)
+    : impl_(std::make_unique<Implementation>(las, header, scratch, cache_mb)) {}
+LasSurfelCache::~LasSurfelCache() = default;
+void LasSurfelCache::Finish() { impl_->Finish(); }
+void ProjectLasDepths(LasSurfelCache& cache, const LasHeader& header, const Reconstruction& model,
+                      const ShutterMotion* motion, int max_size,
                       const std::function<void(uint32_t, cv::Mat&&)>& consume) {
-  LasPointCache points(las, header, scratch, cache_mb);
+  auto& points = cache.Impl();
   const auto stream = points.StreamHandle();
   for (uint32_t cid = 0; cid < model.cameras.size(); ++cid) {
     std::vector<uint32_t> images;
@@ -545,11 +568,12 @@ void ProjectLasDepths(const fs::path& las, const LasHeader& header, const Recons
       }
     }
   }
-  points.Finish();
+  CudaCheck(cudaStreamSynchronize(stream));
 }
 Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                           const fs::path& masks_dir, const fs::path& output,
-                          const SupervisionOptions& options, const ShutterMotion* motion) {
+                          const SupervisionOptions& options, LasSurfelCache& cache,
+                          const ShutterMotion* motion) {
   const auto started = Clock::now();
   const auto header = ReadSceneLas(scene);
   const auto request = SupervisionRequest(scene, model, masks_dir, options, motion != nullptr);
@@ -562,7 +586,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     estimator = std::make_unique<MonocularEstimator>(*geometry);
   }
   Json lenses = Json::array();
-  LasPointCache points(scene.las, header, output, options.cache_mb);
+  auto& points = cache.Impl();
   const auto stream = points.StreamHandle();
   uint64_t depth_pixels = 0, normal_pixels = 0;
   size_t done = 0;
@@ -591,10 +615,10 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   struct LoadedMask {
     cv::Mat pixels;
     int count;
-    std::vector<cv::Mat> faces, normal_faces;  // MoGe faces of the photo for monocular supervision
+    std::vector<cv::Mat> faces;  // MoGe faces of the photo for monocular supervision
   };
   // Lens plans outlive their camera's loop: the monocular fits run with the pending writes.
-  std::array<std::optional<MonocularLens>, 2> lens_plans, normal_plans;
+  std::array<std::optional<MonocularLens>, 2> lens_plans;
   // Cells of each photo whose MoGe depth the trusted LAS confirmed, for the cross-view check; each
   // pending write fills its own image.
   std::vector<cv::Mat> verified_cells(model.images.size());
@@ -619,14 +643,9 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     const auto camera = MapCamera(model.cameras[cid], options.max_size);
     const int w = camera.width, h = camera.height, size = w * h;
     auto& lens = lens_plans.at(cid);
-    auto& normal_lens = normal_plans.at(cid);
     if (monocular) {
-      lens = PlanMonocularLens(model.cameras[cid], camera, estimator->FaceSize(),
-                               DepthFaceHalfDegrees);
-      normal_lens = PlanMonocularLens(model.cameras[cid], camera, estimator->FaceSize(),
-                                      NormalFaceHalfDegrees);
-      lenses.push_back(
-          {{"camera", cid}, {"plan", lens->ToJson()}, {"normal_plan", normal_lens->ToJson()}});
+      lens = PlanMonocularLens(model.cameras[cid], camera, estimator->FaceSize(), FaceHalfDegrees);
+      lenses.push_back({{"camera", cid}, {"plan", lens->ToJson()}});
     }
     const size_t batch = std::min<size_t>(
         32, std::max<size_t>(1, DepthBudget / (size * (sizeof(float) + sizeof(Blend)))));
@@ -656,7 +675,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         masks.push_back(std::async(std::launch::async, [&, id = images[requested]] {
           auto pixels = StaticMask(scene, masks_dir, id, camera, options);
           const int count = cv::countNonZero(pixels);
-          LoadedMask loaded{std::move(pixels), count, {}, {}};
+          LoadedMask loaded{std::move(pixels), count, {}};
           if (lens) {
             auto photo = ReadImage(scene.images[id].source, cv::IMREAD_COLOR);
             if (options.crop) {
@@ -665,7 +684,6 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
             }
             cv::cvtColor(photo, photo, cv::COLOR_BGR2RGB);
             loaded.faces = MonocularEstimator::Faces(*lens, photo);
-            loaded.normal_faces = MonocularEstimator::Faces(*normal_lens, photo);
           }
           return loaded;
         }));
@@ -718,18 +736,16 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         CudaCheck(cudaStreamSynchronize(stream));
         // MoGe faces replace the maps; the LAS depth only scales them and gates their depth. The
         // GPU estimates the faces here; the fit and encoding run with the write on the CPU.
-        std::vector<FaceEstimate> estimates, normal_estimates;
+        std::vector<FaceEstimate> estimates;
         cv::Mat allowed;
         if (monocular) {
           allowed = static_mask.pixels.clone();
           allowed.setTo(0, semantic);
           const auto estimating = Clock::now();
           estimates = estimator->Estimate(*lens, static_mask.faces);
-          normal_estimates = estimator->Estimate(*normal_lens, static_mask.normal_faces);
           estimate_seconds += Seconds(estimating);
         }
         const MonocularLens* plan = monocular ? &*lens : nullptr;
-        const MonocularLens* normal_plan = monocular ? &*normal_lens : nullptr;
         const auto& name = scene.images[id].name;
         const auto dp = output / "depths" / fs::u8path(name + ".png"),
                    np = output / "normals" / fs::u8path(name + ".png");
@@ -738,7 +754,6 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         if (writes.size() >= Lookahead)
           finish();
         writes.push_back(std::async(std::launch::async, [=, estimates = std::move(estimates),
-                                                         normal_estimates = std::move(normal_estimates),
                                                          static_pixels = static_mask.count]() mutable {
           Json monocular_row;
           if (plan) {
@@ -746,21 +761,16 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
             const auto maps = GatherFaces(*plan, estimates, [&](const FaceSample& sample) {
               return fit.LogScale(sample, plan->size);
             });
-            const auto detail = GatherFaces(*normal_plan, normal_estimates,
-                                            [](const FaceSample&) { return 0.; });
             cv::Mat monocular_depth, monocular_normal, confirmed;
-            monocular_row =
-                EncodeMonocular(*plan, maps, detail.normal, depth, normal, allowed, fit.accepted,
-                                MinIncidence, monocular_depth, monocular_normal, confirmed);
+            monocular_row = EncodeMonocular(*plan, maps, depth, normal, allowed, fit.accepted,
+                                            MinIncidence, monocular_depth, monocular_normal,
+                                            confirmed);
             (*verified_out)[id] = ConflictCells(confirmed);
-            Json faces = Json::array(), normal_faces = Json::array();
+            Json faces = Json::array();
             for (const auto& estimate : estimates)
               faces.push_back(estimate.ToJson());
-            for (const auto& estimate : normal_estimates)
-              normal_faces.push_back(estimate.ToJson());
             monocular_row["fit"] = fit.ToJson();
             monocular_row["faces"] = faces;
-            monocular_row["normal_faces"] = normal_faces;
             depth = monocular_depth;
             normal = monocular_normal;
           }
@@ -850,7 +860,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                                     "node first difference 0.1 x mean anchors per node, lattice 2 px"},
                             {"trusted_las", "LAS depth whose surfel normal is within 15 degrees of the "
                                             "MoGe normal; only it is fitted and vetoes MoGe depth"},
-                            {"accept", "at least 2000 trusted LAS anchors, half of them inliers"},
+                            {"accept", "at least 2000 trusted LAS anchors scaled by map area (min 128), "
+                                       "half of them inliers"},
                             {"depth_step_log", .04},
                             {"las_agreement", "within max(3%, 0.03 m)"},
                             {"normals_need_depth", false},

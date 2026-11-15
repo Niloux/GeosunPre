@@ -25,8 +25,6 @@ constexpr double OuterRingDegrees = 15;
 constexpr double FeatherBand = .3;
 // Fewest valid samples in MoGe's 64 x 64 shift grid for a face to be used.
 constexpr size_t MinimumShiftSamples = 32;
-// Fewest grid pixels two faces must share to constrain their relative scale.
-constexpr size_t MinimumOverlapPixels = 500;
 // LAS scale fit: lattice step in grid pixels, Cauchy scale and inlier bound in log distance,
 // overlap residual weight against a LAS residual, and the photo acceptance.
 constexpr int FitLattice = 2;
@@ -386,63 +384,6 @@ bool SampleFace(const FaceEstimate& face, const FaceSample& sample, double& dist
   return true;
 }
 }  // namespace
-FaceAlignment AlignFaces(const MonocularLens& lens, const std::vector<FaceEstimate>& faces) {
-  if (faces.size() != lens.faces.size())
-    throw std::runtime_error("Monocular faces differ from the lens plan");
-  const size_t count = faces.size();
-  std::vector<std::vector<double>> differences(count * count);
-  for (size_t i = 0; i < lens.counts.size(); ++i) {
-    double distance[MonocularLens::MaxSamples];
-    bool valid[MonocularLens::MaxSamples];
-    Eigen::Vector3d normal;
-    for (int k = 0; k < lens.counts[i]; ++k)
-      valid[k] = SampleFace(faces[lens.samples[i][k].face], lens.samples[i][k], distance[k], normal);
-    for (int a = 0; a < lens.counts[i]; ++a)
-      for (int b = 0; b < lens.counts[i]; ++b) {
-        const size_t fa = lens.samples[i][a].face, fb = lens.samples[i][b].face;
-        if (valid[a] && valid[b] && fa < fb)
-          differences[fa * count + fb].push_back(std::log(distance[b] / distance[a]));
-      }
-  }
-  // s_a - s_b = median(log d_b - log d_a) per overlapping pair; face 0 keeps log scale 0.
-  FaceAlignment alignment{std::vector<double>(count, 1.), Json::array()};
-  Eigen::MatrixXd normal = Eigen::MatrixXd::Zero(count, count);
-  Eigen::VectorXd right = Eigen::VectorXd::Zero(count);
-  std::vector<std::array<double, 3>> pairs(count * count);
-  for (size_t a = 0; a < count; ++a)
-    for (size_t b = a + 1; b < count; ++b) {
-      auto& values = differences[a * count + b];
-      if (values.size() < MinimumOverlapPixels)
-        continue;
-      const double median = Quantile(values, .5);
-      for (auto& value : values)
-        value = std::abs(value - median);
-      const double mad = Quantile(values, .5), weight = std::sqrt(double(values.size()));
-      pairs[a * count + b] = {median, mad, double(values.size())};
-      normal(a, a) += weight;
-      normal(b, b) += weight;
-      normal(a, b) -= weight;
-      normal(b, a) -= weight;
-      right[a] += weight * median;
-      right[b] -= weight * median;
-    }
-  normal(0, 0) += 1e6;
-  const Eigen::VectorXd logs = normal.ldlt().solve(right);
-  for (size_t f = 0; f < count; ++f) {
-    if (f && normal(f, f) == 0)
-      throw std::runtime_error("Monocular face " + std::to_string(f) + " overlaps no other face");
-    alignment.scales[f] = std::exp(logs[f]);
-  }
-  for (size_t a = 0; a < count; ++a)
-    for (size_t b = a + 1; b < count; ++b)
-      if (const auto& p = pairs[a * count + b]; p[2] > 0)
-        alignment.pairs.push_back({{"faces", {a, b}},
-                                   {"pixels", size_t(p[2])},
-                                   {"log_ratio_median", p[0]},
-                                   {"log_ratio_mad", p[1]},
-                                   {"aligned_residual", p[0] - logs[a] + logs[b]}});
-  return alignment;
-}
 MonocularMaps GatherFaces(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
                           const std::function<double(const FaceSample&)>& log_scale) {
   if (faces.size() != lens.faces.size())
@@ -557,7 +498,10 @@ FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>
   fit.fields.assign(count, std::vector<double>(n * n, 0.));
   fit.anchors = anchors.size();
   fit.faces = Json::array();
-  if (anchors.size() < MinimumImageAnchors)
+  const size_t min_anchors = std::max<size_t>(
+      128, size_t(std::lround(MinimumImageAnchors * (double(lens.grid.width) * lens.grid.height) /
+                              (1600. * 1600.))));
+  if (anchors.size() < min_anchors)
     return fit;
   auto weight = [](double residual) {
     const double r = residual / CauchyScale;
@@ -698,14 +642,14 @@ FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>
   fit.accepted = double(fit.inliers) >= MinimumInlierFraction * fit.anchors;
   return fit;
 }
-Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps,
-                     const cv::Mat& detail_normal, const cv::Mat& las, const cv::Mat& las_normal,
-                     const cv::Mat& allowed, bool depth, double min_incidence, cv::Mat& depth_mm,
-                     cv::Mat& normal_rgb, cv::Mat& verified) {
+Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps, const cv::Mat& las,
+                     const cv::Mat& las_normal, const cv::Mat& allowed, bool depth,
+                     double min_incidence, cv::Mat& depth_mm, cv::Mat& normal_rgb,
+                     cv::Mat& verified) {
   const int w = lens.grid.width, h = lens.grid.height;
   if (las.size() != cv::Size(w, h) || allowed.size() != las.size() || allowed.type() != CV_8UC1 ||
-      maps.distance.size() != las.size() || las_normal.size() != las.size() ||
-      las_normal.type() != CV_8UC3 || detail_normal.size() != las.size())
+      maps.distance.size() != las.size() || maps.normal.size() != las.size() ||
+      las_normal.size() != las.size() || las_normal.type() != CV_8UC3)
     throw std::runtime_error("Monocular maps differ from the supervision grid");
   // A pixel next to a jump of more than StepLog in log distance holds a blend of both sides.
   cv::Mat step = cv::Mat::zeros(h, w, CV_8UC1);
@@ -737,20 +681,19 @@ Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps,
     for (int x = 0; x < w; ++x) {
       if (!allowed.at<uint8_t>(y, x))
         continue;
-      const auto& detail = detail_normal.at<cv::Vec3f>(y, x);
+      const auto& n = maps.normal.at<cv::Vec3f>(y, x);
       const auto& ray = lens.rays.at<cv::Vec3f>(y, x);
-      if ((detail[0] || detail[1] || detail[2]) &&
-          -(detail[0] * ray[0] + detail[1] * ray[1] + detail[2] * ray[2]) >= min_incidence)
-        normal_rgb.at<cv::Vec3b>(y, x) = cv::Vec3b(uint8_t(127.5f + 127.5f * detail[2] + .5f),
-                                                   uint8_t(127.5f + 127.5f * detail[1] + .5f),
-                                                   uint8_t(127.5f + 127.5f * detail[0] + .5f));
+      if ((n[0] || n[1] || n[2]) &&
+          -(n[0] * ray[0] + n[1] * ray[1] + n[2] * ray[2]) >= min_incidence)
+        normal_rgb.at<cv::Vec3b>(y, x) = cv::Vec3b(uint8_t(127.5f + 127.5f * n[2] + .5f),
+                                                   uint8_t(127.5f + 127.5f * n[1] + .5f),
+                                                   uint8_t(127.5f + 127.5f * n[0] + .5f));
       // A depth between both sides of a step is a point in mid air, whereas thin structures keep
       // their normals, so only depth drops the steps.
       const float d = maps.distance.at<float>(y, x);
       if (d <= 0 || blended.at<uint8_t>(y, x))
         continue;
       // Only trusted LAS depth vetoes MoGe; elsewhere the disagreement is only counted.
-      const auto& n = maps.normal.at<cv::Vec3f>(y, x);
       const double target = las.at<uint16_t>(y, x) / 1000.;
       bool agrees = true, confirmed = false;
       if (target > 0) {
@@ -777,100 +720,6 @@ Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps,
   if (!agreement.empty())
     stats["las_log_ratio"] = {{"p50", Quantile(agreement, .5)}, {"p90", Quantile(agreement, .9)}};
   return stats;
-}
-Json CheckMonocular(const fs::path& input, const fs::path& root, const std::string& image,
-                    const fs::path& output, int max_size) {
-  if (fs::exists(output))
-    throw std::runtime_error("Monocular check output already exists; choose a new directory");
-  const auto scene = ReadScene(input);
-  const auto exposure = std::find_if(scene.images.begin(), scene.images.end(),
-                                     [&](const Exposure& e) { return e.name == image; });
-  if (exposure == scene.images.end())
-    throw std::runtime_error("Photo is not part of the scene: " + image);
-  const auto& camera = scene.cameras[exposure->camera];
-  Models models(root);
-  MonocularEstimator estimator(models);
-  auto started = Clock::now();
-  const auto lens = PlanMonocularLens(camera, MapCamera(camera, max_size), estimator.FaceSize(),
-                                      DepthFaceHalfDegrees);
-  const auto normal_lens = PlanMonocularLens(camera, MapCamera(camera, max_size),
-                                             estimator.FaceSize(), NormalFaceHalfDegrees);
-  const double plan_seconds = Seconds(started);
-  auto bgr = ReadImage(exposure->source, cv::IMREAD_COLOR);
-  cv::Mat rgb;
-  cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
-  started = Clock::now();
-  const auto estimates = estimator.Estimate(lens, MonocularEstimator::Faces(lens, rgb));
-  const auto normal_estimates =
-      estimator.Estimate(normal_lens, MonocularEstimator::Faces(normal_lens, rgb));
-  const double estimate_seconds = Seconds(started);
-  started = Clock::now();
-  const auto alignment = AlignFaces(lens, estimates);
-  const auto maps = GatherFaces(lens, estimates, [&](const FaceSample& sample) {
-    return std::log(alignment.scales[sample.face]);
-  });
-  const auto normal_maps =
-      GatherFaces(normal_lens, normal_estimates, [](const FaceSample&) { return 0.; });
-  const double gather_seconds = Seconds(started);
-
-  fs::create_directories(output / "faces");
-  const auto faces = MonocularEstimator::Faces(lens, rgb);
-  Json face_reports = Json::array();
-  for (size_t f = 0; f < faces.size(); ++f) {
-    cv::Mat face;
-    cv::cvtColor(faces[f], face, cv::COLOR_RGB2BGR);
-    WriteImage(output / "faces" / (std::to_string(f) + ".jpg"), face);
-    face_reports.push_back(estimates[f].ToJson());
-  }
-  const int w = lens.grid.width, h = lens.grid.height;
-  cv::Mat depth = cv::Mat::zeros(h, w, CV_16UC1), normal = cv::Mat::zeros(h, w, CV_8UC3),
-          preview = cv::Mat::zeros(h, w, CV_8UC1), valid = cv::Mat::zeros(h, w, CV_8UC1);
-  std::vector<float> logs;
-  for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w; ++x)
-      if (const float d = maps.distance.at<float>(y, x); d > 0)
-        logs.push_back(std::log(d));
-  if (logs.empty())
-    throw std::runtime_error("Monocular estimate has no valid pixels");
-  std::vector<double> sorted(logs.begin(), logs.end());
-  const double low = Quantile(sorted, .01), high = Quantile(sorted, .99);
-  for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w; ++x) {
-      const float d = maps.distance.at<float>(y, x);
-      if (d <= 0)
-        continue;
-      const auto& n = normal_maps.normal.at<cv::Vec3f>(y, x);
-      depth.at<uint16_t>(y, x) = uint16_t(std::clamp<long>(std::lround(d * 1000), 1, 65535));
-      if (n[0] || n[1] || n[2])
-        normal.at<cv::Vec3b>(y, x) =
-            cv::Vec3b(uint8_t(127.5f + 127.5f * n[2] + .5f), uint8_t(127.5f + 127.5f * n[1] + .5f),
-                      uint8_t(127.5f + 127.5f * n[0] + .5f));
-      preview.at<uint8_t>(y, x) = uint8_t(
-          std::clamp(255 * (std::log(d) - low) / std::max(high - low, 1e-6), 1., 255.));
-      valid.at<uint8_t>(y, x) = 255;
-    }
-  cv::Mat colour;
-  cv::applyColorMap(preview, colour, cv::COLORMAP_TURBO);
-  colour.setTo(cv::Scalar::all(0), ~valid);
-  WriteImage(output / "depth.png", depth);
-  WriteImage(output / "normal.png", normal);
-  WriteImage(output / "depth_preview.jpg", colour);
-  Json report = {{"image", image},
-                 {"camera", camera.label},
-                 {"lens", lens.ToJson()},
-                 {"normal_lens", normal_lens.ToJson()},
-                 {"faces", face_reports},
-                 {"overlap_scales", alignment.scales},
-                 {"overlaps", alignment.pairs},
-                 {"valid_pixels", logs.size()},
-                 {"distance_m", {{"p01", std::exp(low)}, {"p50", std::exp(Quantile(sorted, .5))},
-                                 {"p99", std::exp(high)}}},
-                 {"seconds", {{"plan", plan_seconds},
-                              {"estimate", estimate_seconds},
-                              {"align_and_gather", gather_seconds}}},
-                 {"inference", models.Profile()}};
-  WriteJson(output / "monocular.json", report);
-  return report;
 }
 cv::Mat ConflictCells(const cv::Mat& pixels) {
   cv::Mat cells = cv::Mat::zeros((pixels.rows + ConflictLattice - 1) / ConflictLattice,

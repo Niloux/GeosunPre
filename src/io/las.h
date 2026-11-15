@@ -5,6 +5,7 @@
 #include "app/runtime.h"
 #include "geometry/camera.h"
 namespace geosun {
+struct Reconstruction;
 
 struct LasHeader {
   uint32_t count = 0, offset = 0;
@@ -34,6 +35,6 @@ void ScanLas(const fs::path& path, const LasHeader& header,
 std::vector<Eigen::Vector3d> SampleLas(const fs::path& path, const LasHeader& header,
                                        Json& metadata, size_t maximum = 1500000);
 Json ExportLasPly(const fs::path& las, const LasHeader& header, const fs::path& output,
-                  double voxel = .05);
+                  double voxel = .05, const Reconstruction* model = nullptr);
 void VerifyInitializationPly(const fs::path& path, uint64_t points);
 }  // namespace geosun

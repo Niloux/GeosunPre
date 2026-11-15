@@ -34,9 +34,9 @@
 
 **生产模式**（默认）：工作目录及缓存放在 `OUT.work`（或 `--work` 指定的目录），交付发布并回读校验后整个删除，最后只剩交付目录。中途失败时保留工作目录，以相同命令重跑即可续跑，成功后再删除。交付目录已存在而没有对应工作目录时拒绝重跑。
 
-**调试模式**（`--debug`）：工作目录（默认 `work/<输入目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`、`cleanup`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。
+**调试模式**（`--debug`）：工作目录（默认 `work/<输入目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。
 
-交付包含照片（采用卷帘校正时另附读出运动参数）、掩码、鱼眼 COLMAP 模型、5 cm LAS 初始化 PLY，以及深度和法向监督图：默认由 MoGe-2 在各镜头透视子图上估计，按法向与之一致的可信 LAS 定尺度；`--supervision-source las` 改为 LAS 投影监督。`--no-ply` 省略 PLY，`--ply-voxel` 调整体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着 LAS 监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人）在掩码里改回静态，`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
+交付包含照片（采用卷帘校正时另附读出运动参数）、掩码、鱼眼 COLMAP 模型、50 m 视锥内分档体素 LAS 初始化 PLY（基准体素默认 5 cm，上限 250 万点），以及深度和法向监督图：默认最长边 1024 px，由 MoGe-2 单路 90° 子图同时估计深度和法向，按法向与之一致的可信 LAS 定尺度；`--supervision-source las` 改为 LAS 投影监督。`--no-ply` 省略 PLY，`--ply-voxel` 调整基准体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着 LAS 监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人）在掩码里改回静态，`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
 
 监督尺寸、额外几何掩码、显存预算及 LFS 训练示例见[深度与法向监督](docs/supervision.md)。已有调试工作目录可直接导出到新目录，无需重跑重建。
 
@@ -46,13 +46,7 @@
 
 阶段产物、配置范围、导航匹配、卷帘快门和验收规则见[重建流程与算法](docs/reconstruction.md)。
 
-调试模式的工作目录可用独立命令处理，新交付写入 `--output`，新工作目录写入 `--new-work`（默认 `OUT.work`）。独立 `cleanup` 仅清理稀疏结构，不重跑前端和 SfM。新工作目录先在同级 `.pending` 中完整生成，处理期间锁定来源目录；与 `run` 相同，只有加 `--debug` 时保留新工作目录，否则交付发布后删除；`--no-ply`、`--ply-voxel` 与 `export` 含义相同：
-
-```powershell
-.\run.ps1 cleanup --work "work/场景" --output "D:/成果/场景-清理" --workers 8
-```
-
-默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`。独立 `cleanup` 的新交付在其 `--output`，所选模型为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。程序更新后使用新工作目录。
+默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`。程序更新后使用新工作目录。
 
 `run.ps1` 增量编译后启动 `build/ninja/bin/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。
 

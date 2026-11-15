@@ -9,7 +9,6 @@
 #include "sfm/structure.h"
 #include "sfm/shutter.h"
 #include "alignment/alignment.h"
-#include <opencv2/imgcodecs.hpp>
 #include <set>
 #include <iostream>
 #include <iterator>
@@ -118,7 +117,7 @@ AlignmentLimits Limits(const Json& settings) {
           settings.at("las_p90_m"), settings.at("quality_median_px"),
           settings.at("quality_p90_px")};
 }
-// Delivery options shared by run, export and cleanup.
+// Delivery options shared by run and export.
 struct Delivery {
   bool ply;
   double voxel;
@@ -279,14 +278,13 @@ std::vector<fs::path> CorrectShutter(const Scene& scene, const fs::path& work,
   auto& report = correction.report;
   report["enabled"] = true;
   report["source_model"] = original.value("selected_model", std::string("aligned"));
-  std::vector<fs::path> products{work / "cache/shutter_candidate.bin", work / "cache/shutter.bin",
-                                 work / "cache/shutter.json", work / "cache/shutter_result.json"};
+  std::vector<fs::path> products{work / "cache/shutter.bin", work / "cache/shutter.json",
+                                 work / "cache/shutter_result.json"};
   const auto& selected = correction.accepted ? correction.candidate : model;
   auto result = PostprocessResult(scene, selected, original, "shutter");
   result["shutter"] = report;
   auto saved = report;
   saved["motion"] = MotionToJson(correction.motion, correction.candidate);
-  WriteModel(work / "cache/shutter_candidate.bin", correction.candidate);
   WriteModel(work / "cache/shutter.bin", selected);
   WriteJson(work / "cache/shutter.json", saved);
   WriteJson(work / "cache/shutter_result.json", result);
@@ -307,14 +305,12 @@ std::vector<fs::path> CleanSelected(const Scene& scene, const fs::path& work, co
   const auto& selected = cleanup.accepted ? cleanup.candidate : model;
   auto result = PostprocessResult(scene, selected, original, "cleaned");
   result["cleanup"] = cleanup.report;
-  WriteModel(work / "cache/cleanup_candidate.bin", cleanup.candidate);
   WriteModel(work / "cache/cleaned.bin", selected);
   WriteJson(work / "cache/cleanup.json", cleanup.report);
   WriteJson(work / "result.json", result);
   state.value["registration"] = result.at("quality").at("registration");
   Log("Sparse structure cleanup " + cleanup.report.at("reason").get<std::string>());
-  return {work / "cache/cleanup_candidate.bin", work / "cache/cleaned.bin",
-          work / "cache/cleanup.json", work / "result.json"};
+  return {work / "cache/cleaned.bin", work / "cache/cleanup.json", work / "result.json"};
 }
 // Runs one stage and returns the files that make up its result.
 std::vector<fs::path> RunStage(const std::string& stage, const Scene& scene, const fs::path& work,
@@ -535,120 +531,5 @@ void Export(const Arguments& args) {
     throw std::runtime_error("Output and work directories must be separate");
   ExportSelected(scene, work, output, delivery);
   std::cout << CheckBundle(output).dump() << '\n';
-}
-void Postprocess(const Arguments& args) {
-  args.Validate(
-      WithDeliveryOptions({"--work", "--output", "--workers", "--new-work", "--debug"}));
-  auto delivery = ParseDelivery(args);
-  const bool debug = args.Get("--debug") == "true";
-  const auto source = args.Path("--work"), delivery_output = args.Path("--output");
-  // Like run: the new work directory is kept only with --debug.
-  const auto final_output =
-      args.Get("--new-work").empty() ? ProductionWork(delivery_output) : args.Path("--new-work");
-  if (fs::exists(delivery_output))
-    throw std::runtime_error("Output already exists; choose a new output directory");
-  if (Contains(final_output, delivery_output) || Contains(delivery_output, final_output) ||
-      Contains(source, delivery_output) || Contains(delivery_output, source))
-    throw std::runtime_error("Output must be outside the source and new work directories");
-  const int workers = args.Integer("--workers", 4);
-  if (workers > 32)
-    throw std::runtime_error("workers must be 1-32");
-  if (fs::exists(final_output))
-    throw std::runtime_error("Postprocessing output already exists; choose a new work directory");
-  if (!fs::is_regular_file(source / "scene.json"))
-    throw std::runtime_error("Not a work directory (no scene.json): " + source.u8string());
-  Lock lock(source);
-  // Work directories kept by an older cleanup --debug have no state.json.
-  const auto source_state =
-      fs::exists(source / "state.json") ? ReadJson(source / "state.json") : Json::object();
-  ResolveSupervisionModels(delivery.supervision, RecordedModels(source_state));
-  const auto scene = Scene::FromJson(ReadJson(source / "scene.json"));
-  if (Contains(source, final_output) || Contains(scene.input, final_output))
-    throw std::runtime_error("Postprocessing output must be outside source work and input");
-  // Build the whole work directory beside its destination and publish it only when complete.
-  auto output = final_output;
-  output += ".pending";
-  if (Contains(source, output) || Contains(output, source) || Contains(scene.input, output) ||
-      Contains(output, scene.input))
-    throw std::runtime_error("Postprocessing .pending directory overlaps source work or input");
-  ArchiveInterrupted(output);
-  if (ReadScene(scene.input, scene.las, scene.enhanced).ToJson() != scene.ToJson())
-    throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
-  const auto original = ReadJson(source / "result.json");
-  const bool corrected =
-      original.contains("shutter") && original.at("shutter").value("used", false);
-  const auto model = ReadModel(SelectedModelPath(source, original));
-  AlignmentLimits limits;
-  const auto& saved = original.at("alignment").at("limits");
-  limits.support_fraction = saved.at("support_fraction");
-  limits.median_m = saved.at("median_m");
-  limits.p90_m = saved.at("p90_m");
-  limits.median_px = original.at("quality").at("limits").at("median_px");
-  limits.p90_px = original.at("quality").at("limits").at("p90_px");
-  fs::create_directories(output / "cache");
-  auto cleanup = CleanSparseStructure(scene, model, workers, limits);
-  const bool accepted = cleanup.accepted;
-  auto& report = cleanup.report;
-  report["source_model"] = original.value("selected_model", std::string("aligned"));
-  const auto& selected = accepted ? cleanup.candidate : model;
-  WriteModel(output / "cache/cleanup_candidate.bin", cleanup.candidate);
-  report["source_work"] = source.u8string();
-  auto result = PostprocessResult(scene, selected, original, "cleaned");
-  result["cleanup"] = report;
-  WriteModel(output / "cache/aligned.bin", model);
-  WriteJson(output / "cache/alignment.json", original);
-  WriteModel(output / "cache/cleaned.bin", selected);
-  WriteJson(output / "cache/cleanup.json", report);
-  WriteJson(output / "scene.json", scene.ToJson());
-  WriteJson(output / "result.json", result);
-  // Rolling-shutter corrected models carry their readout motion.
-  if (corrected)
-    fs::copy_file(source / "cache/shutter.json", output / "cache/shutter.json");
-  const std::array<cv::Mat, 2> domains{MaskDomain(scene.cameras[0]), MaskDomain(scene.cameras[1])};
-  for (const auto& image : scene.images) {
-    if (!selected.images[image.id].registered)
-      continue;
-    const auto name = std::to_string(image.id) + ".png";
-    const auto mask = output / "cache/masks" / name;
-    fs::create_directories(mask.parent_path());
-    auto pixels = ReadImage(source / "cache/masks" / name, cv::IMREAD_GRAYSCALE);
-    pixels.setTo(0, domains[image.camera] == 0);
-    WriteImage(mask, pixels);
-  }
-  if (Contains(scene.input, delivery_output) || Contains(delivery_output, scene.input))
-    throw std::runtime_error("Output must be separate from input");
-  ExportBundle(scene, selected, output, delivery_output, delivery.ply, delivery.voxel, result,
-               delivery.supervision, delivery.crop);
-  if (debug) {
-    // A kept work directory must be exportable again: it records the cleanup as its last stage.
-    WorkState state{output / "state.json", Json::object()};
-    state.value = {{"input", scene.input.u8string()},
-                   {"scene", scene.ToJson()},
-                   {"stages",
-                    {{"cleanup",
-                      {{"files", Inventory(output, {output / "cache/cleanup_candidate.bin",
-                                                    output / "cache/cleaned.bin",
-                                                    output / "cache/cleanup.json",
-                                                    output / "result.json"})}}}}},
-                   {"debug", true},
-                   {"output", delivery_output.u8string()},
-                   {"status", "completed"},
-                   {"build", BuildInfo()},
-                   {"error", nullptr},
-                   {"registration", result.at("quality").at("registration")}};
-    for (const auto* key : {"settings", "models"})
-      if (source_state.contains(key))
-        state.value[key] = source_state.at(key);
-    state.Save();
-    fs::rename(output, final_output);
-  } else
-    fs::remove_all(output);
-  Log(args.command + ": " + report.at("reason").get<std::string>());
-  std::cout << Json({{"output", delivery_output.u8string()},
-                     {"work", debug ? Json(final_output.u8string()) : Json(nullptr)},
-                     {"accepted", accepted},
-                     {"reason", report.at("reason")}})
-                   .dump(2)
-            << '\n';
 }
 }  // namespace geosun
