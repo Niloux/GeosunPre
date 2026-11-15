@@ -26,16 +26,6 @@ try {
     }
     $buildRoot = Join-Path $projectRoot 'build\ninja'
     $bin = Join-Path $buildRoot 'bin'
-    $headers = Join-Path $buildRoot '_deps\tensorrt-headers-10.13\include'
-    New-Item -ItemType Directory -Force -Path $headers | Out-Null
-    foreach ($header in @('NvInferRuntime.h','NvInferRuntimeBase.h','NvInferRuntimeCommon.h','NvInferImpl.h','NvInferPluginBase.h','NvInferVersion.h','NvInferLegacyDims.h','NvInferRuntimePlugin.h')) {
-        $path = Join-Path $headers $header
-        if (-not (Test-Path -LiteralPath $path)) {
-            $temporary = $path + '.pending'
-            Invoke-WebRequest ('https://raw.githubusercontent.com/NVIDIA/TensorRT/b8db91e15be2cae4465ac17fab19e0f969e45407/include/' + $header) -OutFile $temporary -TimeoutSec 60
-            Move-Item -LiteralPath $temporary -Destination $path
-        }
-    }
     $cache = Join-Path $buildRoot 'CMakeCache.txt'
     $needsConfigure = $Configure -or -not (Test-Path -LiteralPath $cache) -or
         -not (Test-Path -LiteralPath (Join-Path $buildRoot 'build.ninja'))

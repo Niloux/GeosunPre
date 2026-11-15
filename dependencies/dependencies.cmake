@@ -68,15 +68,28 @@ FetchContent_MakeAvailable(opencv)
 # inference starts; input preparation and export do not load a GPU model.
 set(tensorrt_SOURCE_DIR "${CMAKE_BINARY_DIR}/_deps/tensorrt-headers-10.13")
 file(MAKE_DIRECTORY "${tensorrt_SOURCE_DIR}/include")
-foreach(header NvInferRuntime.h NvInferRuntimeBase.h NvInferRuntimeCommon.h
-    NvInferImpl.h NvInferPluginBase.h NvInferVersion.h NvInferLegacyDims.h NvInferRuntimePlugin.h)
-  if(NOT EXISTS "${tensorrt_SOURCE_DIR}/include/${header}")
-    file(DOWNLOAD "https://raw.githubusercontent.com/NVIDIA/TensorRT/b8db91e15be2cae4465ac17fab19e0f969e45407/include/${header}"
-      "${tensorrt_SOURCE_DIR}/include/${header}.pending" STATUS download_status TIMEOUT 60 INACTIVITY_TIMEOUT 30 TLS_VERIFY ON)
-    list(GET download_status 0 download_code)
-    if(NOT download_code EQUAL 0)
-      message(FATAL_ERROR "Cannot download TensorRT header ${header}: ${download_status}")
+set(tensorrt_headers
+  NvInferImpl.h=73cbf708a2f8a57967cb86e97fc38eed096df11c47b6d76090cbd8fcc21993ea
+  NvInferLegacyDims.h=3e10fe5b85545f2e956e6935271badf0b1c72553b698000a61d46d69c5d53030
+  NvInferPluginBase.h=774e457b2e80f27502ea1aed8132949f6e0788251b5374948e1bfdc9de9fb0ee
+  NvInferRuntime.h=c6ef78bbd8d12c8affa22961d136951e87e7b4c2a405fe44aef40b35264e3686
+  NvInferRuntimeBase.h=cf979038f28817ebee3b2899322aadda4566dafcd8a060c18bf2bdff511dfc8a
+  NvInferRuntimeCommon.h=9461c9d07403c5dd1f8a6dea17fa5c3fe5cef7c4290c6768370a1d8139d4ac5d
+  NvInferRuntimePlugin.h=d337b34b7b7efc1c65ba3405a6551389063669cb0c51704f91578b5f817999fc
+  NvInferVersion.h=1a79848e8ad9a56930f08a630c01fc7dc2e6a0fdde6904dceeb1b47825f9bced)
+foreach(entry IN LISTS tensorrt_headers)
+  string(REPLACE "=" ";" parts "${entry}")
+  list(GET parts 0 header)
+  list(GET parts 1 expected)
+  set(path "${tensorrt_SOURCE_DIR}/include/${header}")
+  if(EXISTS "${path}")
+    file(SHA256 "${path}" actual)
+    if(NOT actual STREQUAL expected)
+      message(FATAL_ERROR "TensorRT header checksum mismatch: ${path}. Remove it and reconfigure.")
     endif()
-    file(RENAME "${tensorrt_SOURCE_DIR}/include/${header}.pending" "${tensorrt_SOURCE_DIR}/include/${header}")
+  else()
+    file(DOWNLOAD "https://raw.githubusercontent.com/NVIDIA/TensorRT/b8db91e15be2cae4465ac17fab19e0f969e45407/include/${header}"
+      "${path}.pending" EXPECTED_HASH "SHA256=${expected}" TIMEOUT 60 INACTIVITY_TIMEOUT 30 TLS_VERIFY ON)
+    file(RENAME "${path}.pending" "${path}")
   endif()
 endforeach()

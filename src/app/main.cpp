@@ -9,122 +9,131 @@
 #include <iostream>
 
 namespace geosun {
+namespace {
+struct Command {
+  const char* name;
+  const char* usage;
+  void (*execute)(const Arguments&);
+};
+
+void RunCommand(const Arguments& args) {
+  Log("GeosunPre: " + BuildInfo().dump());
+  Run(args);
+}
+
+void Help(const Arguments&);
+
+const Command Commands[] = {
+    {"run",
+     "--input INPUT [--output OUT] [--work WORK] [--debug] [--models MODELS] "
+     "[--config JSON] [--no-las-supervision]\n"
+     "  geosunpre run --work WORK [--stage "
+     "prepare|masks|features|matches|sfm|align|shutter|cleanup|export]",
+     RunCommand},
+    {"prepare", "--input INPUT [--output OUT] [--work WORK] [--debug]", RunCommand},
+    {"export", "--work WORK --output OUT [--no-ply] [--ply-voxel METRES] [--no-las-supervision]",
+     Export},
+    {"cleanup",
+     "--work WORK --output OUT [--new-work NEW_WORK] [--debug] [--workers N] "
+     "[--no-ply] [--ply-voxel METRES] [--no-las-supervision]",
+     Postprocess},
+    {"check", "--output DIR",
+     [](const Arguments& args) {
+       args.Validate({"--output"});
+       std::cout << CheckBundle(args.Path("--output")).dump(2) << '\n';
+     }},
+    {"check-supervision", "--output DIR [--compare DIR]",
+     [](const Arguments& args) {
+       args.Validate({"--output", "--compare"});
+       std::cout << MeasureSupervision(args.Path("--output"), args.Get("--compare").empty()
+                                                                  ? fs::path()
+                                                                  : args.Path("--compare"))
+                        .dump(2)
+                 << '\n';
+     }},
+    {"static-masks",
+     "--output DELIVERY --input INPUT --las LAS --new-masks DIR [--enhanced-photos]",
+     [](const Arguments& args) {
+       args.Validate({"--output", "--input", "--las", "--new-masks", "--enhanced-photos"});
+       std::cout << RefineStaticMasks(args.Path("--output"), args.Path("--input"),
+                                      args.Path("--las"), args.Get("--enhanced-photos") == "true",
+                                      args.Path("--new-masks"))
+                        .dump(2)
+                 << '\n';
+     }},
+    {"info", "",
+     [](const Arguments& args) {
+       args.Validate({});
+       auto info = BuildInfo();
+       info["runtime"] = "C++17/CUDA/TensorRT 10.13";
+       info["gpu"] = GpuInfo();
+       info["default_models"] = DefaultModels().u8string();
+       std::cout << info.dump(2) << '\n';
+     }},
+    {"check-models", "--image FILE [--models MODELS]",
+     [](const Arguments& args) {
+       args.Validate({"--models", "--image"});
+       std::cout << CheckModels(
+                        args.Get("--models").empty() ? DefaultModels() : args.Path("--models"),
+                        args.Path("--image"))
+                        .dump(2)
+                 << '\n';
+     }},
+    {"check-monocular",
+     "--input INPUT --image NAME --output DIR [--models MODELS] [--supervision-max-size PIXELS]",
+     [](const Arguments& args) {
+       args.Validate({"--input", "--image", "--output", "--models", "--supervision-max-size"});
+       std::cout << CheckMonocular(
+                        args.Path("--input"),
+                        args.Get("--models").empty() ? DefaultModels() : args.Path("--models"),
+                        args.Get("--image"), args.Path("--output"),
+                        args.Integer("--supervision-max-size", 1600))
+                        .dump(2)
+                 << '\n';
+     }},
+    {"las-ply", "--las FILE --output FILE [--voxel METRES]",
+     [](const Arguments& args) {
+       args.Validate({"--las", "--output", "--voxel"});
+       std::cout << ExportLasPly(args.Path("--las"), ReadLasHeader(args.Path("--las")),
+                                 args.Path("--output"), args.Number("--voxel", .05))
+                        .dump(2)
+                 << '\n';
+     }},
+    {"help", "", Help},
+    {"--help", nullptr, Help},
+};
+
+void Help(const Arguments&) {
+  std::cout << "GeosunPre " << BuildVersion << " - native dual-fisheye/LAS reconstruction\n";
+  for (const auto& command : Commands) {
+    if (command.usage)
+      std::cout << "  geosunpre " << command.name << (*command.usage ? " " : "") << command.usage
+                << '\n';
+  }
+  std::cout << "  Use --debug to keep the work directory for export or cleanup.\n"
+               "  Delivery options: [--supervision-source moge|las] [--supervision-models MODELS]\n"
+               "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS]\n"
+               "    [--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"
+               "    [--no-static-masks] [--no-crop-valid-domain]\n"
+               "  See README.md and docs/output.md for defaults and delivery details.\n";
+}
+}  // namespace
+
 int Main(const std::vector<std::string>& argv) {
   try {
     cv::setNumThreads(1);
-    Arguments args(argv);
-    if (args.command == "run" || args.command == "prepare") {
-      Log("GeosunPre: " + BuildInfo().dump());
-      Run(args);
-    } else if (args.command == "export")
-      Export(args);
-    else if (args.command == "cleanup")
-      Postprocess(args);
-    else if (args.command == "check") {
-      args.Validate({"--output"});
-      std::cout << CheckBundle(args.Path("--output")).dump(2) << '\n';
-    } else if (args.command == "check-supervision") {
-      args.Validate({"--output", "--compare"});
-      std::cout << MeasureSupervision(args.Path("--output"), args.Get("--compare").empty()
-                                                                 ? fs::path()
-                                                                 : args.Path("--compare"))
-                       .dump(2)
-                << '\n';
-    } else if (args.command == "static-masks") {
-      args.Validate({"--output", "--input", "--las", "--new-masks", "--enhanced-photos"});
-      std::cout << RefineStaticMasks(args.Path("--output"), args.Path("--input"),
-                                      args.Path("--las"), args.Get("--enhanced-photos") == "true",
-                                      args.Path("--new-masks"))
-                       .dump(2)
-                << '\n';
-    } else if (args.command == "info") {
-      args.Validate({});
-      auto info = BuildInfo();
-      info["runtime"] = "C++17/CUDA/TensorRT 10.13";
-      info["gpu"] = GpuInfo();
-      info["default_models"] = DefaultModels().u8string();
-      std::cout << info.dump(2) << '\n';
-    } else if (args.command == "check-models") {
-      args.Validate({"--models", "--image"});
-      std::cout << CheckModels(
-                       args.Get("--models").empty() ? DefaultModels() : args.Path("--models"),
-                       args.Path("--image"))
-                       .dump(2)
-                << '\n';
-    } else if (args.command == "check-monocular") {
-      args.Validate({"--input", "--image", "--output", "--models", "--supervision-max-size"});
-      std::cout << CheckMonocular(
-                       args.Path("--input"),
-                       args.Get("--models").empty() ? DefaultModels() : args.Path("--models"),
-                       args.Get("--image"), args.Path("--output"),
-                       args.Integer("--supervision-max-size", 1600))
-                       .dump(2)
-                << '\n';
-    } else if (args.command == "las-ply") {
-      args.Validate({"--las", "--output", "--voxel"});
-      std::cout << ExportLasPly(args.Path("--las"), ReadLasHeader(args.Path("--las")),
-                                args.Path("--output"),
-                                args.Number("--voxel", .05))
-                       .dump(2)
-                << '\n';
-    } else if (args.command == "help" || args.command == "--help") {
-      std::cout
-          << "GeosunPre " << BuildVersion
-          << " - native dual-fisheye/LAS reconstruction\n"
-             "  geosunpre run --input INPUT [--output OUT] [--work WORK] [--debug] "
-             "[--models MODELS] [--config JSON] [--no-las-supervision]\n"
-             "    the delivery is written directly into OUT (default output/<input name>)\n"
-             "    production (default): work and cache live in OUT.work and are removed once "
-             "the delivery is published; an interrupted run resumes with the same command\n"
-             "    --debug keeps the work directory (default work/<input name>) and its cache\n"
-             "  geosunpre run --work WORK [--stage "
-             "prepare|masks|features|matches|sfm|align|shutter|cleanup|export]\n"
-             "    shutter (rolling-shutter correction) runs by default; config "
-             "rolling_shutter=false removes it\n"
-             "    original Image/L and Image/R photos are used; config enhanced_photos=true "
-             "prefers Image/enhanced\n"
-             "  geosunpre prepare --input INPUT [--output OUT] [--work WORK] [--debug]\n"
-             "  geosunpre static-masks --output DELIVERY --input INPUT --las LAS --new-masks DIR "
-             "[--enhanced-photos]\n"
-             "    masks of an existing delivery with persistent people (pictures, posters, "
-             "seated) made static, into a new DIR\n"
-             "  geosunpre export --work WORK --output OUT [--no-ply] [--ply-voxel METRES] "
-             "[--no-las-supervision]\n"
-             "  geosunpre cleanup --work WORK --output OUT [--new-work NEW_WORK] [--debug] "
-             "[--workers N] [--no-ply] [--ply-voxel METRES] [--no-las-supervision]\n"
-             "    export and cleanup read the cache of a --debug work directory\n"
-             "    depth/normal supervision is enabled for run/export/cleanup\n"
-             "    with it, masks make persistent people static again (pictures, posters, seated); "
-             "--no-static-masks keeps the SAM3 masks as they are\n"
-             "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS] "
-             "[--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"
-             "    --supervision-source moge|las: MoGe-2 maps scaled per face to the LAS (default) "
-             "or LAS-projected maps; moge uses the geometry engine of --supervision-models "
-             "MODELS (default: --models, else the default models)\n"
-             "    LAS coordinate GPU cache limit defaults to 2048 MiB (1-4096)\n"
-             "    rolling-shutter corrected models are delivered with the original photos and "
-             "rolling_shutter.json\n"
-             "    photos, masks and the model are cut to each lens's valid domain, losslessly on "
-             "the JPEG MCU grid; --no-crop-valid-domain delivers full frames\n"
-             "  geosunpre check --output DIR\n"
-             "  geosunpre check-supervision --output DIR [--compare DIR]\n"
-             "    measures depth and normal maps against SfM tracks and neighbouring views\n"
-             "  geosunpre info\n"
-             "  geosunpre check-models --image FILE [--models MODELS]\n"
-             "  geosunpre check-monocular --input INPUT --image NAME --output DIR "
-             "[--models MODELS] [--supervision-max-size PIXELS]\n"
-             "  geosunpre las-ply --las FILE --output FILE [--voxel METRES]\n";
-    } else
-      throw std::runtime_error("Unknown command: " + args.command);
-    return 0;
+    const Arguments args(argv);
+    for (const auto& command : Commands) {
+      if (args.command == command.name) {
+        command.execute(args);
+        return 0;
+      }
+    }
+    throw std::runtime_error("Unknown command: " + args.command);
   } catch (const std::exception& error) {
     std::cerr << "geosunpre: " << error.what() << '\n';
     return 1;
   }
 }
 }  // namespace geosun
-#ifdef _WIN32
 int wmain(int argc, wchar_t** argv) { return geosun::Main(geosun::Utf8Arguments(argc, argv)); }
-#else
-int main(int argc, char** argv) { return geosun::Main(geosun::Utf8Arguments(argc, argv)); }
-#endif

@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
+if(NOT CMAKE_HOST_WIN32)
+  message(FATAL_ERROR "GeosunPre supports native Windows builds only.")
+endif()
 # Match ampere_plus engines: SASS for Ampere/Ada/Blackwell, compute_80 PTX for other GPUs >= 8.0.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES "80;86-real;89-real;120-real" CACHE STRING "Target CUDA architectures")
@@ -15,7 +18,7 @@ set(GEOSUN_SOURCES
   src/app/main.cpp src/app/pipeline.cpp src/app/runtime.cpp
   src/io/scene.cpp src/io/cache.cpp src/io/las.cpp src/io/colmap.cpp src/io/crop.cpp
   src/geometry/camera.cpp src/geometry/model.cpp src/geometry/monocular.cpp
-  src/geometry/supervision.cu src/geometry/static_masks.cpp
+  src/geometry/supervision.cpp src/geometry/supervision_kernels.cu src/geometry/static_masks.cpp
   src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/preprocessing.cu src/frontend/frontend.cpp
   src/sfm/reconstruction.cpp src/sfm/optimization.cpp src/sfm/structure.cpp
   src/sfm/shutter.cpp
@@ -65,19 +68,15 @@ target_include_directories(geosunpre SYSTEM PRIVATE ${opencv_BINARY_DIR} ${CMAKE
 target_link_libraries(geosunpre PRIVATE Ceres::ceres Eigen3::Eigen nlohmann_json::nlohmann_json
   nanoflann::nanoflann opencv_core opencv_imgproc opencv_imgcodecs opencv_calib3d CUDA::cudart
   libjpeg-turbo)
-if(WIN32)
-  add_executable(geosun bundle/main.cpp)
-  target_compile_definitions(geosun PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-  target_compile_options(geosun PRIVATE /utf-8 /W4)
-  set_target_properties(geosun PROPERTIES
-    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  target_compile_definitions(geosunpre PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-  target_compile_options(geosunpre PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/W4>)
-  target_link_libraries(geosunpre PRIVATE psapi)
-else()
-  target_link_libraries(geosunpre PRIVATE ${CMAKE_DL_LIBS})
-endif()
+add_executable(geosun bundle/main.cpp)
+target_compile_definitions(geosun PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(geosun PRIVATE /utf-8 /W4)
+set_target_properties(geosun PROPERTIES
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+target_compile_definitions(geosunpre PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(geosunpre PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+target_link_libraries(geosunpre PRIVATE psapi)
 set_target_properties(geosunpre PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 install(TARGETS geosunpre RUNTIME DESTINATION .)
 install(DIRECTORY docs DESTINATION .)

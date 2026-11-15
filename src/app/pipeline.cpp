@@ -12,9 +12,8 @@
 #include <opencv2/imgcodecs.hpp>
 #include <set>
 #include <iostream>
-#ifdef _WIN32
+#include <iterator>
 #include <Windows.h>
-#endif
 
 namespace geosun {
 // Compiled from configs/default.json.
@@ -37,24 +36,18 @@ bool Contains(const fs::path& parent, const fs::path& child) {
   return true;
 }
 class Lock {
-#ifdef _WIN32
-  HANDLE handle = INVALID_HANDLE_VALUE;
-#endif
+  HANDLE handle;
+
  public:
-  explicit Lock(const fs::path& work) {
-#ifdef _WIN32
-    handle = CreateFileW((work / ".lock").c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  explicit Lock(const fs::path& work)
+      : handle(CreateFileW((work / ".lock").c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)) {
     if (handle == INVALID_HANDLE_VALUE)
       throw std::runtime_error("Work directory is in use or cannot be locked");
-#endif
   }
-  ~Lock() {
-#ifdef _WIN32
-    if (handle != INVALID_HANDLE_VALUE)
-      CloseHandle(handle);
-#endif
-  }
+  Lock(const Lock&) = delete;
+  Lock& operator=(const Lock&) = delete;
+  ~Lock() { CloseHandle(handle); }
 };
 Json Settings(const fs::path& file) {
   Json result = Json::parse(DefaultSettings);
@@ -68,23 +61,52 @@ Json Settings(const fs::path& file) {
       result[key] = value;
     }
   }
-  for (const auto* key : {"workers", "ba_workers"})
-    if (!result.at(key).is_number_integer() || result.at(key).get<int>() < 1 ||
-        result.at(key).get<int>() > 32)
-      throw std::runtime_error(std::string(key) + " must be 1-32");
-  if (!result.at("sfm_repair_rounds").is_number_integer() || result.at("sfm_repair_rounds") < 0 ||
-      result.at("sfm_repair_rounds") > 2)
-    throw std::runtime_error("sfm_repair_rounds must be an integer from 0 to 2");
-  for (const auto* key : {"rolling_shutter", "enhanced_photos"})
-    if (!result.at(key).is_boolean())
-      throw std::runtime_error(std::string(key) + " must be a boolean");
-  for (const auto& [key, value] : result.items())
-    if (key != "workers" && key != "calibration_tracks" && key != "sfm_repair_rounds" &&
-        key != "rolling_shutter" && key != "enhanced_photos" &&
-        (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() <= 0))
-      throw std::runtime_error("Expected positive numeric setting: " + key);
-  if (result.at("calibration_tracks") != "all" && result.at("calibration_tracks") != "stable")
-    throw std::runtime_error("calibration_tracks must be all or stable");
+  enum class Kind { Integer, Boolean, Positive, Choice };
+  static constexpr struct {
+    const char* key;
+    Kind kind;
+    int min = 0, max = 0;
+    const char* first = nullptr;
+    const char* second = nullptr;
+  } schema[] = {
+      {"workers", Kind::Integer, 1, 32},
+      {"ba_workers", Kind::Integer, 1, 32},
+      {"sfm_repair_rounds", Kind::Integer, 0, 2},
+      {"rolling_shutter", Kind::Boolean},
+      {"enhanced_photos", Kind::Boolean},
+      {"quality_median_px", Kind::Positive},
+      {"quality_p90_px", Kind::Positive},
+      {"las_support_fraction", Kind::Positive},
+      {"las_median_m", Kind::Positive},
+      {"las_p90_m", Kind::Positive},
+      {"calibration_tracks", Kind::Choice, 0, 0, "all", "stable"},
+  };
+  if (result.size() != std::size(schema))
+    throw std::logic_error("Configuration defaults do not match the settings schema");
+  for (const auto& rule : schema) {
+    const auto& value = result.at(rule.key);
+    const std::string key = rule.key;
+    switch (rule.kind) {
+      case Kind::Integer:
+        if (!value.is_number_integer() || value.get<double>() < rule.min ||
+            value.get<double>() > rule.max)
+          throw std::runtime_error(key + " must be an integer from " +
+                                   std::to_string(rule.min) + " to " + std::to_string(rule.max));
+        break;
+      case Kind::Boolean:
+        if (!value.is_boolean())
+          throw std::runtime_error(key + " must be a boolean");
+        break;
+      case Kind::Positive:
+        if (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() <= 0)
+          throw std::runtime_error("Expected positive numeric setting: " + key);
+        break;
+      case Kind::Choice:
+        if (value != rule.first && value != rule.second)
+          throw std::runtime_error(key + " must be " + rule.first + " or " + rule.second);
+        break;
+    }
+  }
   if (result.at("las_support_fraction").get<double>() > 1 ||
       result.at("quality_median_px").get<double>() > result.at("quality_p90_px").get<double>() ||
       result.at("las_median_m").get<double>() > result.at("las_p90_m").get<double>())

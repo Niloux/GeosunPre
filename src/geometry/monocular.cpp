@@ -1053,10 +1053,11 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
       next = uint32_t(n);
     }
   };
-  const unsigned workers = std::max(1u, std::thread::hardware_concurrency());
+  // Each worker holds up to two decoded depth maps and per-pair conflict buffers.
+  const auto workers = std::min(n, size_t(std::clamp(std::thread::hardware_concurrency(), 1u, 8u)));
   {
     std::vector<std::thread> threads;
-    for (unsigned k = 0; k < workers; ++k)
+    for (size_t k = 0; k < workers; ++k)
       threads.emplace_back(work);
     for (auto& thread : threads)
       thread.join();
@@ -1107,7 +1108,7 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
   };
   {
     std::vector<std::thread> threads;
-    for (unsigned k = 0; k < workers; ++k)
+    for (size_t k = 0; k < workers; ++k)
       threads.emplace_back(rewrite);
     for (auto& thread : threads)
       thread.join();
