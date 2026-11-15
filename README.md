@@ -36,7 +36,7 @@
 
 **调试模式**（`--debug`）：工作目录（默认 `work/<输入目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。
 
-交付包含照片（采用卷帘校正时另附读出运动参数）、掩码、鱼眼 COLMAP 模型、50 m 视锥内分档体素 LAS 初始化 PLY（基准体素默认 5 cm，上限 250 万点），以及深度和法向监督图：默认最长边 1024 px，由 MoGe-2 单路 90° 子图同时估计深度和法向，按法向与之一致的可信 LAS 定尺度；`--supervision-source las` 改为 LAS 投影监督。`--no-ply` 省略 PLY，`--ply-voxel` 调整基准体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着 LAS 监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人）在掩码里改回静态，`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
+交付包含照片（采用卷帘校正时另附读出运动参数）、掩码、鱼眼 COLMAP 模型、50 m 视锥内分档体素 LAS 初始化 PLY（基准体素默认 5 cm，上限 250 万点），以及深度和法向监督图：默认最长边 1024 px，由 MoGe-2 单路 90° 子图同时估计深度和法向，按法向与之一致的可信 LAS 定尺度；`--supervision-source las` 改为 LAS 投影监督。`--no-ply` 省略 PLY，`--ply-voxel` 调整基准体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着 LAS 监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人），以及有 LAS 表面支撑的天空误检块和封闭室内场景残余天空误检均在掩码里改回静态 `255`（配合 `configs/trainer.json` 统一的 `segment_and_ignore`），`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
 
 监督尺寸、额外几何掩码、显存预算及 LFS 训练示例见[深度与法向监督](docs/supervision.md)。已有调试工作目录可直接导出到新目录，无需重跑重建。
 

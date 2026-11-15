@@ -14,7 +14,7 @@
 
 几何过滤不识别玻璃材质。可用 `--supervision-mask-dir DIR` 追加仅影响几何的排除掩码：按 `DIR/{L,R}/**.JPG.png` 保存原图尺寸灰度 PNG，仅 255 保留；未提供文件的照片沿用原静态区域。不同排除掩码使用新交付目录。
 
-定制 LFS 以交付目录为数据路径，直接读取 `depths/`、`normals/` 和 `supervision.json`：识别到毫米深度和 OpenCV 相机法向后，自动把深度损失切到米制 `metric`、法向损失切到 `camera-opencv`，并关闭单目深度和法向的自动生成；显式指定的非默认选择保持不变。深度是沿视线距离，只有 GUT 光栅化按鱼眼视线渲染，训练须加 `--gut`，否则 LFS 告警且离轴处深度监督有偏。监督默认关闭，用 `--use-depth-loss`、`--use-normal-loss` 开启，权重由 `--depth-loss-weight`、`--normal-loss-weight` 设置。掩码的 255/128/0 对应 LFS `segment_and_ignore`。`supervision.json` 记录每图有效像素、生成参数及文件身份，`check` 会回读监督图。
+定制 LFS 以交付目录为数据路径，直接读取 `depths/`、`normals/` 和 `supervision.json`：识别到毫米深度和 OpenCV 相机法向后，自动把深度损失切到米制 `metric`、法向损失切到 `camera-opencv`，并关闭单目深度和法向的自动生成；显式指定的非默认选择保持不变。深度是沿视线距离，只有 GUT 光栅化按鱼眼视线渲染，训练须加 `--gut`，否则 LFS 告警且离轴处深度监督有偏。监督默认关闭，用 `--use-depth-loss`、`--use-normal-loss` 开启，权重由 `--depth-loss-weight`、`--normal-loss-weight` 设置。`configs/trainer.json` 统一使用 `mask_mode = "segment_and_ignore"`：室外保留的 `128` 施加天空不透明度惩罚并忽略 `0`；封闭室内经静态掩码将 `128` 全部改回 `255` 后仅含 `{255, 0}`，在该模式下与 `ignore` 等价，避免室内灯箱或天花被挖空。`supervision.json` 记录每图有效像素、生成参数及文件身份，`check` 会回读监督图。
 
 在 LFS 目录中开启监督试训，并与关闭监督的相同设置对照评估：
 

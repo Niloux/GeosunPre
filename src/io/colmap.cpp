@@ -318,11 +318,14 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   // Static masks need the LAS, like the supervision maps they make consistent with the masks.
   std::unique_ptr<LasSurfelCache> surfel_cache;
   Json static_request = nullptr;
+  Json static_summary;
   if (options.enabled && options.static_masks) {
     masks = BuildStaticMasks(scene, selected, rolling ? &motion : nullptr, work, report,
                              surfel_cache, options.cache_mb);
     static_request = {{"rules", StaticMaskRules()},
                       {"file", FileMetadata(masks / "static_masks.json")}};
+    static_summary = ReadJson(masks / "static_masks.json").at("result");
+    static_summary.erase("component_rows");
     timed("static masks");
   }
   // Photos and masks are independent files; their decoding and writing run on all cores.
@@ -459,8 +462,11 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
                    {"images", photos},
                    {"model_files", sizes},
                    {"initialization", initialization}};
-  if (options.enabled)
+  if (options.enabled) {
     manifest["supervision"] = supervision;
+    if (!static_summary.is_null())
+      manifest["static_masks"] = static_summary;
+  }
   if (rolling)
     manifest["rolling_shutter"] = {{"file", "rolling_shutter.json"},
                                    {"size_bytes", fs::file_size(pending / "rolling_shutter.json")}};

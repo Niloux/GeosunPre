@@ -5,13 +5,15 @@
 namespace geosun {
 class LasSurfelCache;
 
-// Re-decides the transient (person) components of the masks by persistence: where a candidate is
-// in the world (median LAS point), and how many of the views that see that place flagged it
-// transient, over how many seconds. Flagged in a sizeable share of the views over a long time - a
-// picture of people, a poster, a person seated all along - it is static again; a walking person,
-// their shadow or the operator is flagged only where and while they are. Masks are read from
-// source(image) and written, for the registered images, to destination(image). Returns the report
-// with one row per candidate.
+// Re-decides the transient (person) components and sky detections of the masks using the LAS
+// projection:
+// - A transient component is located in the world (median LAS point) and made static again when
+//   flagged in a sizeable share of views over a long time (picture, poster, seated person).
+// - A sky (128) component whose eroded core has dense LAS surface depth is a false positive
+//   (ceiling, lightbox, display panel) and returns to static (255); if the scene as a whole lacks
+//   open sky after removing surface components, remaining indoor sky false positives are cleared.
+// Masks are read from source(image) and written, for the registered images, to destination(image).
+// Returns the report with summary statistics and one row per transient candidate.
 Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterMotion* motion,
                  const LasHeader& header, LasSurfelCache& cache,
                  const std::function<fs::path(uint32_t)>& source,

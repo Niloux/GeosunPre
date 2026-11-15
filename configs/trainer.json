@@ -88,7 +88,7 @@
         "iterations": 30000,
         "lambda_dssim": 0.2199999988079071,
         "late_lr_anneal": 0.30000001192092896,
-        "mask_mode": "ignore",
+        "mask_mode": "segment_and_ignore",
         "mask_opacity_penalty_power": 2.0,
         "mask_opacity_penalty_weight": 1.0,
         "mask_threshold": 0.5,
