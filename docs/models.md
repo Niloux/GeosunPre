@@ -7,10 +7,10 @@
 在项目根目录执行：
 
 ```powershell
-.\prepare-models.ps1
+.\run.ps1 prepare-models sam3.pt
 ```
 
-默认向 `models/` 准备五个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）默认允许 FP16 内部计算，输入为 644×644 方形透视图、固定 2116 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。grounding（SAM3）为掩码阶段检测人物、影子、人形展品和天空，见下文。SAM3 检查点 [facebook/sam3](https://huggingface.co/facebook/sam3) 在 Hugging Face 需登录申请，无法自动下载：首次准备传入 `-Sam3 sam3.pt`，按 SHA256 校验后复制到 `.cache/model-prepare/source/sam3.pt`，以后不再需要该参数。`run.ps1` 默认使用这个目录；通用交付打包时用 `-Models models-ampere-plus-blocked` 指定跨 GPU 模型包，见 README。
+默认向 `models/` 准备五个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）默认允许 FP16 内部计算，输入为 644×644 方形透视图、固定 2116 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。grounding（SAM3）为掩码阶段检测人物、影子、人形展品和天空，见下文。SAM3 检查点 [facebook/sam3](https://huggingface.co/facebook/sam3) 在 Hugging Face 需登录申请，无法自动下载。首次准备时传入 `sam3.pt` 的路径，按 SHA256 校验后复制到 `.cache/model-prepare/source/sam3.pt`，以后可省略路径。`run.ps1` 使用本机引擎，`package.ps1` 自动生成或复用跨 GPU 的交付引擎。
 
 首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。同 GPU 上更换照片分辨率、横竖方向或宽高比不需要重建模型。更换 GPU、模型协议或精度时需指定新的输出目录。
 
@@ -46,15 +46,15 @@ grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的
 - [MoGe](https://github.com/microsoft/MoGe/tree/74fbce054ebed49800de42d0ad0e83495065719a) 源码与 [MoGe-2 ViT-L normal](https://huggingface.co/Ruicheng/moge-2-vitl-normal)：revision `cb0e8bbd6b1e243589717c78e750b1ba4c093acf`，均为 MIT 许可。
 - [SAM3](https://huggingface.co/facebook/sam3)：`sam3.pt`，SHA256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`，SAM License；模型代码取自 ultralytics 8.4.192 及其 CLIP 分词器（固定提交），两者不带依赖安装，只用于导出。
 
-导出和 ONNX→TensorRT 编译是独立资源准备，由根目录 `prepare-models.ps1` 完成。引擎针对构建 GPU，更换 GPU 时重新构建，不默认承诺跨型号兼容。
+需要手动导出 ONNX 或指定引擎参数时，可调用 `tools/windows/prepare-models.ps1`。它默认生成针对构建 GPU 的引擎。
 
 ## ONNX 发布包
 
 权重→ONNX 与 GPU 无关，只需在开发机做一次；ONNX→引擎随 GPU 变化。将前者冻结为发布包，其他机器构建引擎时不再下载权重或 LoMa 源码：
 
 ```powershell
-.\prepare-models.ps1 -OnnxBundle packages/onnx-bundle-v1
-.\prepare-models.ps1 -Models models/other-gpu -OnnxFrom packages/onnx-bundle-v1
+.\tools\windows\prepare-models.ps1 -OnnxBundle packages/onnx-bundle-v1
+.\tools\windows\prepare-models.ps1 -Models models/other-gpu -OnnxFrom packages/onnx-bundle-v1
 ```
 
 `-OnnxBundle` 总是从固定权重重新导出，不接受 `-Models`、`-OnnxFrom`、`-Sam3`、`-MatcherPrecision`、`-GeometryPrecision`；发布包只含 detector、descriptor、matcher、geometry 四个基础模型，以它为 `-OnnxFrom` 构建时 grounding 由目标机器缓存的 SAM3 检查点导出（或传 `-Sam3`）；输出目录已存在时报错。包内含 `onnx/` 四个单文件 ONNX、`references/` 导出时的 PyTorch 输入输出、`images/` 两张验证照片及 `onnx-bundle.json`（来源版本、检测器范围、max_features、geometry 输入尺寸与 token 数及全部文件 SHA256）。作为 `-OnnxFrom` 的发布包保持只读。导出同样经 `.pending` 目录校验后发布。
@@ -66,8 +66,8 @@ grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的
 按目标设备或精度调整准备参数，使用新目录：
 
 ```powershell
-.\prepare-models.ps1 -Models models/other-gpu -OnnxFrom models
-.\prepare-models.ps1 -Images "D:/照片/A.JPG","D:/照片/B.JPG"
+.\tools\windows\prepare-models.ps1 -Models models/other-gpu -OnnxFrom models
+.\tools\windows\prepare-models.ps1 -Images "D:/照片/A.JPG","D:/照片/B.JPG"
 ```
 
 - `-Models`：输出目录，默认 `models`。完整且兼容的包检查清单、引擎 SHA256、推理 DLL 与真实推理后复用，不重建；GPU、动态范围、匹配精度或校验值不符时报错，应指定新目录。

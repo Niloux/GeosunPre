@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param([ValidateRange(1, 2147483647)][int]$Jobs = 8, [switch]$Configure)
 $ErrorActionPreference = 'Stop'
-Push-Location $PSScriptRoot
+$projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+Push-Location $projectRoot
 try {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (-not (Test-Path -LiteralPath $vswhere)) { throw 'Install the Visual Studio 2022 C++ desktop tools.' }
@@ -23,7 +24,7 @@ try {
         }
         $env:PATH = $ninjaRoot + ';' + $env:PATH
     }
-    $buildRoot = Join-Path $PSScriptRoot 'build\ninja'
+    $buildRoot = Join-Path $projectRoot 'build\ninja'
     $bin = Join-Path $buildRoot 'bin'
     $headers = Join-Path $buildRoot '_deps\tensorrt-headers-10.13\include'
     New-Item -ItemType Directory -Force -Path $headers | Out-Null
@@ -39,7 +40,7 @@ try {
     $needsConfigure = $Configure -or -not (Test-Path -LiteralPath $cache) -or
         -not (Test-Path -LiteralPath (Join-Path $buildRoot 'build.ninja'))
     if (-not $needsConfigure) {
-        $needsConfigure = (Get-Item -LiteralPath (Join-Path $PSScriptRoot 'CMakePresets.json')).LastWriteTimeUtc -gt
+        $needsConfigure = (Get-Item -LiteralPath (Join-Path $projectRoot 'CMakePresets.json')).LastWriteTimeUtc -gt
             (Get-Item -LiteralPath $cache).LastWriteTimeUtc
     }
     if ($needsConfigure) {

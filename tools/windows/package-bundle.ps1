@@ -9,6 +9,7 @@ param(
 # Both packages are copied unchanged. The launcher and its README come from
 # the current build and checkout so existing paired packages can be reused.
 $ErrorActionPreference = 'Stop'
+$projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 function Resolve-Dir([string]$Path) {
     $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path).TrimEnd([char[]]'\/')
@@ -42,8 +43,8 @@ $Preprocess = Resolve-Dir $Preprocess
 $Trainer = Resolve-Dir $Trainer
 $pre = Read-Record $Preprocess
 $train = Read-Record $Trainer
-if ($pre.models.hardware_compatibility -eq 'none') {
-    Write-Warning "This bundle's models require $($pre.models.build_gpu). Use an ampere_plus preprocess package for other supported GPUs."
+if ($pre.models.hardware_compatibility -ne 'ampere_plus') {
+    throw 'Delivery requires an ampere_plus preprocess package. Create it with package.ps1.'
 }
 if (-not (Test-Path -LiteralPath (Join-Path $Preprocess 'geosunpre.exe') -PathType Leaf)) { throw "Not a GeosunPre package: $Preprocess" }
 if (-not (Test-Path -LiteralPath (Join-Path $Trainer 'bin/geosun_3dgs_train.exe') -PathType Leaf)) { throw "Not a trainer package: $Trainer" }
@@ -63,7 +64,7 @@ Test-Package $Trainer $train 'Trainer'
 # The training config must match the commit of the paired preprocess package.
 # cmd redirection keeps the blob bytes; PowerShell would re-decode them.
 function Save-Committed([string]$Path, [string]$Destination) {
-    & cmd /c "git -C `"$PSScriptRoot`" show `"$($pre.revision):$Path`" > `"$Destination`""
+    & cmd /c "git -C `"$projectRoot`" show `"$($pre.revision):$Path`" > `"$Destination`""
     if ($LASTEXITCODE) { throw "GeosunPre commit $($pre.revision) has no $Path." }
 }
 $scratch = Join-Path ([IO.Path]::GetTempPath()) "geosun-bundle-$PID.json"
@@ -77,7 +78,7 @@ if ($committedConfig -ne $packagedConfig) {
 }
 
 if (-not $Output) {
-    $Output = Join-Path $PSScriptRoot "packages\Geosun-$($pre.version)-$($pre.revision)-$($pre.models.hardware_compatibility)-trainer-$($train.revision)-exe"
+    $Output = Join-Path $projectRoot "packages\Geosun-$($pre.version)-$($pre.revision)-$($pre.models.hardware_compatibility)-trainer-$($train.revision)-exe"
 }
 $destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output).TrimEnd([char[]]'\/')
 $pending = "$destination.pending"
@@ -86,20 +87,20 @@ foreach ($path in @($destination, $pending, $archive, "$archive.pending", "$arch
     if (Test-Path -LiteralPath $path) { throw "Choose a new -Output. Already exists: $path" }
 }
 if (-not $Image) {
-    $Image = @((Join-Path $PSScriptRoot 'packages\onnx-bundle-v1\images\A.jpg'),
-        (Join-Path $PSScriptRoot '.cache\model-prepare\source\LoMa-8fb59c458f2a2ef44314f462467b229c27786bf0\assets\0015_A.jpg')) |
+    $Image = @((Join-Path $projectRoot 'packages\onnx-bundle-v1\images\A.jpg'),
+        (Join-Path $projectRoot '.cache\model-prepare\source\LoMa-8fb59c458f2a2ef44314f462467b229c27786bf0\assets\0015_A.jpg')) |
         Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 }
 if (-not $Image -or -not (Test-Path -LiteralPath $Image -PathType Leaf)) { throw 'Specify -Image with a real photograph for model verification.' }
-$launcher = Join-Path $PSScriptRoot 'build\ninja\bin\geosun.exe'
-if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw 'Build geosun.exe with build.ps1 before packaging.' }
+$launcher = Join-Path $projectRoot 'build\ninja\bin\geosun.exe'
+if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw 'Build geosun.exe with package.ps1 before assembling the bundle.' }
 
 New-Item -ItemType Directory -Path $pending | Out-Null
 Copy-Item -LiteralPath $Preprocess -Destination (Join-Path $pending 'preprocess') -Recurse
 Copy-Item -LiteralPath $Trainer -Destination (Join-Path $pending 'trainer') -Recurse
 $utf8 = [Text.UTF8Encoding]::new($false)
 Copy-Item -LiteralPath $launcher -Destination (Join-Path $pending 'geosun.exe')
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'bundle/README.md') -Destination (Join-Path $pending 'README.md')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'bundle/README.md') -Destination (Join-Path $pending 'README.md')
 $record = [ordered]@{
     preprocess = [ordered]@{
         version = $pre.version; revision = $pre.revision

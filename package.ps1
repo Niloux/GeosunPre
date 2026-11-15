@@ -1,24 +1,52 @@
 [CmdletBinding()]
 param(
-    [string]$Models = (Join-Path $PSScriptRoot 'models'),
+    [string]$Models,
     [string]$Output,
-    [string]$Image
+    [string]$Image,
+    [string]$Preprocess,
+    [string]$Trainer
 )
 $ErrorActionPreference = 'Stop'
+$tools = Join-Path $PSScriptRoot 'tools\windows'
+if ($Preprocess -or $Trainer) {
+    if (-not ($Preprocess -and $Trainer) -or $Models) {
+        throw 'Bundle packaging requires both -Preprocess and -Trainer, without -Models.'
+    }
+    & (Join-Path $tools 'build.ps1') | Out-Host
+    & (Join-Path $tools 'package-bundle.ps1') -Preprocess $Preprocess -Trainer $Trainer -Output $Output -Image $Image
+    return
+}
+& git -C $PSScriptRoot diff --quiet HEAD --
+if ($LASTEXITCODE -eq 1) { throw 'Commit your changes and rerun package.ps1.' }
+if ($LASTEXITCODE) { throw 'Cannot verify the source revision for delivery.' }
+& (Join-Path $tools 'build.ps1') | Out-Host
 $program = Join-Path $PSScriptRoot 'build\ninja\bin\geosunpre.exe'
-if (-not (Test-Path -LiteralPath $program)) { throw 'Run build.ps1 first.' }
-$Models = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Models).TrimEnd([char[]]'\/')
-$manifestPath = Join-Path $Models 'manifest.json'
-if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Model package has no manifest: $Models" }
-$manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
-$hardware = if ($manifest.hardware_compatibility) { $manifest.hardware_compatibility } else { 'none' }
 $infoJson = & $program info
 if ($LASTEXITCODE) { throw 'geosunpre.exe info failed.' }
 $info = ($infoJson -join "`n") | ConvertFrom-Json
 # A delivery must be reproducible from a commit.
 if ($info.revision -like '*-dirty' -or $info.revision -eq 'unknown') {
-    throw "Executable was built from uncommitted sources ($($info.revision)). Commit, run build.ps1, then package."
+    throw "Executable was built from uncommitted sources ($($info.revision)). Commit your changes and rerun package.ps1."
 }
+if (-not $Models) {
+    $localModels = Join-Path $PSScriptRoot 'models'
+    $localManifest = Join-Path $localModels 'manifest.json'
+    if (-not (Test-Path -LiteralPath $localManifest -PathType Leaf)) {
+        throw 'Run .\run.ps1 prepare-models [path-to-sam3.pt] first so delivery can reuse the ONNX graphs.'
+    }
+    # Keep a separate delivery model directory for each set of local models.
+    $key = (Get-FileHash -LiteralPath $localManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+    $Models = Join-Path $PSScriptRoot ".cache\delivery-models\$key"
+    if (-not (Test-Path -LiteralPath (Join-Path $Models 'manifest.json') -PathType Leaf)) {
+        & (Join-Path $tools 'prepare-models.ps1') -Models $Models -OnnxFrom $localModels -HardwareCompatibility ampere_plus
+    }
+}
+$Models = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Models).TrimEnd([char[]]'\/')
+$manifestPath = Join-Path $Models 'manifest.json'
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Model package has no manifest: $Models" }
+$manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json
+$hardware = $manifest.hardware_compatibility
+if ($hardware -ne 'ampere_plus') { throw "Delivery requires ampere_plus models: $Models" }
 if (-not $Output) {
     $Output = Join-Path $PSScriptRoot "packages\GeosunPre-$($info.version)-$($info.revision)-$hardware"
 }

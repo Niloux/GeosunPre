@@ -1123,7 +1123,7 @@ void ResolveSupervisionModels(SupervisionOptions& options, const fs::path& packa
   if (!ReadJson(options.geometry_models / "manifest.json").at("models").contains("geometry"))
     throw std::runtime_error(
         "MoGe supervision needs the geometry engine: " + options.geometry_models.u8string() +
-        "; prepare it with prepare-models.ps1, pass --supervision-models, or use "
+        "; prepare it with run.ps1 prepare-models, pass --supervision-models, or use "
         "--supervision-source las");
 }
 Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const fs::path& masks_dir,

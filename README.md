@@ -4,23 +4,18 @@
 
 ## 开始使用
 
-在 Windows x64 上安装 Visual Studio 2022 C++ 桌面工具链及 CMake 工具、Windows SDK、CUDA Toolkit 12.8、CMake 3.24 以上，然后在项目根目录的普通 PowerShell 中执行：
+在 Windows x64 上安装 Visual Studio 2022 C++ 桌面工具链及 CMake 工具、Windows SDK、CUDA Toolkit 12.8、CMake 3.24 以上。首次使用时在项目根目录准备本机模型（已有 `models/` 可跳过）：
 
 ```powershell
-.\build.ps1
-.\prepare-models.ps1
-.\run.ps1 run --input "D:/数据/场景" --output "D:/成果/场景"
+.\run.ps1 prepare-models sam3.pt
 ```
 
-这就是完整的默认流程。构建始终使用当前源码；GPU 预处理、特征颜色缓存、鱼眼 PnP、解析 BA 导数和迭代 Schur 优化均默认启用。
-
-| 步骤 | 默认行为 |
+| 用途 | 命令 |
 | --- | --- |
-| `build.ps1` | 使用 Ninja 编译 Release 程序到 `build/ninja/bin/geosunpre.exe`，自动应用 Ceres Schur 回代修复 |
-| `prepare-models.ps1` | 为 GPU 0 准备 `models/`（含 SAM3 grounding，首次需 `-Sam3 sam3.pt`），匹配器默认 FP16，检测器支持动态宽高 |
-| `run.ps1 run` | 使用上述程序和 `models/`，完成重建、LAS 配准、卷帘快门校正、独立稀疏点清理及 COLMAP/PLY、深度和法向监督导出 |
+| 本地调试 | `.\run.ps1 run --input "D:/数据/场景" --output "D:/成果/场景"`，自动增量编译并使用本机模型 |
+| 发给别人 | `.\package.ps1`，提交源码后执行，自动编译并打包跨显卡模型 |
 
-构建统一使用单配置 Ninja Release。脚本自动加载 x64 MSVC 环境，优先使用 PATH 中的 Ninja，否则使用 Visual Studio 自带的 Ninja。首次构建下载固定依赖到 `build/ninja/_deps/` 并编译，此后复用缓存。日常构建只编译变化影响到的文件，CMake 文件变化由 Ninja 自动重新配置；修改 preset 后自动重新配置，也可用 `build.ps1 -Configure` 显式重新配置，`-Jobs` 控制并行数（默认 8）。构建版本与时间单独生成，不会使全部源码因时间变化而重编。
+构建使用 Ninja Release，首次下载固定依赖到 `build/ninja/_deps/`，之后复用缓存。需要单独调整并行数或强制重新配置时，可调用 `tools/windows/build.ps1` 的 `-Jobs` 或 `-Configure`。
 
 首次准备模型下载转换工具和固定权重到 `.cache/model-prepare/`，需要联网及数 GB 下载空间。此后复用缓存。模型准备使用独立 Python 环境，运行程序与独立运行包使用 C++/CUDA/TensorRT。
 
@@ -113,7 +108,7 @@ cleanup 主要去除视觉稀疏模型中重投影不一致、视差不足、深
 
 默认流程的最终所选模型在 `cache/cleaned.bin`，配准模型保留在 `cache/aligned.bin`，卷帘校正阶段的所选模型在 `cache/shutter.bin`。独立 `cleanup` 的新交付在其 `--output`，所选模型为 `cleaned.bin`。这些目录可用 `export` 再导出，不作为 `run` 的阶段恢复目录。程序更新后使用新工作目录。
 
-`run.ps1` 固定启动 `build/ninja/bin/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。重新编译只需执行 `build.ps1`。
+`run.ps1` 增量编译后启动 `build/ninja/bin/geosunpre.exe`，启动日志和 `info` 显示程序路径、构建版本及时间。
 
 ## 模型与工作目录
 
@@ -136,31 +131,22 @@ models/
 
 ## 打包部署
 
-交付包面向任意算力 ≥ 8.0 的 NVIDIA GPU：程序编译 sm_80/86/89/120 机器码及 compute_80 PTX，模型使用 `ampere_plus` 引擎。先准备通用模型，提交源码后编译并打包：
+交付包面向算力 ≥ 8.0 的 NVIDIA GPU。提交源码后运行：
 
 ```powershell
-.\prepare-models.ps1 -Models models-ampere-plus-blocked -OnnxFrom packages/onnx-bundle-v1 -HardwareCompatibility ampere_plus
-.\build.ps1
-.\package.ps1 -Models models-ampere-plus-blocked
+.\package.ps1
 ```
 
-`package.ps1` 默认读取 `models/`，拒绝含未提交改动的程序，输出 `packages/GeosunPre-版本-提交-引擎级别/` 目录。包内含程序、运行库、模型引擎与 TensorRT 运行库、用户文档（输入、输出、缓存）、许可证和记录全部文件 SHA256 的 `package.json`。打包后用包内程序执行五模型检查并回读文件哈希，通过后发布。支持 `-Models`、`-Output`、`-Image`；输出目录须不存在。
+`package.ps1` 自动增量编译，并从本机 `models/` 的 ONNX 首次生成 `ampere_plus` 引擎，之后按本机模型清单复用缓存。也可以用 `-Models` 指定已准备好的兼容模型。通过五模型检查和文件哈希回读后，输出 `packages/GeosunPre-版本-提交-ampere_plus/`。可用 `-Output` 指定一个新目录，或用 `-Image` 指定用于验证的真实照片。
 
 独立部署时，将整个包目录复制到目标 Windows 机器，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
 
 预处理和训练作为整体交付时，训练配置以 `configs/trainer.json` 为准。提交后在同级 LFS 仓库执行 `scripts\package-windows-trainer.cmd`，它默认读取这份配置并记录当前 GeosunPre 提交；再组装整体包：
 
 ```powershell
-.\package-bundle.ps1 -Preprocess packages/GeosunPre-版本-提交-引擎级别 -Trainer ..\LichtFeld-Studio\build-delivery\Geosun-3DGS-Trainer-sm80-时间
+.\package.ps1 -Preprocess packages/GeosunPre-版本-提交-ampere_plus -Trainer ..\LichtFeld-Studio\build-delivery\Geosun-3DGS-Trainer-sm80-时间
 ```
 
-`package-bundle.ps1` 原样复制两个子包到 `preprocess/`、`trainer/`，使用 `build.ps1` 构建的 `geosun.exe` 和当前的 `bundle/README.md`。组装前核对两个子包全部文件哈希、两者均来自提交、训练器配对的 GeosunPre 提交及其配置与该提交一致；组装后回读，执行启动器、五模型和训练器检查，输出 `packages/Geosun-…-trainer-提交-exe/` 及同名 `.zip`、`.zip.sha256`。整体包用法见 [bundle/README.md](bundle/README.md)。
-
-发给使用不同显卡的人时，用已有的 ONNX 构建兼容引擎并打出对应的预处理子包。
-
-```powershell
-.\prepare-models.ps1 -Models build/models-ampere-plus -OnnxFrom models -HardwareCompatibility ampere_plus
-.\package.ps1 -Models build/models-ampere-plus
-```
+`package.ps1` 在整包模式下编译启动器，原样复制两个子包到 `preprocess/` 和 `trainer/`。脚本核对文件哈希、提交和训练配置，并检查启动器、五模型和训练器，最后输出交付目录、ZIP 和 SHA256 文件。整体包用法见 [bundle/README.md](bundle/README.md)。
 
 构建依赖使用固定版本；Ceres 使用轻量日志和 Eigen 稀疏求解，OpenCV 只构建图像处理所需模块。Ceres 回代补丁由 CMake 自动应用，清空 `build/` 后重新构建同样生效。

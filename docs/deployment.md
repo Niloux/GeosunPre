@@ -2,7 +2,7 @@
 
 Windows x64，需算力 ≥ 8.0 的 NVIDIA GPU（RTX 30/40/50、RTX A 系列等），建议驱动 R570 及以上（开发机验证驱动 610.88）。`package.json` 记录版本、提交、引擎级别和全部文件 SHA256。无需安装 Python、CUDA Toolkit、Visual Studio 或联网。
 
-运行包由项目的 `build.ps1` 编译程序，再由 `package.ps1` 收集程序、模型、运行库和文档。默认准备流程生成 FP16 匹配引擎，并保留关键层的 FP32 计算。将整个运行包复制到目标机器，在包目录打开 PowerShell：
+项目的 `package.ps1` 会编译程序，准备或复用跨显卡模型，并收集所需运行库和文档。默认模型使用 FP16 匹配引擎，并保留关键层的 FP32 计算。将整个运行包复制到目标机器，在包目录打开 PowerShell：
 
 ```powershell
 .\geosunpre.exe info

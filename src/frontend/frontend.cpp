@@ -284,7 +284,7 @@ int GroundingSize(const Json& manifest) {
           Json{"scores", "boxes", "masks", "semantic"})
     throw std::runtime_error(
         "Masks need SAM3 grounding of person/shadow/robot/sky; prepare the models with "
-        "prepare-models.ps1");
+        "run.ps1 prepare-models");
   return manifest.at("grounding_size");
 }
 struct GroundingResult {
