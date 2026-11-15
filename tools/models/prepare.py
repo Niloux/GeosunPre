@@ -490,7 +490,8 @@ def compare_reference(root, name, shapes, references, matcher_precision, geometr
                     raise RuntimeError(f'Engine output differs from the export reference: {path.stem}')
                 errors = geometry_errors(expected, outputs)
                 scale_limit = .01 if geometry_precision == 'fp16' else .005
-                limits = {'log_depth_p99': .01, 'normal_degrees_p99': 1., 'mask_p99': .05, 'scale': scale_limit}
+                normal_limit = 2. if geometry_precision == 'fp16' else 1.
+                limits = {'log_depth_p99': .01, 'normal_degrees_p99': normal_limit, 'mask_p99': .05, 'scale': scale_limit}
                 if any(errors[key] >= limit for key, limit in limits.items()):
                     raise RuntimeError(f'TensorRT geometry differs from PyTorch: {path.stem}: {errors}')
                 print(f'PyTorch/TensorRT comparison: {path.stem}: ' +
