@@ -296,7 +296,7 @@ fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
   return target;
 }
 }  // namespace
-void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::path& work,
+Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
                   const SupervisionOptions& supervision_options, bool crop) {
   // A rolling-shutter corrected model describes photos at its reference poses; they are delivered
@@ -368,8 +368,7 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
       throw std::runtime_error("Output exists with different inputs; choose a new output");
     if (surfel_cache)
       surfel_cache->Finish();
-    CheckBundle(output);
-    return;
+    return CheckBundle(output);
   }
   // Delivery copies the original files, so they must still be the ones reconstructed.
   for (const auto& e : scene.images)
@@ -472,9 +471,10 @@ void ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
                                    {"size_bytes", fs::file_size(pending / "rolling_shutter.json")}};
   WriteJson(pending / "manifest.json", manifest);
   timed("reports");
-  CheckBundle(pending);
+  auto checked = CheckBundle(pending);
   timed("readback");
   fs::rename(pending, output);
+  return checked;
 }
 Json CheckBundle(const fs::path& output) {
   const auto manifest = ReadJson(output / "manifest.json");

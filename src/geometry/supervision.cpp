@@ -224,6 +224,11 @@ class LasPointCache {
   cudaStream_t StreamHandle() const { return compute_.value; }
   uint64_t Count() const { return count_; }
   uint64_t Excluded() const { return excluded_; }
+  void ProjectNearest(const Projection* cameras, const float3* rays, float* nearest, int width,
+                      int height, size_t images) {
+    Project(cameras, rays, nearest, nullptr, width, height, images, false);
+    ++batches_;
+  }
   void Project(const Projection* cameras, const float3* rays, float* nearest, Blend* blends,
                int width, int height, size_t images) {
     for (const bool accumulate : {false, true})
@@ -492,6 +497,7 @@ Projection MakeProjection(const LasHeader& header, const Reconstruction& model,
       p.rotation[r * 3 + c] = rotation(r, c);
   }
   std::copy(camera.params.begin(), camera.params.end(), p.params);
+  const double cos_max = std::cos(MaxTheta) - 1e-6;
   if (motion) {
     const Eigen::Vector3d moved = motion->readout[cid] * motion->velocity[id];
     for (int k = 0; k < 3; ++k) {
@@ -500,6 +506,26 @@ Projection MakeProjection(const LasHeader& header, const Reconstruction& model,
     }
     p.rolling = 1;
     p.axis = motion->axis;
+    const double t2 = (Pi / 2) * (Pi / 2);
+    const double max_radial = (Pi / 2) * (1 + std::abs(camera.params[4]) * t2 +
+                                          std::abs(camera.params[5]) * t2 * t2 +
+                                          std::abs(camera.params[6]) * t2 * t2 * t2 +
+                                          std::abs(camera.params[7]) * t2 * t2 * t2 * t2);
+    const double axis_size = motion->axis ? camera.height : camera.width;
+    const double axis_focal = std::abs(camera.params[motion->axis ? 1 : 0]);
+    const double axis_center = camera.params[motion->axis ? 3 : 2];
+    const double max_s = (std::abs(axis_center - .5 * axis_size) + axis_focal * max_radial) /
+                             std::max(1., axis_size) +
+                         .5;
+    const double shift = max_s * moved.norm();
+    const double rot = max_s * motion->rotation[id].norm();
+    p.max_q2 = std::pow(MaxDepth + shift + 1e-4, 2);
+    p.min_qz_slope = std::max(0., cos_max - rot);
+    p.qz_slack = (1. + cos_max + rot) * shift + 1e-4;
+  } else {
+    p.max_q2 = (MaxDepth + 1e-4) * (MaxDepth + 1e-4);
+    p.min_qz_slope = cos_max;
+    p.qz_slack = 0;
   }
   return p;
 }
@@ -526,8 +552,8 @@ void ProjectLasDepths(LasSurfelCache& cache, const LasHeader& header, const Reco
       continue;
     const auto camera = MapCamera(model.cameras[cid], max_size);
     const int w = camera.width, h = camera.height, size = w * h;
-    const size_t batch = std::min<size_t>(
-        32, std::max<size_t>(1, DepthBudget / (size * (sizeof(float) + sizeof(Blend)))));
+    const size_t batch =
+        std::min<size_t>(160, std::max<size_t>(1, DepthBudget / (size * sizeof(float))));
     std::vector<float3> ray_host(size);
     const double valid_radius = camera.Radius();
     for (int y = 0; y < h; ++y)
@@ -538,9 +564,8 @@ void ProjectLasDepths(LasSurfelCache& cache, const LasHeader& header, const Reco
                                        ? camera.Ray({x + .5, y + .5}) : Eigen::Vector3d::Zero();
         ray_host[y * w + x] = make_float3(float(ray.x()), float(ray.y()), float(ray.z()));
       }
-    DeviceBuffer nearest(batch * size * sizeof(float)), blends(batch * size * sizeof(Blend)),
-        cameras(batch * sizeof(Projection)), rays(size * sizeof(float3)),
-        depth(size * sizeof(float)), codes(size * sizeof(unsigned));
+    DeviceBuffer nearest(batch * size * sizeof(float)), cameras(batch * sizeof(Projection)),
+        rays(size * sizeof(float3));
     CudaCheck(
         cudaMemcpyAsync(rays.data, ray_host.data(), rays.bytes, cudaMemcpyHostToDevice, stream));
     for (size_t first = 0; first < images.size(); first += batch) {
@@ -551,18 +576,15 @@ void ProjectLasDepths(LasSurfelCache& cache, const LasHeader& header, const Reco
       CudaCheck(cudaMemcpyAsync(cameras.data, projection.data(), count * sizeof(Projection),
                                 cudaMemcpyHostToDevice, stream));
       CudaCheck(cudaMemsetAsync(nearest.data, 0x7f, count * size * sizeof(float), stream));
-      CudaCheck(cudaMemsetAsync(blends.data, 0, count * size * sizeof(Blend), stream));
-      points.Project(static_cast<const Projection*>(cameras.data),
-                     static_cast<const float3*>(rays.data), static_cast<float*>(nearest.data),
-                     static_cast<Blend*>(blends.data), w, h, count);
-      CudaCheck(cudaStreamSynchronize(stream));
+      points.ProjectNearest(static_cast<const Projection*>(cameras.data),
+                            static_cast<const float3*>(rays.data),
+                            static_cast<float*>(nearest.data), w, h, count);
+      ResolveNearest(static_cast<float*>(nearest.data), count * size_t(size), stream);
       for (size_t j = 0; j < count; ++j) {
-        ResolveDepth(static_cast<const Blend*>(blends.data) + j * size,
-                     static_cast<float*>(depth.data), static_cast<unsigned*>(codes.data), size,
-                     stream);
         cv::Mat result(h, w, CV_32FC1);
-        CudaCheck(cudaMemcpyAsync(result.data, depth.data, depth.bytes, cudaMemcpyDeviceToHost,
-                                  stream));
+        CudaCheck(cudaMemcpyAsync(result.data,
+                                  static_cast<const float*>(nearest.data) + j * size_t(size),
+                                  size_t(size) * sizeof(float), cudaMemcpyDeviceToHost, stream));
         CudaCheck(cudaStreamSynchronize(stream));
         consume(images[first + j], std::move(result));
       }

@@ -4,7 +4,9 @@
 #include <vector>
 
 namespace geosun::supervision_gpu {
-constexpr double MinIncidence = .3;
+constexpr double MinIncidence = .3, MaxDepth = 65.535;
+// Half of FieldOfViewDegrees in radians, kept as the published constant.
+constexpr double MaxTheta = 1.396263401595464;
 // Foreground occlusion margin covers the measured spread of LAS silhouettes.
 constexpr float OcclusionSpread = .01f;
 constexpr int MaxOcclusionMargin = 24;
@@ -25,8 +27,11 @@ struct Surfel {
 };
 // motion holds the readout rotation and the readout translation (readout time times velocity)
 // of a rolling-shutter image, both in the reference camera frame; see ShutterMotion.
+// max_q2, min_qz_slope and qz_slack bound points before rolling-shutter iteration with no
+// false negatives.
 struct Projection {
-  double rotation[9], translation[3], params[8], scales[3], motion[6];
+  double rotation[9], translation[3], params[8], scales[3], motion[6], max_q2, min_qz_slope,
+      qz_slack;
   int rolling, axis;
 };
 // Per-pixel sums of the surfels within BlendBand of the nearest one: weights, weighted ray
@@ -45,8 +50,7 @@ std::vector<Surfel> SlabSurfels(const std::vector<int3>& points, size_t own, int
 void Project(const Surfel* points, size_t count, size_t images, const Projection* cameras,
              const float3* rays, float* nearest, Blend* blends, int width, int height,
              bool accumulate, cudaStream_t stream);
-void ResolveDepth(const Blend* blends, float* depth, unsigned* codes, int size,
-                  cudaStream_t stream);
+void ResolveNearest(float* depths, size_t count, cudaStream_t stream);
 void EncodeMaps(const Blend* blends, int w, int h, int boundary, float focal, const uint8_t* keep,
                 const float3* rays, float* raw_depth, unsigned* codes, float* filtered,
                 float* scratch, uint8_t* limit, uint8_t* dilated, float* seeds, uint8_t* edge,

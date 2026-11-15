@@ -18,7 +18,7 @@ cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用
 
 `cache/features/索引.bin`：字符串标记 `GEOSUN_FEATURES`；uint32 image、dimension；uint64 N（32–3072）；N 条 float32 `(x,y,nx,ny,score)`；N×256 个 float32 描述子；256 个 float32 检索向量（描述子均值的 L2 归一化）；N 条 uint8 RGB。颜色取原图对应像素，避免 SfM 末尾重复解码照片。
 
-`cache/matches/a_b.bin`：标记 `GEOSUN_MATCHES`；uint32 a、b（a<b）；uint64 M；M 条 `(uint32 feature_a,feature_b,float32 score)`。候选在 pairs.json。每幅图另外选择导航位置 5 m 内、曝光时间相隔超过 10 s 的候选作为回访候选，排除反向运动（同镜头且导航速度夹角超过 120°、两者速率均超过 0.1 m/s），按距离最近排序并对同镜头候选做时空去重（相隔不足 2 s 或导航位置相距不足 1 m），每图最多保留 6 个；L/R 不作同步假设，候选仍须通过描述子匹配和鱼眼几何验证。匹配报告的 navigation_added_pairs 记录本次新增的导航候选数。初始近邻在曝光排序编号 `±8` 窗口内连接（编号差超过 4 时按步长 2 采样），并限制导航位置相距不超过 15 m 且不反向运动；初始检索从曝光窗口外、导航位置不超过 20 m 且不反向运动的候选中按描述子相似度排序，从前 8 个候选选最多 3 个并排除同镜头相隔不足 2 s 的重复候选，L/R 不作同步假设。补匹配由 `sfm_repair_rounds` 控制，取值 `0`（默认）、`1` 或 `2`；启用时保持已有边和特征身份，针对未注册或未达到每图 32 个观测、8 个覆盖格子的图像在 `±48` 近邻窗及 `[12,48)`、`[48,160)`、`[160,N)` 三段检索（每段前 12 个）扩展密集边。
+`cache/matches/a_b.bin`：标记 `GEOSUN_MATCHES`；uint32 a、b（a<b）；uint64 M；M 条 `(uint32 feature_a,feature_b,float32 score)`。候选在 pairs.json。局部近邻按 L/R 各自曝光序建立：同镜头步长 `{1, 2, 3, 4, 5, 8}` 且导航位置相距不超过 15 m（短窗保留反向退步边）；异镜头取曝光时间差 `|Δt| <= 2.5 s`、15 m 内的最近至多 4 帧，不假设同步。导航回访候选取曝光时间相隔超过 10 s 的候选（同镜头 5 m 内排除反向运动，至多 5 个；异镜头 4 m 内至多 2 个，合计最多 6 个），同/异镜头池内先按相隔 `>= 12 s` 轨迹通次各取最近 1 帧，再按相隔 `>= 2.5 s` 且距已选 ≥ 1 m 补足，避免单一通次占满配额；反向运动定义为同镜头且导航速度夹角超过 120°、两者速率均超过 0.1 m/s。匹配报告的 `navigation_added_pairs` 记录本次新增的导航候选数。初始外观检索在局部窗外、导航位置不超过 20 m 且 `|Δt| > 10 s` 时过滤反向运动的候选中分 `|Δt| > 30 s` 与 `<= 30 s` 两段排序，各取前 8 按同镜头 `< 2 s` 去重（先取至多 2 个远距回环、再从中距补足至多 3 个，不足则由远距补齐）。补匹配由 `sfm_repair_rounds` 控制，取值 `0`（默认）、`1` 或 `2`；启用时保持已有边和特征身份，针对未注册或未达到每图 32 个观测、8 个覆盖格子的图像在同镜头 `±24` 步、异镜头 `|Δt| <= 12 s`（至多 12 个）及 `[6,24)`、`[24,80)`、`[80,N)` 三段检索（每段前 12 个）扩展密集边。
 
 `cache/{visual,aligned}.bin`：标记 `GEOSUN_RECONSTRUCTION`；相机 JSON 字符串；uint32 gauge_image、scale_image；float64 gauge_baseline；uint64 图像数、点数。图像为 uint32 camera、uint8 registered、7 个 float64 `qx qy qz qw tx ty tz`、uint64 N、N 对 float64 像素坐标。点为 3 个 float64 XYZ、3 个 uint8 RGB、float64 error、uint64 轨迹长度及 `(uint32 image,feature)` 列表。点引用由轨迹重建；空轨迹保留内部编号，导出时省略。
 
@@ -30,7 +30,7 @@ cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用
 
 默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。align 产物为 `cache/aligned.bin` 和 `cache/alignment.json`，后续处理不改写它们。
 
-配置 `rolling_shutter` 默认为 true，在 align 与 cleanup 之间执行 shutter 阶段，写入 `cache/shutter.bin`、`cache/shutter.json` 和中间结果 `cache/shutter_result.json`。shutter.bin 保存所选模型：通过验收时为换算到参考位姿的候选，否则为上一步模型。shutter.json 在报告之外保存 `motion`：`readout_axis`（rows 或 columns）、读出比例约定、相机点公式、两镜头 `readout_s`，以及每幅已注册照片的 `rotation_rad`（参考相机系、整帧读出）和 `velocity_m_s`（参考相机系）。配置为 false 时不生成这些缓存，最终报告记录 shutter.enabled=false。
+配置 `rolling_shutter` 默认为 true，在 align 与 cleanup 之间执行 shutter 阶段，写入 `cache/shutter.bin`、`cache/shutter.json` 和中间结果 `cache/shutter_result.json`。shutter.bin 保存所选模型：通过验收时为换算到参考位姿的候选，否则为上一步模型。shutter.json 在报告之外保存 `motion`：`readout_axis`（rows 或 columns）、读出比例约定、相机点公式、两镜头 `readout_s`，以及每幅已注册照片的 `rotation_rad`（参考相机系、整帧读出）和 `velocity_m_s`（参考相机系）；报告另含两轴轻量预筛 `axis_screen` 与 `axis_attempts`（`evaluated: "full" | "screen"`）。配置为 false 时不生成这些缓存，最终报告记录 shutter.enabled=false。
 
 cleanup 阶段默认对上一步所选模型独立清理与验收，写入 `cache/cleaned.bin`、`cache/cleanup.json` 和最终 `result.json`。可靠 LAS 平面支撑少于 200 条时不采用清理；清理候选未通过时同样保留清理前模型，cleaned.bin 保存所选结果，cleanup.used=false 及 reason 记录原因。清理只处理稀疏点及轨迹，相机内参和位姿保持不变。cleanup.source_model 记录输入缓存（aligned 或 shutter），quality 与导航误差按最终所选模型计算。
 

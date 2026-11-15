@@ -1,6 +1,7 @@
 #include "sfm/shutter.h"
 #include "frontend/frontend.h"
 #include "geometry/supervision.h"
+#include <optional>
 #include <set>
 
 namespace geosun {
@@ -176,7 +177,79 @@ struct ShutterInputs {
   std::vector<PlaneConstraint> planes, training_planes;
   std::set<uint64_t> training;
   std::vector<uint64_t> validation;
+  std::vector<std::array<uint32_t, 2>> frames;
 };
+struct AxisScreen {
+  int axis = 1;
+  bool consistent = false;
+  std::array<double, 2> readout{};
+  std::vector<double> explained;
+  double cost_drop_ratio = 0;
+  size_t tracks = 0;
+  double seconds = 0;
+  Json ToJson() const {
+    return {{"readout_axis", axis ? "rows" : "columns"},
+            {"consistent", consistent},
+            {"readout_s", readout},
+            {"explained_rotation", explained},
+            {"cost_drop_ratio", cost_drop_ratio},
+            {"tracks", tracks},
+            {"seconds", seconds}};
+  }
+};
+std::set<uint64_t> SelectScreenTracks(const Reconstruction& source,
+                                      const std::set<uint64_t>& training) {
+  std::vector<uint64_t> pool;
+  pool.reserve(training.size());
+  for (uint64_t id : training)
+    if (source.points[id].track.size() >= 3)
+      pool.push_back(id);
+  if (pool.empty())
+    pool.assign(training.begin(), training.end());
+  const size_t stride = std::max<size_t>(1, pool.size() / 8000);
+  std::set<uint64_t> selected;
+  std::vector<size_t> observations(source.images.size(), 0);
+  auto add = [&](uint64_t id) {
+    if (!selected.insert(id).second)
+      return;
+    for (const auto& o : source.points[id].track)
+      ++observations[o.image];
+  };
+  for (size_t i = 0; i < pool.size(); i += stride)
+    add(pool[i]);
+  for (uint64_t id : training)
+    for (const auto& o : source.points[id].track)
+      if (observations[o.image] < 24) {
+        add(id);
+        break;
+      }
+  return selected;
+}
+AxisScreen ScreenAlongAxis(const Scene& scene, const Reconstruction& source,
+                           const ShutterInputs& inputs, const std::set<uint64_t>& screen_tracks,
+                           const std::vector<PlaneConstraint>& screen_planes, int axis,
+                           int ba_workers) {
+  const auto started = Clock::now();
+  AxisScreen screen;
+  screen.axis = axis;
+  screen.tracks = screen_tracks.size();
+  auto model = source;
+  ShutterMotion motion;
+  motion.axis = axis;
+  motion.rotation.assign(source.images.size(), Eigen::Vector3d::Zero());
+  motion.velocity = inputs.velocity;
+  const auto opt = Optimize(model, scene.cameras, "fixed", ba_workers, 3, {}, screen_planes,
+                            inputs.navigation, screen_tracks, &motion, inputs.frames);
+  const auto consistency = ReadoutConsistency(scene, model, motion, screen.consistent);
+  screen.readout = motion.readout;
+  for (const auto& lens : consistency)
+    screen.explained.push_back(lens.at("explained_rotation").get<double>());
+  const double initial_cost = opt.at("initial_cost").get<double>(),
+               final_cost = opt.at("final_cost").get<double>();
+  screen.cost_drop_ratio = initial_cost > 0 ? (initial_cost - final_cost) / initial_cost : 0;
+  screen.seconds = Seconds(started);
+  return screen;
+}
 ShutterCorrection CorrectAlongAxis(const Scene& scene, const Reconstruction& source,
                                    const ShutterInputs& inputs, int axis, int workers,
                                    const AlignmentLimits& limits, int ba_workers) {
@@ -197,7 +270,7 @@ ShutterCorrection CorrectAlongAxis(const Scene& scene, const Reconstruction& sou
   // Synchronous L/R reference (middle-line) poses are rigid; this is the only BA given the rig.
   report["optimization"] =
       Optimize(model, scene.cameras, "principal", ba_workers, 150, {}, inputs.training_planes,
-               inputs.navigation, inputs.training, &motion, SynchronousFrames(scene));
+               inputs.navigation, inputs.training, &motion, inputs.frames);
   // Held-out reprojection with every camera fixed: the source projection against the
   // rolling-shutter projection, each with its points refit to the same observations.
   auto before = source;
@@ -369,50 +442,86 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
     else
       inputs.training.insert(id);
   }
+  inputs.frames = SynchronousFrames(scene);
   for (const auto& plane : inputs.planes)
     if (inputs.training.count(plane.point)) {
       inputs.training_planes.push_back(plane);
       // Keep the accepted LAS offset; the constraints hold the metric frame, not a new fit.
       inputs.training_planes.back().center = source.points[plane.point].xyz;
     }
-  // Sensors may be stored rotated, so rows and columns are both solved, concurrently since each
-  // works on its own copy of the model. An accepted hypothesis wins over a rejected one;
-  // otherwise the lower held-out median decides.
-  std::array<std::future<ShutterCorrection>, 2> solves;
-  for (const int axis : {1, 0})
-    solves[1 - axis] = std::async(std::launch::async, [&, axis] {
-      return CorrectAlongAxis(scene, source, inputs, axis, workers, limits, ba_workers);
-    });
+  // Screen both readout axes sequentially on a compact multi-view track subset so the full BA runs
+  // uncontended on ba_workers for the winning axis, falling back to the second axis if the first
+  // fails acceptance or screening does not unambiguously separate them.
+  const auto screen_tracks = SelectScreenTracks(source, inputs.training);
+  std::vector<PlaneConstraint> screen_planes;
+  for (const auto& plane : inputs.training_planes)
+    if (screen_tracks.count(plane.point))
+      screen_planes.push_back(plane);
+  const std::array<AxisScreen, 2> screens{
+      ScreenAlongAxis(scene, source, inputs, screen_tracks, screen_planes, 1, ba_workers),
+      ScreenAlongAxis(scene, source, inputs, screen_tracks, screen_planes, 0, ba_workers)};
+  for (const auto& s : screens)
+    Log(std::string("Shutter axis screen ") + (s.axis ? "rows" : "columns") + ": consistent=" +
+        (s.consistent ? "true" : "false") + ", cost_drop=" + std::to_string(s.cost_drop_ratio) +
+        ", seconds=" + std::to_string(s.seconds));
+  const bool prefer_columns = (screens[1].consistent != screens[0].consistent)
+                                  ? screens[1].consistent
+                                  : (screens[1].cost_drop_ratio > screens[0].cost_drop_ratio);
+  const size_t primary_idx = prefer_columns ? 1 : 0, secondary_idx = 1 - primary_idx;
+  std::array<std::optional<ShutterCorrection>, 2> full;
+  full[primary_idx] =
+      CorrectAlongAxis(scene, source, inputs, screens[primary_idx].axis, workers, limits, ba_workers);
+  const bool unambiguous = full[primary_idx]->accepted && screens[primary_idx].consistent &&
+                           !screens[secondary_idx].consistent;
+  if (!unambiguous)
+    full[secondary_idx] = CorrectAlongAxis(scene, source, inputs, screens[secondary_idx].axis,
+                                           workers, limits, ba_workers);
   ShutterCorrection best;
-  Json attempts = Json::array();
-  for (auto& solve : solves) {
-    auto attempt = solve.get();
-    const auto& r = attempt.report;
-    Json explained = Json::array();
-    for (const auto& lens : r.at("readout_consistency"))
-      explained.push_back(lens.at("explained_rotation"));
-    attempts.push_back({{"readout_axis", r.at("readout_axis")},
-                        {"accepted", attempt.accepted},
-                        {"failed_checks", r.at("failed_checks")},
-                        {"readout_s", r.at("readout_s")},
-                        {"explained_rotation", explained},
-                        {"validation_after_px", r.at("validation_after_px")},
-                        {"seconds", r.at("seconds")}});
-    const auto held = [](const ShutterCorrection& c) {
-      const auto& median = c.report.at("validation_after_px").at("median");
-      return median.is_number() ? median.get<double>() : INFINITY;
-    };
-    if (best.report.is_null() || (attempt.accepted && !best.accepted) ||
-        (attempt.accepted == best.accepted && held(attempt) < held(best)))
-      best = std::move(attempt);
+  Json attempts = Json::array(), screen_report = Json::array();
+  const auto held = [](const ShutterCorrection& c) {
+    const auto& median = c.report.at("validation_after_px").at("median");
+    return median.is_number() ? median.get<double>() : INFINITY;
+  };
+  for (size_t idx = 0; idx < 2; ++idx) {
+    const auto& s = screens[idx];
+    screen_report.push_back(s.ToJson());
+    if (full[idx]) {
+      auto& attempt = *full[idx];
+      const auto& r = attempt.report;
+      Json explained = Json::array();
+      for (const auto& lens : r.at("readout_consistency"))
+        explained.push_back(lens.at("explained_rotation"));
+      attempts.push_back({{"readout_axis", r.at("readout_axis")},
+                          {"evaluated", "full"},
+                          {"accepted", attempt.accepted},
+                          {"failed_checks", r.at("failed_checks")},
+                          {"readout_s", r.at("readout_s")},
+                          {"explained_rotation", explained},
+                          {"validation_after_px", r.at("validation_after_px")},
+                          {"seconds", r.at("seconds")}});
+      if (best.report.is_null() || (attempt.accepted && !best.accepted) ||
+          (attempt.accepted == best.accepted && held(attempt) < held(best)))
+        best = std::move(attempt);
+    } else {
+      attempts.push_back({{"readout_axis", s.axis ? "rows" : "columns"},
+                          {"evaluated", "screen"},
+                          {"accepted", false},
+                          {"failed_checks", Json::array({"physical_readout"})},
+                          {"readout_s", s.readout},
+                          {"explained_rotation", s.explained},
+                          {"cost_drop_ratio", s.cost_drop_ratio},
+                          {"seconds", s.seconds}});
+    }
   }
   auto& report = best.report;
   report["method"] = "per-image readout rotation and per-lens readout time with the navigation "
-                     "velocity, jointly with cameras, points and intrinsics, along rows and columns";
+                     "velocity, jointly with cameras, points and intrinsics, screened along rows "
+                     "and columns";
   report["holdout_rule"] = "whole tracks of at least three views with IDs divisible by five";
   report["training_tracks"] = inputs.training.size();
   report["validation_tracks"] = inputs.validation.size();
   report["surface_constraints"] = inputs.planes.size();
+  report["axis_screen"] = screen_report;
   report["axis_attempts"] = attempts;
   report["seconds"] = Seconds(started);
   return best;

@@ -196,11 +196,11 @@ void RecordModels(WorkState& state, const fs::path& root) {
   state.value["models"] = root.u8string();
   state.Save();
 }
-void ExportSelected(const Scene& scene, const fs::path& work, const fs::path& output,
+Json ExportSelected(const Scene& scene, const fs::path& work, const fs::path& output,
                     const Delivery& delivery) {
   const auto result = ReadJson(work / "result.json");
-  ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, delivery.ply,
-               delivery.voxel, result, delivery.supervision, delivery.crop);
+  return ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, delivery.ply,
+                      delivery.voxel, result, delivery.supervision, delivery.crop);
 }
 std::vector<fs::path> ReconstructVisual(const Scene& scene, const fs::path& work,
                                         const fs::path& root, const Json& settings,
@@ -529,7 +529,6 @@ void Export(const Arguments& args) {
     throw std::runtime_error("Output must be separate from input");
   if (Contains(work, output) || Contains(output, work))
     throw std::runtime_error("Output and work directories must be separate");
-  ExportSelected(scene, work, output, delivery);
-  std::cout << CheckBundle(output).dump() << '\n';
+  std::cout << ExportSelected(scene, work, output, delivery).dump() << '\n';
 }
 }  // namespace geosun

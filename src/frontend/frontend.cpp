@@ -18,6 +18,9 @@ fs::path MaskPath(const fs::path& work, uint32_t id) {
   return work / "cache/masks" / (std::to_string(id) + ".png");
 }
 namespace {
+double ExposureDeltaSeconds(const Exposure& a, const Exposure& b) {
+  return (a.week - b.week) * 604800. + a.seconds - b.seconds;
+}
 // A same-lens exposure passed in the opposite travel direction faces the other side: the rig has
 // turned half a circle, so the other lens covers what this one saw. On 生产车间 half of these pairs
 // shared no reconstructed point. Exposures with no clear motion are kept.
@@ -32,37 +35,54 @@ std::vector<uint32_t> NavigationRevisitCandidates(const Scene& scene,
                                                   const std::vector<Eigen::Vector3d>& positions,
                                                   const std::vector<Eigen::Vector3d>& velocities,
                                                   uint32_t image) {
-  constexpr double radius_m = 5., minimum_seconds = 10.;
-  constexpr size_t maximum_candidates = 6;
-  std::vector<std::pair<double, uint32_t>> nearby;
+  constexpr double same_radius_m = 5., cross_radius_m = 4., minimum_seconds = 10.;
+  constexpr size_t maximum_candidates = 6, maximum_cross_candidates = 2;
+  std::vector<std::pair<double, uint32_t>> same_nearby, cross_nearby;
   const auto& exposure = scene.images[image];
   for (uint32_t id = 0; id < scene.images.size(); ++id) {
     const auto& other = scene.images[id];
-    const double seconds = (exposure.week - other.week) * 604800. +
-                           exposure.seconds - other.seconds;
-    if (std::abs(seconds) <= minimum_seconds || FacesAway(scene, velocities, image, id))
+    const double seconds = ExposureDeltaSeconds(exposure, other);
+    if (std::abs(seconds) <= minimum_seconds)
       continue;
     const double squared_distance = (positions[image] - positions[id]).squaredNorm();
-    if (squared_distance <= radius_m * radius_m)
-      nearby.emplace_back(squared_distance, id);
+    if (other.camera == exposure.camera) {
+      if (squared_distance <= same_radius_m * same_radius_m &&
+          !FacesAway(scene, velocities, image, id))
+        same_nearby.emplace_back(squared_distance, id);
+    } else if (squared_distance <= cross_radius_m * cross_radius_m) {
+      cross_nearby.emplace_back(squared_distance, id);
+    }
   }
-  std::sort(nearby.begin(), nearby.end());
+  std::sort(same_nearby.begin(), same_nearby.end());
+  std::sort(cross_nearby.begin(), cross_nearby.end());
   std::vector<uint32_t> candidates;
-  for (const auto& entry : nearby) {
-    const uint32_t id = entry.second;
-    const auto& candidate = scene.images[id];
-    const bool duplicate = std::any_of(candidates.begin(), candidates.end(), [&](uint32_t prev_id) {
-      const auto& prev = scene.images[prev_id];
-      const double dt = (candidate.week - prev.week) * 604800. + candidate.seconds - prev.seconds;
-      return candidate.camera == prev.camera &&
-             (std::abs(dt) < 2. || (positions[id] - positions[prev_id]).squaredNorm() < 1.);
-    });
-    if (duplicate)
-      continue;
-    candidates.push_back(id);
-    if (candidates.size() >= maximum_candidates)
-      break;
-  }
+  auto select_diverse = [&](const std::vector<std::pair<double, uint32_t>>& nearby, size_t cap) {
+    std::vector<uint32_t> chosen;
+    auto pick_pass = [&](double min_dt, bool check_dist) {
+      for (const auto& entry : nearby) {
+        if (chosen.size() >= cap)
+          break;
+        const uint32_t id = entry.second;
+        if (std::find(chosen.begin(), chosen.end(), id) != chosen.end())
+          continue;
+        const auto& candidate = scene.images[id];
+        const bool duplicate = std::any_of(chosen.begin(), chosen.end(), [&](uint32_t prev_id) {
+          const double dt = std::abs(ExposureDeltaSeconds(candidate, scene.images[prev_id]));
+          return dt < min_dt ||
+                 (check_dist && (positions[id] - positions[prev_id]).squaredNorm() < 1.);
+        });
+        if (!duplicate)
+          chosen.push_back(id);
+      }
+    };
+    pick_pass(12., false);
+    pick_pass(2.5, true);
+    candidates.insert(candidates.end(), chosen.begin(), chosen.end());
+  };
+  select_diverse(same_nearby, maximum_candidates - 1);
+  if (candidates.size() < maximum_candidates)
+    select_diverse(cross_nearby,
+                   std::min(maximum_cross_candidates, maximum_candidates - candidates.size()));
   return candidates;
 }
 struct FrontendTiming {
@@ -623,8 +643,9 @@ Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
   return timing.Report(started, &models);
 }
 namespace {
-// Pairs to match: the cached ones, near exposures, navigation revisits and descriptor retrieval
-// over several exposure distances. Repair adds dense edges for the requested images only.
+// Pairs to match: the cached ones, per-lens near exposures, closest cross-lens exposures,
+// navigation revisits and descriptor retrieval over several exposure distances. Repair adds dense
+// edges for the requested images only.
 std::set<std::pair<uint32_t, uint32_t>> CandidatePairs(const Scene& scene, const fs::path& work,
                                                        const std::set<uint32_t>& repair,
                                                        size_t& navigation_added_pairs) {
@@ -632,6 +653,13 @@ std::set<std::pair<uint32_t, uint32_t>> CandidatePairs(const Scene& scene, const
   std::vector<std::array<float, 256>> retrieval;
   for (uint32_t id = 0; id < n; ++id)
     retrieval.push_back(ReadFeatures(FeaturePath(work, id)).retrieval);
+  std::array<std::vector<uint32_t>, 2> lens_images;
+  std::vector<size_t> lens_rank(n, 0);
+  for (uint32_t id = 0; id < n; ++id) {
+    const uint32_t cam = scene.images[id].camera;
+    lens_rank[id] = lens_images.at(cam).size();
+    lens_images.at(cam).push_back(id);
+  }
   std::set<std::pair<uint32_t, uint32_t>> pairs;
   const auto positions = NavigationPositions(scene);
   const auto velocities = NavigationVelocities(scene);
@@ -648,17 +676,37 @@ std::set<std::pair<uint32_t, uint32_t>> CandidatePairs(const Scene& scene, const
   for (uint32_t id = 0; id < n; ++id) {
     if (!repair.empty() && !repair.count(id))
       continue;
-    const uint32_t span = repair.empty() ? 8 : 48;
-    for (uint32_t k = id > span ? id - span : 0; k < std::min(n, id + span + 1); ++k) {
-      const uint32_t distance = id > k ? id - k : k - id;
-      // Keep the closest exposures dense, then spread connections over the remaining window
-      // within a local navigation radius. Repair keeps dense edges for requested images.
-      if (repair.empty() &&
-          ((distance > 4 && distance % 2 != 0) || FacesAway(scene, velocities, id, k) ||
-           (positions[id] - positions[k]).squaredNorm() > 15. * 15.))
+    const uint32_t cam = scene.images[id].camera;
+    // Same-lens temporal neighbors: interleaved L/R ordering halves a global index span, so step
+    // along each lens independently. Keep short-window pairs even when backing out of a dead end.
+    const auto& same = lens_images.at(cam);
+    const size_t rank = lens_rank[id], same_span = repair.empty() ? 8 : 24;
+    for (size_t idx = rank > same_span ? rank - same_span : 0;
+         idx < std::min(same.size(), rank + same_span + 1); ++idx) {
+      const size_t step = rank > idx ? rank - idx : idx - rank;
+      if (step == 0)
         continue;
-      add(id, k);
+      if (repair.empty() &&
+          ((step > 5 && step != 8) ||
+           (positions[id] - positions[same[idx]]).squaredNorm() > 15. * 15.))
+        continue;
+      add(id, same[idx]);
     }
+    // Cross-lens temporal neighbors by exposure timestamp, without assuming L/R synchronization.
+    const auto& opposite = lens_images.at(1 - cam);
+    const double max_dt = repair.empty() ? 2.5 : 12.0;
+    std::vector<std::pair<double, uint32_t>> cross;
+    for (uint32_t k : opposite) {
+      const double abs_dt = std::abs(ExposureDeltaSeconds(scene.images[id], scene.images[k]));
+      if (abs_dt > max_dt)
+        continue;
+      if (repair.empty() && (positions[id] - positions[k]).squaredNorm() > 15. * 15.)
+        continue;
+      cross.emplace_back(abs_dt, k);
+    }
+    std::sort(cross.begin(), cross.end());
+    for (size_t i = 0; i < std::min<size_t>(repair.empty() ? 4 : 12, cross.size()); ++i)
+      add(id, cross[i].second);
     // Revisited surfaces can have poor global descriptor similarity because
     // their scale and the surrounding scene changed. Navigation supplies
     // independent candidates; matching and ray-space verification still decide
@@ -669,42 +717,58 @@ std::set<std::pair<uint32_t, uint32_t>> CandidatePairs(const Scene& scene, const
       navigation_added_pairs += pairs.size() - before;
     }
     if (repair.empty()) {
-      std::vector<std::pair<double, uint32_t>> options;
+      std::vector<std::pair<double, uint32_t>> loop_options, mid_options;
       for (uint32_t j = 0; j < n; ++j) {
-        const uint32_t distance = id > j ? id - j : j - id;
-        if (distance <= span || FacesAway(scene, velocities, id, j) ||
+        const bool same_cam = cam == scene.images[j].camera;
+        const size_t same_step =
+            lens_rank[id] > lens_rank[j] ? lens_rank[id] - lens_rank[j] : lens_rank[j] - lens_rank[id];
+        const double abs_dt = std::abs(ExposureDeltaSeconds(scene.images[id], scene.images[j]));
+        if ((same_cam ? (same_step <= 5 || same_step == 8) : abs_dt <= 2.5) ||
+            (abs_dt > 10. && FacesAway(scene, velocities, id, j)) ||
             (positions[id] - positions[j]).squaredNorm() > 20. * 20. ||
             pairs.count({std::min(id, j), std::max(id, j)}))
           continue;
         double similarity = 0;
         for (int d = 0; d < 256; ++d)
           similarity += retrieval[id][d] * retrieval[j][d];
-        options.emplace_back(similarity, j);
+        (abs_dt > 30. ? loop_options : mid_options).emplace_back(similarity, j);
       }
-      std::sort(options.rbegin(), options.rend());
+      std::sort(loop_options.rbegin(), loop_options.rend());
+      std::sort(mid_options.rbegin(), mid_options.rend());
       std::vector<uint32_t> selected;
-      for (size_t k = 0; k < std::min<size_t>(8, options.size()); ++k) {
-        const auto j = options[k].second;
-        if (selected.size() == 3)
-          break;
-        const auto& candidate = scene.images[j];
-        const bool duplicate = std::any_of(selected.begin(), selected.end(), [&](uint32_t p) {
-          const auto& previous = scene.images[p];
-          const double seconds =
-              (candidate.week - previous.week) * 604800. + candidate.seconds - previous.seconds;
-          return candidate.camera == previous.camera && std::abs(seconds) < 2.;
-        });
-        if (duplicate)
-          continue;
-        selected.push_back(j);
-        add(id, j);
-      }
+      auto pick_from = [&](const std::vector<std::pair<double, uint32_t>>& options,
+                           size_t target_total) {
+        for (size_t k = 0; k < std::min<size_t>(8, options.size()) && selected.size() < target_total;
+             ++k) {
+          const auto j = options[k].second;
+          if (std::find(selected.begin(), selected.end(), j) != selected.end())
+            continue;
+          const auto& candidate = scene.images[j];
+          const bool duplicate = std::any_of(selected.begin(), selected.end(), [&](uint32_t p) {
+            const auto& previous = scene.images[p];
+            const double seconds = ExposureDeltaSeconds(candidate, previous);
+            return candidate.camera == previous.camera && std::abs(seconds) < 2.;
+          });
+          if (duplicate)
+            continue;
+          selected.push_back(j);
+          add(id, j);
+        }
+      };
+      pick_from(loop_options, 2);
+      pick_from(mid_options, 3);
+      pick_from(loop_options, 3);
     } else {
-      for (const auto range : std::vector<std::array<uint32_t, 2>>{{12, 48}, {48, 160}, {160, n}}) {
+      for (const auto range : std::vector<std::array<size_t, 2>>{{6, 24}, {24, 80}, {80, n}}) {
         std::vector<std::pair<double, uint32_t>> options;
         for (uint32_t j = 0; j < n; ++j) {
-          const uint32_t distance = id > j ? id - j : j - id;
-          if (distance < range[0] || distance >= range[1] || FacesAway(scene, velocities, id, j))
+          const bool same_cam = cam == scene.images[j].camera;
+          const size_t same_step = lens_rank[id] > lens_rank[j] ? lens_rank[id] - lens_rank[j]
+                                                                 : lens_rank[j] - lens_rank[id];
+          const size_t distance = same_cam ? same_step : size_t(id > j ? id - j : j - id) / 2;
+          const double abs_dt = std::abs(ExposureDeltaSeconds(scene.images[id], scene.images[j]));
+          if (distance < range[0] || distance >= range[1] ||
+              (abs_dt > 10. && FacesAway(scene, velocities, id, j)))
             continue;
           double similarity = 0;
           for (int d = 0; d < 256; ++d)

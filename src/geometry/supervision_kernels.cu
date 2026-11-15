@@ -9,9 +9,6 @@
 
 namespace geosun::supervision_gpu {
 namespace {
-constexpr double MaxDepth = 65.535;
-// Half of FieldOfViewDegrees in radians, kept as the published constant.
-constexpr double MaxTheta = 1.396263401595464;
 // The world normal is octahedral-coded as two 16-bit values in 1..65535; 0 means no normal.
 __device__ unsigned EncodeNormal(float x, float y, float z) {
   const float s = fabsf(x) + fabsf(y) + fabsf(z);
@@ -66,6 +63,12 @@ __global__ void ProjectSurfels(const Surfel* points, int count, const Projection
          py = c.rotation[3] * x + c.rotation[4] * y + c.rotation[5] * z + c.translation[1],
          pz = c.rotation[6] * x + c.rotation[7] * y + c.rotation[8] * z + c.translation[2];
   if (pz <= 0)
+    return;
+  const double q2 = px * px + py * py + pz * pz;
+  if (q2 > c.max_q2)
+    return;
+  const double qz_bound = pz + c.qz_slack;
+  if (c.min_qz_slope > 0 && qz_bound * qz_bound < c.min_qz_slope * c.min_qz_slope * q2)
     return;
   double wx = 0, wy = 0, wz = 0;
   if (c.rolling) {
@@ -684,9 +687,15 @@ void Project(const Surfel* points, size_t count, size_t images, const Projection
   CudaCheck(cudaGetLastError());
 }
 
-void ResolveDepth(const Blend* blends, float* depth, unsigned* codes, int size,
-                  cudaStream_t stream) {
-  Resolve<<<(size + 255) / 256, 256, 0, stream>>>(blends, depth, codes, size);
+__global__ void ClearEmptyNearest(float* depths, size_t count) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count && !(depths[i] <= float(MaxDepth)))
+    depths[i] = 0;
+}
+
+void ResolveNearest(float* depths, size_t count, cudaStream_t stream) {
+  ClearEmptyNearest<<<unsigned((count + 255) / 256), 256, 0, stream>>>(depths, count);
+  CudaCheck(cudaGetLastError());
 }
 
 void EncodeMaps(const Blend* blends, int w, int h, int boundary, float focal,
