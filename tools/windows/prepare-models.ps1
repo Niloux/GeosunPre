@@ -58,7 +58,7 @@ try {
         Write-Host 'Installing the isolated model export/build environment (first run only)...'
         Invoke-Tool $uvPath @('pip', 'install', '--python', $python, 'torch==2.8.0', 'torchvision==0.23.0', '--index-url', 'https://download.pytorch.org/whl/cu128')
         Invoke-Tool $uvPath @('pip', 'install', '--python', $python, '-r', $requirements, '--extra-index-url', 'https://pypi.nvidia.com')
-        & $uvPath pip uninstall --python $python ultralytics clip 2>$null | Out-Null
+        Invoke-Tool $uvPath @('pip', 'uninstall', '--python', $python, 'ultralytics', 'clip')
         Set-Content -LiteralPath $stamp -Value $identity -Encoding ASCII
     }
     $target = if ($OnnxBundle) { $OnnxBundle } else { $Models }
