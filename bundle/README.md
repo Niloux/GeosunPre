@@ -25,7 +25,7 @@ Windows x64，需算力 ≥ 8.0 的 NVIDIA GPU（RTX 30/40/50、RTX A 系列等�
 .\geosun.exe --scene "D:/数据/场景" --output "D:/成果/场景"
 ```
 
-`--output` 下生成 `delivery/`（训练数据）、`train/project.licht` 和 `export/`（含 `splats.ply`、`mesh.ply` 和 `mesh_osgb/`）。导出由包内训练器完成。默认纹理像素尺寸为 0.02 场景单位，可用 `--texel-size` 调整。
+`--output` 下生成 `delivery/`（训练数据）、`train/project.licht`、`export/`（含 `splats.ply`、`mesh.ply` 和 `mesh_osgb/`）以及 `logs/`（含总控日志 `geosun.log`、预处理日志 `preprocess.log`、训练日志 `train.log`、导出日志 `export.log` 与训练器运行期崩溃诊断目录 `runtime/logs/`，全程不写入系统用户目录 `%USERPROFILE%`；排障时可直接打包 `logs/` 目录）。导出由包内训练器完成。默认纹理像素尺寸为 0.02 场景单位，可用 `--texel-size` 调整。
 
 - 预处理中途失败：以相同命令重跑即续跑，已完成的交付只做回读检查。
 - 训练中途失败：移走 `train.pending` 后重跑，或用新的 `--output`。

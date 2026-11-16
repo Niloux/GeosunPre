@@ -1,9 +1,12 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <locale>
@@ -22,7 +25,8 @@ void Help() {
                "  --step all|preprocess|train|export  (default: all)\n"
                "  --texel-size NUMBER                 (default: 0.02)\n"
                "  --preprocess-arg VALUE              (repeat for each argument)\n"
-               "  --train-arg VALUE                   (repeat for each argument)\n";
+               "  --train-arg VALUE                   (repeat for each argument)\n"
+               "  Logs are written under --output/logs/.\n";
 }
 
 fs::path BundleRoot() {
@@ -56,28 +60,233 @@ std::wstring Quote(const std::wstring& value) {
                           std::string(action) + " " + program.u8string());
 }
 
-void Run(const fs::path& program, Args args, const Args& extra, const char* stage) {
+std::string Timestamp() {
+  SYSTEMTIME st{};
+  GetLocalTime(&st);
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "[%04u-%02u-%02u %02u:%02u:%02u.%03u]",
+                static_cast<unsigned>(st.wYear), static_cast<unsigned>(st.wMonth),
+                static_cast<unsigned>(st.wDay), static_cast<unsigned>(st.wHour),
+                static_cast<unsigned>(st.wMinute), static_cast<unsigned>(st.wSecond),
+                static_cast<unsigned>(st.wMilliseconds));
+  return std::string(buffer);
+}
+
+std::string FormatSeconds(double seconds) {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  out << std::fixed << std::setprecision(2) << seconds;
+  return out.str();
+}
+
+struct UniqueHandle {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  UniqueHandle() = default;
+  explicit UniqueHandle(HANDLE value) : handle(value) {}
+  UniqueHandle(const UniqueHandle&) = delete;
+  UniqueHandle& operator=(const UniqueHandle&) = delete;
+  ~UniqueHandle() { Close(); }
+  void Close() noexcept {
+    if (handle != INVALID_HANDLE_VALUE && handle != nullptr) {
+      CloseHandle(handle);
+      handle = INVALID_HANDLE_VALUE;
+    }
+  }
+  bool Valid() const noexcept { return handle != INVALID_HANDLE_VALUE && handle != nullptr; }
+};
+
+class LogSink {
+ public:
+  explicit LogSink(const fs::path& path) {
+    if (const auto parent = path.parent_path(); !parent.empty())
+      fs::create_directories(parent);
+    // Security attributes stay null so child processes do not inherit log handles.
+    handle_.handle = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (!handle_.Valid())
+      ProcessError("Cannot open log", path, GetLastError());
+  }
+
+  void WriteRaw(const char* data, std::size_t size) const {
+    std::size_t offset = 0;
+    while (offset < size) {
+      const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(size - offset, 1u << 20));
+      DWORD written = 0;
+      if (!WriteFile(handle_.handle, data + offset, chunk, &written, nullptr) || written == 0) {
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                                "Cannot write log file");
+      }
+      offset += static_cast<std::size_t>(written);
+    }
+  }
+
+  void WriteLine(const std::string& message) const {
+    const auto line = Timestamp() + " " + message + "\n";
+    WriteRaw(line.data(), line.size());
+  }
+
+ private:
+  UniqueHandle handle_;
+};
+
+std::wstring BuildCommand(const fs::path& program, Args args, const Args& extra) {
   args.insert(args.end(), extra.begin(), extra.end());
   auto command = Quote(program.native());
   for (const auto& arg : args)
     command += L" " + Quote(arg);
+  return command;
+}
+
+void FinishProcess(const fs::path& program, UniqueHandle& process_handle, const char* stage,
+                   const LogSink& geosun_log,
+                   std::chrono::steady_clock::time_point started) {
+  const auto waited = WaitForSingleObject(process_handle.handle, INFINITE);
+  DWORD code = 0;
+  const bool read = waited == WAIT_OBJECT_0 && GetExitCodeProcess(process_handle.handle, &code);
+  const auto error = read ? ERROR_SUCCESS : GetLastError();
+  process_handle.Close();
+  if (!read)
+    ProcessError("Cannot get exit code from", program, error);
+  const auto elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  geosun_log.WriteLine("Finished " + std::string(stage) + " in " + FormatSeconds(elapsed) +
+                       "s (exit code " + std::to_string(code) + ")");
+  if (code)
+    throw std::runtime_error(std::string(stage) + " failed (exit code " + std::to_string(code) +
+                             ").");
+}
+
+void RunTee(const fs::path& program, Args args, const Args& extra, const char* stage,
+            const LogSink& geosun_log, const fs::path& stage_log_path) {
+  LogSink stage_log(stage_log_path);
+  stage_log.WriteLine("=== " + std::string(stage) + " ===");
+  auto command = BuildCommand(program, std::move(args), extra);
+  geosun_log.WriteLine("Start " + std::string(stage) + ": " + fs::path(command).u8string());
   std::cout << "> " << stage << std::endl;
+
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof(sa);
+  sa.bInheritHandle = TRUE;
+  HANDLE raw_read = INVALID_HANDLE_VALUE;
+  HANDLE raw_write = INVALID_HANDLE_VALUE;
+  if (!CreatePipe(&raw_read, &raw_write, &sa, 0))
+    ProcessError("Cannot create output pipe for", program, GetLastError());
+  UniqueHandle read_pipe(raw_read);
+  UniqueHandle write_pipe(raw_write);
+  if (!SetHandleInformation(read_pipe.handle, HANDLE_FLAG_INHERIT, 0))
+    ProcessError("Cannot configure output pipe for", program, GetLastError());
+
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = nullptr;
+  startup.hStdOutput = write_pipe.handle;
+  startup.hStdError = write_pipe.handle;
   PROCESS_INFORMATION process{};
+  const auto started = std::chrono::steady_clock::now();
   if (!CreateProcessW(program.c_str(), command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr,
                       &startup, &process))
     ProcessError("Cannot start", program, GetLastError());
-  CloseHandle(process.hThread);
-  const auto waited = WaitForSingleObject(process.hProcess, INFINITE);
-  DWORD code = 0;
-  const bool read = waited == WAIT_OBJECT_0 && GetExitCodeProcess(process.hProcess, &code);
-  const auto error = read ? ERROR_SUCCESS : GetLastError();
-  CloseHandle(process.hProcess);
-  if (!read)
-    ProcessError("Cannot get exit code from", program, error);
-  if (code)
-    throw std::runtime_error(std::string(stage) + " failed (exit code " + std::to_string(code) + ").");
+  UniqueHandle thread_handle(process.hThread);
+  UniqueHandle process_handle(process.hProcess);
+  thread_handle.Close();
+  write_pipe.Close();
+
+  std::string pending_line;
+  char buffer[4096];
+  DWORD read_bytes = 0;
+  while (ReadFile(read_pipe.handle, buffer, sizeof(buffer), &read_bytes, nullptr) &&
+         read_bytes > 0) {
+    std::cout.write(buffer, static_cast<std::streamsize>(read_bytes));
+    std::cout.flush();
+    for (DWORD i = 0; i < read_bytes; ++i) {
+      const char ch = buffer[i];
+      if (ch == '\r')
+        continue;
+      if (ch == '\n') {
+        stage_log.WriteLine(pending_line);
+        pending_line.clear();
+      } else {
+        pending_line.push_back(ch);
+      }
+    }
+  }
+  if (!pending_line.empty())
+    stage_log.WriteLine(pending_line);
+  read_pipe.Close();
+  FinishProcess(program, process_handle, stage, geosun_log, started);
+}
+
+struct TrainerLogGuard {
+  fs::path session_log;
+  fs::path target_log;
+  const char* stage;
+  std::uintmax_t start_offset;
+  bool env_set = false;
+
+  ~TrainerLogGuard() {
+    if (env_set)
+      SetEnvironmentVariableW(L"LFS_HOME", nullptr);
+    try {
+      std::error_code ec;
+      if (!fs::is_regular_file(session_log, ec) || ec)
+        return;
+      const auto current_size = static_cast<std::uintmax_t>(fs::file_size(session_log, ec));
+      if (ec || current_size == 0)
+        return;
+      const std::uintmax_t read_from = current_size < start_offset ? 0 : start_offset;
+      if (current_size <= read_from)
+        return;
+      std::ifstream in(session_log, std::ios::binary);
+      if (!in)
+        return;
+      in.seekg(static_cast<std::streamoff>(read_from), std::ios::beg);
+      std::string slice(static_cast<std::size_t>(current_size - read_from), '\0');
+      in.read(slice.data(), static_cast<std::streamsize>(slice.size()));
+      const auto bytes_read = static_cast<std::size_t>(in.gcount());
+      if (bytes_read == 0)
+        return;
+      LogSink stage_log(target_log);
+      stage_log.WriteLine("=== " + std::string(stage) + " ===");
+      stage_log.WriteRaw(slice.data(), bytes_read);
+      if (slice[bytes_read - 1] != '\n')
+        stage_log.WriteRaw("\n", 1);
+    } catch (const std::exception& error) {
+      std::cerr << "Warning: cannot archive " << stage << " log: " << error.what() << '\n';
+    }
+  }
+};
+
+void RunTrainer(const fs::path& program, Args args, const Args& extra, const char* stage,
+                const LogSink& geosun_log, const fs::path& logs_dir,
+                const fs::path& target_log_path) {
+  const auto runtime_home = logs_dir / L"runtime";
+  const auto session_log = runtime_home / L"logs/geosun-3dgs-trainer.log";
+  std::error_code ec;
+  const auto initial_size = fs::is_regular_file(session_log, ec)
+                                ? static_cast<std::uintmax_t>(fs::file_size(session_log, ec))
+                                : std::uintmax_t{0};
+  TrainerLogGuard guard{session_log, target_log_path, stage, ec ? std::uintmax_t{0} : initial_size};
+  if (!SetEnvironmentVariableW(L"LFS_HOME", runtime_home.c_str()))
+    ProcessError("Cannot set LFS_HOME for", program, GetLastError());
+  guard.env_set = true;
+
+  auto command = BuildCommand(program, std::move(args), extra);
+  geosun_log.WriteLine("Start " + std::string(stage) + ": " + fs::path(command).u8string());
+  std::cout << "> " << stage << std::endl;
+
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  const auto started = std::chrono::steady_clock::now();
+  if (!CreateProcessW(program.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                      &startup, &process))
+    ProcessError("Cannot start", program, GetLastError());
+  UniqueHandle thread_handle(process.hThread);
+  UniqueHandle process_handle(process.hProcess);
+  thread_handle.Close();
+  FinishProcess(program, process_handle, stage, geosun_log, started);
 }
 
 void RequireFile(const fs::path& path) {
@@ -239,48 +448,70 @@ void Pipeline(int argc, wchar_t** argv) {
     RequireFile(delivery / L"result.json");
   if (step == L"export")
     RequireFile(train / L"project.licht");
-  CheckDiskSpace(out, scene, step, need_preprocess);
 
-  if (run_preprocess) {
-    if (delivery_ready) {
-      std::cout << "Delivery already exists: " << delivery.u8string() << '\n';
-    } else {
-      Run(geosunpre, {L"run", L"--input", scene.native(), L"--output", delivery.native()},
-          preprocess_args, "Preprocess");
-    }
-    Run(geosunpre, {L"check", L"--output", delivery.native()}, {}, "Delivery check");
-  }
+  const auto logs = out / L"logs";
+  LogSink geosun_log(logs / L"geosun.log");
+  geosun_log.WriteLine("Session start: step=" + fs::path(step).u8string() +
+                       " scene=" + (scene.empty() ? std::string("<none>") : scene.u8string()) +
+                       " output=" + out.u8string() +
+                       " texel_size=" + fs::path(texel).u8string());
+  try {
+    CheckDiskSpace(out, scene, step, need_preprocess);
+    geosun_log.WriteLine("Disk space check passed.");
 
-  if (step == L"all" || step == L"train") {
-    RequireFile(delivery / L"result.json");
-    RequireAbsent(train);
-    const auto pending = out / L"train.pending";
-    for (const auto ch : root.native()) {
-      if (ch > 127) {
-        std::cerr << "Warning: bundle path is not ASCII; the trainer falls back to CPU JPEG decoding.\n";
-        break;
+    if (run_preprocess) {
+      if (delivery_ready) {
+        const std::string line = "Delivery already exists: " + delivery.u8string();
+        std::cout << line << '\n';
+        geosun_log.WriteLine(line);
+      } else {
+        RunTee(geosunpre, {L"run", L"--input", scene.native(), L"--output", delivery.native()},
+               preprocess_args, "Preprocess", geosun_log, logs / L"preprocess.log");
       }
+      RunTee(geosunpre, {L"check", L"--output", delivery.native()}, {}, "Delivery check",
+             geosun_log, logs / L"preprocess.log");
     }
-    CreatePending(pending);
-    Run(trainer, {L"--config", config.native(), L"-d", delivery.native(), L"-o", pending.native()},
-        train_args, "Training");
-    PublishPending(pending, train);
-    std::cout << "Training: " << train.u8string() << '\n';
-  }
 
-  if (export_results) {
-    const auto project = train / L"project.licht";
-    RequireFile(project);
-    CreatePending(export_pending);
-    const auto mesh = export_pending / L"mesh.ply";
-    Run(trainer, {L"mesh", project.native(), L"-d", delivery.native(), L"-o", mesh.native(),
-                  L"--texel-size", texel, L"--export", L"ply", L"--output-name", L"splats"},
-        {}, "Export 3DGS PLY, mesh and OSGB");
-    RequireFile(export_pending / L"splats.ply");
-    RequireFile(mesh);
-    CheckOsgb(export_pending / L"mesh_osgb");
-    PublishPending(export_pending, export_dir);
-    std::cout << "Export: " << export_dir.u8string() << '\n';
+    if (step == L"all" || step == L"train") {
+      RequireFile(delivery / L"result.json");
+      RequireAbsent(train);
+      const auto pending = out / L"train.pending";
+      for (const auto ch : root.native()) {
+        if (ch > 127) {
+          const std::string warning =
+              "Warning: bundle path is not ASCII; the trainer falls back to CPU JPEG decoding.";
+          std::cerr << warning << '\n';
+          geosun_log.WriteLine(warning);
+          break;
+        }
+      }
+      CreatePending(pending);
+      RunTrainer(trainer, {L"--config", config.native(), L"-d", delivery.native(), L"-o", pending.native()},
+                 train_args, "Training", geosun_log, logs, logs / L"train.log");
+      PublishPending(pending, train);
+      geosun_log.WriteLine("Published training output: " + train.u8string());
+      std::cout << "Training: " << train.u8string() << '\n';
+    }
+
+    if (export_results) {
+      const auto project = train / L"project.licht";
+      RequireFile(project);
+      CreatePending(export_pending);
+      const auto mesh = export_pending / L"mesh.ply";
+      RunTrainer(trainer, {L"mesh", project.native(), L"-d", delivery.native(), L"-o", mesh.native(),
+                           L"--texel-size", texel, L"--export", L"ply", L"--output-name", L"splats"},
+                 {}, "Export 3DGS PLY, mesh and OSGB", geosun_log, logs, logs / L"export.log");
+      RequireFile(export_pending / L"splats.ply");
+      RequireFile(mesh);
+      CheckOsgb(export_pending / L"mesh_osgb");
+      PublishPending(export_pending, export_dir);
+      geosun_log.WriteLine("Published export output: " + export_dir.u8string());
+      std::cout << "Export: " << export_dir.u8string() << '\n';
+    }
+    geosun_log.WriteLine("Session completed successfully.");
+  } catch (const std::exception& error) {
+    geosun_log.WriteLine(std::string("ERROR: ") + error.what());
+    throw;
   }
 }
 }  // namespace
