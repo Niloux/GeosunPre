@@ -504,6 +504,7 @@ std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Recon
     p -= origin;
   auto surface = CoherentSurfaces(target, .025, workers);
   std::vector<PlaneConstraint> planes;
+  Points matched_local;
   for (uint64_t id = 0; id < model.points.size(); ++id) {
     const auto& p = model.points[id];
     if (p.track.size() < 3 || p.error > 2)
@@ -516,6 +517,19 @@ std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Recon
       continue;
     planes.push_back({id, surface->centres[nearest] + origin, surface->normals[nearest],
                       std::max({.01, surface->noise[nearest], header.scale.maxCoeff()})});
+    matched_local.push_back(local);
+  }
+  if (matched_local.size() >= 8) {
+    try {
+      const auto regions = Partition(matched_local);
+      std::map<Tile, size_t> counts;
+      for (const auto& tile : regions.tiles)
+        ++counts[tile];
+      const double mean = double(planes.size()) / std::max<size_t>(1, counts.size());
+      for (size_t i = 0; i < planes.size(); ++i)
+        planes[i].sigma *= std::max(.5, std::sqrt(double(counts[regions.tiles[i]]) / mean));
+    } catch (const std::exception&) {
+    }
   }
   return planes;
 }

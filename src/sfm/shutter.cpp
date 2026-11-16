@@ -1,6 +1,7 @@
 #include "sfm/shutter.h"
 #include "frontend/frontend.h"
 #include "geometry/supervision.h"
+#include <algorithm>
 #include <optional>
 #include <set>
 
@@ -172,6 +173,7 @@ namespace {
 // Inputs shared by the readout-axis hypotheses.
 struct ShutterInputs {
   Json source_quality;
+  ExposureKinematics kinematics;
   std::vector<Eigen::Vector3d> velocity;
   std::vector<Eigen::Vector3d> navigation;
   std::vector<PlaneConstraint> planes, training_planes;
@@ -179,6 +181,57 @@ struct ShutterInputs {
   std::vector<uint64_t> validation;
   std::vector<std::array<uint32_t, 2>> frames;
 };
+struct EvaluatedAxis {
+  ShutterCorrection correction;
+  Reconstruction unrectified;
+};
+Reconstruction RectifyModel(const Reconstruction& model, const ShutterMotion& motion, int workers,
+                            std::vector<double>& shift) {
+  Reconstruction rectified = model;
+  const size_t n = model.images.size();
+  std::vector<std::vector<double>> shifts(n);
+  ParallelFor(n, workers, 4, [&](size_t i) {
+    auto& image = rectified.images[i];
+    if (!image.registered)
+      return;
+    const auto& camera = model.cameras[image.camera];
+    std::vector<double> ranges(image.pixels.size(), 0), known;
+    for (uint32_t k = 0; k < image.pixels.size(); ++k)
+      if (image.points[k] != NoPoint) {
+        ranges[k] = Exposed(model, motion, {uint32_t(i), k}, model.points[image.points[k]].xyz).norm();
+        known.push_back(ranges[k]);
+      }
+    const double fallback = known.empty() ? MaximumRange : Quantile(known, .5);
+    for (uint32_t k = 0; k < image.pixels.size(); ++k) {
+      const auto original = model.images[i].pixels[k];
+      image.pixels[k] = Rectify(camera, motion, uint32_t(i), image.camera, original,
+                                ranges[k] > 0 ? ranges[k] : fallback);
+      if (image.points[k] != NoPoint)
+        shifts[i].push_back((image.pixels[k] - original).norm());
+    }
+  });
+  rectified.Filter();
+  shift.clear();
+  for (const auto& rows : shifts)
+    shift.insert(shift.end(), rows.begin(), rows.end());
+  return rectified;
+}
+bool MotionStats(const Reconstruction& model, const ShutterMotion& motion,
+                 std::vector<double>& rotation, std::vector<double>& translation) {
+  rotation.clear();
+  translation.clear();
+  bool bounded = true;
+  for (uint32_t i = 0; i < model.images.size(); ++i)
+    if (model.images[i].registered) {
+      rotation.push_back(motion.rotation[i].norm() * 180 / Pi);
+      translation.push_back(std::abs(motion.readout[model.images[i].camera]) *
+                            motion.velocity[i].norm());
+      bounded = bounded && motion.rotation[i].cwiseAbs().maxCoeff() < RotationBound * .999;
+    }
+  for (uint32_t lens = 0; lens < 2; ++lens)
+    bounded = bounded && std::abs(motion.readout[lens]) < ReadoutBound * .999;
+  return bounded;
+}
 struct AxisScreen {
   int axis = 1;
   bool consistent = false;
@@ -250,20 +303,24 @@ AxisScreen ScreenAlongAxis(const Scene& scene, const Reconstruction& source,
   screen.seconds = Seconds(started);
   return screen;
 }
-ShutterCorrection CorrectAlongAxis(const Scene& scene, const Reconstruction& source,
-                                   const ShutterInputs& inputs, int axis, int workers,
-                                   const AlignmentLimits& limits, int ba_workers) {
+EvaluatedAxis CorrectAlongAxis(const Scene& scene, const Reconstruction& source,
+                               const ShutterInputs& inputs, int axis,
+                               std::array<double, 2> initial_readout, int workers,
+                               const AlignmentLimits& limits, int ba_workers) {
   const auto started = Clock::now();
   const auto& source_quality = inputs.source_quality;
   const auto& planes = inputs.planes;
   const auto& validation = inputs.validation;
-  ShutterCorrection result;
+  EvaluatedAxis evaluated;
+  auto& result = evaluated.correction;
   auto model = source;
   auto& motion = result.motion;
   const size_t n = source.images.size();
   motion.axis = axis;
   motion.rotation.assign(n, Eigen::Vector3d::Zero());
   motion.velocity = inputs.velocity;
+  for (size_t c = 0; c < 2; ++c)
+    motion.readout[c] = std::clamp(initial_readout[c], -.04, .04);
   Log(std::string("Rolling-shutter readout along ") + (axis ? "rows" : "columns"));
   auto& report = result.report;
   report = {{"readout_axis", axis ? "rows" : "columns"}, {"used", false}};
@@ -279,6 +336,7 @@ ShutterCorrection CorrectAlongAxis(const Scene& scene, const Reconstruction& sou
     RefinePoint(before, before.points[id].track, before.points[id].xyz);
     RefineShutterPoint(model, motion, model.points[id].track, model.points[id].xyz);
   });
+  evaluated.unrectified = model;
   HoldoutErrors held_before, held_after;
   for (const uint64_t id : validation)
     for (const auto& o : source.points[id].track) {
@@ -321,48 +379,15 @@ ShutterCorrection CorrectAlongAxis(const Scene& scene, const Reconstruction& sou
   }
   // Every observation moves to the reference pose at the range of its point; observations
   // without a point use the median range of the image's points.
-  auto& rectified = result.candidate;
-  rectified = model;
-  std::vector<std::vector<double>> shifts(n);
-  ParallelFor(n, workers, 4, [&](size_t i) {
-    auto& image = rectified.images[i];
-    if (!image.registered)
-      return;
-    const auto& camera = model.cameras[image.camera];
-    std::vector<double> ranges(image.pixels.size(), 0), known;
-    for (uint32_t k = 0; k < image.pixels.size(); ++k)
-      if (image.points[k] != NoPoint) {
-        ranges[k] = Exposed(model, motion, {uint32_t(i), k}, model.points[image.points[k]].xyz).norm();
-        known.push_back(ranges[k]);
-      }
-    const double fallback = known.empty() ? MaximumRange : Quantile(known, .5);
-    for (uint32_t k = 0; k < image.pixels.size(); ++k) {
-      const auto original = model.images[i].pixels[k];
-      image.pixels[k] = Rectify(camera, motion, uint32_t(i), image.camera, original,
-                                ranges[k] > 0 ? ranges[k] : fallback);
-      if (image.points[k] != NoPoint)
-        shifts[i].push_back((image.pixels[k] - original).norm());
-    }
-  });
-  rectified.Filter();
   std::vector<double> shift;
-  for (const auto& rows : shifts)
-    shift.insert(shift.end(), rows.begin(), rows.end());
+  auto& rectified = result.candidate;
+  rectified = RectifyModel(model, motion, workers, shift);
   const auto quality = rectified.Quality(scene, limits.median_px, limits.p90_px);
   const auto plane_before = PlaneErrors(source, planes), plane_after = PlaneErrors(rectified, planes);
   bool consistent = false;
   const auto consistency = ReadoutConsistency(scene, rectified, motion, consistent);
   std::vector<double> rotation, translation;
-  bool bounded = true;
-  for (uint32_t i = 0; i < n; ++i)
-    if (source.images[i].registered) {
-      rotation.push_back(motion.rotation[i].norm() * 180 / Pi);
-      translation.push_back(std::abs(motion.readout[source.images[i].camera]) *
-                            motion.velocity[i].norm());
-      bounded = bounded && motion.rotation[i].cwiseAbs().maxCoeff() < RotationBound * .999;
-    }
-  for (uint32_t lens = 0; lens < 2; ++lens)
-    bounded = bounded && std::abs(motion.readout[lens]) < ReadoutBound * .999;
+  const bool bounded = MotionStats(source, motion, rotation, translation);
   const auto validation_before = Statistics(held_before.all),
              validation_after = Statistics(held_after.all);
   const double source_p90 = source_quality.at("reprojection_px").at("p90");
@@ -411,7 +436,113 @@ ShutterCorrection CorrectAlongAxis(const Scene& scene, const Reconstruction& sou
   report["source_quality"] = source_quality;
   report["candidate_quality"] = quality;
   report["seconds"] = Seconds(started);
-  return result;
+  return evaluated;
+}
+void PolishAcceptedShutter(const Scene& scene, const Reconstruction& source,
+                           const ShutterInputs& inputs, int workers, const AlignmentLimits& limits,
+                           int ba_workers, EvaluatedAxis& accepted_axis) {
+  const auto started = Clock::now();
+  Reconstruction model = accepted_axis.unrectified;
+  ShutterMotion motion = accepted_axis.correction.motion;
+  for (uint32_t i = 0; i < model.images.size(); ++i)
+    if (model.images[i].registered) {
+      const Eigen::Vector3d v_nav = model.images[i].pose.Rotation() * inputs.kinematics.velocity[i];
+      const Eigen::Vector3d r_cam =
+          model.images[i].pose.Rotation() * inputs.kinematics.lever_arm[i];
+      const double tau = motion.readout[model.images[i].camera];
+      motion.velocity[i] = std::abs(tau) > 1e-3
+                               ? Eigen::Vector3d(v_nav - (motion.rotation[i] / tau).cross(r_cam))
+                               : v_nav;
+    }
+  std::set<uint64_t> all_tracks;
+  for (uint64_t id = 0; id < model.points.size(); ++id) {
+    const auto& point = model.points[id];
+    if (point.track.size() < 2 || !point.xyz.allFinite())
+      continue;
+    const bool positive_depth =
+        std::all_of(point.track.begin(), point.track.end(), [&](const auto& o) {
+          return model.images[o.image].registered &&
+                 model.images[o.image].pose.Apply(point.xyz).z() > 1e-3;
+        });
+    if (positive_depth) {
+      all_tracks.insert(id);
+      model.points[id].error = ShutterPointError(model, motion, model.points[id]);
+    }
+  }
+  auto& report = accepted_axis.correction.report;
+  const auto polish_planes = LasPlaneConstraints(scene, model, workers);
+  Log("Rolling-shutter polish: " + std::to_string(all_tracks.size()) + " tracks, " +
+      std::to_string(polish_planes.size()) + " LAS planes");
+  const auto polish_opt =
+      Optimize(model, scene.cameras, "principal", ba_workers, 100, {}, polish_planes,
+               inputs.navigation, all_tracks, &motion, inputs.frames);
+  std::vector<double> shift;
+  auto rectified = RectifyModel(model, motion, workers, shift);
+  const auto quality = rectified.Quality(scene, limits.median_px, limits.p90_px);
+  const auto plane_after = PlaneErrors(rectified, inputs.planes);
+  const auto polish_plane_fit = PlaneErrors(rectified, polish_planes);
+  bool consistent = false;
+  const auto consistency = ReadoutConsistency(scene, rectified, motion, consistent);
+  std::vector<double> rotation, translation;
+  const bool bounded = MotionStats(source, motion, rotation, translation);
+  const auto& unpolished_quality = report.at("candidate_quality");
+  const auto& source_images = inputs.source_quality.at("images");
+  const auto& unpolished_images = unpolished_quality.at("images");
+  const auto& polished_images = quality.at("images");
+  bool per_image_stable = true;
+  for (size_t i = 0; i < source.images.size(); ++i) {
+    if (!source.images[i].registered)
+      continue;
+    const auto& a_p90 = source_images[i].at("reprojection_px").at("p90");
+    const auto& b_p90 = unpolished_images[i].at("reprojection_px").at("p90");
+    const auto& c_p90 = polished_images[i].at("reprojection_px").at("p90");
+    if (!a_p90.is_number() || !b_p90.is_number() || !c_p90.is_number() ||
+        c_p90.get<double>() > std::max(a_p90.get<double>(), b_p90.get<double>()) * 1.1 + .1) {
+      per_image_stable = false;
+      break;
+    }
+  }
+  const double source_p90 = inputs.source_quality.at("reprojection_px").at("p90");
+  const auto& plane_before = report.at("plane_before_m");
+  const Json checks = {
+      {"visual_acceptance", quality.at("passed")},
+      {"per_image_stability", per_image_stable},
+      {"full_reprojection", quality.at("reprojection_px").at("p90").is_number() &&
+                                quality.at("reprojection_px").at("p90").get<double>() <=
+                                    source_p90 * 1.05 + .05},
+      {"surface_fit", inputs.planes.empty() ||
+                          (plane_after.at("p90").is_number() &&
+                           plane_after.at("p90").get<double>() <=
+                               plane_before.at("p90").get<double>() * 1.25 + .01)},
+      {"physical_readout", consistent},
+      {"motion_within_bounds", bounded},
+      {"registered_images_preserved", rectified.Registered() == source.Registered()}};
+  const auto failed = FailedChecks(checks);
+  if (!failed.empty()) {
+    report["polish"] = {{"used", false},
+                        {"tracks", all_tracks.size()},
+                        {"surface_constraints", polish_planes.size()},
+                        {"checks", checks},
+                        {"failed_checks", failed},
+                        {"seconds", Seconds(started)}};
+    return;
+  }
+  accepted_axis.correction.candidate = std::move(rectified);
+  accepted_axis.correction.motion = std::move(motion);
+  report["readout_s"] = accepted_axis.correction.motion.readout;
+  report["readout_rotation_deg"] = Statistics(rotation);
+  report["readout_translation_m"] = Statistics(translation);
+  report["readout_consistency"] = consistency;
+  report["observation_shift_px"] = Statistics(shift);
+  report["plane_after_m"] = plane_after;
+  report["candidate_quality"] = quality;
+  report["polish"] = {{"used", true},
+                      {"tracks", all_tracks.size()},
+                      {"surface_constraints", polish_planes.size()},
+                      {"plane_after_reassociated_m", polish_plane_fit},
+                      {"optimization", polish_opt},
+                      {"checks", checks},
+                      {"seconds", Seconds(started)}};
 }
 }  // namespace
 ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction& source,
@@ -424,11 +555,11 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   inputs.source_quality = source.Quality(scene, limits.median_px, limits.p90_px);
   if (!inputs.source_quality.at("passed").get<bool>())
     throw std::runtime_error("Rolling-shutter source reconstruction failed visual acceptance");
-  const auto velocities = NavigationVelocities(scene);
+  inputs.kinematics = ReadExposureKinematics(scene);
   inputs.velocity.assign(source.images.size(), Eigen::Vector3d::Zero());
   for (uint32_t i = 0; i < source.images.size(); ++i)
     if (source.images[i].registered)
-      inputs.velocity[i] = source.images[i].pose.Rotation() * velocities[i];
+      inputs.velocity[i] = source.images[i].pose.Rotation() * inputs.kinematics.velocity[i];
   inputs.navigation = NavigationPositions(scene);
   Log("Rolling-shutter correction: " + std::to_string(source.Registered()) + " images");
   inputs.planes = LasPlaneConstraints(scene, source, workers);
@@ -468,15 +599,16 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
                                   ? screens[1].consistent
                                   : (screens[1].cost_drop_ratio > screens[0].cost_drop_ratio);
   const size_t primary_idx = prefer_columns ? 1 : 0, secondary_idx = 1 - primary_idx;
-  std::array<std::optional<ShutterCorrection>, 2> full;
-  full[primary_idx] =
-      CorrectAlongAxis(scene, source, inputs, screens[primary_idx].axis, workers, limits, ba_workers);
-  const bool unambiguous = full[primary_idx]->accepted && screens[primary_idx].consistent &&
-                           !screens[secondary_idx].consistent;
+  std::array<std::optional<EvaluatedAxis>, 2> full;
+  full[primary_idx] = CorrectAlongAxis(scene, source, inputs, screens[primary_idx].axis,
+                                       screens[primary_idx].readout, workers, limits, ba_workers);
+  const bool unambiguous = full[primary_idx]->correction.accepted &&
+                           screens[primary_idx].consistent && !screens[secondary_idx].consistent;
   if (!unambiguous)
-    full[secondary_idx] = CorrectAlongAxis(scene, source, inputs, screens[secondary_idx].axis,
-                                           workers, limits, ba_workers);
-  ShutterCorrection best;
+    full[secondary_idx] =
+        CorrectAlongAxis(scene, source, inputs, screens[secondary_idx].axis,
+                         screens[secondary_idx].readout, workers, limits, ba_workers);
+  EvaluatedAxis best;
   Json attempts = Json::array(), screen_report = Json::array();
   const auto held = [](const ShutterCorrection& c) {
     const auto& median = c.report.at("validation_after_px").at("median");
@@ -487,20 +619,22 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
     screen_report.push_back(s.ToJson());
     if (full[idx]) {
       auto& attempt = *full[idx];
-      const auto& r = attempt.report;
+      const auto& r = attempt.correction.report;
       Json explained = Json::array();
       for (const auto& lens : r.at("readout_consistency"))
         explained.push_back(lens.at("explained_rotation"));
       attempts.push_back({{"readout_axis", r.at("readout_axis")},
                           {"evaluated", "full"},
-                          {"accepted", attempt.accepted},
+                          {"accepted", attempt.correction.accepted},
                           {"failed_checks", r.at("failed_checks")},
                           {"readout_s", r.at("readout_s")},
                           {"explained_rotation", explained},
                           {"validation_after_px", r.at("validation_after_px")},
                           {"seconds", r.at("seconds")}});
-      if (best.report.is_null() || (attempt.accepted && !best.accepted) ||
-          (attempt.accepted == best.accepted && held(attempt) < held(best)))
+      if (best.correction.report.is_null() ||
+          (attempt.correction.accepted && !best.correction.accepted) ||
+          (attempt.correction.accepted == best.correction.accepted &&
+           held(attempt.correction) < held(best.correction)))
         best = std::move(attempt);
     } else {
       attempts.push_back({{"readout_axis", s.axis ? "rows" : "columns"},
@@ -513,7 +647,9 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
                           {"seconds", s.seconds}});
     }
   }
-  auto& report = best.report;
+  if (best.correction.accepted)
+    PolishAcceptedShutter(scene, source, inputs, workers, limits, ba_workers, best);
+  auto& report = best.correction.report;
   report["method"] = "per-image readout rotation and per-lens readout time with the navigation "
                      "velocity, jointly with cameras, points and intrinsics, screened along rows "
                      "and columns";
@@ -524,7 +660,7 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   report["axis_screen"] = screen_report;
   report["axis_attempts"] = attempts;
   report["seconds"] = Seconds(started);
-  return best;
+  return std::move(best.correction);
 }
 double ShutterPointError(const Reconstruction& model, const ShutterMotion& motion,
                          const ModelPoint& point) {

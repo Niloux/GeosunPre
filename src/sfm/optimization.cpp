@@ -224,6 +224,21 @@ struct RigLink {
     return true;
   }
 };
+// Synchronous frame readout-rotation coupling: wr / tr = R_ext * (wl / tl), written in
+// homogeneous cross-multiplied form so it stays smooth through tl = tr = 0 and handles
+// both same-sign and opposite-sign sensor scan directions.
+struct RigShutterRotation {
+  template <class T>
+  bool operator()(const T* wl, const T* wr, const T* tl, const T* tr, const T* rig, T* r) const {
+    const T qe[] = {rig[3], rig[0], rig[1], rig[2]};
+    T predicted[3];
+    ceres::QuaternionRotatePoint(qe, wl, predicted);
+    const T scale = ceres::sqrt(tl[0] * tl[0] + tr[0] * tr[0] + T(1e-6));
+    for (int i = 0; i < 3; ++i)
+      r[i] = (tl[0] * wr[i] - tr[0] * predicted[i]) / (scale * T(RigShutterRotationSigma));
+    return true;
+  }
+};
 class Progress : public ceres::IterationCallback {
   Clock::time_point last = Clock::now();
 
@@ -457,6 +472,13 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         problem.AddResidualBlock(new ceres::AutoDiffCostFunction<RigLink, 6, 7, 7, 7>(new RigLink),
                                  new ceres::HuberLoss(2), m.images[f[0]].pose.params.data(),
                                  m.images[f[1]].pose.params.data(), rig.params.data());
+        if (shutter && m.images[f[0]].camera != m.images[f[1]].camera)
+          problem.AddResidualBlock(
+              new ceres::AutoDiffCostFunction<RigShutterRotation, 3, 3, 3, 1, 1, 7>(
+                  new RigShutterRotation),
+              new ceres::HuberLoss(4), shutter->rotation[f[0]].data(),
+              shutter->rotation[f[1]].data(), &shutter->readout[m.images[f[0]].camera],
+              &shutter->readout[m.images[f[1]].camera], rig.params.data());
         if (!rig_frames++) {
           problem.SetManifold(rig.params.data(),
                               new ceres::ProductManifold<ceres::EigenQuaternionManifold,

@@ -35,6 +35,13 @@ std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene);
 LasHeader ReadSceneLas(const Scene& scene);
 // Trajectory velocity in the LAS frame (m/s) at every exposure, from +-50 ms of navigation.
 std::vector<Eigen::Vector3d> NavigationVelocities(const Scene& scene);
+struct ExposureKinematics {
+  std::vector<Eigen::Vector3d> velocity;
+  std::vector<Eigen::Vector3d> lever_arm;
+};
+// High-precision ENH trajectory velocity (+-20 ms) and rigid lever arm (lens minus trajectory)
+// in the LAS frame at every exposure, for rolling-shutter readout motion.
+ExposureKinematics ReadExposureKinematics(const Scene& scene);
 // (L, R) image indices of each frame number exposed by both lenses when every such pair was
 // exposed within 2 ms; empty when the lenses are not synchronized.
 std::vector<std::array<uint32_t, 2>> SynchronousFrames(const Scene& scene);

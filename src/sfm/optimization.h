@@ -60,6 +60,7 @@ constexpr double NavigationSigma = .03, NavigationGate = .25;
 // Synchronous L/R exposures share one body pose: R = extrinsic * L. Independent solutions on 室内
 // and 展厅 scatter about the mean extrinsic by 0.03-0.06 degrees and 2 mm (median).
 constexpr double RigRotationSigma = Pi / 180 * .01, RigPositionSigma = .001;
+constexpr double RigShutterRotationSigma = Pi / 180 * .02;
 // Robust mean extrinsic (R from L) of the frames with both exposures registered; false with
 // fewer than four such frames.
 bool RigExtrinsic(const Reconstruction& model, const std::vector<std::array<uint32_t, 2>>& frames,
