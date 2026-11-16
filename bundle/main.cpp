@@ -1,7 +1,10 @@
 #include <windows.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <locale>
 #include <sstream>
@@ -101,6 +104,63 @@ void CheckOsgb(const fs::path& path) {
   throw std::runtime_error("No OSGB files in " + path.u8string());
 }
 
+fs::path ExistingAncestor(fs::path path) {
+  path = fs::absolute(path).lexically_normal();
+  while (!path.empty() && !fs::exists(path)) {
+    const auto parent = path.parent_path();
+    if (parent == path)
+      break;
+    path = parent;
+  }
+  return path;
+}
+
+std::uint64_t DirectoryBytes(const fs::path& root) {
+  std::uint64_t total = 0;
+  std::error_code ec;
+  for (const auto& entry :
+       fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec)) {
+    if (ec)
+      break;
+    if (entry.is_regular_file(ec)) {
+      const auto bytes = entry.file_size(ec);
+      if (!ec)
+        total += static_cast<std::uint64_t>(bytes);
+    }
+  }
+  return total;
+}
+
+std::string FormatGiB(std::uint64_t bytes) {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  out << std::fixed << std::setprecision(1)
+      << (static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+  return out.str();
+}
+
+void CheckDiskSpace(const fs::path& out, const fs::path& scene, const std::wstring& step,
+                    bool need_preprocess) {
+  std::uint64_t required = 0;
+  if (need_preprocess)
+    required += std::max<std::uint64_t>(8ULL << 30, DirectoryBytes(scene) * 3 / 2);
+  if (step == L"all" || step == L"train")
+    required += 6ULL << 30;
+  if (step == L"all" || step == L"export")
+    required += 4ULL << 30;
+  if (!required)
+    return;
+  const auto probe = ExistingAncestor(out);
+  const auto info = fs::space(probe);
+  const auto available = static_cast<std::uint64_t>(info.available);
+  if (available < required) {
+    throw std::runtime_error("Insufficient free disk space on " + probe.u8string() + ": " +
+                             FormatGiB(available) + " GiB available, at least " +
+                             FormatGiB(required) + " GiB required for --step " +
+                             fs::path(step).u8string() + ".");
+  }
+}
+
 void Pipeline(int argc, wchar_t** argv) {
   fs::path scene, out;
   std::wstring step = L"all", texel = L"0.02";
@@ -149,13 +209,27 @@ void Pipeline(int argc, wchar_t** argv) {
     RequireAbsent(export_dir);
     RequireAbsent(export_pending);
   }
+  const bool run_preprocess = step == L"all" || step == L"preprocess";
+  const bool delivery_ready = fs::exists(delivery) && !fs::exists(out / L"delivery.work");
+  const bool need_preprocess = run_preprocess && !delivery_ready;
+  if (need_preprocess) {
+    if (scene.empty())
+      throw std::runtime_error("Specify --scene with the scene directory.");
+    if (!fs::is_directory(scene))
+      throw std::runtime_error("Scene directory does not exist: " + scene.u8string());
+  }
+  if (step == L"all" || step == L"train")
+    RequireAbsent(train);
+  if (step == L"train")
+    RequireFile(delivery / L"result.json");
+  if (step == L"export")
+    RequireFile(train / L"project.licht");
+  CheckDiskSpace(out, scene, step, need_preprocess);
 
-  if (step == L"all" || step == L"preprocess") {
-    if (fs::exists(delivery) && !fs::exists(out / L"delivery.work")) {
+  if (run_preprocess) {
+    if (delivery_ready) {
       std::cout << "Delivery already exists: " << delivery.u8string() << '\n';
     } else {
-      if (scene.empty())
-        throw std::runtime_error("Specify --scene with the scene directory.");
       Run(geosunpre, {L"run", L"--input", scene.native(), L"--output", delivery.native()},
           preprocess_args, "Preprocess");
     }

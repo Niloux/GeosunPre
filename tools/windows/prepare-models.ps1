@@ -53,13 +53,12 @@ try {
     }
     $requirements = Join-Path $projectRoot 'tools\models\requirements.txt'
     $stamp = Join-Path $cache 'environment.sha256'
-    $withoutDependencies = Join-Path $projectRoot 'tools\models\requirements-nodeps.txt'
-    $identity = (Get-FileHash -LiteralPath $requirements, $withoutDependencies -Algorithm SHA256).Hash -join ''
+    $identity = (Get-FileHash -LiteralPath $requirements -Algorithm SHA256).Hash
     if (-not (Test-Path -LiteralPath $stamp) -or (Get-Content -Raw -LiteralPath $stamp).Trim() -ne $identity) {
         Write-Host 'Installing the isolated model export/build environment (first run only)...'
         Invoke-Tool $uvPath @('pip', 'install', '--python', $python, 'torch==2.8.0', 'torchvision==0.23.0', '--index-url', 'https://download.pytorch.org/whl/cu128')
         Invoke-Tool $uvPath @('pip', 'install', '--python', $python, '-r', $requirements, '--extra-index-url', 'https://pypi.nvidia.com')
-        Invoke-Tool $uvPath @('pip', 'install', '--python', $python, '--no-deps', '-r', $withoutDependencies)
+        & $uvPath pip uninstall --python $python ultralytics clip 2>$null | Out-Null
         Set-Content -LiteralPath $stamp -Value $identity -Encoding ASCII
     }
     $target = if ($OnnxBundle) { $OnnxBundle } else { $Models }

@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CACHE = ROOT / '.cache' / 'model-prepare'
 LOMA_COMMIT = '8fb59c458f2a2ef44314f462467b229c27786bf0'
 MOGE_COMMIT = '74fbce054ebed49800de42d0ad0e83495065719a'
+SAM3_COMMIT = 'eef6839bcfc3458dd52ea80535dc6bd62aea86b1'
 GEOMETRY_REVISION = 'cb0e8bbd6b1e243589717c78e750b1ba4c093acf'
 # facebook/sam3 is gated on Hugging Face, so the checkpoint is supplied as a local file.
 GROUNDING_SHA256 = '9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e'
@@ -73,6 +74,19 @@ def moge_source():
         with zipfile.ZipFile(archive) as source:
             source.extractall(destination.parent)
         ready.write_text(MOGE_COMMIT, encoding='ascii')
+    return destination
+
+
+def sam3_source():
+    archive = resource(Path(f'sam3-{SAM3_COMMIT}.zip'),
+                       f'https://codeload.github.com/facebookresearch/sam3/zip/{SAM3_COMMIT}',
+                       '1e3b5af415245c373be7cd1508e40693b70c57201bd6b7d92c9393559f9efd2f')
+    destination = CACHE / 'source' / f'sam3-{SAM3_COMMIT}'
+    ready = destination / '.source-ready'
+    if not ready.is_file():
+        with zipfile.ZipFile(archive) as source:
+            source.extractall(destination.parent)
+        ready.write_text(SAM3_COMMIT, encoding='ascii')
     return destination
 
 

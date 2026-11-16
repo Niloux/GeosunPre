@@ -34,8 +34,17 @@ if (-not $Models) {
     if (-not (Test-Path -LiteralPath $localManifest -PathType Leaf)) {
         throw 'Run .\run.ps1 prepare-models [path-to-sam3.pt] first so delivery can reuse the ONNX graphs.'
     }
-    # Keep a separate delivery model directory for each set of local models.
-    $key = (Get-FileHash -LiteralPath $localManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Keep a separate delivery model directory for each set of local models and export recipe.
+    $recipePaths = @('prepare.py', 'networks.py', 'resources.py', 'requirements.txt') |
+        ForEach-Object { Join-Path $PSScriptRoot "tools\models\$_" }
+    $combined = ((@($localManifest) + $recipePaths) |
+        ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant() }) -join ''
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $key = [BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::ASCII.GetBytes($combined))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
     $Models = Join-Path $PSScriptRoot ".cache\delivery-models\$key"
     if (-not (Test-Path -LiteralPath (Join-Path $Models 'manifest.json') -PathType Leaf)) {
         & (Join-Path $tools 'prepare-models.ps1') -Models $Models -OnnxFrom $localModels -HardwareCompatibility ampere_plus

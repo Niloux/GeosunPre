@@ -201,7 +201,7 @@ class BlockedSelfAttention(nn.Module):
         return (x if a.batch_first else x.transpose(0, 1)), None
 
 
-def block_grounding_attention(model, vitdet, encoder):
+def block_grounding_attention(model, vitdet, encoder, model_misc):
     """Route the SAM3 trunk and DETR encoder self-attention through blocked attention."""
     class Functional:
         scaled_dot_product_attention = staticmethod(blocked_sdpa)
@@ -211,7 +211,7 @@ def block_grounding_attention(model, vitdet, encoder):
 
     vitdet.F = Functional()
     layers = [m for m in model.modules() if isinstance(m, encoder.TransformerEncoderLayer)
-              and isinstance(m.self_attn, nn.MultiheadAttention)]
+              and isinstance(m.self_attn, (nn.MultiheadAttention, model_misc.MultiheadAttention))]
     if not layers:
         raise RuntimeError('SAM3 has no encoder self-attention to block')
     for layer in layers:
@@ -223,16 +223,42 @@ class Grounding(nn.Module):
 
     Per prompt: the top-k joint scores (query score times presence), their normalized cxcywh
     boxes and mask logits, and the semantic logits of the prompt."""
-    def __init__(self, model, prompts, top_k):
+    def __init__(self, model, prompts, top_k, find_stage_cls, prompt_cls):
         super().__init__()
         self.model = model
         self.top_k = top_k
-        self.register_buffer('text_ids', torch.arange(len(prompts)))
+        self._find_stage_cls = find_stage_cls
+        self._prompt_cls = prompt_cls
+        with torch.no_grad():
+            text_outputs = model.backbone.forward_text(prompts, device='cuda')
+        self.register_buffer('language_features', text_outputs['language_features'].float())
+        self.register_buffer('language_mask', text_outputs['language_mask'])
+        self.register_buffer('img_ids', torch.zeros(len(prompts), dtype=torch.long, device='cuda'))
+        self.register_buffer('text_ids', torch.arange(len(prompts), dtype=torch.long, device='cuda'))
+        self.register_buffer('box_embeddings', torch.zeros(0, len(prompts), 4, dtype=torch.float32, device='cuda'))
+        self.register_buffer('box_mask', torch.zeros(len(prompts), 0, dtype=torch.bool, device='cuda'))
 
     def forward(self, image):
-        features = self.model.backbone.forward_image(image)
-        features.pop('sam2_backbone_out', None)
-        out = self.model.forward_grounding(features, self.text_ids)
+        backbone_out = self.model.backbone.forward_image(image)
+        backbone_out.pop('sam2_backbone_out', None)
+        backbone_out['language_features'] = self.language_features
+        backbone_out['language_mask'] = self.language_mask
+        find_input = self._find_stage_cls(
+            img_ids=self.img_ids,
+            text_ids=self.text_ids,
+            input_boxes=None,
+            input_boxes_mask=None,
+            input_boxes_label=None,
+            input_points=None,
+            input_points_mask=None,
+        )
+        geo_prompt = self._prompt_cls(box_embeddings=self.box_embeddings, box_mask=self.box_mask)
+        out = self.model.forward_grounding(
+            backbone_out=backbone_out,
+            find_input=find_input,
+            find_target=None,
+            geometric_prompt=geo_prompt,
+        )
         scores = out['pred_logits'].sigmoid().squeeze(-1) * out['presence_logit_dec'].sigmoid()
         scores, index = scores.topk(self.top_k, dim=1)
         boxes = out['pred_boxes'].gather(1, index[..., None].expand(-1, -1, 4))

@@ -15,8 +15,9 @@ import torch
 import onnx
 import tensorrt as trt
 
-from resources import (CACHE, GEOMETRY_REVISION, GROUNDING_SHA256, LOMA_COMMIT, MOGE_COMMIT, geometry_weights,
-                       grounding_weights, loma_source, moge_source, sha256, torch_weights)
+from resources import (CACHE, GEOMETRY_REVISION, GROUNDING_SHA256, LOMA_COMMIT, MOGE_COMMIT, SAM3_COMMIT,
+                       geometry_weights, grounding_weights, loma_source, moge_source, sam3_source, sha256,
+                       torch_weights)
 from networks import (ATTENTION_BLOCK, Detector, Descriptor, Geometry, Grounding, Matcher,
                       block_grounding_attention, fix_descriptor_positions, fix_geometry_positions,
                       real_rotary)
@@ -34,6 +35,7 @@ GROUNDING_SIZE = 1008
 GROUNDING_MASK_SIZE = 288
 GROUNDING_PROMPTS = ['person', 'shadow', 'robot', 'sky']
 GROUNDING_TOP_K = 20
+GROUNDING_SOURCE = {'model': 'facebook/sam3', 'sam3_commit': SAM3_COMMIT, 'checkpoint_sha256': GROUNDING_SHA256}
 LOGGER = trt.Logger(trt.Logger.WARNING)
 CONTRACTS = {
     'detector': (['image'], ['logits']),
@@ -45,7 +47,7 @@ CONTRACTS = {
 # A package holds all five models. Bundles hold the checkpoint-independent four.
 BASE_MODELS = [name for name in CONTRACTS if name != 'grounding']
 BUNDLE ='onnx-bundle.json'
-RECIPE_FILES = ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt', 'requirements-nodeps.txt')
+RECIPE_FILES = ('prepare.py', 'networks.py', 'resources.py', 'requirements.txt')
 # Hardware compatibility trades some tactics for one engine set on every Ampere+ GPU.
 HARDWARE_LEVELS = {'none': None, 'ampere_plus': (8, 0)}
 REFERENCES = [f'{name}.npz' for name in BASE_MODELS] + [
@@ -131,20 +133,50 @@ def load_geometry():
 
 
 def load_grounding(weights):
-    """SAM3 with baked prompt embeddings and the real-valued rotary encoding used for export."""
-    from ultralytics.models.sam.build_sam3 import build_sam3_image_model
-    import ultralytics.models.sam.sam3.encoder as encoder
-    import ultralytics.models.sam.sam3.vitdet as vitdet
-    model = build_sam3_image_model(str(weights)).float().eval().cuda().requires_grad_(False)
-    with torch.no_grad():
-        model.set_classes(GROUNDING_PROMPTS)
-    module = Grounding(model, GROUNDING_PROMPTS, GROUNDING_TOP_K).cuda().eval()
+    """Official SAM3 with baked prompt embeddings and the real-valued rotary encoding used for export."""
+    source = sam3_source()
+    if str(source) not in sys.path:
+        sys.path.insert(0, str(source))
+    from sam3.model_builder import build_sam3_image_model
+    import sam3.model.encoder as encoder
+    import sam3.model.vitdet as vitdet
+    import sam3.model.model_misc as model_misc
+    from sam3.model.data_misc import FindStage
+    from sam3.model.geometry_encoders import Prompt
+
+    # sam3.model_builder enables TF32 at import time; keep deterministic FP32 reference math.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    # multi_head_attention_forward enables flash/mem_efficient SDP; keep Math SDP pinned for export.
+    orig_flash = torch.backends.cuda.enable_flash_sdp
+    orig_mem = torch.backends.cuda.enable_mem_efficient_sdp
+    torch.backends.cuda.enable_flash_sdp = lambda *_: None
+    torch.backends.cuda.enable_mem_efficient_sdp = lambda *_: None
+    orig_flash(False)
+    orig_mem(False)
+    torch.backends.cuda.enable_math_sdp(True)
+
+    # Replace fused bfloat16 _addmm_activation with standard FP32 linear + activation for ONNX export.
+    vitdet.addmm_act = lambda act_cls, linear, x: act_cls()(linear(x))
+
+    bpe_path = source / 'sam3' / 'assets' / 'bpe_simple_vocab_16e6.txt.gz'
+    model = build_sam3_image_model(
+        bpe_path=str(bpe_path),
+        device='cuda',
+        eval_mode=True,
+        checkpoint_path=str(weights),
+        load_from_HF=False,
+        enable_segmentation=True,
+        enable_inst_interactivity=False,
+        compile=False,
+    ).float().eval().cuda().requires_grad_(False)
+    module = Grounding(model, GROUNDING_PROMPTS, GROUNDING_TOP_K, FindStage, Prompt).cuda().eval()
     generator = torch.Generator('cuda').manual_seed(0)
     image = torch.rand((1, 3, GROUNDING_SIZE, GROUNDING_SIZE), device='cuda', generator=generator) * 2 - 1
     with torch.no_grad():
         upstream = module(image)
         vitdet.apply_rotary_enc = real_rotary
-        block_grounding_attention(model, vitdet, encoder)
+        block_grounding_attention(model, vitdet, encoder, model_misc)
         exported = module(image)
     # Mask logits are unbounded; scores and boxes carry the detections.
     for before, after, tolerance in zip(upstream, exported, (1e-4, 1e-3, .5, .5)):
@@ -764,12 +796,14 @@ def main():
             bundle = read_bundle(origin.parent)
         if (origin.parent / 'manifest.json').is_file():
             reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
-        # A grounding graph is reused only with the same baked prompts and attention blocks.
+        # A grounding graph is reused only with the same baked prompts, attention blocks, and grounding source.
         prompts = (reuse_manifest or {}).get('grounding_prompts')
         blocks = (reuse_manifest or {}).get('grounding_attention_block')
+        grounding_source = (reuse_manifest or {}).get('grounding_source')
         settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in names
                                  if name != 'grounding' or
-                                 (prompts == GROUNDING_PROMPTS and blocks == ATTENTION_BLOCK)}
+                                 (prompts == GROUNDING_PROMPTS and blocks == ATTENTION_BLOCK and
+                                  grounding_source == GROUNDING_SOURCE)}
     # A bundle carries its own validation images; no upstream source download is needed.
     source = None if args.images or bundle else loma_source()
     if args.images:
@@ -871,8 +905,7 @@ def main():
                 'grounding_size': GROUNDING_SIZE, 'grounding_mask_size': GROUNDING_MASK_SIZE,
                 'grounding_prompts': GROUNDING_PROMPTS, 'grounding_top_k': GROUNDING_TOP_K,
                 'grounding_attention_block': ATTENTION_BLOCK,
-                'grounding_source': {'model': 'facebook/sam3', 'checkpoint_sha256': GROUNDING_SHA256,
-                                     'ultralytics': importlib.metadata.version('ultralytics')}}
+                'grounding_source': GROUNDING_SOURCE}
     write_json(pending / 'manifest.json', manifest)
     # Publish in PowerShell after this process releases any Windows file handles.
     print(f'Model package verified: {pending}', flush=True)

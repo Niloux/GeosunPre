@@ -16,7 +16,7 @@
 
 ## 模型接口
 
-manifest.json：tensorrt=`10.13.3.9`、gpu、hardware_compatibility、matcher_precision、matcher_score_precision、geometry_precision、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、geometry_size=644、geometry_tokens=2116、geometry_source（MoGe 提交、模型名与 revision）、models、grounding_size=1008、grounding_mask_size=288、grounding_prompts=`["person","shadow","robot","sky"]`、grounding_top_k=20、grounding_source（模型名、检查点 SHA256、导出所用 ultralytics 版本）。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`。matcher_score_precision 记录最终评分精度，默认 FP16 主干搭配 FP32 评分。hardware_compatibility 为 `none` 或 `ampere_plus`；gpu 始终记录构建 GPU。
+manifest.json：tensorrt=`10.13.3.9`、gpu、hardware_compatibility、matcher_precision、matcher_score_precision、geometry_precision、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、geometry_size=644、geometry_tokens=2116、geometry_source（MoGe 提交、模型名与 revision）、models、grounding_size=1008、grounding_mask_size=288、grounding_prompts=`["person","shadow","robot","sky"]`、grounding_top_k=20、grounding_source（模型名、sam3_commit 与检查点 SHA256）。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`。matcher_score_precision 记录最终评分精度，默认 FP16 主干搭配 FP32 评分。hardware_compatibility 为 `none` 或 `ampere_plus`；gpu 始终记录构建 GPU。
 
 detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max=[1536,1536]`。opt 只用于 TensorRT 编译优化，不限制原图尺寸。
 
@@ -44,7 +44,7 @@ grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的
 - [DaD](https://github.com/Parskatt/dad/releases/tag/v0.1.0) 检测器。
 - [DINOv2](https://github.com/facebookresearch/dinov2)：ViT-L/14。
 - [MoGe](https://github.com/microsoft/MoGe/tree/74fbce054ebed49800de42d0ad0e83495065719a) 源码与 [MoGe-2 ViT-L normal](https://huggingface.co/Ruicheng/moge-2-vitl-normal)：revision `cb0e8bbd6b1e243589717c78e750b1ba4c093acf`，均为 MIT 许可。
-- [SAM3](https://huggingface.co/facebook/sam3)：`sam3.pt`，SHA256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`，SAM License；模型代码取自 ultralytics 8.4.192 及其 CLIP 分词器（固定提交），两者不带依赖安装，只用于导出。
+- [SAM3](https://huggingface.co/facebook/sam3)：`sam3.pt`，SHA256 `9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e`，SAM License；模型代码与 BPE 词表直接取自官方 [facebookresearch/sam3](https://github.com/facebookresearch/sam3/tree/eef6839bcfc3458dd52ea80535dc6bd62aea86b1)（固定提交 `eef6839bcfc3458dd52ea80535dc6bd62aea86b1`），只用于导出。
 
 需要手动导出 ONNX 或指定引擎参数时，可调用 `tools/windows/prepare-models.ps1`。它默认生成针对构建 GPU 的引擎。
 
