@@ -84,9 +84,11 @@ models/
 预处理和训练作为整体交付时，训练配置以 `configs/trainer.json` 为准。提交后在同级 LFS 仓库执行 `scripts\package-windows-trainer.cmd`，它默认读取这份配置并记录当前 GeosunPre 提交；再组装整体包：
 
 ```powershell
-.\package.ps1 -Preprocess packages/GeosunPre-版本-提交-ampere_plus -Trainer ..\LichtFeld-Studio\build-delivery\Geosun-3DGS-Trainer-sm80-时间
+.\package.ps1 -BundleVersion 1.1.0 -Preprocess packages/GeosunPre-版本-提交-ampere_plus -Trainer ..\LichtFeld-Studio\build-delivery\Geosun-3DGS-Trainer-sm80-时间
 ```
 
-`package.ps1` 在整包模式下编译启动器，原样复制两个子包到 `preprocess/` 和 `trainer/`。脚本核对文件哈希、提交和训练配置，并检查启动器、五模型和训练器，最后输出交付目录、ZIP 和 SHA256 文件。整体包用法见 [bundle/README.md](bundle/README.md)。
+`-BundleVersion` 指定 Geosun 3DGS 的整包版本。正式版用 `1.1.0` 这类版本号，候选版用 `1.1.0-rc.2` 这类版本号。默认输出 `packages/Geosun-3DGS-1.1.0-Windows-x64.zip`、同名解压目录和 `.zip.sha256` 文件。整包与两个子包各自的版本都记录在 `bundle.json`，发出新包时分配新的整包版本。
+
+`package.ps1` 在整包模式下编译启动器，原样复制两个子包到 `preprocess/` 和 `trainer/`。脚本核对文件哈希、提交和训练配置，并检查启动器、五模型和训练器。整体包用法见 [bundle/README.md](bundle/README.md)。
 
 构建依赖使用固定版本；Ceres 使用轻量日志和 Eigen 稀疏求解，OpenCV 只构建图像处理所需模块。Ceres 回代补丁由 CMake 自动应用，清空 `build/` 后重新构建同样生效。

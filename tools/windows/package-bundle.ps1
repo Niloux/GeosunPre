@@ -2,6 +2,9 @@
 param(
     [Parameter(Mandatory)] [string]$Preprocess,
     [Parameter(Mandatory)] [string]$Trainer,
+    [Parameter(Mandatory)]
+    [ValidatePattern('\A[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[1-9][0-9]*)?\z')]
+    [string]$BundleVersion,
     [string]$Output,
     [string]$Image
 )
@@ -10,6 +13,16 @@ param(
 # the current build and checkout so existing paired packages can be reused.
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$BundleVersion = $BundleVersion.ToLowerInvariant()
+if (-not $Output) {
+    $Output = Join-Path $projectRoot "packages\Geosun-3DGS-$BundleVersion-Windows-x64"
+}
+$destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output).TrimEnd([char[]]'\/')
+$pending = "$destination.pending"
+$archive = "$destination.zip"
+foreach ($path in @($destination, $pending, $archive, "$archive.pending", "$archive.sha256")) {
+    if (Test-Path -LiteralPath $path) { throw "Choose a new -Output. Already exists: $path" }
+}
 
 function Resolve-Dir([string]$Path) {
     $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path).TrimEnd([char[]]'\/')
@@ -77,15 +90,6 @@ if ($committedConfig -ne $packagedConfig) {
     throw "Trainer config/trainer.json differs from configs/trainer.json at GeosunPre $($pre.revision)."
 }
 
-if (-not $Output) {
-    $Output = Join-Path $projectRoot "packages\Geosun-$($pre.version)-$($pre.revision)-$($pre.models.hardware_compatibility)-trainer-$($train.revision)-exe"
-}
-$destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output).TrimEnd([char[]]'\/')
-$pending = "$destination.pending"
-$archive = "$destination.zip"
-foreach ($path in @($destination, $pending, $archive, "$archive.pending", "$archive.sha256")) {
-    if (Test-Path -LiteralPath $path) { throw "Choose a new -Output. Already exists: $path" }
-}
 if (-not $Image) {
     $Image = @((Join-Path $projectRoot 'packages\onnx-bundle-v1\images\A.jpg'),
         (Join-Path $projectRoot '.cache\model-prepare\source\LoMa-8fb59c458f2a2ef44314f462467b229c27786bf0\assets\0015_A.jpg')) |
@@ -99,9 +103,10 @@ New-Item -ItemType Directory -Path $pending | Out-Null
 Copy-Item -LiteralPath $Preprocess -Destination (Join-Path $pending 'preprocess') -Recurse
 Copy-Item -LiteralPath $Trainer -Destination (Join-Path $pending 'trainer') -Recurse
 $utf8 = [Text.UTF8Encoding]::new($false)
-Copy-Item -LiteralPath $launcher -Destination (Join-Path $pending 'geosun.exe')
+Copy-Item -LiteralPath $launcher -Destination (Join-Path $pending 'Geosun.exe')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'bundle/README.md') -Destination (Join-Path $pending 'README.md')
 $record = [ordered]@{
+    version = $BundleVersion
     preprocess = [ordered]@{
         version = $pre.version; revision = $pre.revision
         hardware_compatibility = $pre.models.hardware_compatibility
@@ -114,7 +119,7 @@ $record = [ordered]@{
         package_json_sha256 = Get-Sha256 (Join-Path $pending 'trainer/package.json')
     }
     files = [ordered]@{
-        'geosun.exe' = Get-Sha256 (Join-Path $pending 'geosun.exe')
+        'Geosun.exe' = Get-Sha256 (Join-Path $pending 'Geosun.exe')
         'README.md' = Get-Sha256 (Join-Path $pending 'README.md')
     }
 }
@@ -124,7 +129,7 @@ $record = [ordered]@{
 Test-Package (Join-Path $pending 'preprocess') $pre 'Bundled GeosunPre'
 Test-Package (Join-Path $pending 'trainer') $train 'Bundled trainer'
 $before = Get-Files $pending
-& (Join-Path $pending 'geosun.exe') --help
+& (Join-Path $pending 'Geosun.exe') --help
 if ($LASTEXITCODE) { throw "Bundled launcher does not start. Files remain in $pending" }
 & (Join-Path $pending 'preprocess\geosunpre.exe') check-models --image $Image
 if ($LASTEXITCODE) { throw "Bundled inference failed. Files remain in $pending" }

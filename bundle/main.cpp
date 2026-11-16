@@ -21,7 +21,7 @@ namespace fs = std::filesystem;
 using Args = std::vector<std::wstring>;
 
 void Help() {
-  std::cout << "Usage: geosun.exe --scene PATH --output PATH\n"
+  std::cout << "Usage: Geosun.exe --scene PATH --output PATH\n"
                "  --step all|preprocess|train|export  (default: all)\n"
                "  --texel-size NUMBER                 (default: 0.02)\n"
                "  --preprocess-arg VALUE              (repeat for each argument)\n"
@@ -33,7 +33,7 @@ fs::path BundleRoot() {
   std::wstring path(32768, L'\0');
   const auto size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
   if (!size || size >= path.size())
-    throw std::runtime_error("Cannot locate geosun.exe");
+    throw std::runtime_error("Cannot locate Geosun.exe");
   path.resize(size);
   return fs::path(path).parent_path();
 }

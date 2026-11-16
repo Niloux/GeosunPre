@@ -4,16 +4,19 @@ param(
     [string]$Output,
     [string]$Image,
     [string]$Preprocess,
-    [string]$Trainer
+    [string]$Trainer,
+    [ValidatePattern('\A[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[1-9][0-9]*)?\z')]
+    [string]$BundleVersion
 )
 $ErrorActionPreference = 'Stop'
 $tools = Join-Path $PSScriptRoot 'tools\windows'
-if ($Preprocess -or $Trainer) {
-    if (-not ($Preprocess -and $Trainer) -or $Models) {
-        throw 'Bundle packaging requires both -Preprocess and -Trainer, without -Models.'
+if ($Preprocess -or $Trainer -or $BundleVersion) {
+    if (-not ($Preprocess -and $Trainer -and $BundleVersion) -or $Models) {
+        throw 'Bundle packaging requires -Preprocess, -Trainer and -BundleVersion, without -Models.'
     }
     & (Join-Path $tools 'build.ps1') | Out-Host
-    & (Join-Path $tools 'package-bundle.ps1') -Preprocess $Preprocess -Trainer $Trainer -Output $Output -Image $Image
+    & (Join-Path $tools 'package-bundle.ps1') -Preprocess $Preprocess -Trainer $Trainer `
+        -BundleVersion $BundleVersion -Output $Output -Image $Image
     return
 }
 & git -C $PSScriptRoot diff --quiet HEAD --
