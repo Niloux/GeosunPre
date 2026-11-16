@@ -95,6 +95,21 @@ void CreatePending(const fs::path& path) {
     throw std::runtime_error("Path already exists: " + path.u8string());
 }
 
+void PublishPending(const fs::path& pending, const fs::path& target) {
+  std::error_code ec;
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    fs::rename(pending, target, ec);
+    if (!ec)
+      return;
+    const auto code = ec.value();
+    if (code != ERROR_ACCESS_DENIED && code != ERROR_SHARING_VIOLATION &&
+        code != ERROR_LOCK_VIOLATION)
+      break;
+    Sleep(100);
+  }
+  throw fs::filesystem_error("Cannot publish output directory", pending, target, ec);
+}
+
 void CheckOsgb(const fs::path& path) {
   if (fs::is_directory(path)) {
     for (const auto& entry : fs::recursive_directory_iterator(path))
@@ -249,7 +264,7 @@ void Pipeline(int argc, wchar_t** argv) {
     CreatePending(pending);
     Run(trainer, {L"--config", config.native(), L"-d", delivery.native(), L"-o", pending.native()},
         train_args, "Training");
-    fs::rename(pending, train);
+    PublishPending(pending, train);
     std::cout << "Training: " << train.u8string() << '\n';
   }
 
@@ -264,7 +279,7 @@ void Pipeline(int argc, wchar_t** argv) {
     RequireFile(export_pending / L"splats.ply");
     RequireFile(mesh);
     CheckOsgb(export_pending / L"mesh_osgb");
-    fs::rename(export_pending, export_dir);
+    PublishPending(export_pending, export_dir);
     std::cout << "Export: " << export_dir.u8string() << '\n';
   }
 }

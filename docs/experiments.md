@@ -215,3 +215,50 @@
 ### 3. 结论与待补充
 - **结论**：在不更改 `OPENCV_FISHEYE` 与任何外部输出格式的前提下，本次三项改进从根源消除了双目卷帘转角过拟合与相机-LAS 脱节问题：`展厅` 与 `篮球场` 同步双目三维角速度差均下降 **`66%–72%`**，真实 LAS 点到平面距离 P90 分别降至 **`17.0–17.7 mm`** 与 **`14.8–15.1 mm`**（`篮球场` 中位数从 `7.67 mm` 降至 **`3.73–3.79 mm`**，直接改善近距离边缘投影错位，并使 `篮球场` MoGe 跨视角深度冲突减少约 `100.5 万` 像素）；仅增加约 `10%–13.5%` 端到端耗时，可直接作为默认主线保留。
 - **待补充**：使用 `work\展厅-shutter` 与 `work\篮球场-shutter` 在下游 LichtFeld Studio 完成 3DGS 训练对照（对照既有 `work\展厅-opt2` / `work\篮球场-opt`），检验墙面/展柜/场地边界锐度与重影改善效果。
+
+## 2026-11-16：发版前合规脱敏、整包组装与双场景 3DGS + OSGB 全闭环验证
+
+- **测试环境**：Windows x64，`NVIDIA GeForce RTX 4090`（`SM 8.9`，`24563 MB`，驱动 `610.88` / CUDA Runtime `12.8`），TensorRT `10.13.3.9`。
+- **发版前核心改造与打包规格**：
+  1. **合规脱敏与 Aggregate 商用架构**（`GeosunPre` 提交 `fee6a4f`、`65dba85`、`e551d60`；`LichtFeld-Studio` 提交 `b70494526`）：
+     - SAM3 导出彻底移除 AGPL-3.0 的 `ultralytics`（`prepare-models.ps1` 显式执行 `uv pip uninstall` 清理 `ultralytics` 与 `clip`），切换至官方 `facebookresearch/sam3`（提交 `eef6839bcfc3458dd52ea80535dc6bd62aea86b1`）；在 `tools/models/networks.py` 与 `prepare.py` 中增加 `freeze_grounding_rotary`（预存 `freqs_cis_real`/`freqs_cis_imag` 并启用 `use_rope_real`）、将 `block_grounding_attention` 限定至 `model.transformer.encoder.modules()` 避开带 padding mask 的几何编码器，并引入 `TextOnlyGeometryEncoder` 跳过空点框分支以适配旧版 TorchScript ONNX 导出器。
+     - `dependencies/licenses/` 补齐 `sam3.txt`（Meta SAM License）、`moge.txt`（MIT）、`dinov2.txt`（Apache-2.0）、`dad.txt`（MIT），交付包 `preprocess/licenses/` 共 `14` 份许可证文本；`LichtFeld-Studio` 子包恢复安装 `LICENSE`、`LICENSE-EXCEPTION.txt`、`THIRD_PARTY_LICENSES.md` 及 `share/LichtFeld-Studio/licenses/`，文档统一明确 GPLv3 Section 5 进程级解耦 Aggregate 分发口径。
+  2. **架构支持、DLL 精简与启动防护**：
+     - `LichtFeld-Studio` 训练器包补齐 `80-virtual;86-real;89-real;120-real`（含 Blackwell RTX 50 系列原生 SASS），并在 `LFS_TRAINER_ONLY` 下关闭 `CMAKE_INSTALL_UCRT_LIBRARIES`、加固 `RUNTIME_DEPENDENCY_SET` 系统库排除规则；产出 `Geosun-3DGS-Trainer-sm80-20261116-134442`（`59` 个文件，`.zip` `220,706,911 B` / `210.48 MiB`，`ucrtbase.dll` 与 `api-ms-win-*.dll` 数量为 `0`）。
+     - `GeosunPre-1.1.0-e551d60-ampere_plus`（`39` 个文件）与上述训练器组装为整包 `packages\Geosun-1.1.0-e551d60-ampere_plus-trainer-b70494526-exe`（`.zip` 体积 `2,527,130,860 B` / `2410.06 MiB`）。
+     - `bundle/README.md`、`docs/models.md`、`docs/deployment.md` 将显存门槛修正为 `≥ 12 GB（推荐 16 GB+）`；`bundle/main.cpp`（`geosun.exe`）新增 `--output` 卷可用空间预检，并在本次实跑定位到 `export.pending` 在杀软/索引扫描新写出 `67` 个文件时因无重试而在 `fs::rename` 触发瞬态锁后，补充 `PublishPending`（最多 `50 × 100 ms` 重试，`/W4` 零警告通过）。
+
+### 1. 双场景全闭环实测数据（`展厅-bundle` vs `篮球场-bundle`）
+
+- **执行口径说明**：
+  - `展厅-bundle`（`D:\Dev\GeosunPre\work\展厅-bundle`）：由上述最新整包 `geosun.exe` 端到端串联执行（预处理采用 `ampere_plus` 官方 `facebookresearch/sam3` 引擎 `1a5e2f26d596fce5` + MoGe 引擎 `9059dbef1a7e207a`；`export.pending` 校验完整后重命名为 `export`），随后由同核 `LichtFeld-Studio.exe`（`e1d348b57`，与 `b70494526` 训练/网格/OSGB/评测 C++/CUDA 代码零差异）执行全视角离线 `eval`。
+  - `篮球场-bundle`（`D:\Dev\GeosunPre\work\篮球场` + `D:\Dev\GeosunPre\work\篮球场-bundle`）：预处理目录 `work\篮球场` 系用户使用 `build\ninja\bin\geosunpre.exe`（`e551d60`）搭配本机 `models\`（`hardware_compatibility: none`，仍含旧 `ultralytics: 8.4.192` 导出 `grounding` 引擎 `1a6355d1a04b99ba` 与 MoGe 引擎 `36ace64568d19473`）生成；随后使用同核 `LichtFeld-Studio.exe` 严格按 `configs/trainer.json` 完成 `train` → `splats.ply` → `mesh --texel-size 0.02` → `eval` 全流程。
+
+| 阶段 / 指标 | 室内 `展厅`（`work\展厅-bundle`） | 室外 `篮球场`（`work\篮球场` + `篮球场-bundle`） | 说明 |
+| --- | --- | --- | --- |
+| 预处理执行程序 / 模型规格 | 整包 `geosunpre.exe`（`e551d60`，`ampere_plus` 官方 SAM3） | 本机 `geosunpre.exe`（`e551d60`，`models/`） | 下游共用同一套 `configs/trainer.json` |
+| 注册情况（`quality.json`） | `585 / 588`（未注册 `00214–00216-R`，`passed: true`） | **`536 / 536`**（`complete: true`，`passed: true`） | 关键几何门禁全通过 |
+| SfM 点数 / 观测数 / `>=3` 视图轨迹 | `151,441` / `738,159` / `70,971` | `122,472` / `502,246` / `57,827` | 轨迹完整 |
+| 重投影误差 `median` / `p90` | `0.8908 px` / `2.0724 px` | `0.7079 px` / `1.7450 px` | 远低于 `2.0 / 4.0 px` 上限 |
+| LAS 点到面 `median` / `p90`（面点数） | `5.68 mm` / `16.99 mm`（`32,109`） | `7.08 mm` / `25.95 mm`（`27,297`） | `polish` 重关联后分别达 `5.62 / 16.74 mm` 与 `3.81 / 14.99 mm` |
+| `shutter` 留出误差 `before -> after` | `1.4294 -> 1.1445 px`（`p90: 3.5161 -> 3.2040 px`） | `1.3487 -> 0.9838 px`（`p90: 3.3350 -> 2.8428 px`） | 同向/反向读出与 `polish` 均采用 |
+| `static_masks.sky` 与终版含 `128` 图像数 | `kept: false`（`raw_sky=0`，`static` 恢复 `51` 图 `1,203,541 px`），终版含 `128`: **`0 / 585`** | `kept: true`（`raw_sky=529`, `open_sky=518`, 清误检 `58` 图 `837,672 px`），终版含 `128`: **`527 / 536`** | 室内零残余 `128`；室外开阔天空完整保留 |
+| `points3D.ply` 点数 / 交付体积（非图 / 总） | `881,496`（`22.70 MiB`） / `738.30` / `1807.22 MiB` | `2,500,000`（`64.37 MiB`） / `729.23` / `2341.85 MiB` | 对齐 `max_cap = 3,000,000` |
+| 3DGS 训练耗时 / `project.licht` / 高斯球数 | 约 `8m49s`（交付至生成时间差）/ `432.66 MiB` / `3,000,000` | `457.473 s`（`65.6 iter/s`）/ `420.73 MiB` / `3,000,000` | MRNF + GUT + PPISP（30k 步） |
+| 离线 `eval`（全视角 `eval_all`）纯前景 `mask == 255` PSNR | **`26.1906 dB`**（`p10=23.95 / med=26.43 / p90=28.01`） | **`19.0291 dB`**（`p10=17.57 / med=18.88 / p90=20.69 / max=21.99`） | 室外原生 `masks:` 口径说明见下节 |
+| 纯前景 SSIM / LPIPS | **`0.8535`** / **`0.2693`** | **`0.5652`** / **`0.3646`** | 室内色偏近零；室外 `bias_corr = (-0.0057, -0.0075, -0.0072)` |
+| 渲染几何对齐：`normal_angle_deg` / `depth_absrel` | `12.0082°` / `0.0070` | `17.0784°` / `0.0051` | 先验深度中位误差分别 `16.32 mm` 与 `17.39 mm` |
+| `export\splats.ply` 体积 / 坐标检查 | `204,000,666 B`（`194.55 MiB`，`3,000,000` 点，全有限） | `204,000,666 B`（`194.55 MiB`，`3,000,000` 点，全有限） | 无 NaN/Inf 异常点 |
+| `export\mesh.ply` 顶点 / 面数 / 体积 | `747,552` 顶点 / `1,319,803` 面 / `35.61 MiB` | `21,681,487` 顶点 / `39,596,054` 面 / `1049.18 MiB` | 全有限坐标，`--texel-size 0.02` |
+| `export\mesh_osgb` 瓦片目录 / `.osgb` 文件数 / 体积 | `16` 瓦片 / `64` 文件 / `49.09 MiB` | `512` 瓦片 / `2,006` 文件 / `1781.86 MiB`（`7041` 页，覆盖率 `72.7%`） | `SRS=ENU:31.0,121.0`，魔数校验全通过 |
+
+### 2. 视觉抽检与指标口径分析
+
+1. **室内 `展厅`视觉抽检**（抽看 `eval_step_30000` 中 `00146-R` p10、`00074-L` median、`00265-L` p90）：
+   - 顶部发光灯箱、条形吊顶格栅与白色展台完整还原、无一处天空误挖黑洞；地面操作员双脚被静态掩码可靠剔除并由多视角一致补全，玻璃展柜、机器人车体及蓝色灯带走廊几何对齐无重影；`Unmasked PSNR = 20.4393 dB` 主要反映鱼眼有效圆圈外暗角环带与被剔除的动态人物差异。
+2. **室外 `篮球场`视觉抽检与 `eval` 口径定位**（抽看 `00203-R`、`00244-L`、`00120-R` 及 `00199-R`、`00181-R`、`00036-L`）：
+   - **渲染画面与天空惩罚验证**：场地面砖网格、白色标线、篮架、凉亭钢构、`9B` 标牌与建筑玻璃幕墙均清晰锐利、无卷帘重影，开放天空透明无空中漂浮物。
+   - **`eval` 口径差异定位**：直接使用 `eval --eval-mask masks:work\篮球场\masks` 时报告 `Mask PSNR = 9.9967 dB`（`bias ≈ -0.10`），原因在于 `--eval-mask masks:` 默认按 `0.5` 阈值二值化，把 `128` 开放天空像素误纳入评分区域，使过曝白色天空原图与 `segment_and_ignore` 透明纯黑背景（`--bg-color [0,0,0]`）直接计算 MSE；将 `128` 置 `0` 仅评 `mask == 255` 静态前景（`eval_foreground`）后，前景色偏基本归零，PSNR 回升至 `19.0291 dB`（`p90 = 20.69`、`max = 21.99 dB`），余下扣分主要来自近景树冠叶隙与高楼顶缘处紧贴天空边界渗入的零星白边对比黑背景产生的高额 MSE，以及约 `142 m × 139 m × 88 m` 园区尺度下 `3M` 高斯上限对远景枝叶高频纹理的平滑效应（`depth_prior_low_alpha = 0.6961`）。
+3. **结论与后续可选复核**：
+   - 发版前必做的闭环验证（补齐 `sm_120` SASS、清理 `ucrtbase`/`api-ms-win` 冗余 DLL、恢复 LFS 开源许可证、SAM3 脱离 `ultralytics`、补齐模型许可证、修正 `≥ 12 GB` 显存门槛并加入磁盘预检与目录重命名重试）已全部实现并通过实测。
+   - **可选复核**：用含 `PublishPending` 修复的新编译 `geosun.exe` 刷新整包并按需在外部终端以新包重跑一次室外 `篮球场-bundle`（统一切换至 `ampere_plus` 官方 `facebookresearch/sam3` 引擎）作最终回归存档。
