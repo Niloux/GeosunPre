@@ -19,8 +19,8 @@ from resources import (CACHE, GEOMETRY_REVISION, GROUNDING_SHA256, LOMA_COMMIT, 
                        geometry_weights, grounding_weights, loma_source, moge_source, sam3_source, sha256,
                        torch_weights)
 from networks import (ATTENTION_BLOCK, Detector, Descriptor, Geometry, Grounding, Matcher,
-                      block_grounding_attention, fix_descriptor_positions, fix_geometry_positions,
-                      real_rotary)
+                      TextOnlyGeometryEncoder, block_grounding_attention, fix_descriptor_positions,
+                      fix_geometry_positions, freeze_grounding_rotary)
 
 TRT_VERSION = '10.13.3.9'
 MAX_FEATURES = 3072
@@ -175,8 +175,10 @@ def load_grounding(weights):
     image = torch.rand((1, 3, GROUNDING_SIZE, GROUNDING_SIZE), device='cuda', generator=generator) * 2 - 1
     with torch.no_grad():
         upstream = module(image)
-        vitdet.apply_rotary_enc = real_rotary
+        freeze_grounding_rotary(model, vitdet)
         block_grounding_attention(model, vitdet, encoder, model_misc)
+        # Skip empty point/box operations that the legacy ONNX exporter cannot lower.
+        model.geometry_encoder = TextOnlyGeometryEncoder(model.geometry_encoder).eval()
         exported = module(image)
     # Mask logits are unbounded; scores and boxes carry the detections.
     for before, after, tolerance in zip(upstream, exported, (1e-4, 1e-3, .5, .5)):

@@ -134,22 +134,16 @@ class Geometry(nn.Module):
         return tuple(output[key].float() for key in ('points', 'normal', 'mask', 'metric_scale'))
 
 
-def real_rotary(xq, xk, freqs_cis, repeat_freqs_k=False):
-    """Upstream rotary encoding on (real, imaginary) pairs; ONNX has no complex tensors."""
-    cos, sin = freqs_cis.real.to(xq.dtype), freqs_cis.imag.to(xq.dtype)
-
-    def rotate(x, c, s):
-        x = x.unflatten(-1, (-1, 2))
-        a, b = x[..., 0], x[..., 1]
-        return torch.stack([a * c - b * s, a * s + b * c], -1).flatten(-2)
-
-    if xk.shape[-2] == 0:
-        return rotate(xq, cos, sin), xk
-    c, s = cos, sin
-    if repeat_freqs_k and xk.shape[-2] != xq.shape[-2]:
-        r = xk.shape[-2] // xq.shape[-2]
-        c, s = c.repeat(*([1] * (c.ndim - 2)), r, 1), s.repeat(*([1] * (s.ndim - 2)), r, 1)
-    return rotate(xq, cos, sin), rotate(xk, c, s)
+def freeze_grounding_rotary(model, vitdet):
+    """Use SAM3's real-valued rotary path with constants prepared before tracing."""
+    for attention in model.modules():
+        if isinstance(attention, vitdet.Attention) and attention.freqs_cis is not None:
+            frequencies = attention.freqs_cis
+            attention.register_buffer('freqs_cis_real', frequencies.real.contiguous())
+            attention.register_buffer('freqs_cis_imag', frequencies.imag.contiguous())
+            # _apply_rope checks for this buffer before selecting the real-valued path.
+            attention.freqs_cis = attention.freqs_cis_real
+            attention.use_rope_real = True
 
 
 # TensorRT keeps SAM3 attention logits in FP32 and so cannot fuse attention: each global attention
@@ -210,12 +204,32 @@ def block_grounding_attention(model, vitdet, encoder, model_misc):
             return getattr(F, name)
 
     vitdet.F = Functional()
-    layers = [m for m in model.modules() if isinstance(m, encoder.TransformerEncoderLayer)
+    # The geometry prompt encoder uses the same layer class with padding masks.
+    layers = [m for m in model.transformer.encoder.modules()
+              if isinstance(m, encoder.TransformerEncoderLayer)
               and isinstance(m.self_attn, (nn.MultiheadAttention, model_misc.MultiheadAttention))]
     if not layers:
         raise RuntimeError('SAM3 has no encoder self-attention to block')
     for layer in layers:
         layer.self_attn = BlockedSelfAttention(layer.self_attn)
+
+
+class TextOnlyGeometryEncoder(nn.Module):
+    """Encode the geometry CLS token for grounding with fixed text-only prompts."""
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, geo_prompt, img_feats, img_sizes, img_pos_embeds):
+        encoder = self.encoder
+        features, positions = img_feats[-1], img_pos_embeds[-1]
+        batch = features.shape[1]
+        token = encoder.cls_embed.weight.view(1, 1, encoder.d_model).expand(-1, batch, -1)
+        mask = torch.zeros((batch, 1), dtype=torch.bool, device=features.device)
+        token = encoder.norm(encoder.final_proj(token))
+        for layer in encoder.encode:
+            token = layer(tgt=token, memory=features, tgt_key_padding_mask=mask, pos=positions)
+        return encoder.encode_norm(token), mask
 
 
 class Grounding(nn.Module):
