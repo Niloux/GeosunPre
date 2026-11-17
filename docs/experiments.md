@@ -286,3 +286,43 @@
 
 - **LichtFeld-Studio**：统一 `metrics.cpp` 中 `MaskMode::SegmentAndIgnore` 的 `masks:<folder>` 加载经 `load_eval_mask_file` / `classify_keep_mask_for_metrics`（仅保留 `mask == 255` 前景，排除 `128` 天空与 `0` 忽略）；在 `native_gut_evaluation` 透传 `rolling_shutter`，并在日志（`Eval: rolling shutter active for K / N cameras`、`EvalMetrics::to_string()`）及 `metrics_report.txt`（`Rolling shutter cameras: K / N`）显式记录实际激活卷帘相机数。
 - **契约文档**：[output.md](file:///D:/Dev/GeosunPre/docs/output.md#L102-L117) 补齐 `eval_all`、`mask == 255` 前景计分与卷帘日志/指标核验条目。
+
+---
+
+## 2026-11-17：LichtFeld-Studio 训练器包体瘦身（保留全架构 SASS + Tensor 模板隔离 + Core CUDA 去重 + Fatbin 压缩）
+
+### 1. 根因确认与改造方案（方案 A）
+
+基于基线产物 [Geosun-3DGS-1.1.1-Windows-x64.zip](file:///D:/Dev/GeosunPre/packages/Geosun-3DGS-1.1.1-Windows-x64.zip) 与 `build-windows-trainer-ptx80` 构建目录复核，保持 `CMAKE_CUDA_ARCHITECTURES="80-virtual;86-real;89-real;120-real"`（RTX 30/40/50 零 runtime JIT 延迟），从以下 3 个根因同步瘦身：
+
+1. **Tensor 泛型/广播核模板跨编译单元隔离与单点实例化**：
+   - 抽取 `run_with_thrust_policy` 至 [thrust_policy.cuh](file:///D:/Dev/LichtFeld-Studio/src/core/tensor/internal/thrust_policy.cuh)。
+   - [tensor_ops.hpp](file:///D:/Dev/LichtFeld-Studio/src/core/tensor/internal/tensor_ops.hpp) 停止向外部 `.cu` 暴露 `tensor_generic_ops.cuh` 与 `tensor_broadcast_ops.cuh` 的核模板实现，仅保留 `LFS_CORE_API` 声明（并用宏守卫避免核心实现 TU 重声明冲突）；移除 `mrnf_kernels.cu` 对 `tensor_generic_ops.cuh` 的冗余包含。
+   - 统一 [tensor_ops.cu](file:///D:/Dev/LichtFeld-Studio/src/core/tensor/tensor_ops.cu)、[tensor_broadcast_ops.cu](file:///D:/Dev/LichtFeld-Studio/src/core/tensor/tensor_broadcast_ops.cu) 与 [tensor_exports.cu](file:///D:/Dev/LichtFeld-Studio/src/core/tensor/tensor_exports.cu) 之间的重复显式实例化，并将 `launch_ieee_*_float` 及缺失浮点/标量显式实例化集中导出到 `geosun_3dgs_core.dll`。
+2. **`lfs_core_cuda` 全量导出与 EXE/DLL 去重**：
+   - 将原使用静态占位宏 `LFS_CUDA_API` 或未导出的 `lfs_core_cuda` 接口（含 `image_quantize`、`initial_scales`、`mask_normalization`、`selection_ops`、`splat_transform`、`sh_layout`、`sh_value_quant_kernels`、`exportable_storage`、`lanczos_resize`、`undistort` 及 `RasterizerMemoryArena` / `GlobalArenaManager` 成员方法）统一标记为 `LFS_CORE_API`。
+   - [src/core/CMakeLists.txt](file:///D:/Dev/LichtFeld-Studio/src/core/CMakeLists.txt) 以 `$<LINK_LIBRARY:WHOLE_ARCHIVE,lfs_core_cuda>` 将全部 `lfs_core_cuda` 符号完整导出到 `lfs_core`（`geosun_3dgs_core.dll`），并在 `src/training`、`fastgs`、`src/io` 中移除对静态库 `lfs_core_cuda` 的重复链接（`src/io` 改直连 `CUDA::cuda_driver`）。
+3. **CUDA 12.8 Fatbin 全条目压缩**：
+   - 在 [LichtFeld-Studio/CMakeLists.txt](file:///D:/Dev/LichtFeld-Studio/CMakeLists.txt) 为非 Debug CUDA 编译统一开启 `-Xfatbin=-compress-all`（CUDA ≥ 12.8 追加 `--compress-mode=size`），压缩 `sm_86` / `sm_89` / `sm_120` 原生 SASS 与 `compute_80` PTX。
+
+### 2. 前后体积对比（实测）
+
+| 指标项 | 瘦身前基线（`1.1.1`） | 方案 A 瘦身后 | 变化幅度 | 备注 |
+| --- | --- | --- | --- | --- |
+| `build-windows-trainer-ptx80` `.cu.obj`（91 个） | `954.32 MiB` | `186.27 MiB` | **`-80.5%`** | 消除外部 TU 模板泛化 + fatbin 压缩 |
+| `geosun_3dgs_train.exe`（未压缩 / ZIP） | `495.08` / `96.91 MiB` | `32.74` / `25.26 MiB` | **`-93.4%`** / **`-73.9%`** | — |
+| `geosun_3dgs_core.dll`（未压缩 / ZIP） | `237.90` / `35.65 MiB` | `16.55` / `11.57 MiB` | **`-93.0%`** / **`-67.5%`** | — |
+| `curand64_10.dll`（未压缩 / ZIP） | `68.62` / `59.34 MiB` | `68.62` / `59.34 MiB` | `0.0%` | 宿主机 `tensor_random_ops.cpp` 仍依赖 `curandCreateGenerator`，占现 `trainer/` ZIP 约 `52.1%` |
+| `trainer/` 合计（未压缩 / ZIP，60 文件） | `838.93` / `209.74 MiB` | `154.57` / `113.80 MiB` | **`-81.6%`** / **`-45.7%`** | 独立训练器包 `Geosun-3DGS-Trainer-sm80-20261117-190930.zip` 由 `210.48 MiB` 降至 **`113.83 MiB`**（`-45.9%`） |
+| 整包 `Geosun-3DGS-1.1.1-Windows-x64.zip` | `2410.02 MiB` | **`2314.09 MiB`** | **`-95.93 MiB`** | `preprocess/` 与发射器占比保持 `2200.26 MiB`（`43` 文件） |
+
+### 3. 回归构建、`cuobjdump` 与正式打包验收
+
+- **训练器与完整 GUI 双构建通过**：`build-windows-trainer-ptx80`（`lfs_train`）与 [build-windows-release](file:///D:/Dev/LichtFeld-Studio/build-windows-release)（`LichtFeld-Studio.exe` `23.08 MiB`、`lfs_core.dll` `9.6 MiB`）均 `exit code 0`。
+- **`cuobjdump` 校验通过**：
+  - `geosun_3dgs_train.exe` 含 `220/220` 条 `compressed` 记录（`ptx:sm_80`、`elf:sm_86`、`elf:sm_89`、`elf:sm_120` 各 `55`）；`geosun_3dgs_core.dll` 含 `124/124` 条 `compressed` 记录（四目标各 `31`）。
+  - `cuobjdump --dump-symbols geosun_3dgs_train.exe` 对 Tensor 泛型/广播核模板匹配数为 **`0`**；对 EXE 提取的 `220` 份与 DLL 提取的 `124` 份 cubin/PTX 做 SHA-256 交叉比对，跨二进制重复模块数为 **`0`**（基线为 `6` 个模块 / `48.13 MiB`）。
+- **真机 GPU 端到端冒烟通过（`RTX 4090`）**：对 `work\展厅`（`585` 图 + 掩码 + 深度/法向先验）执行 `--iter 100 --headless`，`nvImageCodec` GPU 解码、卷帘与 MRNF+GUT+PPISP 在 `2.135 s` 内正常完成（`46.8 iter/s`，写出 `project.licht` `104.17 MiB`，`exit code 0`）。
+- **提交与正式重打包完成**：
+  - `LichtFeld-Studio` 已提交为 `70fb4a973`；清理 `build-windows-trainer-ptx80\src` 中旧 CP936 `#deps 0` `.cpp.obj` 后经 `package-windows-trainer.cmd` 重编验证 `main.cpp.obj` 已纳入 `include/git_version.h` 依赖，产出无 `-dirty` 的 [Geosun-3DGS-Trainer-sm80-20261117-190930.zip](file:///D:/Dev/LichtFeld-Studio/build-delivery/Geosun-3DGS-Trainer-sm80-20261117-190930.zip)（`113.83 MiB`），已删除 `20261116-134442`、`20261117-153642`、`20261117-190309` 旧训练器包及未瘦身旧版 `1.1.1` 整包。
+  - 配对 `GeosunPre` `33ac17c`（`GeosunPre-1.1.1-33ac17c-ampere_plus`）通过 `package.ps1` 重新封装 [Geosun-3DGS-1.1.1-Windows-x64.zip](file:///D:/Dev/GeosunPre/packages/Geosun-3DGS-1.1.1-Windows-x64.zip)（`2314.09 MiB`，`exit code 0`），通过 `Geosun.exe --help`、`geosunpre.exe check-models`（`passed: true`）与 `geosun_3dgs_train.exe --version`（`Geosun 3DGS Trainer v0.5.5-dev-305-g70fb4a973 (70fb4a973)`）及落盘前后哈希一致性核验。
