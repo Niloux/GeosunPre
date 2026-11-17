@@ -98,3 +98,20 @@ images         [{image_id, camera_id, name, rotation_rad[3], velocity_m_s[3], tr
 `run` 与 `export` 默认把每个镜头的照片、掩码与模型裁到该镜头有效域的外接窗口；`--no-crop-valid-domain` 交付整幅原图。裁剪使下游少处理鱼眼圆外恒为 0 的像素。窗口取该镜头全部已注册照片静态掩码非零像素的外接框，四周各留 16 px（不超出原图）；左上角对齐照片 JPEG 的 MCU 网格，照片按 DCT 系数无损裁剪，不重新编码，EXIF 等标记原样保留（EXIF 中记录的像素尺寸不改写）。掩码按窗口精确裁剪。窗口沿读出轴以图像中心对称，读出比例只按 `N'/N` 缩放（N、N' 为裁剪前后沿读出轴的尺寸）：`rolling_shutter.json` 的 `rotation_rad`、`translation_m` 与 `readout_s` 同乘 `N'/N`，`velocity_m_s` 与参考位姿不变，交付在裁剪后图像上按同一公式 `s = (c - N/2)/N` 使用。
 
 `cameras.bin` 的宽高为窗口尺寸，主点减去窗口原点，畸变参数不变；`images.bin` 的特征坐标减去窗口原点，`points3D.bin` 的 error 按裁剪后的投影重新计算。深度、法向监督按裁剪后的相机生成，静态及额外排除掩码先裁到窗口再缩放到监督图；监督图像素只有在其原图面积内全部有效时才有效（对无效像素做面积缩放，结果须严格为 0）。`manifest.json` 的 request 另含 `crop`（`mode: "valid_domain"` 与两镜头窗口），监督请求另含 `crop_windows`，因此裁剪与未裁剪交付不会被视为同一请求。`check` 对裁剪交付按同样规则回读。
+
+## 下游训练与评测核验契约
+
+结合下游默认训练配置 [trainer.json](../configs/trainer.json)，评测与交付核验须遵守以下三项契约：
+
+1. **全视角评测与数据集切分（`eval_all`）**：
+   - `configs/trainer.json` 默认 `"eval_all": false`、`"test_every": 8`（训练期按每 8 张抽样 1 张作为 `test` 留出集，评估留出视角泛化；开启评测时按 `eval_steps` 执行）。
+   - 执行离线全视角评测或全量拟合复核时，须显式开启 `--eval-all`（等价 `"eval_all": true`）：全部已注册视角同时用于训练与评测，`per_image_metrics.json` 中各视图 `"split"` 统一记为 `"train"`，不保留 `test` 留出集，也不对留出相机执行额外姿态重拟合；因此 `--eval-all` 指标反映全场景拟合度，不代表留出泛化精度。
+2. **静态前景计分（`mask == 255`，`segment_and_ignore`）**：
+   - 交付 `masks/` 与 `configs/trainer.json` 默认 `"mask_mode": "segment_and_ignore"` 约定统一的三段单通道语义：`255` 为静态前景、`128` 为开放天空（`segment`，训练期受不透明度惩罚并配合 `"bg_color": [0.0, 0.0, 0.0]` 收敛为透明黑底）、`0` 为动态人物及有效域外（`ignore`）。
+   - 主评测指标（`PSNR`、`SSIM`、`LPIPS`、`FLIP` 及前景色偏 `bias` / `bias_corr`）在 `segment_and_ignore` 下**只对 `mask == 255` 像素计分**（内部按 uint8 `> 250` 或浮点 `> kMaskKeepMin` 分类 keep 掩码），`128` 与 `0` 均不计入前景指标；如需分项查看全图或被遮挡区表现，须配合 `--eval-mask-report mask,unmasked,inverted` 输出对照集合。
+   - 该计分口径在所有掩码来源上必须一致：数据集内建 sidecar `masks/`、RGBA `alpha`（`"use_alpha_as_mask": true`）以及离线显式 `--eval-mask masks:<folder>` 在 `segment_and_ignore` 模式下均不得退化为 `mask_threshold = 0.5` 的普通二值化（避免将 `128/255` 天空误纳入 keep，导致过曝天空原图与透明黑底渲染计算 MSE 而引起显著负色偏与 PSNR 失真）。
+3. **卷帘快门日志与指标核验**：
+   - 当交付包存在 `rolling_shutter.json` 时，下游定制 LFS 须在初始化与每次评测输出中显式可核验卷帘启用状态：
+     - **初始化日志**：满足 `"gut": true` 且 `"undistort": false` 时记录 `Rolling shutter: <N> cameras render with the {row|column} readout motion from rolling_shutter.json`；若条件不满足则明确告警并按全局快门处理。
+     - **评测输出**：每次有效评测统计实际激活卷帘渲染的相机数 `rolling_shutter_cameras`（要求 GUT 启用、相机附带卷帘参数、非 `undistort` 针孔网格、非 `EQUIRECTANGULAR` 且读出轴渲染尺寸 `> 1`，并在 `"undistort": true` 且 `"eval_space": "distorted"` 原生 GUT 评测路径保持透传），同时写入运行日志（`Eval: rolling shutter active for <K> / <N> cameras` 与汇总 `EvalMetrics::to_string()` 中的 `rolling_shutter_cameras: K/N`）及 `metrics_report.txt` 中的 `Rolling shutter cameras: K / N`（`metrics.csv` 与 `per_image_metrics.json` 保持既有结构不变）。
+     - **核验准则**：按 `configs/trainer.json` 默认口径（`"gut": true`、`"undistort": false`、`"eval_space": "distorted"`）评测含 `rolling_shutter.json` 的交付包时，须核验 `K == N > 0`；未附带 `rolling_shutter.json`、关闭 `--gut` 或在去畸变空间评测时则应为 `K == 0`。

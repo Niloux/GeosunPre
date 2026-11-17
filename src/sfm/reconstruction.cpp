@@ -269,13 +269,29 @@ Pair Verify(const Scene& scene, const Reconstruction& model, const MatchSet& mat
     }
     return false;
   };
+  const uint32_t seed = matches.a * 73856093u ^ matches.b * 19349663u;
+  const uint32_t usac_seed = (seed ^ 0x9e3779b9u) & 0x7fffffffu;
+  cv::UsacParams usac;
+  usac.confidence = .999;
+  usac.maxIterations = 1000;
+  usac.threshold = 3 / focal;
+  usac.sampler = cv::SAMPLING_UNIFORM;
+  usac.score = cv::SCORE_METHOD_MAGSAC;
+  usac.loMethod = cv::LOCAL_OPTIM_SIGMA;
+  usac.loSampleSize = 50;
+  usac.loIterations = 10;
+  usac.neighborsSearch = cv::NEIGH_FLANN_KNN;
+  usac.final_polisher = cv::MAGSAC;
+  usac.isParallel = false;
+  usac.randomGeneratorState = int(usac_seed ? usac_seed : 1u);
+  const cv::Mat eye = cv::Mat::eye(3, 3, CV_64F);
   const cv::Mat initial =
-      cv::findEssentialMat(na, nb, 1., cv::Point2d(), cv::USAC_MAGSAC, .999, 3 / focal);
+      cv::findEssentialMat(na, nb, eye, eye, cv::noArray(), cv::noArray(), cv::noArray(), usac);
   for (int row = 0; row + 3 <= initial.rows; row += 3)
     score(Matrix(initial.rowRange(row, row + 3)));
   // Five-point hypotheses use perspective coordinates only for the minimal
   // solve. Consensus and local refinement use the native fisheye pixel metric.
-  std::mt19937 rng(matches.a * 73856093u ^ matches.b * 19349663u);
+  std::mt19937 rng(seed);
   std::uniform_int_distribution<size_t> choose(0, ra.size() - 1);
   size_t trials = 1024;
   for (size_t trial = 0; trial < trials; ++trial) {
@@ -747,7 +763,7 @@ bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
   };
   // Perspective coordinates are only used by the minimal solver. Every
   // consensus decision is measured in the original fisheye image pixels.
-  std::mt19937 rng(id * 73856093u + uint32_t(xyz.size()));
+  std::mt19937 rng(id * 2654435761u ^ 0x9e3779b9u);
   std::uniform_int_distribution<size_t> choose(0, xyz.size() - 1);
   size_t trials = 2000;
   for (size_t trial = 0; trial < trials; ++trial) {

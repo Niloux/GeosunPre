@@ -262,3 +262,27 @@
 3. **结论与后续可选复核**：
    - 发版前必做的闭环验证（补齐 `sm_120` SASS、清理 `ucrtbase`/`api-ms-win` 冗余 DLL、恢复 LFS 开源许可证、SAM3 脱离 `ultralytics`、补齐模型许可证、修正 `≥ 12 GB` 显存门槛并加入磁盘预检与目录重命名重试）已全部实现并通过实测。
    - **可选复核**：用含 `PublishPending` 修复的新编译 `geosun.exe` 刷新整包并按需在外部终端以新包重跑一次室外 `篮球场-bundle`（统一切换至 `ampere_plus` 官方 `facebookresearch/sam3` 引擎）作最终回归存档。
+
+---
+
+## 2026-11-17：`Verify`/`Register` 种子解耦一致性实测 + 评测掩码/卷帘核验契约补齐
+
+### 1. `展厅` `--stage sfm` 两次连跑一致性实测
+
+基于 [D:\Data\展厅](file:///D:/Data/展厅)（`588` 图、`9,349` 候选像对）一次生成至 `matches` 的同一份缓存，在修复 [reconstruction.cpp](file:///D:/Dev/GeosunPre/src/sfm/reconstruction.cpp#L272-L295)（`Verify` 显式传入带确定性非零像对种子的 `cv::UsacParams`）与 [reconstruction.cpp](file:///D:/Dev/GeosunPre/src/sfm/reconstruction.cpp#L766)（`Register` 种子解耦为仅依赖 `id`）后，分别在默认 `"ba_workers": 8`（`work\展厅-sfm-verify`）与单线程 BA 对照 `"ba_workers": 1`（`work\展厅-sfm-verify-b1`）下连续执行两次 `--stage sfm`：
+
+| 配置 / 轮次 | `verified_pairs` / `tracks` | 注册图像数 | 三维点 / 观测数 | 重投影 `median` / `p90` | 耗时（s） | `visual.bin` SHA256 与非耗时字段差异 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `ba_workers = 8` Run 1 | `7967` / `181488` | `585 / 588`（缺 `00214–00216-R`） | `206,101` / `958,242` | `1.2743` / `3.2796 px` | `238.28` | `7B311C1D...` |
+| `ba_workers = 8` Run 2 | `7967` / `181488` | `582 / 588`（缺 `00214–00219-R`） | `205,765` / `958,308` | `1.2756` / `3.2849 px` | `168.95` | `10A0AF6B...`（`2,438` 项非耗时差异） |
+| `ba_workers = 1` Run 1 | `7967` / `181488` | `585 / 588`（缺 `00214–00216-R`） | `206,197` / `959,622` | `1.2754` / `3.2855 px` | `428.71` | `F4EB5606...` |
+| `ba_workers = 1` Run 2 | `7967` / `181488` | `585 / 588`（缺 `00214–00216-R`） | `206,197` / `959,622` | `1.2754` / `3.2855 px` | `419.11` | **`F4EB5606...`（完全一致，非耗时差异 `0`）** |
+
+- **根因定位与取舍**：
+  1. `Verify`、`Tracks`、`Seed`（`00273-R + 00274-R`，`2,622` 观测）与 `Register` 已完全消除伪随机分支；`ba_workers = 1` 下连续两次 `visual.bin` 与全部 `88` 轮 BA / 位姿 / 点云结果逐字节一致（`SHA256: F4EB5606E1A0B1292B4DFDFD646124189F9A3B71564EA63050F8B16B24765791`）。
+  2. `ba_workers = 8` 下 `opt[0].initial_cost` 在第 15 位有效数字即出现 `~4.5e-13` 偏差（`1168.82532073046` vs `1168.8253207304595`），源于 Ceres `options.num_threads = 8` 多线程浮点累加归约顺序；在第 14 轮 `BA focal`（`102` 图 `146,420` 观测）处线性迭代数相差 1（`47` vs `48`）并使第 15 轮 `BA radial` 翻动 1 个观测（`149,063` vs `149,062`），经后续增补最终分支为 `585` vs `582` 帧。默认保持 `"ba_workers": 8` 以兼顾约 `2×` 速度收益；严格按比特复现基准场景时可显式传入 `--config` `"ba_workers": 1`。
+
+### 2. 下游评测与契约同步
+
+- **LichtFeld-Studio**：统一 `metrics.cpp` 中 `MaskMode::SegmentAndIgnore` 的 `masks:<folder>` 加载经 `load_eval_mask_file` / `classify_keep_mask_for_metrics`（仅保留 `mask == 255` 前景，排除 `128` 天空与 `0` 忽略）；在 `native_gut_evaluation` 透传 `rolling_shutter`，并在日志（`Eval: rolling shutter active for K / N cameras`、`EvalMetrics::to_string()`）及 `metrics_report.txt`（`Rolling shutter cameras: K / N`）显式记录实际激活卷帘相机数。
+- **契约文档**：[output.md](file:///D:/Dev/GeosunPre/docs/output.md#L102-L117) 补齐 `eval_all`、`mask == 255` 前景计分与卷帘日志/指标核验条目。
