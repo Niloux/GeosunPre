@@ -362,13 +362,30 @@ Pair Verify(const Scene& scene, const Reconstruction& model, const MatchSet& mat
 std::vector<Pair> VerifyPairs(const Scene& scene, const Reconstruction& model, const fs::path& work,
                               const std::vector<std::array<uint32_t, 2>>& candidates, int workers) {
   std::vector<Pair> pairs(candidates.size());
-  std::atomic<size_t> done{0};
-  ParallelFor(candidates.size(), workers, 1, [&](size_t i) {
-    const auto p = candidates[i];
-    pairs[i] = Verify(scene, model, ReadMatches(MatchPath(work, p[0], p[1])));
-    const auto n = done.fetch_add(1) + 1;
-    if (n % 500 == 0)
-      Log("Geometry " + std::to_string(n) + "/" + std::to_string(candidates.size()));
+  if (candidates.empty())
+    return pairs;
+  const auto archive_path = MatchesPath(work);
+  const auto index = IndexMatchArchive(archive_path, false);
+  std::atomic<size_t> next{0}, done{0};
+  const int threads = std::min<int>(workers, int(candidates.size()));
+  ParallelFor(size_t(threads), threads, 1, [&](size_t) {
+    std::ifstream stream(archive_path, std::ios::binary);
+    if (!stream)
+      throw std::runtime_error("Cannot read match archive: " + archive_path.u8string());
+    for (;;) {
+      const size_t i = next.fetch_add(1);
+      if (i >= candidates.size())
+        break;
+      const auto p = candidates[i];
+      const auto it = index.find({p[0], p[1]});
+      if (it == index.end())
+        throw std::runtime_error("Missing match record in archive: " + std::to_string(p[0]) +
+                                 "_" + std::to_string(p[1]));
+      pairs[i] = Verify(scene, model, ReadMatchRecord(stream, it->second, p[0], p[1]));
+      const auto n = done.fetch_add(1) + 1;
+      if (n % 500 == 0)
+        Log("Geometry " + std::to_string(n) + "/" + std::to_string(candidates.size()));
+    }
   });
   return pairs;
 }
@@ -934,10 +951,12 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     m.Filter();
     filter_seconds += Seconds(phase);
   };
+  auto last_checkpoint = Clock::now();
   auto save_checkpoint = [&] {
     const auto phase = Clock::now();
     WriteModel(checkpoint, m);
     checkpoint_seconds += Seconds(phase);
+    last_checkpoint = Clock::now();
   };
   const bool resumed = fs::exists(checkpoint);
   if (resumed) {
@@ -1176,7 +1195,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       }
       if (registered % 16 == 0)
         Log("Registered " + std::to_string(registered) + "/" + std::to_string(m.images.size()));
-      if (registered % 8 == 0)
+      if (registered % 8 == 0 && Seconds(last_checkpoint) >= 20.0)
         save_checkpoint();
       break;
     }

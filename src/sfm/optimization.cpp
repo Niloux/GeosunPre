@@ -28,9 +28,8 @@ Eigen::Matrix<double, 3, 4> RotationJacobian(const Eigen::Quaterniond& unit,
   j -= 2 * rotated * unit.coeffs().transpose();
   return j / norm;
 }
-void CameraJacobian(const Camera& camera, const Eigen::Vector3d& v, double* jacobian) {
-  Eigen::Map<Eigen::Matrix<double, 2, 8, Eigen::RowMajor>> camera_j(jacobian);
-  camera_j.setZero();
+Eigen::Matrix<double, 2, 8> CameraJacobian(const Camera& camera, const Eigen::Vector3d& v) {
+  Eigen::Matrix<double, 2, 8> camera_j = Eigen::Matrix<double, 2, 8>::Zero();
   const auto& cam = camera.params;
   const double r = std::hypot(v.x(), v.y()), theta = std::atan2(r, v.z()), t2 = theta * theta;
   const double d =
@@ -46,6 +45,7 @@ void CameraJacobian(const Camera& camera, const Eigen::Vector3d& v, double* jaco
     camera_j(1, k) = cam[1] * v.y() * radial;
     power *= t2;
   }
+  return camera_j;
 }
 struct Reprojection : ceres::SizedCostFunction<2, 7, 3, 8> {
   Eigen::Vector2d pixel;
@@ -59,6 +59,8 @@ struct Reprojection : ceres::SizedCostFunction<2, 7, 3, 8> {
     rotation.coeffs() /= norm;
     const Eigen::Vector3d rotated = rotation * point;
     const Eigen::Vector3d v = rotated + Eigen::Map<const Eigen::Vector3d>(pose + 4);
+    if (v.z() <= 1e-6)
+      return false;
     Camera camera;
     std::copy_n(parameters[2], 8, camera.params.begin());
     Eigen::Map<Eigen::Vector2d> output(residual);
@@ -75,14 +77,17 @@ struct Reprojection : ceres::SizedCostFunction<2, 7, 3, 8> {
       Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[1]);
       point_j = j * rotation.toRotationMatrix();
     }
-    if (jacobians[2])
-      CameraJacobian(camera, v, jacobians[2]);
+    if (jacobians[2]) {
+      Eigen::Map<Eigen::Matrix<double, 2, 8, Eigen::RowMajor>> cam_j(jacobians[2]);
+      cam_j = CameraJacobian(camera, v);
+    }
     return true;
   }
 };
-// Reprojection of an observation exposed at readout fraction s; see ShutterMotion. The extra
-// blocks are the image's readout rotation and its lens readout time.
-struct ShutterReprojection : ceres::SizedCostFunction<2, 7, 3, 8, 3, 1> {
+// Reprojection of an observation exposed at readout fraction s; see ShutterMotion. The image
+// parameter block packs [pose(7), readout_rotation(3)] and the camera block packs
+// [intrinsics(8), readout_time(1)].
+struct ShutterReprojection : ceres::SizedCostFunction<2, 10, 3, 9> {
   Eigen::Vector2d pixel;
   Eigen::Vector3d velocity;
   double s;
@@ -92,15 +97,19 @@ struct ShutterReprojection : ceres::SizedCostFunction<2, 7, 3, 8, 3, 1> {
   bool Evaluate(double const* const* parameters, double* residual,
                 double** jacobians) const override {
     const auto* pose = parameters[0];
-    const Eigen::Map<const Eigen::Vector3d> point(parameters[1]), w(parameters[3]);
-    const double readout = parameters[4][0];
+    const Eigen::Map<const Eigen::Vector3d> point(parameters[1]), w(pose + 7);
+    const double readout = parameters[2][8];
     Eigen::Quaterniond rotation(pose[3], pose[0], pose[1], pose[2]);
     const double norm = rotation.norm();
     rotation.coeffs() /= norm;
     const Eigen::Vector3d rotated = rotation * point;
+    if (rotated.z() + pose[6] <= 1e-6)
+      return false;
     const Eigen::Vector3d b =
         rotated + Eigen::Map<const Eigen::Vector3d>(pose + 4) - s * readout * velocity;
     const Eigen::Vector3d v = b + s * w.cross(b);
+    if (v.z() <= 1e-6)
+      return false;
     Camera camera;
     std::copy_n(parameters[2], 8, camera.params.begin());
     Eigen::Map<Eigen::Vector2d> output(residual);
@@ -112,30 +121,27 @@ struct ShutterReprojection : ceres::SizedCostFunction<2, 7, 3, 8, 3, 1> {
     const auto j = camera.ProjectionJacobian(v);
     const Eigen::Matrix<double, 2, 3> ja = j * a;
     if (jacobians[0]) {
-      Eigen::Map<Eigen::Matrix<double, 2, 7, Eigen::RowMajor>> pose_j(jacobians[0]);
+      Eigen::Map<Eigen::Matrix<double, 2, 10, Eigen::RowMajor>> pose_j(jacobians[0]);
       pose_j.leftCols<4>() = ja * RotationJacobian(rotation, point, rotated, norm);
-      pose_j.rightCols<3>() = ja;
+      pose_j.middleCols<3>(4) = ja;
+      Eigen::Matrix3d cross;
+      cross << 0, -b.z(), b.y(), b.z(), 0, -b.x(), -b.y(), b.x(), 0;
+      pose_j.rightCols<3>() = -s * j * cross;
     }
     if (jacobians[1]) {
       Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[1]);
       point_j = ja * rotation.toRotationMatrix();
     }
-    if (jacobians[2])
-      CameraJacobian(camera, v, jacobians[2]);
-    if (jacobians[3]) {
-      Eigen::Matrix3d cross;
-      cross << 0, -b.z(), b.y(), b.z(), 0, -b.x(), -b.y(), b.x(), 0;
-      Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> rotation_j(jacobians[3]);
-      rotation_j = -s * j * cross;
-    }
-    if (jacobians[4]) {
-      Eigen::Map<Eigen::Vector2d> readout_j(jacobians[4]);
-      readout_j = -s * ja * velocity;
+    if (jacobians[2]) {
+      Eigen::Map<Eigen::Matrix<double, 2, 9, Eigen::RowMajor>> cam_j(jacobians[2]);
+      cam_j.leftCols<8>() = CameraJacobian(camera, v);
+      cam_j.col(8) = -s * ja * velocity;
     }
     return true;
   }
 };
-struct Depth : ceres::SizedCostFunction<1, 7, 3> {
+template <int PoseDim>
+struct Depth : ceres::SizedCostFunction<2, PoseDim, 3> {
   double minimum, gain;
   Depth(double minimum_depth, double weight) : minimum(minimum_depth), gain(weight) {}
   bool Evaluate(double const* const* parameters, double* residual,
@@ -148,20 +154,22 @@ struct Depth : ceres::SizedCostFunction<1, 7, 3> {
     const Eigen::Vector3d rotated = rotation * point;
     const bool active = rotated.z() + pose[6] < minimum;
     residual[0] = active ? gain * (minimum - rotated.z() - pose[6]) : 0;
+    residual[1] = 0;
     if (jacobians) {
       if (jacobians[0]) {
-        Eigen::Map<Eigen::Matrix<double, 1, 7, Eigen::RowMajor>> pose_j(jacobians[0]);
+        Eigen::Map<Eigen::Matrix<double, 2, PoseDim, Eigen::RowMajor>> pose_j(jacobians[0]);
         pose_j.setZero();
         if (active) {
-          pose_j.leftCols<4>() = -gain * RotationJacobian(rotation, point, rotated, norm).row(2);
-          pose_j[6] = -gain;
+          pose_j.template block<1, 4>(0, 0) =
+              -gain * RotationJacobian(rotation, point, rotated, norm).row(2);
+          pose_j(0, 6) = -gain;
         }
       }
       if (jacobians[1]) {
-        Eigen::Map<Eigen::RowVector3d> point_j(jacobians[1]);
+        Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[1]);
         point_j.setZero();
         if (active)
-          point_j = -gain * rotation.toRotationMatrix().row(2);
+          point_j.row(0) = -gain * rotation.toRotationMatrix().row(2);
       }
     }
     return true;
@@ -181,14 +189,20 @@ struct Baseline {
     return true;
   }
 };
-struct Plane {
-  Eigen::Vector3d center, normal;
-  double sigma;
-  template <class T>
-  bool operator()(const T* point, T* residual) const {
-    residual[0] = T(0);
-    for (int i = 0; i < 3; ++i)
-      residual[0] += T(normal[i] / sigma) * (point[i] - T(center[i]));
+struct PlaneCost : ceres::SizedCostFunction<2, 3> {
+  Eigen::Vector3d unit, center;
+  PlaneCost(const Eigen::Vector3d& c, const Eigen::Vector3d& normal, double sigma)
+      : unit(normal / sigma), center(c) {}
+  bool Evaluate(double const* const* parameters, double* residual,
+                double** jacobians) const override {
+    const Eigen::Map<const Eigen::Vector3d> point(parameters[0]);
+    residual[0] = unit.dot(point - center);
+    residual[1] = 0;
+    if (jacobians && jacobians[0]) {
+      Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[0]);
+      point_j.row(0) = unit.transpose();
+      point_j.row(1).setZero();
+    }
     return true;
   }
 };
@@ -229,13 +243,17 @@ struct RigLink {
 // both same-sign and opposite-sign sensor scan directions.
 struct RigShutterRotation {
   template <class T>
-  bool operator()(const T* wl, const T* wr, const T* tl, const T* tr, const T* rig, T* r) const {
+  bool operator()(const T* left, const T* right, const T* cam_l, const T* cam_r, const T* rig,
+                  T* r) const {
+    const T* wl = left + 7;
+    const T* wr = right + 7;
+    const T tl = cam_l[8], tr = cam_r[8];
     const T qe[] = {rig[3], rig[0], rig[1], rig[2]};
     T predicted[3];
     ceres::QuaternionRotatePoint(qe, wl, predicted);
-    const T scale = ceres::sqrt(tl[0] * tl[0] + tr[0] * tr[0] + T(1e-6));
+    const T scale = ceres::sqrt(tl * tl + tr * tr + T(1e-6));
     for (int i = 0; i < 3; ++i)
-      r[i] = (tl[0] * wr[i] - tr[0] * predicted[i]) / (scale * T(RigShutterRotationSigma));
+      r[i] = (tl * wr[i] - tr * predicted[i]) / (scale * T(RigShutterRotationSigma));
     return true;
   }
 };
@@ -366,6 +384,19 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   size_t observations = 0;
   const bool metric = !nav.empty();
   size_t variable_count = 0;
+  std::vector<std::array<double, 10>> shutter_images;
+  std::array<std::array<double, 9>, 2> shutter_cameras{};
+  if (shutter) {
+    shutter_images.resize(m.images.size());
+    for (size_t id = 0; id < m.images.size(); ++id) {
+      std::copy_n(m.images[id].pose.params.data(), 7, shutter_images[id].data());
+      std::copy_n(shutter->rotation[id].data(), 3, shutter_images[id].data() + 7);
+    }
+    for (size_t cid = 0; cid < m.cameras.size(); ++cid) {
+      std::copy_n(m.cameras[cid].params.data(), 8, shutter_cameras[cid].data());
+      shutter_cameras[cid][8] = shutter->readout[cid];
+    }
+  }
   for (auto& p : m.points)
     if (p.track.size() >= 2) {
       if (!selected_points.empty() && !selected_points.count(uint64_t(&p - m.points.data())))
@@ -374,6 +405,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           std::none_of(p.track.begin(), p.track.end(),
                        [&](const auto& o) { return variable_images.count(o.image) != 0; }))
         continue;
+      const bool need_depth_guard = !metric || p.track.size() == 2;
       for (const auto& o : p.track) {
         ++observations;
         auto& image = m.images[o.image];
@@ -381,17 +413,22 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         if (depth <= 0)
           throw std::runtime_error("BA requires positive initial depth");
         const Eigen::Vector2d pixel = image.pixels[o.feature];
-        if (shutter)
+        if (shutter) {
           problem.AddResidualBlock(
               new ShutterReprojection(pixel, shutter->velocity[o.image],
                                       shutter->Fraction(m.cameras[image.camera], pixel)),
-              loss, image.pose.params.data(), p.xyz.data(), m.cameras[image.camera].params.data(),
-              shutter->rotation[o.image].data(), &shutter->readout[image.camera]);
-        else
+              loss, shutter_images[o.image].data(), p.xyz.data(),
+              shutter_cameras[image.camera].data());
+          if (need_depth_guard)
+            problem.AddResidualBlock(new Depth<10>(.05 * depth, 1000 / depth), nullptr,
+                                     shutter_images[o.image].data(), p.xyz.data());
+        } else {
           problem.AddResidualBlock(new Reprojection(pixel), loss, image.pose.params.data(),
                                    p.xyz.data(), m.cameras[image.camera].params.data());
-        problem.AddResidualBlock(new Depth(.05 * depth, 1000 / depth), nullptr,
-                                 image.pose.params.data(), p.xyz.data());
+          if (need_depth_guard)
+            problem.AddResidualBlock(new Depth<7>(.05 * depth, 1000 / depth), nullptr,
+                                     image.pose.params.data(), p.xyz.data());
+        }
         used_images.insert(o.image);
         used_cameras.insert(image.camera);
       }
@@ -401,27 +438,56 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   if (used_images.size() < 2)
     throw std::runtime_error("Insufficient BA observations");
   for (uint32_t id : used_images) {
-    auto* pose = m.images[id].pose.params.data();
-    problem.SetManifold(
-        pose,
-        new ceres::ProductManifold<ceres::EigenQuaternionManifold, ceres::EuclideanManifold<3>>());
-    ordering->AddElementToGroup(pose, 1);
-    if ((!metric && id == m.gauge_image) ||
-        (!variable_images.empty() && !variable_images.count(id)))
-      problem.SetParameterBlockConstant(pose);
-    else
-      ++variable_count;
+    const bool fixed_pose =
+        (!metric && id == m.gauge_image) || (!variable_images.empty() && !variable_images.count(id));
+    if (shutter) {
+      auto* block = shutter_images[id].data();
+      ordering->AddElementToGroup(block, 1);
+      if (fixed_pose) {
+        problem.SetManifold(block, new ceres::SubsetManifold(10, {0, 1, 2, 3, 4, 5, 6}));
+      } else {
+        problem.SetManifold(
+            block, new ceres::ProductManifold<ceres::EigenQuaternionManifold,
+                                              ceres::EuclideanManifold<6>>());
+        ++variable_count;
+      }
+      for (int i = 7; i < 10; ++i) {
+        problem.SetParameterLowerBound(block, i, -.05);
+        problem.SetParameterUpperBound(block, i, .05);
+      }
+    } else {
+      auto* pose = m.images[id].pose.params.data();
+      problem.SetManifold(
+          pose,
+          new ceres::ProductManifold<ceres::EigenQuaternionManifold, ceres::EuclideanManifold<3>>());
+      ordering->AddElementToGroup(pose, 1);
+      if (fixed_pose)
+        problem.SetParameterBlockConstant(pose);
+      else
+        ++variable_count;
+    }
   }
-  if (!metric && used_images.count(m.gauge_image) && used_images.count(m.scale_image))
-    problem.AddResidualBlock(
-        new ceres::AutoDiffCostFunction<Baseline, 1, 7, 7>(new Baseline{m.gauge_baseline}), nullptr,
-        m.images[m.gauge_image].pose.params.data(), m.images[m.scale_image].pose.params.data());
+  if (!metric && used_images.count(m.gauge_image) && used_images.count(m.scale_image)) {
+    if (shutter)
+      problem.AddResidualBlock(
+          new ceres::AutoDiffCostFunction<Baseline, 1, 10, 10>(new Baseline{m.gauge_baseline}),
+          nullptr, shutter_images[m.gauge_image].data(), shutter_images[m.scale_image].data());
+    else
+      problem.AddResidualBlock(
+          new ceres::AutoDiffCostFunction<Baseline, 1, 7, 7>(new Baseline{m.gauge_baseline}),
+          nullptr, m.images[m.gauge_image].pose.params.data(),
+          m.images[m.scale_image].pose.params.data());
+  }
   for (uint32_t cid : used_cameras) {
-    auto* params = m.cameras[cid].params.data();
+    double* params = shutter ? shutter_cameras[cid].data() : m.cameras[cid].params.data();
+    const int dim = shutter ? 9 : 8;
     ordering->AddElementToGroup(params, 1);
-    if (stage == "fixed")
-      problem.SetParameterBlockConstant(params);
-    else {
+    if (stage == "fixed") {
+      if (shutter)
+        problem.SetManifold(params, new ceres::SubsetManifold(9, {0, 1, 2, 3, 4, 5, 6, 7}));
+      else
+        problem.SetParameterBlockConstant(params);
+    } else {
       std::vector<int> fixed;
       if (stage == "focal")
         fixed = {2, 3, 6, 7};
@@ -430,55 +496,59 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
       else if (stage != "principal")
         throw std::runtime_error("Unknown calibration stage: " + stage);
       if (!fixed.empty())
-        problem.SetManifold(params, new ceres::SubsetManifold(8, fixed));
+        problem.SetManifold(params, new ceres::SubsetManifold(dim, fixed));
       const auto delta = initial[cid].CalibrationBounds();
       for (int i = 0; i < 8; ++i) {
         problem.SetParameterLowerBound(params, i, initial[cid].params[i] - delta[i]);
         problem.SetParameterUpperBound(params, i, initial[cid].params[i] + delta[i]);
       }
     }
-  }
-  if (shutter) {
-    // At most ~3 degrees of rotation and 50 ms per readout; a solution at a bound is reported.
-    for (uint32_t id : used_images) {
-      auto* rotation = shutter->rotation[id].data();
-      ordering->AddElementToGroup(rotation, 1);
-      for (int i = 0; i < 3; ++i) {
-        problem.SetParameterLowerBound(rotation, i, -.05);
-        problem.SetParameterUpperBound(rotation, i, .05);
-      }
-    }
-    for (uint32_t cid : used_cameras) {
-      ordering->AddElementToGroup(&shutter->readout[cid], 1);
-      problem.SetParameterLowerBound(&shutter->readout[cid], 0, -.05);
-      problem.SetParameterUpperBound(&shutter->readout[cid], 0, .05);
+    if (shutter) {
+      problem.SetParameterLowerBound(params, 8, -.05);
+      problem.SetParameterUpperBound(params, 8, .05);
     }
   }
   for (const auto& p : planes)
     if (problem.HasParameterBlock(m.points.at(p.point).xyz.data()))
-      problem.AddResidualBlock(
-          new ceres::AutoDiffCostFunction<Plane, 1, 3>(new Plane{p.center, p.normal, p.sigma}),
-          new ceres::HuberLoss(2), m.points[p.point].xyz.data());
+      problem.AddResidualBlock(new PlaneCost(p.center, p.normal, p.sigma), loss,
+                               m.points[p.point].xyz.data());
   if (!nav.empty())
-    for (uint32_t id : used_images)
-      problem.AddResidualBlock(
-          new ceres::AutoDiffCostFunction<Position, 3, 7>(new Position{nav.at(id)}),
-          new ceres::HuberLoss(2), m.images[id].pose.params.data());
+    for (uint32_t id : used_images) {
+      if (shutter)
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<Position, 3, 10>(new Position{nav.at(id)}), loss,
+            shutter_images[id].data());
+      else
+        problem.AddResidualBlock(
+            new ceres::AutoDiffCostFunction<Position, 3, 7>(new Position{nav.at(id)}), loss,
+            m.images[id].pose.params.data());
+    }
   Pose rig;
   size_t rig_frames = 0;
+  ceres::LossFunction* rig_shutter_loss = nullptr;
   if (!frames.empty() && RigExtrinsic(m, frames, rig))
     for (const auto& f : frames)
       if (used_images.count(f[0]) && used_images.count(f[1])) {
-        problem.AddResidualBlock(new ceres::AutoDiffCostFunction<RigLink, 6, 7, 7, 7>(new RigLink),
-                                 new ceres::HuberLoss(2), m.images[f[0]].pose.params.data(),
-                                 m.images[f[1]].pose.params.data(), rig.params.data());
-        if (shutter && m.images[f[0]].camera != m.images[f[1]].camera)
+        if (shutter) {
           problem.AddResidualBlock(
-              new ceres::AutoDiffCostFunction<RigShutterRotation, 3, 3, 3, 1, 1, 7>(
-                  new RigShutterRotation),
-              new ceres::HuberLoss(4), shutter->rotation[f[0]].data(),
-              shutter->rotation[f[1]].data(), &shutter->readout[m.images[f[0]].camera],
-              &shutter->readout[m.images[f[1]].camera], rig.params.data());
+              new ceres::AutoDiffCostFunction<RigLink, 6, 10, 10, 7>(new RigLink), loss,
+              shutter_images[f[0]].data(), shutter_images[f[1]].data(), rig.params.data());
+          if (m.images[f[0]].camera != m.images[f[1]].camera) {
+            if (!rig_shutter_loss)
+              rig_shutter_loss = new ceres::HuberLoss(4);
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<RigShutterRotation, 3, 10, 10, 9, 9, 7>(
+                    new RigShutterRotation),
+                rig_shutter_loss, shutter_images[f[0]].data(), shutter_images[f[1]].data(),
+                shutter_cameras[m.images[f[0]].camera].data(),
+                shutter_cameras[m.images[f[1]].camera].data(), rig.params.data());
+          }
+        } else {
+          problem.AddResidualBlock(
+              new ceres::AutoDiffCostFunction<RigLink, 6, 7, 7, 7>(new RigLink), loss,
+              m.images[f[0]].pose.params.data(), m.images[f[1]].pose.params.data(),
+              rig.params.data());
+        }
         if (!rig_frames++) {
           problem.SetManifold(rig.params.data(),
                               new ceres::ProductManifold<ceres::EigenQuaternionManifold,
@@ -509,6 +579,16 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   ceres::Solve(options, &problem, &summary);
   if (!summary.IsSolutionUsable())
     throw std::runtime_error("BA failed: " + summary.BriefReport());
+  if (shutter) {
+    for (uint32_t id : used_images) {
+      std::copy_n(shutter_images[id].data(), 7, m.images[id].pose.params.data());
+      std::copy_n(shutter_images[id].data() + 7, 3, shutter->rotation[id].data());
+    }
+    for (uint32_t cid : used_cameras) {
+      std::copy_n(shutter_cameras[cid].data(), 8, m.cameras[cid].params.data());
+      shutter->readout[cid] = shutter_cameras[cid][8];
+    }
+  }
   if (metric)
     m.gauge_baseline =
         (m.images[m.gauge_image].pose.Center() - m.images[m.scale_image].pose.Center()).norm();

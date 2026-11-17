@@ -297,7 +297,7 @@ ApplyCounts Apply(Context& context, uint32_t id, cv::Size grid) {
   }
   const auto path = context.destination(id);
   fs::create_directories(path.parent_path());
-  WriteImage(path, labelled.mask);
+  WriteImage(path, labelled.mask, 1);
   return counts;
 }
 }  // namespace

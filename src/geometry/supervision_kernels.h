@@ -44,6 +44,16 @@ struct SurfelStats {
   std::vector<float> radius, rms;
 };
 
+struct ConflictView {
+  double rotation[9], translation[3], params[8], motion_rot[3], motion_trans[3];
+  int rolling, axis, camera, width, height, cw, ch;
+};
+struct ConflictPair {
+  uint32_t pair_index;
+  uint16_t slot_a, slot_b;
+  uint32_t id_a, id_b;
+};
+
 // Surfels of the slab's first own points; the rest of points is the halo.
 std::vector<Surfel> SlabSurfels(const std::vector<int3>& points, size_t own, int3 origin,
                                 float3 scale, cudaStream_t stream, SurfelStats& stats);
@@ -55,4 +65,18 @@ void EncodeMaps(const Blend* blends, int w, int h, int boundary, float focal, co
                 const float3* rays, float* raw_depth, unsigned* codes, float* filtered,
                 float* scratch, uint8_t* limit, uint8_t* dilated, float* seeds, uint8_t* edge,
                 uint16_t* millimetres, uchar3* normals, cudaStream_t stream);
+void SampleMogeShiftGrid(const float* points, const float* mask, const uint8_t* face_valid,
+                         int size, float4* samples, cudaStream_t stream);
+void BuildMogeFaceEstimates(const float* points, const float* normals, const float* mask,
+                            const uint8_t* face_valid, const double* shifts,
+                            const uint8_t* shift_ok, const float* metric_scales,
+                            const double* to_camera, int faces, int size, double focal,
+                            float* out_distance, float* out_normal, uint32_t* valid_counts,
+                            cudaStream_t stream);
+void CheckConflictPairs(const uint16_t* depths_base, size_t depth_stride, const ConflictView* views,
+                        const double3* rays_cam0, const double3* rays_cam1,
+                        const ConflictPair* pairs, int num_pairs, int max_cells, int lattice_step,
+                        double view_limit, double tolerance, uint8_t* pair_own,
+                        uint8_t* pair_other, unsigned int* tile_conflicts, unsigned long long* stats,
+                        cudaStream_t stream);
 }  // namespace geosun::supervision_gpu

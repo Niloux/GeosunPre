@@ -275,8 +275,13 @@ class LasPointCache {
     }
   }
   void Finish() {
-    CudaCheck(cudaStreamSynchronize(compute_.value));
-    CudaCheck(cudaStreamSynchronize(upload_.value));
+    if (compute_.value)
+      CudaCheck(cudaStreamSynchronize(compute_.value));
+    if (upload_.value)
+      CudaCheck(cudaStreamSynchronize(upload_.value));
+    resident_.reset();
+    for (auto& slot : transfers_)
+      slot.reset();
     if (!file_.empty()) {
       fs::remove(file_);
       file_.clear();
@@ -643,8 +648,14 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   std::array<std::optional<MonocularLens>, 2> lens_plans;
   // Cells of each photo whose MoGe depth the trusted LAS confirmed, for the cross-view check; each
   // pending write fills its own image.
+  const bool hold_depths =
+      monocular && uint64_t(model.Registered()) * uint64_t(options.max_size) *
+                           uint64_t(options.max_size) * sizeof(uint16_t) <=
+                       (1536ULL << 20);
   std::vector<cv::Mat> verified_cells(model.images.size());
+  std::vector<cv::Mat> held_depths(hold_depths ? model.images.size() : 0);
   auto* verified_out = &verified_cells;
+  auto* held_out = hold_depths ? &held_depths : nullptr;
   // Pending writes use the lens plans and verified cells above, which are destroyed before the
   // queue itself; on an exception, wait for the tasks first (their results are discarded).
   struct DrainWrites {
@@ -797,14 +808,22 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
             normal = monocular_normal;
           }
           const auto valid = Counts(depth, normal, !monocular);
-          WriteImage(dp, depth);
+          if (!hold_depths)
+            WriteImage(dp, depth);
           WriteImage(np, normal);
-          Json row = {{"image_index", id}, {"name", name}, {"width", w}, {"height", h},
-                      {"depth_size", fs::file_size(dp)}, {"normal_size", fs::file_size(np)},
-                      {"static_pixels", static_pixels}, {"depth_pixels", valid.first},
+          Json row = {{"image_index", id},
+                      {"name", name},
+                      {"width", w},
+                      {"height", h},
+                      {"depth_size", hold_depths ? uint64_t(0) : fs::file_size(dp)},
+                      {"normal_size", fs::file_size(np)},
+                      {"static_pixels", static_pixels},
+                      {"depth_pixels", valid.first},
                       {"normal_pixels", valid.second}};
           if (monocular)
             row["monocular"] = monocular_row;
+          if (hold_depths)
+            (*held_out)[id] = std::move(depth);
           return Written{id, std::move(row)};
         }));
       }
@@ -812,10 +831,16 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   }
   while (!writes.empty())
     finish();
+  const uint64_t accepted_records = points.Count(), excluded_records = points.Excluded();
+  const Json point_cache_profile = points.Profile(), surfel_summary = points.Surfels();
+  const Json geometry_profile = monocular ? geometry->Profile() : Json();
+  points.Finish();
+  estimator.reset();
+  geometry.reset();
   Json view_conflicts;
   if (monocular) {
-    view_conflicts =
-        FilterViewConflicts(output, scene, model, motion, options.max_size, verified_cells, rows);
+    view_conflicts = FilterViewConflicts(output, scene, model, motion, options.max_size,
+                                         verified_cells, rows, held_out);
     depth_pixels = 0;
     for (const auto& row : rows)
       if (!row.is_null())
@@ -830,13 +855,12 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
       images.push_back(row);
   if (request != SupervisionRequest(scene, model, masks_dir, options, motion != nullptr))
     throw std::runtime_error("LAS or geometry exclusion masks changed during supervision export");
-  points.Finish();
   Json summary = {{"request", request},
           {"source", "valid original LAS records"},
           {"projection", motion ? "rolling_shutter_readout_line" : "global_shutter"},
-          {"accepted_records", points.Count()},
-          {"excluded_records", points.Excluded()},
-          {"point_cache", points.Profile()},
+          {"accepted_records", accepted_records},
+          {"excluded_records", excluded_records},
+          {"point_cache", point_cache_profile},
           {"depth_format", "uint16_png_mm"},
           {"depth_type", "ray_distance"},
           {"invalid_depth", 0},
@@ -854,7 +878,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"depth_rendering", "las_surfel_tangent_disks_blended_within_0.01_m_plus_1_percent_of_nearest"},
           {"normal_blend_minimum_agreement", MinNormalAgreement},
           {"normal_estimator", motion ? "las_knn_pca_surfel_readout_line" : "las_knn_pca_surfel"},
-          {"surfels", points.Surfels()},
+          {"surfels", surfel_summary},
           {"minimum_abs_normal_dot_ray", MinIncidence},
           {"depth_pixels", depth_pixels},
           {"normal_pixels", normal_pixels},
@@ -888,7 +912,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                             {"las_agreement", "within max(3%, 0.03 m)"},
                             {"normals_need_depth", false},
                             {"view_conflicts", view_conflicts},
-                            {"inference", geometry->Profile()}};
+                            {"inference", geometry_profile}};
   }
   return summary;
 }

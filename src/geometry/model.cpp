@@ -1,5 +1,6 @@
 #include "geometry/model.h"
 #include "io/cache.h"
+#include <algorithm>
 #include <set>
 #include <cmath>
 
@@ -39,32 +40,46 @@ void Reconstruction::Apply(const Similarity& s) {
 void Reconstruction::RebuildReferences() {
   for (auto& image : images)
     image.points.assign(image.pixels.size(), NoPoint);
+  std::vector<uint32_t> seen;
+  seen.reserve(64);
   for (uint64_t id = 0; id < points.size(); ++id) {
-    std::set<uint32_t> seen;
+    seen.clear();
     for (const auto& o : points[id].track) {
       if (o.image >= images.size() || o.feature >= images[o.image].pixels.size() ||
-          !images[o.image].registered || !seen.insert(o.image).second ||
+          !images[o.image].registered ||
+          std::find(seen.begin(), seen.end(), o.image) != seen.end() ||
           images[o.image].points[o.feature] != NoPoint)
         throw std::runtime_error("Invalid or conflicting reconstruction track");
+      seen.push_back(o.image);
       images[o.image].points[o.feature] = id;
     }
   }
 }
 void Reconstruction::Filter(double threshold, double min_angle) {
   const double cosine = std::cos(min_angle * Pi / 180);
+  std::vector<Eigen::Matrix3d> rotations(images.size());
+  std::vector<Eigen::Vector3d> translations(images.size()), centers(images.size());
+  for (size_t i = 0; i < images.size(); ++i)
+    if (images[i].registered) {
+      rotations[i] = images[i].pose.Rotation().toRotationMatrix();
+      translations[i] = images[i].pose.Translation();
+      centers[i] = images[i].pose.Center();
+    }
   for (auto& p : points) {
+    if (p.track.empty())
+      continue;
     std::vector<Observation> track;
     std::vector<Eigen::Vector3d> directions;
     double error = 0;
     for (const auto& o : p.track) {
       const auto& image = images[o.image];
-      const auto xyz = image.pose.Apply(p.xyz);
+      const auto xyz = rotations[o.image] * p.xyz + translations[o.image];
       const auto& c = cameras[image.camera];
       const double e = (c.Project(xyz) - image.pixels[o.feature]).norm();
       if (xyz.z() > 1e-9 && xyz.allFinite() && std::isfinite(e) && e <= threshold) {
         track.push_back(o);
         error += e;
-        directions.push_back((p.xyz - image.pose.Center()).normalized());
+        directions.push_back((p.xyz - centers[o.image]).normalized());
       }
     }
     bool parallax = false;

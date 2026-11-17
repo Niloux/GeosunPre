@@ -12,6 +12,9 @@
 #include <deque>
 #include <future>
 #include <functional>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 namespace geosun {
 fs::path MaskPath(const fs::path& work, uint32_t id) {
@@ -161,7 +164,7 @@ class AsyncWriter {
   }
   template <class Function>
   void Submit(Function write) {
-    if (jobs.size() == 2)
+    if (jobs.size() == 4)
       Pop();
     jobs.push_back(std::async(std::launch::async, [write = std::move(write)] {
       const auto started = Clock::now();
@@ -206,6 +209,10 @@ std::vector<size_t> Select(const std::vector<std::array<float, 3>>& points, cons
   return result;
 }
 class FeatureCache {
+  static constexpr size_t kCapacity = 3072;
+  static constexpr size_t kKeypointsBytes = kCapacity * 2 * sizeof(float);
+  static constexpr size_t kDescriptorsBytes = kCapacity * 256 * sizeof(float);
+  static constexpr size_t kMaskBytes = kCapacity * sizeof(float);
   const fs::path work;
   std::list<uint32_t> order;
   struct Entry {
@@ -214,6 +221,9 @@ class FeatureCache {
     std::list<uint32_t>::iterator position;
   };
   std::map<uint32_t, Entry> entries;
+  std::vector<std::shared_ptr<DeviceBuffer>> free_keypoints, free_descriptors, free_masks;
+  HostBuffer pinned;
+  cudaStream_t upload_stream = nullptr;
   struct Loaded {
     FeatureSet value;
     double seconds;
@@ -221,10 +231,22 @@ class FeatureCache {
   std::map<uint32_t, std::future<Loaded>> pending;
 
  public:
-  explicit FeatureCache(fs::path path) : work(std::move(path)) {}
+  explicit FeatureCache(fs::path path)
+      : work(std::move(path)), pinned(kKeypointsBytes + kDescriptorsBytes + kMaskBytes) {
+    CudaCheck(cudaStreamCreateWithFlags(&upload_stream, cudaStreamNonBlocking));
+  }
+  ~FeatureCache() {
+    for (auto& job : pending)
+      if (job.second.valid())
+        job.second.wait();
+    if (upload_stream) {
+      cudaStreamSynchronize(upload_stream);
+      cudaStreamDestroy(upload_stream);
+    }
+  }
   double read_seconds = 0, wait_seconds = 0, upload_seconds = 0;
   void Prefetch(uint32_t id) {
-    if (entries.count(id) || pending.count(id) || pending.size() >= 4)
+    if (entries.count(id) || pending.count(id) || pending.size() >= 8)
       return;
     const auto path = FeaturePath(work, id);
     pending.emplace(id, std::async(std::launch::async, [path] {
@@ -239,8 +261,17 @@ class FeatureCache {
       order.splice(order.begin(), order, it->second.position);
       return it->second;
     }
-    if (entries.size() >= 48) {
-      entries.erase(order.back());
+    if (entries.size() >= 96) {
+      const auto evicted = entries.find(order.back());
+      auto recycle = [](std::shared_ptr<DeviceBuffer>& buf,
+                        std::vector<std::shared_ptr<DeviceBuffer>>& pool) {
+        if (buf && buf.use_count() == 1)
+          pool.push_back(std::move(buf));
+      };
+      recycle(evicted->second.keypoints.device, free_keypoints);
+      recycle(evicted->second.descriptors.device, free_descriptors);
+      recycle(evicted->second.mask.device, free_masks);
+      entries.erase(evicted);
       order.pop_back();
     }
     order.push_front(id);
@@ -259,13 +290,122 @@ class FeatureCache {
     wait_seconds += Seconds(waiting);
     const auto uploading = Clock::now();
     const auto n = entry.value.pixels.size();
-    entry.keypoints = Tensor::Upload({1, 3072, 2}, entry.value.normalized[0].data(), n * 2);
-    entry.descriptors = Tensor::Upload({1, 3072, 256}, entry.value.descriptors.data(), n * 256);
-    const std::vector<float> mask(n, 1.f);
-    entry.mask = Tensor::Upload({1, 3072}, mask.data(), mask.size());
+    auto acquire = [](std::vector<std::shared_ptr<DeviceBuffer>>& pool, size_t bytes) {
+      if (!pool.empty()) {
+        auto buf = std::move(pool.back());
+        pool.pop_back();
+        return buf;
+      }
+      return std::make_shared<DeviceBuffer>(bytes);
+    };
+    auto kp_dev = acquire(free_keypoints, kKeypointsBytes);
+    auto desc_dev = acquire(free_descriptors, kDescriptorsBytes);
+    auto mask_dev = acquire(free_masks, kMaskBytes);
+    auto* kp_host = static_cast<float*>(pinned.data);
+    auto* desc_host =
+        reinterpret_cast<float*>(static_cast<uint8_t*>(pinned.data) + kKeypointsBytes);
+    auto* mask_host = reinterpret_cast<float*>(static_cast<uint8_t*>(pinned.data) +
+                                               kKeypointsBytes + kDescriptorsBytes);
+    std::memcpy(kp_host, entry.value.normalized[0].data(), n * 2 * sizeof(float));
+    if (n < kCapacity)
+      std::memset(kp_host + n * 2, 0, (kCapacity - n) * 2 * sizeof(float));
+    std::memcpy(desc_host, entry.value.descriptors.data(), n * 256 * sizeof(float));
+    if (n < kCapacity)
+      std::memset(desc_host + n * 256, 0, (kCapacity - n) * 256 * sizeof(float));
+    std::fill_n(mask_host, n, 1.f);
+    if (n < kCapacity)
+      std::fill_n(mask_host + n, kCapacity - n, 0.f);
+    CudaCheck(cudaMemcpyAsync(kp_dev->data, kp_host, kKeypointsBytes, cudaMemcpyHostToDevice,
+                              upload_stream));
+    CudaCheck(cudaMemcpyAsync(desc_dev->data, desc_host, kDescriptorsBytes, cudaMemcpyHostToDevice,
+                              upload_stream));
+    CudaCheck(cudaMemcpyAsync(mask_dev->data, mask_host, kMaskBytes, cudaMemcpyHostToDevice,
+                              upload_stream));
+    CudaCheck(cudaStreamSynchronize(upload_stream));
+    entry.keypoints.shape = {1, int64_t(kCapacity), 2};
+    entry.keypoints.type = 0;
+    entry.keypoints.device = std::move(kp_dev);
+    entry.descriptors.shape = {1, int64_t(kCapacity), 256};
+    entry.descriptors.type = 0;
+    entry.descriptors.device = std::move(desc_dev);
+    entry.mask.shape = {1, int64_t(kCapacity)};
+    entry.mask.type = 0;
+    entry.mask.device = std::move(mask_dev);
     upload_seconds += Seconds(uploading);
     entry.position = order.begin();
     return entries.emplace(id, std::move(entry)).first->second;
+  }
+};
+class ArchiveWriterQueue {
+  MatchArchiveWriter writer_;
+  std::deque<MatchSet> queue_;
+  std::mutex mutex_;
+  std::condition_variable can_push_, can_pop_;
+  bool stop_ = false;
+  std::exception_ptr error_;
+  std::thread worker_;
+
+ public:
+  double seconds = 0;
+  explicit ArchiveWriterQueue(const fs::path& path)
+      : writer_(path), worker_([this] { Run(); }) {}
+  ~ArchiveWriterQueue() {
+    if (worker_.joinable()) {
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_ = true;
+      }
+      can_pop_.notify_all();
+      worker_.join();
+    }
+  }
+  void Submit(MatchSet&& item) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    can_push_.wait(lock, [&] { return queue_.size() < 128 || error_ != nullptr; });
+    if (error_)
+      std::rethrow_exception(error_);
+    queue_.push_back(std::move(item));
+    can_pop_.notify_one();
+  }
+  void Finish() {
+    if (!worker_.joinable())
+      return;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    can_pop_.notify_all();
+    worker_.join();
+    if (error_)
+      std::rethrow_exception(error_);
+  }
+
+ private:
+  void Run() {
+    try {
+      for (;;) {
+        std::deque<MatchSet> batch;
+        {
+          std::unique_lock<std::mutex> lock(mutex_);
+          can_pop_.wait(lock, [&] { return !queue_.empty() || stop_; });
+          if (queue_.empty() && stop_)
+            break;
+          batch.swap(queue_);
+        }
+        can_push_.notify_all();
+        const auto started = Clock::now();
+        for (const auto& m : batch)
+          writer_.Append(m);
+        seconds += Seconds(started);
+      }
+      const auto started = Clock::now();
+      writer_.Flush();
+      seconds += Seconds(started);
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      error_ = std::current_exception();
+      can_push_.notify_all();
+    }
   }
 };
 // SAM3 grounding of the whole photo, prompts person, shadow, robot and sky.
@@ -532,7 +672,7 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
     const auto path = MaskPath(work, record.id);
     writer.Submit([path, mask = std::move(mask)] {
       const auto temporary = path.parent_path() / (path.stem().u8string() + ".writing.png");
-      WriteImage(temporary, mask);
+      WriteImage(temporary, mask, 1);
       PublishFile(temporary, path);
     });
     ++timing.computed;
@@ -791,23 +931,35 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
   const uint32_t n = uint32_t(scene.images.size());
   size_t navigation_added_pairs;
   const auto pairs = CandidatePairs(scene, work, repair, navigation_added_pairs);
+  const auto archive_path = MatchesPath(work);
+  const auto existing = IndexMatchArchive(archive_path, true);
   std::vector<std::pair<uint32_t, uint32_t>> pending;
   for (const auto& [a, b] : pairs) {
-    if (fs::exists(MatchPath(work, a, b)))
+    if (existing.count({a, b}))
       ++timing.reused;
     else
       pending.emplace_back(a, b);
   }
   Json report;
   if (!pending.empty()) {
+    std::sort(pending.begin(), pending.end(), [](const auto& lhs, const auto& rhs) {
+      constexpr uint32_t Tile = 32;
+      const uint32_t la = lhs.first / Tile, ra = rhs.first / Tile;
+      if (la != ra)
+        return la < ra;
+      const uint32_t lb = lhs.second / Tile, rb = rhs.second / Tile;
+      if (lb != rb)
+        return (la & 1u) ? (lb > rb) : (lb < rb);
+      return lhs < rhs;
+    });
     Models models(root);
     FeatureCache cache(work);
-    AsyncWriter writer;
+    ArchiveWriterQueue writer(archive_path);
     for (size_t index = 0; index < pending.size(); ++index) {
       const auto [a, b] = pending[index];
       const auto& fa = cache.Get(a);
       const auto& fb = cache.Get(b);
-      for (size_t next = index + 1; next < std::min(pending.size(), index + 3); ++next) {
+      for (size_t next = index + 1; next < std::min(pending.size(), index + 5); ++next) {
         cache.Prefetch(pending[next].first);
         cache.Prefetch(pending[next].second);
       }
@@ -831,8 +983,7 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
         }
       }
       timing.postprocess += Seconds(phase);
-      const auto path = MatchPath(work, a, b);
-      writer.Submit([path, m = std::move(m)] { WriteMatches(path, m); });
+      writer.Submit(std::move(m));
       ++timing.computed;
       if ((index + 1) % 500 == 0)
         Log("Matches " + std::to_string(index + 1) + "/" + std::to_string(pending.size()));
@@ -843,8 +994,11 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
     timing.wait = cache.wait_seconds;
     timing.preprocess = cache.upload_seconds;
     report = timing.Report(started, &models);
-  } else
+  } else {
+    if (!fs::exists(archive_path))
+      MatchArchiveWriter(archive_path).Flush();
     report = timing.Report(started);
+  }
   Json list = Json::array();
   std::vector<double> degrees(n, 0);
   for (const auto& [a, b] : pairs) {

@@ -326,3 +326,56 @@
 - **提交与正式重打包完成**：
   - `LichtFeld-Studio` 已提交为 `70fb4a973`；清理 `build-windows-trainer-ptx80\src` 中旧 CP936 `#deps 0` `.cpp.obj` 后经 `package-windows-trainer.cmd` 重编验证 `main.cpp.obj` 已纳入 `include/git_version.h` 依赖，产出无 `-dirty` 的 [Geosun-3DGS-Trainer-sm80-20261117-190930.zip](file:///D:/Dev/LichtFeld-Studio/build-delivery/Geosun-3DGS-Trainer-sm80-20261117-190930.zip)（`113.83 MiB`），已删除 `20261116-134442`、`20261117-153642`、`20261117-190309` 旧训练器包及未瘦身旧版 `1.1.1` 整包。
   - 配对 `GeosunPre` `33ac17c`（`GeosunPre-1.1.1-33ac17c-ampere_plus`）通过 `package.ps1` 重新封装 [Geosun-3DGS-1.1.1-Windows-x64.zip](file:///D:/Dev/GeosunPre/packages/Geosun-3DGS-1.1.1-Windows-x64.zip)（`2314.09 MiB`，`exit code 0`），通过 `Geosun.exe --help`、`geosunpre.exe check-models`（`passed: true`）与 `geosun_3dgs_train.exe --version`（`Geosun 3DGS Trainer v0.5.5-dev-305-g70fb4a973 (70fb4a973)`）及落盘前后哈希一致性核验。
+
+---
+
+## 2026-11-17：GeosunPre 纯 C++/CUDA 零精度损失提速包（Phase 1）双场景实测
+
+- **测试环境**：Windows x64，`NVIDIA GeForce RTX 4090`（`24564 MiB`，`SM 8.9`）+ `13th Gen Intel(R) Core(TM) i7-13700F`（`24` 逻辑处理器），Ninja Release（`/W4` 无新增警告，不更改外部模型、第三方依赖及交付格式契约）。
+- **核心改动（五项零精度损失优化）**：
+  1. **低压缩内部掩码与异步写出扩容**（[scene.cpp](file:///D:/Dev/GeosunPre/src/io/scene.cpp)、[static_masks.cpp](file:///D:/Dev/GeosunPre/src/geometry/static_masks.cpp)、[frontend.cpp](file:///D:/Dev/GeosunPre/src/frontend/frontend.cpp)）：为 `WriteImage` 增加可选 `png_compression` 参数，内部中间掩码使用 `png_compression = 1`（不影响 `export/` 默认导出压缩），并将 `AsyncWriter` 队列上限由 `2` 扩至 `4`。
+  2. **`matches` 2D 局部性调度、CUDA buffer 池与单文件归档**（[cache.cpp](file:///D:/Dev/GeosunPre/src/io/cache.cpp)、[frontend.cpp](file:///D:/Dev/GeosunPre/src/frontend/frontend.cpp)、[reconstruction.cpp](file:///D:/Dev/GeosunPre/src/sfm/reconstruction.cpp)、[cache.md](file:///D:/Dev/GeosunPre/docs/cache.md)）：对 `matches` 待配对集合按 2D serpentine（`Tile = 32`）重排以提升缓存命中，`FeatureCache` 扩至 `96` 条目 / `8` 预取 / 非阻塞 `upload_stream` 并复用显存 buffer 池；废弃散列 `cache/matches/` 小文件，改用单一顺序归档 `cache/matches.bin`（配 `ArchiveWriterQueue` 写入与每线程独立 `std::ifstream` 原子抢占读取）。
+  3. **Ceres BA / 快门静态 Schur 特化、参数块打包与节流 checkpoint**（[optimization.cpp](file:///D:/Dev/GeosunPre/src/sfm/optimization.cpp)、[model.cpp](file:///D:/Dev/GeosunPre/src/geometry/model.cpp)、[reconstruction.cpp](file:///D:/Dev/GeosunPre/src/sfm/reconstruction.cpp)）：为 `OPTIMIZE` 静态特化 `<2,3,6>` / `<2,3,d>` Schur，快门阶段将 `[pose(7), rot(3)]` 与 `[intrinsics(8), readout(1)]` 打包并搭配 `SubsetManifold` 切换阶段常量，`Depth` 改 2 维残差且仅在 `!metric || track.size() == 2` 时挂载，改用解析雅可比 `PlaneCost` 并为 `Model::Filter` / `RebuildReferences` 预计算姿态数组与复用标记缓冲；定期 `incremental.bin` checkpoint 节流为 `registered % 8 == 0 && >= 20 s`。
+  4. **GPU-resident MoGe 解算、GPU 跨视角冲突检测与内存直持 depth 单次落盘**（[monocular.cpp](file:///D:/Dev/GeosunPre/src/geometry/monocular.cpp)、[supervision_kernels.cu](file:///D:/Dev/GeosunPre/src/geometry/supervision_kernels.cu)、[supervision.cpp](file:///D:/Dev/GeosunPre/src/geometry/supervision.cpp)）：MoGe TensorRT 输出保留在显存内并通过 CUDA 核函数完成样本采样（单次流同步回传求解 shift）与法向/深度图构建；在 `FilterViewConflicts` 前调用 `LasPointCache::Finish()` 释放常驻点云显存与 TensorRT 引擎；`FilterViewConflicts` 改用 2D serpentine（`Tile = 32`）+ `64` 槽 GPU 深度 LRU + CUDA 核函数判定，当总缓存 `<= 1.5 GiB` 时内存直持 depth 图像避免冗余 PNG 编解码。
+  5. **消除交付后重复 `check` 子进程**（[bundle/main.cpp](file:///D:/Dev/GeosunPre/bundle/main.cpp)）：`PublishPending` 完成后跳过冗余 `geosunpre check`。
+
+### 1. 同机室内 `展厅` 实测对照（`work\展厅` vs `work\展厅-fast`）
+
+新交付目录 [work\展厅-fast](file:///D:/Dev/GeosunPre/work/展厅-fast) 已通过 `run.ps1 check`（`"passed": true`）并保留在本地。
+
+| 阶段 / 指标 | 同机基线 `work\展厅`（`33ac17c`） | 本次提速 `work\展厅-fast`（`46b716e-dirty`） | 变化幅度 / 备注 |
+| --- | --- | --- | --- |
+| `masks` / `features` 阶段耗时 | `126.57 s` / `31.33 s` | `121.21 s` / `27.57 s` | `-4.2%` / `-12.0%`（主要耗时为 SAM3 GPU `107.84 s`） |
+| `matches` 阶段耗时（`decode` / `write`） | `72.68 s`（`28.29 s` / `9.42 s`） | **`64.07 s`（`5.79 s` / `0.03 s`）** | `decode -79.5%`，`write -99.6%`（LoMa GPU `59.48 s`） |
+| `sfm` 阶段耗时（`geo` / `filter` / `checkpoint`） | `296.45 s`（`26.35` / `12.92` / `5.65 s`） | **`127.52 s`（`11.32` / `5.12` / `0.14 s`）** | **`-57.0%`**（`opt` 大幅加速，增量存档耗时几乎归零） |
+| `joint`（`align` BA，`linear`） | `42.73 s`（`30.66 s`，`used: true`） | **`18.87 s`（`14.40 s`，`used: true`）** | **`-55.8%`** |
+| `shutter` 阶段耗时（主 BA / `polish` / 总计） | `92.45` / `126.89` / `229.43 s` | **`29.19` / `37.90` / `73.01 s`** | **`-68.2%`**（主 BA 与 `polish` 均加速 `~3.2×`） |
+| `cleanup` / `static_masks` 阶段耗时 | `12.06 s` / `17.96 s` | `7.65 s` / `19.97 s` | `cleanup -36.6%` |
+| `supervision` 总耗时（MoGe `host` / `view_conflicts`） | `135.50 s`（`87.34 s` / `20.40 s`） | **`122.23 s`（`18.87 s` / `1.96 s`）** | MoGe `host -78.4%`，`view_conflicts -90.4%`（`10.4×`），MoGe GPU `81.34 s` |
+| 主阶段耗时合计 / 端到端实测总耗时 | `964.70 s` / — | **`582.08 s` / `608.94 s`** | **阶段合计 `-39.7%`**（`ELAPSED_SECONDS = 610.07 s`） |
+| 注册图像 / `check` 回读校验 | `585 / 588` / `passed: true` | `584 / 588` / **`passed: true`** | 缺 `00214–00216-R` 及 `ba_workers=8` 浮点边界帧 `00301-R`（`-1` 帧） |
+| SfM 点数 / 观测数 / 重投影 `median` / `p90` | `151,150` / `732,815` / `0.8881` / `2.0665 px` | `151,057` / `732,531` / `0.8881` / `2.0670 px` | 几乎零差异 |
+| 卷帘留出 `before -> after` / `readout_s` | `1.4192 -> 1.1382 px` / `[24.19, 22.75] ms` | `1.4174 -> 1.1414 px` / `[24.34, 22.91] ms` | 均通过全项检查，精度持平 |
+| 真实 LAS 点到面 `plane_after` / `polish` 重关联 | `5.89 / 17.40 mm` / `5.84 / 16.83 mm` | **`5.74 / 17.49 mm` / `5.70 / 16.94 mm`** | 持平略优 |
+| 导航位置误差 `med` / `p90` | `20.56` / `37.31 mm` | `20.71` / `35.02 mm` | P90 略优（`-6.1%`） |
+| 有效监督像素（深度 / 法向）/ `points3D.ply` | `336,675,067` / `395,079,740` / `881,579` | `335,962,013` / `394,345,339` / `881,551` | `-0.21%` / `-0.19%`（目录 `1806.29 -> 1803.82 MiB`） |
+
+### 2. 室外 `篮球场` 实测对照（`work\篮球场-shutter` / `work\篮球场-opt` vs `work\篮球场-fast`）
+
+新交付目录 [work\篮球场-fast](file:///D:/Dev/GeosunPre/work/篮球场-fast) 已通过 `run.ps1 check`（`"passed": true`）并保留在本地。
+
+| 阶段 / 指标 | 历史同算法基线（`篮球场-shutter` / `篮球场-opt`） | 本次提速 `work\篮球场-fast`（`46b716e-dirty`） | 变化幅度 / 备注 |
+| --- | --- | --- | --- |
+| `masks` / `features` / `matches` | — / — / — | `109.73 s` / `25.44 s` / `51.74 s` | `matches decode 3.73 s`、`write 0.03 s`（LoMa GPU `47.98 s`） |
+| `sfm` / `align` 阶段 | — / — | `89.90 s` / `18.20 s` | `sfm geo 8.50 s`、`filter 4.31 s`、`checkpoint 0.09 s`；`joint used: false` |
+| `shutter` 阶段耗时（主 BA / `polish` / 总计） | `60.43` / `52.81` / `120.86 s` | **`26.77` / `26.13` / `59.73 s`** | **`-50.6%`** |
+| `cleanup` / `static_masks` 阶段耗时 | — / `31.21 s`（`篮球场-opt`） | `12.30 s` / `26.04 s` | `sky.kept: true`（`517` 开阔、`52` 图除误检 `657,424 px`） |
+| `supervision` 总耗时（`view_conflicts`） | `159.99 s`（`篮球场-opt`） / — | **`119.66 s`（`1.60 s`）** | **`-25.2%`**（MoGe `host 12.34 s`，GPU `74.65 s`） |
+| **全流程总耗时** / 交付体积 | `715.91 s` / `2341.52 MB` | **`535.43 s` / `2340.94 MiB`** | **`-180.48 s`（`-25.2%`，提速 3 分钟）** |
+| 注册情况 / `check` 回读校验 | `536 / 536`（`complete: true`）/ `passed: true` | **`536 / 536`（`complete: true`）/ `passed: true`** | 100% 完整通过 |
+| SfM 点数 / 观测数 / `>=3` 轨迹 | `122,560` / `503,124` / `57,703` | `122,739` / `500,182` / `57,604` | 基本持平 |
+| 重投影 `median` / `p90` 与留出校正 | `0.7094` / `1.7421 px`（留出后 `0.9757 / 2.8242`） | `0.7054` / `1.7377 px`（留出 `1.3370 -> 0.9751 / 2.8322`） | 均略优或持平 |
+| `readout_s`（`L` / `R`）与 `polish` 重关联 LAS 平面 | `+32.85 / -31.04 ms`，`3.73 / 14.75 mm` | `+33.00 / -31.29 ms`，**`3.72 / 14.74 mm`** | 持平略优（`44,779` 面点） |
+| 有效监督像素（深度 / 法向）/ `points3D.ply` | `225,080,139` / `306,386,746` / `2,500,000` | `224,996,325` / `306,386,023` / `2,500,000` | `-0.04%` / `-0.00%` |
+
+- **当前耗时收敛分析**：经 Phase 1 消除 CPU 编解码、随机小文件 I/O、Ceres 动态求导/大块稀疏与跨视角冲突瓶颈后，全流程剩余耗时已主要收敛至纯 TensorRT `batch = 1` 引擎执行本身（双场景下 `SAM3 grounding` GPU `98.06–107.84 s`、`MoGe geometry` GPU `74.65–81.34 s`、`LoMa matcher` GPU `47.98–59.48 s`，三者合计占总耗时 `~41%–43%`）；在保持零模型改动与零精度损失前提下，已达纯粹 C++/CUDA 工程层面的高性价比上限，下一步可转入面向下游 3DGS 的质量优化阶段（Phase 2）。

@@ -1,5 +1,6 @@
 #include "geometry/monocular.h"
 #include "geometry/supervision.h"
+#include "geometry/supervision_kernels.h"
 #include "io/scene.h"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -8,10 +9,13 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <future>
+#include <list>
 #include <mutex>
 #include <thread>
+#include <tuple>
 
 namespace geosun {
 namespace {
@@ -61,21 +65,22 @@ void AddRing(std::vector<Eigen::Matrix3d>& rotations, int ring, double tilt) {
 }
 // Z shift turning MoGe's affine point map into camera space for the known face focal, as MoGe's
 // own inference: min sum |xy / (z + shift) - uv|^2 over its 64 x 64 nearest-neighbour grid.
-bool SolveShift(const float* points, const cv::Mat& valid, int size, double& shift) {
+bool SolveShiftFromSamples(const float4* grid, int size, double& shift) {
   struct Sample {
     double x, y, z, u, v;
   };
   std::vector<Sample> samples;
+  samples.reserve(4096);
   double nearest = INFINITY;
   for (int i = 0; i < 64; ++i)
     for (int j = 0; j < 64; ++j) {
-      const int row = i * size / 64, column = j * size / 64;
-      if (!valid.at<uint8_t>(row, column))
+      const float4 s = grid[i * 64 + j];
+      if (s.w <= 0.f)
         continue;
-      const float* p = points + 3 * (size_t(row) * size + column);
-      samples.push_back({p[0], p[1], p[2], (2. * column + 1 - size) / size,
+      const int row = i * size / 64, column = j * size / 64;
+      samples.push_back({double(s.x), double(s.y), double(s.z), (2. * column + 1 - size) / size,
                          (2. * row + 1 - size) / size});
-      nearest = std::min(nearest, double(p[2]));
+      nearest = std::min(nearest, double(s.z));
     }
   if (samples.size() < MinimumShiftSamples)
     return false;
@@ -278,16 +283,62 @@ MonocularLens PlanMonocularLens(const Camera& source, const Camera& grid, int si
   }
   return lens;
 }
+struct MonocularEstimator::Workspace {
+  cudaStream_t stream = nullptr;
+  int faces = 0;
+  const MonocularLens* cached_lens = nullptr;
+  std::unique_ptr<DeviceBuffer> d_points, d_normals, d_masks, d_face_valid, d_metric_scales,
+      d_shift_samples, d_shifts, d_shift_ok, d_to_camera, d_out_distance, d_out_normal,
+      d_valid_counts;
+  std::unique_ptr<HostBuffer> h_face_valid, h_shift_samples, h_metric_scales, h_shifts, h_shift_ok,
+      h_to_camera, h_out_distance, h_out_normal, h_valid_counts;
+  explicit Workspace(cudaStream_t s) : stream(s) {}
+  ~Workspace() {
+    if (stream)
+      cudaStreamSynchronize(stream);
+  }
+  void Reserve(int count, int size) {
+    if (count <= faces)
+      return;
+    const size_t face_pixels = size_t(size) * size, total_pixels = size_t(count) * face_pixels;
+    d_points = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
+    d_normals = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
+    d_masks = std::make_unique<DeviceBuffer>(total_pixels * sizeof(float));
+    d_face_valid = std::make_unique<DeviceBuffer>(total_pixels);
+    d_metric_scales = std::make_unique<DeviceBuffer>(size_t(count) * sizeof(float));
+    d_shift_samples = std::make_unique<DeviceBuffer>(size_t(count) * 4096 * sizeof(float4));
+    d_shifts = std::make_unique<DeviceBuffer>(size_t(count) * sizeof(double));
+    d_shift_ok = std::make_unique<DeviceBuffer>(size_t(count));
+    d_to_camera = std::make_unique<DeviceBuffer>(size_t(count) * 9 * sizeof(double));
+    d_out_distance = std::make_unique<DeviceBuffer>(total_pixels * sizeof(float));
+    d_out_normal = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
+    d_valid_counts = std::make_unique<DeviceBuffer>(size_t(count) * sizeof(uint32_t));
+    h_face_valid = std::make_unique<HostBuffer>(total_pixels);
+    h_shift_samples = std::make_unique<HostBuffer>(size_t(count) * 4096 * sizeof(float4));
+    h_metric_scales = std::make_unique<HostBuffer>(size_t(count) * sizeof(float));
+    h_shifts = std::make_unique<HostBuffer>(size_t(count) * sizeof(double));
+    h_shift_ok = std::make_unique<HostBuffer>(size_t(count));
+    h_to_camera = std::make_unique<HostBuffer>(size_t(count) * 9 * sizeof(double));
+    h_out_distance = std::make_unique<HostBuffer>(total_pixels * sizeof(float));
+    h_out_normal = std::make_unique<HostBuffer>(total_pixels * 3 * sizeof(float));
+    h_valid_counts = std::make_unique<HostBuffer>(size_t(count) * sizeof(uint32_t));
+    faces = count;
+    cached_lens = nullptr;
+  }
+};
 MonocularEstimator::MonocularEstimator(Models& models)
-    : models_(models), pixels_(models.Stream()) {
+    : models_(models),
+      pixels_(models.Stream()),
+      workspace_(std::make_unique<Workspace>(models.Stream())) {
   const auto& manifest = models.Manifest();
   if (!manifest.at("models").contains("geometry"))
     throw std::runtime_error("Model package has no geometry engine; use run.ps1 prepare-models");
   size_ = manifest.at("geometry_size");
   // Load the engine now, so device memory budgets measured afterwards see it.
   pixels_.Upload(cv::Mat::zeros(size_, size_, CV_8UC3));
-  models_.Predict("geometry", {pixels_.Normalize(size_, size_)});
+  models_.Predict("geometry", {pixels_.Normalize(size_, size_)}, true);
 }
+MonocularEstimator::~MonocularEstimator() = default;
 std::vector<cv::Mat> MonocularEstimator::Faces(const MonocularLens& lens, const cv::Mat& rgb) {
   const auto source = Prefiltered(lens, rgb);
   std::vector<cv::Mat> faces;
@@ -303,65 +354,122 @@ std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens
                                                        const std::vector<cv::Mat>& images) {
   if (lens.size != size_ || images.size() != lens.faces.size())
     throw std::runtime_error("Monocular faces differ from the geometry engine or lens plan");
-  const int size = size_;
-  // The CPU half of a face (shift solve, distance and normal maps) runs beside the GPU inference
-  // of the following faces; a few in flight bound the memory of their host-side outputs.
-  auto process = [&lens, size](size_t f, const std::vector<Tensor>& outputs) {
-    const std::vector<int64_t> map{1, size, size, 3};
+  const int size = size_, faces = int(images.size());
+  if (!faces)
+    return {};
+  const size_t face_pixels = size_t(size) * size;
+  const auto stream = models_.Stream();
+  workspace_->Reserve(faces, size);
+  if (workspace_->cached_lens != &lens) {
+    auto* dst = static_cast<uint8_t*>(workspace_->h_face_valid->data);
+    for (int f = 0; f < faces; ++f) {
+      const auto& v = lens.faces[f].valid;
+      if (v.type() != CV_8UC1 || v.cols != size || v.rows != size)
+        throw std::runtime_error("Unexpected monocular face valid mask");
+      if (v.isContinuous())
+        std::memcpy(dst + size_t(f) * face_pixels, v.data, face_pixels);
+      else {
+        cv::Mat cont = v.clone();
+        std::memcpy(dst + size_t(f) * face_pixels, cont.data, face_pixels);
+      }
+    }
+    CudaCheck(cudaMemcpyAsync(workspace_->d_face_valid->data, dst, size_t(faces) * face_pixels,
+                              cudaMemcpyHostToDevice, stream));
+    workspace_->cached_lens = &lens;
+  }
+  const std::vector<int64_t> map{1, size, size, 3};
+  for (int f = 0; f < faces; ++f) {
+    pixels_.Upload(images[f]);
+    const auto outputs = models_.Predict("geometry", {pixels_.Normalize(size, size)}, true);
     if (outputs.size() != 4 || outputs[0].shape != map || outputs[1].shape != map ||
         outputs[2].shape != std::vector<int64_t>{1, size, size} ||
-        outputs[3].shape != std::vector<int64_t>{1})
+        outputs[3].shape != std::vector<int64_t>{1} || !outputs[0].device ||
+        !outputs[1].device || !outputs[2].device || !outputs[3].device)
       throw std::runtime_error("Geometry engine output contract differs");
-    const float *points = outputs[0].Floats(), *normals = outputs[1].Floats(),
-                *mask = outputs[2].Floats();
-    const auto& face = lens.faces[f];
-    cv::Mat valid(size, size, CV_8UC1);
-    for (int i = 0; i < size * size; ++i)
-      valid.data[i] = face.valid.data[i] && mask[i] > .5f && std::isfinite(points[3 * i + 2]) ? 255 : 0;
-    FaceEstimate estimate;
-    estimate.distance = cv::Mat::zeros(size, size, CV_32FC1);
-    estimate.normal = cv::Mat::zeros(size, size, CV_32FC3);
-    estimate.metric_scale = outputs[3].Floats()[0];
-    if (!std::isfinite(estimate.metric_scale) || estimate.metric_scale <= 0)
-      throw std::runtime_error("Geometry engine returned an invalid metric scale");
-    if (SolveShift(points, valid, size, estimate.shift)) {
-      const Eigen::Matrix3d to_camera = face.rotation.transpose();
-      for (int v = 0; v < size; ++v)
-        for (int u = 0; u < size; ++u) {
-          const size_t i = size_t(v) * size + u;
-          const double depth = points[3 * i + 2] + estimate.shift;
-          if (!valid.data[i] || !(depth > 0))
-            continue;
-          const Eigen::Vector3d ray((u + .5 - size / 2.) / lens.focal,
-                                    (v + .5 - size / 2.) / lens.focal, 1);
-          Eigen::Vector3d n =
-              to_camera * Eigen::Vector3d(normals[3 * i], normals[3 * i + 1], normals[3 * i + 2]);
-          if (n.dot(to_camera * ray) > 0)
-            n = -n;
-          estimate.distance.at<float>(v, u) = float(depth * ray.norm() * estimate.metric_scale);
-          estimate.normal.at<cv::Vec3f>(v, u) = cv::Vec3f(float(n.x()), float(n.y()), float(n.z()));
-          ++estimate.valid;
-        }
-    }
-    return estimate;
-  };
-  constexpr size_t InFlight = 4;
-  std::vector<FaceEstimate> estimates;
-  std::deque<std::future<FaceEstimate>> pending;
-  for (size_t f = 0; f < images.size(); ++f) {
-    pixels_.Upload(images[f]);
-    auto outputs = models_.Predict("geometry", {pixels_.Normalize(size, size)});
-    pending.push_back(std::async(std::launch::async, [process, f, outputs = std::move(outputs)] {
-      return process(f, outputs);
-    }));
-    if (pending.size() >= InFlight) {
-      estimates.push_back(pending.front().get());
-      pending.pop_front();
-    }
+    CudaCheck(cudaMemcpyAsync(
+        static_cast<float*>(workspace_->d_points->data) + size_t(f) * face_pixels * 3,
+        outputs[0].device->data, face_pixels * 3 * sizeof(float), cudaMemcpyDeviceToDevice,
+        stream));
+    CudaCheck(cudaMemcpyAsync(
+        static_cast<float*>(workspace_->d_normals->data) + size_t(f) * face_pixels * 3,
+        outputs[1].device->data, face_pixels * 3 * sizeof(float), cudaMemcpyDeviceToDevice,
+        stream));
+    CudaCheck(cudaMemcpyAsync(
+        static_cast<float*>(workspace_->d_masks->data) + size_t(f) * face_pixels,
+        outputs[2].device->data, face_pixels * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    CudaCheck(cudaMemcpyAsync(static_cast<float*>(workspace_->d_metric_scales->data) + f,
+                              outputs[3].device->data, sizeof(float), cudaMemcpyDeviceToDevice,
+                              stream));
+    supervision_gpu::SampleMogeShiftGrid(
+        static_cast<const float*>(workspace_->d_points->data) + size_t(f) * face_pixels * 3,
+        static_cast<const float*>(workspace_->d_masks->data) + size_t(f) * face_pixels,
+        static_cast<const uint8_t*>(workspace_->d_face_valid->data) + size_t(f) * face_pixels,
+        size, static_cast<float4*>(workspace_->d_shift_samples->data) + size_t(f) * 4096, stream);
   }
-  while (!pending.empty()) {
-    estimates.push_back(pending.front().get());
-    pending.pop_front();
+  CudaCheck(cudaMemcpyAsync(workspace_->h_shift_samples->data, workspace_->d_shift_samples->data,
+                            size_t(faces) * 4096 * sizeof(float4), cudaMemcpyDeviceToHost, stream));
+  CudaCheck(cudaMemcpyAsync(workspace_->h_metric_scales->data, workspace_->d_metric_scales->data,
+                            size_t(faces) * sizeof(float), cudaMemcpyDeviceToHost, stream));
+  CudaCheck(cudaStreamSynchronize(stream));
+  const auto* metric_scales = static_cast<const float*>(workspace_->h_metric_scales->data);
+  const auto* samples = static_cast<const float4*>(workspace_->h_shift_samples->data);
+  auto* shifts = static_cast<double*>(workspace_->h_shifts->data);
+  auto* shift_ok = static_cast<uint8_t*>(workspace_->h_shift_ok->data);
+  auto* to_camera = static_cast<double*>(workspace_->h_to_camera->data);
+  for (int f = 0; f < faces; ++f) {
+    if (!std::isfinite(metric_scales[f]) || metric_scales[f] <= 0)
+      throw std::runtime_error("Geometry engine returned an invalid metric scale");
+    double shift = 0;
+    shift_ok[f] = SolveShiftFromSamples(samples + size_t(f) * 4096, size, shift) ? 1 : 0;
+    shifts[f] = shift;
+    const Eigen::Matrix3d tc = lens.faces[f].rotation.transpose();
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c)
+        to_camera[f * 9 + r * 3 + c] = tc(r, c);
+  }
+  CudaCheck(cudaMemcpyAsync(workspace_->d_shifts->data, shifts, size_t(faces) * sizeof(double),
+                            cudaMemcpyHostToDevice, stream));
+  CudaCheck(cudaMemcpyAsync(workspace_->d_shift_ok->data, shift_ok, size_t(faces),
+                            cudaMemcpyHostToDevice, stream));
+  CudaCheck(cudaMemcpyAsync(workspace_->d_to_camera->data, to_camera,
+                            size_t(faces) * 9 * sizeof(double), cudaMemcpyHostToDevice, stream));
+  CudaCheck(cudaMemsetAsync(workspace_->d_valid_counts->data, 0, size_t(faces) * sizeof(uint32_t),
+                            stream));
+  supervision_gpu::BuildMogeFaceEstimates(
+      static_cast<const float*>(workspace_->d_points->data),
+      static_cast<const float*>(workspace_->d_normals->data),
+      static_cast<const float*>(workspace_->d_masks->data),
+      static_cast<const uint8_t*>(workspace_->d_face_valid->data),
+      static_cast<const double*>(workspace_->d_shifts->data),
+      static_cast<const uint8_t*>(workspace_->d_shift_ok->data),
+      static_cast<const float*>(workspace_->d_metric_scales->data),
+      static_cast<const double*>(workspace_->d_to_camera->data), faces, size, lens.focal,
+      static_cast<float*>(workspace_->d_out_distance->data),
+      static_cast<float*>(workspace_->d_out_normal->data),
+      static_cast<uint32_t*>(workspace_->d_valid_counts->data), stream);
+  CudaCheck(cudaMemcpyAsync(workspace_->h_out_distance->data, workspace_->d_out_distance->data,
+                            size_t(faces) * face_pixels * sizeof(float), cudaMemcpyDeviceToHost,
+                            stream));
+  CudaCheck(cudaMemcpyAsync(workspace_->h_out_normal->data, workspace_->d_out_normal->data,
+                            size_t(faces) * face_pixels * 3 * sizeof(float), cudaMemcpyDeviceToHost,
+                            stream));
+  CudaCheck(cudaMemcpyAsync(workspace_->h_valid_counts->data, workspace_->d_valid_counts->data,
+                            size_t(faces) * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+  CudaCheck(cudaStreamSynchronize(stream));
+  const auto* out_dist = static_cast<const float*>(workspace_->h_out_distance->data);
+  const auto* out_norm = static_cast<const float*>(workspace_->h_out_normal->data);
+  const auto* valid_counts = static_cast<const uint32_t*>(workspace_->h_valid_counts->data);
+  std::vector<FaceEstimate> estimates(faces);
+  for (int f = 0; f < faces; ++f) {
+    auto& e = estimates[f];
+    e.metric_scale = metric_scales[f];
+    e.shift = shift_ok[f] ? shifts[f] : 0.0;
+    e.valid = valid_counts[f];
+    e.distance = cv::Mat(size, size, CV_32FC1);
+    std::memcpy(e.distance.data, out_dist + size_t(f) * face_pixels, face_pixels * sizeof(float));
+    e.normal = cv::Mat(size, size, CV_32FC3);
+    std::memcpy(e.normal.data, out_norm + size_t(f) * face_pixels * 3,
+                face_pixels * 3 * sizeof(float));
   }
   return estimates;
 }
@@ -730,9 +838,71 @@ cv::Mat ConflictCells(const cv::Mat& pixels) {
         cells.at<uint8_t>(y / ConflictLattice, x / ConflictLattice) = 255;
   return cells;
 }
+namespace {
+class DepthLruCache {
+  const fs::path& output_;
+  const Scene& scene_;
+  const Reconstruction& model_;
+  const std::array<Camera, 2>& grids_;
+  std::list<uint32_t> order_;
+  struct Item {
+    cv::Mat image;
+    std::list<uint32_t>::iterator pos;
+  };
+  std::map<uint32_t, Item> items_;
+
+ public:
+  DepthLruCache(const fs::path& output, const Scene& scene, const Reconstruction& model,
+                const std::array<Camera, 2>& grids)
+      : output_(output), scene_(scene), model_(model), grids_(grids) {}
+  const cv::Mat& Get(uint32_t i) {
+    auto it = items_.find(i);
+    if (it != items_.end()) {
+      order_.splice(order_.begin(), order_, it->second.pos);
+      return it->second.image;
+    }
+    if (items_.size() >= 96) {
+      items_.erase(order_.back());
+      order_.pop_back();
+    }
+    auto depth = ReadImage(output_ / "depths" / fs::u8path(scene_.images[i].name + ".png"),
+                           cv::IMREAD_UNCHANGED);
+    const auto& grid = grids_[model_.images[i].camera];
+    if (depth.type() != CV_16UC1 || depth.cols != grid.width || depth.rows != grid.height)
+      throw std::runtime_error("Unexpected supervision depth map: " + scene_.images[i].name);
+    order_.push_front(i);
+    return items_.emplace(i, Item{std::move(depth), order_.begin()}).first->second.image;
+  }
+};
+struct ConflictStream {
+  cudaStream_t value = nullptr;
+  ConflictStream() { CudaCheck(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking)); }
+  ~ConflictStream() {
+    if (value) {
+      cudaStreamSynchronize(value);
+      cudaStreamDestroy(value);
+    }
+  }
+};
+struct StageEvents {
+  static constexpr int Count = 4;
+  std::array<cudaEvent_t, Count> events{};
+  std::array<bool, Count> recorded{};
+  StageEvents() {
+    for (auto& e : events)
+      CudaCheck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+  }
+  ~StageEvents() {
+    for (auto& e : events)
+      if (e)
+        cudaEventDestroy(e);
+  }
+};
+}  // namespace
 Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Reconstruction& model,
                          const ShutterMotion* motion, int max_size,
-                         const std::vector<cv::Mat>& verified, std::vector<Json>& rows) {
+                         const std::vector<cv::Mat>& verified, std::vector<Json>& rows,
+                         std::vector<cv::Mat>* held_depths) {
   const auto started = std::chrono::steady_clock::now();
   const size_t n = model.images.size();
   const std::array<Camera, 2> grids{MapCamera(model.cameras[0], max_size),
@@ -766,19 +936,6 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
     for (const uint32_t j : others)
       paired[i][j] = paired[j][i] = 1;
   }
-  std::array<std::vector<Eigen::Vector3d>, 2> rays;
-  for (int c = 0; c < 2; ++c) {
-    const auto& grid = grids[c];
-    const double radius = grid.Radius();
-    rays[c].assign(size_t(grid.width) * grid.height, Eigen::Vector3d::Zero());
-    for (int y = 0; y < grid.height; y += ConflictLattice)
-      for (int x = 0; x < grid.width; x += ConflictLattice) {
-        const double dx = (x + .5 - grid.params[2]) / grid.params[0],
-                     dy = (y + .5 - grid.params[3]) / grid.params[1];
-        if (dx * dx + dy * dy <= radius * radius)
-          rays[c][size_t(y) * grid.width + x] = grid.Ray({x + .5, y + .5});
-      }
-  }
   auto cells_of = [&](uint32_t i) {
     const auto& grid = grids[model.images[i].camera];
     return std::make_pair((grid.width + ConflictLattice - 1) / ConflictLattice,
@@ -786,163 +943,290 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
   };
   // Per cell, the number of views contradicting it.
   std::vector<std::vector<uint8_t>> conflicts(n);
-  std::vector<std::mutex> locks(n);
   for (uint32_t i = 0; i < n; ++i)
     if (model.images[i].registered) {
       const auto [cw, ch] = cells_of(i);
       conflicts[i].assign(size_t(cw) * ch, 0);
       if (verified.at(i).type() != CV_8UC1 || verified[i].cols != cw || verified[i].rows != ch)
         throw std::runtime_error("LAS-verified cells differ from the conflict lattice");
+      if (held_depths) {
+        const auto& grid = grids[model.images[i].camera];
+        const auto& depth = held_depths->at(i);
+        if (depth.type() != CV_16UC1 || depth.cols != grid.width || depth.rows != grid.height)
+          throw std::runtime_error("Unexpected held supervision depth map: " + scene.images[i].name);
+      }
     }
-  auto read_depth = [&](uint32_t i) {
-    const auto depth = ReadImage(output / "depths" / fs::u8path(scene.images[i].name + ".png"),
-                                 cv::IMREAD_UNCHANGED);
-    const auto& grid = grids[model.images[i].camera];
-    if (depth.type() != CV_16UC1 || depth.cols != grid.width || depth.rows != grid.height)
-      throw std::runtime_error("Unexpected supervision depth map: " + scene.images[i].name);
-    return depth;
+  constexpr uint32_t Tile = 32;
+  struct TileBatch {
+    uint32_t ti, tj;
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;
   };
+  std::map<std::pair<uint32_t, uint32_t>, std::vector<std::pair<uint32_t, uint32_t>>> tile_map;
+  size_t total_pairs = 0;
+  for (uint32_t i = 0; i < n; ++i)
+    for (uint32_t j = i + 1; j < n; ++j)
+      if (paired[i][j]) {
+        tile_map[{i / Tile, j / Tile}].emplace_back(i, j);
+        ++total_pairs;
+      }
+  std::vector<TileBatch> tiles;
+  tiles.reserve(tile_map.size());
+  for (auto& [key, list] : tile_map)
+    tiles.push_back({key.first, key.second, std::move(list)});
+  for (size_t i = 0; i < tiles.size();) {
+    size_t end = i + 1;
+    while (end < tiles.size() && tiles[end].ti == tiles[i].ti)
+      ++end;
+    if (tiles[i].ti & 1u)
+      std::reverse(tiles.begin() + std::ptrdiff_t(i), tiles.begin() + std::ptrdiff_t(end));
+    i = end;
+  }
   const double view_limit = std::cos(ConflictFieldOfViewDegrees * Pi / 360),
                tolerance = std::exp(ConflictLog);
-  std::atomic<uint64_t> tested{0}, conflicting{0};
-  // Flags the cells of a, and the cells of b its points land on, where a's depth lies in front of
-  // b's.
-  auto check = [&](uint32_t a, uint32_t b, const cv::Mat& da, const cv::Mat& db,
-                   std::vector<uint8_t>& own, std::vector<uint8_t>& other) {
-    const uint32_t ca = model.images[a].camera, cb = model.images[b].camera;
-    const auto& ga = grids[ca];
-    const auto& gb = grids[cb];
-    const int cells_a = (ga.width + ConflictLattice - 1) / ConflictLattice,
-              cells_b = (gb.width + ConflictLattice - 1) / ConflictLattice;
-    uint64_t local_tested = 0, local_conflicting = 0;
-    for (int y = 0; y < ga.height; y += ConflictLattice)
-      for (int x = 0; x < ga.width; x += ConflictLattice) {
-        const auto millimetres = da.at<uint16_t>(y, x);
-        const Eigen::Vector3d& ray = rays[ca][size_t(y) * ga.width + x];
-        if (!millimetres || ray.isZero())
-          continue;
-        const Eigen::Vector3d seen = millimetres / 1000. * ray;
-        const Eigen::Vector3d reference =
-            motion ? motion->Reference(a, ca, motion->Fraction(ga, {x + .5, y + .5}), seen) : seen;
-        const Eigen::Vector3d world = rotations[a].transpose() * (reference - translations[a]);
-        const Eigen::Vector3d there = rotations[b] * world + translations[b];
-        Eigen::Vector3d moved = there;
-        Eigen::Vector2d pixel;
-        double s = 0;
-        bool visible = true;
-        for (int k = 0; k < (motion ? 4 : 1); ++k) {
-          if (motion)
-            moved = motion->Apply(b, cb, s, there);
-          if (moved.z() < view_limit * moved.norm()) {
-            visible = false;
+  uint64_t tested_total = 0, conflicting_total = 0;
+  if (!tiles.empty()) {
+    std::array<std::vector<double3>, 2> lattice_rays;
+    std::array<int, 2> cam_cw{}, cam_ch{};
+    for (int c = 0; c < 2; ++c) {
+      const auto& grid = grids[c];
+      const double radius = grid.Radius();
+      cam_cw[c] = (grid.width + ConflictLattice - 1) / ConflictLattice;
+      cam_ch[c] = (grid.height + ConflictLattice - 1) / ConflictLattice;
+      lattice_rays[c].assign(size_t(cam_cw[c]) * cam_ch[c], make_double3(0., 0., 0.));
+      for (int cy = 0; cy < cam_ch[c]; ++cy)
+        for (int cx = 0; cx < cam_cw[c]; ++cx) {
+          const int x = cx * ConflictLattice, y = cy * ConflictLattice;
+          const double dx = (x + .5 - grid.params[2]) / grid.params[0],
+                       dy = (y + .5 - grid.params[3]) / grid.params[1];
+          if (dx * dx + dy * dy <= radius * radius) {
+            const auto ray = grid.Ray({x + .5, y + .5});
+            lattice_rays[c][size_t(cy) * cam_cw[c] + cx] = make_double3(ray.x(), ray.y(), ray.z());
+          }
+        }
+    }
+    std::vector<supervision_gpu::ConflictView> h_views(n);
+    for (size_t i = 0; i < n; ++i) {
+      if (!model.images[i].registered)
+        continue;
+      const uint32_t cid = model.images[i].camera;
+      const auto& grid = grids[cid];
+      auto& v = h_views[i];
+      for (int r = 0; r < 3; ++r) {
+        v.translation[r] = translations[i][r];
+        for (int c = 0; c < 3; ++c)
+          v.rotation[r * 3 + c] = rotations[i](r, c);
+      }
+      std::copy(grid.params.begin(), grid.params.end(), v.params);
+      if (motion) {
+        const Eigen::Vector3d m_trans = motion->readout[cid] * motion->velocity[i];
+        for (int k = 0; k < 3; ++k) {
+          v.motion_rot[k] = motion->rotation[i][k];
+          v.motion_trans[k] = m_trans[k];
+        }
+        v.rolling = 1;
+        v.axis = motion->axis;
+      }
+      v.camera = int(cid);
+      v.width = grid.width;
+      v.height = grid.height;
+      v.cw = cam_cw[cid];
+      v.ch = cam_ch[cid];
+    }
+    const size_t max_pixels = std::max(size_t(grids[0].width) * grids[0].height,
+                                       size_t(grids[1].width) * grids[1].height);
+    const int max_cells = std::max(cam_cw[0] * cam_ch[0], cam_cw[1] * cam_ch[1]);
+    constexpr int GpuSlots = 64, BatchPairs = 256;
+    const size_t max_tile_pairs = Tile * Tile;
+    DeviceBuffer d_depths(size_t(GpuSlots) * max_pixels * sizeof(uint16_t)),
+        d_tile_conflicts(size_t(GpuSlots) * max_cells * sizeof(unsigned int)),
+        d_pair_own(size_t(BatchPairs) * max_cells),
+        d_pair_other(size_t(BatchPairs) * max_cells),
+        d_pairs(max_tile_pairs * sizeof(supervision_gpu::ConflictPair)),
+        d_views(n * sizeof(supervision_gpu::ConflictView)),
+        d_rays0(lattice_rays[0].size() * sizeof(double3)),
+        d_rays1(lattice_rays[1].size() * sizeof(double3)),
+        d_stats(2 * sizeof(unsigned long long));
+    HostBuffer h_depth_stage(size_t(StageEvents::Count) * max_pixels * sizeof(uint16_t)),
+        h_pairs(max_tile_pairs * sizeof(supervision_gpu::ConflictPair)),
+        h_tile_conflicts(size_t(GpuSlots) * max_cells * sizeof(unsigned int));
+    StageEvents stage_events;
+    ConflictStream stream;
+    CudaCheck(cudaMemcpyAsync(d_views.data, h_views.data(), d_views.bytes, cudaMemcpyHostToDevice,
+                              stream.value));
+    CudaCheck(cudaMemcpyAsync(d_rays0.data, lattice_rays[0].data(), d_rays0.bytes,
+                              cudaMemcpyHostToDevice, stream.value));
+    CudaCheck(cudaMemcpyAsync(d_rays1.data, lattice_rays[1].data(), d_rays1.bytes,
+                              cudaMemcpyHostToDevice, stream.value));
+    CudaCheck(cudaMemsetAsync(d_stats.data, 0, d_stats.bytes, stream.value));
+    DepthLruCache lru(output, scene, model, grids);
+    std::array<int, GpuSlots> slot_image;
+    slot_image.fill(-1);
+    std::array<uint64_t, GpuSlots> slot_stamp{};
+    uint64_t stamp = 0, stage_seq = 0;
+    std::vector<int> slot_of(n, -1);
+    for (const auto& tile : tiles) {
+      std::vector<uint32_t> tile_images;
+      tile_images.reserve(GpuSlots);
+      for (const auto& [a, b] : tile.pairs) {
+        if (slot_of[a] == -1) {
+          slot_of[a] = -2;
+          tile_images.push_back(a);
+        }
+        if (slot_of[b] == -1) {
+          slot_of[b] = -2;
+          tile_images.push_back(b);
+        }
+      }
+      std::array<bool, GpuSlots> in_tile{};
+      for (uint32_t id : tile_images)
+        for (int s = 0; s < GpuSlots; ++s)
+          if (slot_image[s] == int(id)) {
+            slot_of[id] = s;
+            in_tile[s] = true;
             break;
           }
-          pixel = gb.Project(moved);
-          if (motion)
-            s = motion->Fraction(gb, pixel);
-        }
-        if (!visible)
+      for (uint32_t id : tile_images) {
+        if (slot_of[id] >= 0)
           continue;
-        const int u = int(std::floor(pixel.x())), v = int(std::floor(pixel.y()));
-        if (u < 1 || v < 1 || u >= gb.width - 1 || v >= gb.height - 1)
-          continue;
-        // The nearest depth of b's 3 x 3 neighbourhood, all of which must hold depth: a point near
-        // a depth edge of b or off its valid depth is no evidence.
-        uint16_t nearest = 65535;
-        for (int k = 0; k < 9 && nearest; ++k) {
-          const auto value = db.at<uint16_t>(v + k / 3 - 1, u + k % 3 - 1);
-          nearest = value ? std::min(nearest, value) : uint16_t(0);
-        }
-        if (!nearest)
-          continue;
-        ++local_tested;
-        const size_t cell_a = size_t(y / ConflictLattice) * cells_a + x / ConflictLattice,
-                     cell_b = size_t(v / ConflictLattice) * cells_b + u / ConflictLattice;
-        const double metres = moved.norm();
-        if (metres * 1000 * tolerance < nearest) {
-          ++local_conflicting;
-          own[cell_a] = other[cell_b] = 1;
-        }
+        int chosen = -1;
+        for (int s = 0; s < GpuSlots; ++s)
+          if (!in_tile[s] && (chosen < 0 || slot_stamp[s] < slot_stamp[chosen]))
+            chosen = s;
+        if (chosen < 0)
+          throw std::runtime_error("Conflict GPU depth cache exhausted");
+        slot_image[chosen] = int(id);
+        in_tile[chosen] = true;
+        slot_of[id] = chosen;
+        const cv::Mat& depth = held_depths ? (*held_depths)[id] : lru.Get(id);
+        const int stage_idx = int(stage_seq % StageEvents::Count);
+        if (stage_events.recorded[stage_idx])
+          CudaCheck(cudaEventSynchronize(stage_events.events[stage_idx]));
+        const size_t pixels = size_t(depth.rows) * depth.cols;
+        auto* dst = static_cast<uint16_t*>(h_depth_stage.data) + size_t(stage_idx) * max_pixels;
+        if (depth.isContinuous())
+          std::memcpy(dst, depth.data, pixels * sizeof(uint16_t));
+        else
+          for (int r = 0; r < depth.rows; ++r)
+            std::memcpy(dst + size_t(r) * depth.cols, depth.ptr<uint16_t>(r),
+                        size_t(depth.cols) * sizeof(uint16_t));
+        CudaCheck(cudaMemcpyAsync(
+            static_cast<uint16_t*>(d_depths.data) + size_t(chosen) * max_pixels, dst,
+            pixels * sizeof(uint16_t), cudaMemcpyHostToDevice, stream.value));
+        CudaCheck(cudaEventRecord(stage_events.events[stage_idx], stream.value));
+        stage_events.recorded[stage_idx] = true;
+        ++stage_seq;
       }
-    tested += local_tested;
-    conflicting += local_conflicting;
-  };
-  auto merge = [&](uint32_t i, const std::vector<uint8_t>& local) {
-    std::lock_guard<std::mutex> guard(locks[i]);
-    for (size_t k = 0; k < local.size(); ++k)
-      if (local[k] && conflicts[i][k] < 255)
-        ++conflicts[i][k];
-  };
-  std::atomic<uint32_t> next{0};
-  std::exception_ptr failure;
-  std::mutex failure_lock;
-  auto work = [&] {
-    try {
-      for (uint32_t i; (i = next++) < n;) {
-        if (!model.images[i].registered)
-          continue;
-        const auto di = read_depth(i);
-        for (uint32_t j = i + 1; j < n; ++j) {
-          if (!paired[i][j])
-            continue;
-          const auto dj = read_depth(j);
-          // One vote per neighbouring view: flags are collected per pair, so two views that
-          // contradict the same cell count twice on either side of the pair.
-          std::vector<uint8_t> own(conflicts[i].size()), other(conflicts[j].size());
-          check(i, j, di, dj, own, other);
-          check(j, i, dj, di, other, own);
-          merge(i, own);
-          merge(j, other);
-        }
+      for (uint32_t id : tile_images)
+        slot_stamp[slot_of[id]] = ++stamp;
+      auto* h_pair_ptr = static_cast<supervision_gpu::ConflictPair*>(h_pairs.data);
+      for (size_t k = 0; k < tile.pairs.size(); ++k) {
+        const auto [a, b] = tile.pairs[k];
+        h_pair_ptr[k] = {uint32_t(k), uint16_t(slot_of[a]), uint16_t(slot_of[b]), a, b};
       }
-    } catch (...) {
-      std::lock_guard<std::mutex> guard(failure_lock);
-      if (!failure)
-        failure = std::current_exception();
-      next = uint32_t(n);
+      CudaCheck(cudaMemcpyAsync(d_pairs.data, h_pair_ptr,
+                                tile.pairs.size() * sizeof(supervision_gpu::ConflictPair),
+                                cudaMemcpyHostToDevice, stream.value));
+      CudaCheck(cudaMemsetAsync(d_tile_conflicts.data, 0,
+                                size_t(GpuSlots) * max_cells * sizeof(unsigned int), stream.value));
+      for (size_t base = 0; base < tile.pairs.size(); base += BatchPairs) {
+        const int count = int(std::min<size_t>(BatchPairs, tile.pairs.size() - base));
+        CudaCheck(cudaMemsetAsync(d_pair_own.data, 0, size_t(count) * max_cells, stream.value));
+        CudaCheck(cudaMemsetAsync(d_pair_other.data, 0, size_t(count) * max_cells, stream.value));
+        supervision_gpu::CheckConflictPairs(
+            static_cast<const uint16_t*>(d_depths.data), max_pixels,
+            static_cast<const supervision_gpu::ConflictView*>(d_views.data),
+            static_cast<const double3*>(d_rays0.data), static_cast<const double3*>(d_rays1.data),
+            static_cast<const supervision_gpu::ConflictPair*>(d_pairs.data) + base, count,
+            max_cells, ConflictLattice, view_limit, tolerance,
+            static_cast<uint8_t*>(d_pair_own.data), static_cast<uint8_t*>(d_pair_other.data),
+            static_cast<unsigned int*>(d_tile_conflicts.data),
+            static_cast<unsigned long long*>(d_stats.data), stream.value);
+      }
+      CudaCheck(cudaMemcpyAsync(h_tile_conflicts.data, d_tile_conflicts.data,
+                                size_t(GpuSlots) * max_cells * sizeof(unsigned int),
+                                cudaMemcpyDeviceToHost, stream.value));
+      CudaCheck(cudaStreamSynchronize(stream.value));
+      const auto* tile_votes = static_cast<const unsigned int*>(h_tile_conflicts.data);
+      for (uint32_t id : tile_images) {
+        const int s = slot_of[id];
+        const unsigned int* src = tile_votes + size_t(s) * max_cells;
+        auto& dst = conflicts[id];
+        for (size_t k = 0; k < dst.size(); ++k) {
+          const unsigned int sum = unsigned(dst[k]) + src[k];
+          dst[k] = uint8_t(std::min(255u, sum));
+        }
+        slot_of[id] = -1;
+      }
     }
-  };
-  // Each worker holds up to two decoded depth maps and per-pair conflict buffers.
-  const auto workers = std::min(n, size_t(std::clamp(std::thread::hardware_concurrency(), 1u, 8u)));
-  {
-    std::vector<std::thread> threads;
-    for (size_t k = 0; k < workers; ++k)
-      threads.emplace_back(work);
-    for (auto& thread : threads)
-      thread.join();
+    unsigned long long stats_host[2]{};
+    CudaCheck(cudaMemcpyAsync(stats_host, d_stats.data, sizeof(stats_host), cudaMemcpyDeviceToHost,
+                              stream.value));
+    CudaCheck(cudaStreamSynchronize(stream.value));
+    tested_total = stats_host[0];
+    conflicting_total = stats_host[1];
   }
-  if (failure)
-    std::rethrow_exception(failure);
   // A cell loses its depth when it is not LAS-verified and at least ConflictMinimumViews views
   // contradict it. Agreeing views do not outvote them: in a LAS hole two groups of views can each
   // agree among themselves, and nothing tells which group is right.
-  next = 0;
+  const auto workers = std::min(n, size_t(std::clamp(std::thread::hardware_concurrency(), 1u, 8u)));
+  std::atomic<uint32_t> next{0};
+  std::exception_ptr failure;
+  std::mutex failure_lock;
   std::atomic<uint64_t> dropped_total{0};
   auto rewrite = [&] {
     try {
       for (uint32_t i; (i = next++) < n;) {
         if (!model.images[i].registered)
           continue;
-        auto depth = read_depth(i);
         const auto [cw, ch] = cells_of(i);
-        uint64_t dropped = 0;
-        for (int y = 0; y < depth.rows; ++y) {
-          auto* d = depth.ptr<uint16_t>(y);
-          for (int x = 0; x < depth.cols; ++x) {
-            if (!d[x])
-              continue;
-            const size_t k = size_t(y / ConflictLattice) * cw + x / ConflictLattice;
-            if (!verified[i].data[k] && conflicts[i][k] >= ConflictMinimumViews) {
-              d[x] = 0;
-              ++dropped;
-            }
+        bool any_candidate = false;
+        const size_t cell_count = size_t(cw) * ch;
+        for (size_t k = 0; k < cell_count; ++k)
+          if (!verified[i].data[k] && conflicts[i][k] >= ConflictMinimumViews) {
+            any_candidate = true;
+            break;
           }
-        }
         auto& row = rows.at(i);
-        if (dropped) {
-          const auto path = output / "depths" / fs::u8path(scene.images[i].name + ".png");
+        const auto path = output / "depths" / fs::u8path(scene.images[i].name + ".png");
+        uint64_t dropped = 0;
+        if (held_depths) {
+          auto depth = std::move((*held_depths)[i]);
+          if (any_candidate)
+            for (int y = 0; y < depth.rows; ++y) {
+              auto* d = depth.ptr<uint16_t>(y);
+              for (int x = 0; x < depth.cols; ++x) {
+                if (!d[x])
+                  continue;
+                const size_t k = size_t(y / ConflictLattice) * cw + x / ConflictLattice;
+                if (!verified[i].data[k] && conflicts[i][k] >= ConflictMinimumViews) {
+                  d[x] = 0;
+                  ++dropped;
+                }
+              }
+            }
           WriteImage(path, depth);
           row["depth_size"] = fs::file_size(path);
+        } else if (any_candidate) {
+          auto depth = ReadImage(path, cv::IMREAD_UNCHANGED);
+          const auto& grid = grids[model.images[i].camera];
+          if (depth.type() != CV_16UC1 || depth.cols != grid.width || depth.rows != grid.height)
+            throw std::runtime_error("Unexpected supervision depth map: " + scene.images[i].name);
+          for (int y = 0; y < depth.rows; ++y) {
+            auto* d = depth.ptr<uint16_t>(y);
+            for (int x = 0; x < depth.cols; ++x) {
+              if (!d[x])
+                continue;
+              const size_t k = size_t(y / ConflictLattice) * cw + x / ConflictLattice;
+              if (!verified[i].data[k] && conflicts[i][k] >= ConflictMinimumViews) {
+                d[x] = 0;
+                ++dropped;
+              }
+            }
+          }
+          if (dropped) {
+            WriteImage(path, depth);
+            row["depth_size"] = fs::file_size(path);
+          }
         }
         row["depth_pixels"] = row.at("depth_pixels").get<uint64_t>() - dropped;
         row["monocular"]["view_conflict_pixels"] = dropped;
@@ -964,10 +1248,6 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
   }
   if (failure)
     std::rethrow_exception(failure);
-  size_t pairs = 0;
-  for (uint32_t i = 0; i < n; ++i)
-    for (uint32_t j = i + 1; j < n; ++j)
-      pairs += paired[i][j];
   return {{"neighbours", ConflictNeighbours},
           {"shared_tracks", ConflictSharedTracks},
           {"baseline_m", ConflictBaselineMetres},
@@ -975,9 +1255,9 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
           {"in_front_log", ConflictLog},
           {"drop", "cell not LAS-verified with at least 2 contradicting views"},
           {"neighbourhood", "3 x 3 nearest depth of the other view, all valid"},
-          {"pairs", pairs},
-          {"tested_samples", tested.load()},
-          {"conflicting_samples", conflicting.load()},
+          {"pairs", total_pairs},
+          {"tested_samples", tested_total},
+          {"conflicting_samples", conflicting_total},
           {"dropped_depth_pixels", dropped_total.load()},
           {"seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()}};
 }

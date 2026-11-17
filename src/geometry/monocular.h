@@ -45,12 +45,15 @@ struct FaceEstimate {
   Json ToJson() const;
 };
 class MonocularEstimator {
+  struct Workspace;
   Models& models_;
   ImagePreprocessor pixels_;
   int size_;
+  std::unique_ptr<Workspace> workspace_;
 
  public:
   explicit MonocularEstimator(Models& models);
+  ~MonocularEstimator();
   int FaceSize() const { return size_; }
   // images are the RGB8 faces of one photo from Faces.
   std::vector<FaceEstimate> Estimate(const MonocularLens& lens, const std::vector<cv::Mat>& images);
@@ -110,5 +113,6 @@ cv::Mat ConflictCells(const cv::Mat& pixels);
 // parameters and totals.
 Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Reconstruction& model,
                          const ShutterMotion* motion, int max_size,
-                         const std::vector<cv::Mat>& verified, std::vector<Json>& rows);
+                         const std::vector<cv::Mat>& verified, std::vector<Json>& rows,
+                         std::vector<cv::Mat>* held_depths = nullptr);
 }  // namespace geosun

@@ -51,15 +51,31 @@ struct Match {
   uint32_t a, b;
   float score;
 };
+static_assert(sizeof(Match) == 12);
 struct MatchSet {
   uint32_t a, b;
   std::vector<Match> matches;
 };
+using MatchArchiveIndex = std::map<std::pair<uint32_t, uint32_t>, uint64_t>;
+class MatchArchiveWriter {
+  fs::path path_;
+  std::fstream stream_;
+  std::vector<char> buffer_;
+
+ public:
+  explicit MatchArchiveWriter(const fs::path& path);
+  ~MatchArchiveWriter();
+  MatchArchiveWriter(const MatchArchiveWriter&) = delete;
+  MatchArchiveWriter& operator=(const MatchArchiveWriter&) = delete;
+  void Append(const MatchSet& matches);
+  void Flush();
+};
 void WriteFeatures(const fs::path& path, const FeatureSet& features);
 FeatureSet ReadFeatures(const fs::path& path);
-void WriteMatches(const fs::path& path, const MatchSet& matches);
-MatchSet ReadMatches(const fs::path& path);
+MatchArchiveIndex IndexMatchArchive(const fs::path& path, bool truncate_incomplete);
+MatchSet ReadMatchRecord(std::ifstream& stream, uint64_t offset, uint32_t expected_a,
+                         uint32_t expected_b);
 fs::path FeaturePath(const fs::path& work, uint32_t image);
-fs::path MatchPath(const fs::path& work, uint32_t a, uint32_t b);
+fs::path MatchesPath(const fs::path& work);
 fs::path SelectedModelPath(const fs::path& work, const Json& result);
 }  // namespace geosun

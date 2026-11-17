@@ -131,9 +131,15 @@ cv::Mat ReadImage(const fs::path& path, int mode) {
     throw std::runtime_error("Cannot decode image: " + path.u8string());
   return image;
 }
-void WriteImage(const fs::path& path, const cv::Mat& image) {
+void WriteImage(const fs::path& path, const cv::Mat& image, int png_compression) {
   std::vector<uint8_t> bytes;
-  if (!cv::imencode(path.extension().u8string(), image, bytes))
+  std::vector<int> params;
+  const auto ext = path.extension().u8string();
+  if (png_compression >= 0 && (ext == ".png" || ext == ".PNG")) {
+    params.push_back(cv::IMWRITE_PNG_COMPRESSION);
+    params.push_back(png_compression);
+  }
+  if (!cv::imencode(ext, image, bytes, params))
     throw std::runtime_error("Cannot encode image");
   fs::create_directories(path.parent_path());
   std::ofstream stream(path, std::ios::binary);

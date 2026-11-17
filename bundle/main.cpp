@@ -464,12 +464,12 @@ void Pipeline(int argc, wchar_t** argv) {
         const std::string line = "Delivery already exists: " + delivery.u8string();
         std::cout << line << '\n';
         geosun_log.WriteLine(line);
+        RunTee(geosunpre, {L"check", L"--output", delivery.native()}, {}, "Delivery check",
+               geosun_log, logs / L"preprocess.log");
       } else {
         RunTee(geosunpre, {L"run", L"--input", scene.native(), L"--output", delivery.native()},
                preprocess_args, "Preprocess", geosun_log, logs / L"preprocess.log");
       }
-      RunTee(geosunpre, {L"check", L"--output", delivery.native()}, {}, "Delivery check",
-             geosun_log, logs / L"preprocess.log");
     }
 
     if (step == L"all" || step == L"train") {

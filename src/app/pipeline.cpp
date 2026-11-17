@@ -243,7 +243,7 @@ std::vector<fs::path> ReconstructVisual(const Scene& scene, const fs::path& work
     profile["repairs"].push_back(MakeMatches(scene, work, root, deficient));
     WriteJson(profile_path, profile);
     state.value["stages"]["matches"]["files"] =
-        Inventory(work, {work / "cache/matches", work / "cache/pairs.json", profile_path});
+        Inventory(work, {MatchesPath(work), work / "cache/pairs.json", profile_path});
     state.Save();
   }
   WriteModel(work / "cache/visual.bin", model);
@@ -330,7 +330,7 @@ std::vector<fs::path> RunStage(const std::string& stage, const Scene& scene, con
   }
   if (stage == "matches") {
     WriteJson(work / "cache/matches_profile.json", MakeMatches(scene, work, root));
-    return {work / "cache/matches", work / "cache/pairs.json", work / "cache/matches_profile.json"};
+    return {MatchesPath(work), work / "cache/pairs.json", work / "cache/matches_profile.json"};
   }
   if (stage == "sfm")
     return ReconstructVisual(scene, work, root, settings, state);

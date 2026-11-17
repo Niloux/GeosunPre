@@ -719,4 +719,259 @@ void EncodeMaps(const Blend* blends, int w, int h, int boundary, float focal,
                                      normals, w, h);
   CudaCheck(cudaGetLastError());
 }
+
+namespace {
+__global__ void SampleMogeShiftGridKernel(const float* points, const float* mask,
+                                          const uint8_t* face_valid, int size, float4* samples) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= 64 * 64)
+    return;
+  const int i = k / 64, j = k % 64;
+  const int row = i * size / 64, column = j * size / 64;
+  const size_t idx = size_t(row) * size + column;
+  const float pz = points[3 * idx + 2];
+  if (face_valid[idx] && mask[idx] > .5f && isfinite(pz))
+    samples[k] = make_float4(points[3 * idx], points[3 * idx + 1], pz, 1.f);
+  else
+    samples[k] = make_float4(0.f, 0.f, 0.f, 0.f);
+}
+
+__global__ void BuildMogeFaceEstimatesKernel(const float* points, const float* normals,
+                                             const float* mask, const uint8_t* face_valid,
+                                             const double* shifts, const uint8_t* shift_ok,
+                                             const float* metric_scales, const double* to_camera,
+                                             int size, double focal, float* out_distance,
+                                             float* out_normal, uint32_t* valid_counts) {
+  __shared__ unsigned int block_valid[256];
+  const int tid = threadIdx.x;
+  const int idx = blockIdx.x * blockDim.x + tid;
+  const int f = blockIdx.y;
+  const size_t face_pixels = size_t(size) * size;
+  unsigned int is_valid = 0;
+  if (idx < int(face_pixels)) {
+    const size_t p_idx = size_t(f) * face_pixels + size_t(idx);
+    const float pz = points[3 * p_idx + 2];
+    const bool valid_px = face_valid[p_idx] && mask[p_idx] > .5f && isfinite(pz);
+    const double depth = double(pz) + shifts[f];
+    if (shift_ok[f] && valid_px && depth > 0.0) {
+      const int v = idx / size, u = idx % size;
+      const double rx = (u + 0.5 - size * 0.5) / focal;
+      const double ry = (v + 0.5 - size * 0.5) / focal;
+      const double ray_norm = sqrt(rx * rx + ry * ry + 1.0);
+      const double* tc = to_camera + size_t(f) * 9;
+      const double nx0 = normals[3 * p_idx], ny0 = normals[3 * p_idx + 1],
+                   nz0 = normals[3 * p_idx + 2];
+      double nx = tc[0] * nx0 + tc[1] * ny0 + tc[2] * nz0;
+      double ny = tc[3] * nx0 + tc[4] * ny0 + tc[5] * nz0;
+      double nz = tc[6] * nx0 + tc[7] * ny0 + tc[8] * nz0;
+      const double cx = tc[0] * rx + tc[1] * ry + tc[2];
+      const double cy = tc[3] * rx + tc[4] * ry + tc[5];
+      const double cz = tc[6] * rx + tc[7] * ry + tc[8];
+      if (nx * cx + ny * cy + nz * cz > 0.0) {
+        nx = -nx;
+        ny = -ny;
+        nz = -nz;
+      }
+      out_distance[p_idx] = float(depth * ray_norm * double(metric_scales[f]));
+      out_normal[3 * p_idx] = float(nx);
+      out_normal[3 * p_idx + 1] = float(ny);
+      out_normal[3 * p_idx + 2] = float(nz);
+      is_valid = 1;
+    } else {
+      out_distance[p_idx] = 0.f;
+      out_normal[3 * p_idx] = 0.f;
+      out_normal[3 * p_idx + 1] = 0.f;
+      out_normal[3 * p_idx + 2] = 0.f;
+    }
+  }
+  block_valid[tid] = is_valid;
+  __syncthreads();
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride)
+      block_valid[tid] += block_valid[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0 && block_valid[0] > 0)
+    atomicAdd(valid_counts + f, block_valid[0]);
+}
+
+__device__ void CheckConflictDirection(const uint16_t* da, const uint16_t* db,
+                                       const ConflictView& va, const ConflictView& vb,
+                                       const double3* rays_a, int cell, int lattice_step,
+                                       double view_limit, double tolerance, uint8_t* own,
+                                       uint8_t* other, unsigned long long& tested,
+                                       unsigned long long& conflicting) {
+  const int cx = cell % va.cw, cy = cell / va.cw;
+  const int x = cx * lattice_step, y = cy * lattice_step;
+  const uint16_t millimetres = da[size_t(y) * va.width + x];
+  const double3 ray = rays_a[cell];
+  if (!millimetres || (ray.x == 0.0 && ray.y == 0.0 && ray.z == 0.0))
+    return;
+  const double dist_a = double(millimetres) / 1000.0;
+  const double sx = dist_a * ray.x, sy = dist_a * ray.y, sz = dist_a * ray.z;
+  double rx = sx, ry = sy, rz = sz;
+  if (va.rolling) {
+    const double size_a = va.axis ? va.height : va.width;
+    const double coord_a = va.axis ? (y + 0.5) : (x + 0.5);
+    const double s = (coord_a - 0.5 * size_a) / size_a;
+    const double wx = s * va.motion_rot[0], wy = s * va.motion_rot[1], wz = s * va.motion_rot[2];
+    const double w2 = wx * wx + wy * wy + wz * wz;
+    const double dot_wm = wx * sx + wy * sy + wz * sz;
+    const double cxw = wy * sz - wz * sy, cyw = wz * sx - wx * sz, czw = wx * sy - wy * sx;
+    const double inv = 1.0 / (1.0 + w2);
+    rx = (sx - cxw + dot_wm * wx) * inv + s * va.motion_trans[0];
+    ry = (sy - cyw + dot_wm * wy) * inv + s * va.motion_trans[1];
+    rz = (sz - czw + dot_wm * wz) * inv + s * va.motion_trans[2];
+  }
+  const double dx = rx - va.translation[0], dy = ry - va.translation[1], dz = rz - va.translation[2];
+  const double wx_p = va.rotation[0] * dx + va.rotation[3] * dy + va.rotation[6] * dz;
+  const double wy_p = va.rotation[1] * dx + va.rotation[4] * dy + va.rotation[7] * dz;
+  const double wz_p = va.rotation[2] * dx + va.rotation[5] * dy + va.rotation[8] * dz;
+  const double tx = vb.rotation[0] * wx_p + vb.rotation[1] * wy_p + vb.rotation[2] * wz_p +
+                    vb.translation[0];
+  const double ty = vb.rotation[3] * wx_p + vb.rotation[4] * wy_p + vb.rotation[5] * wz_p +
+                    vb.translation[1];
+  const double tz = vb.rotation[6] * wx_p + vb.rotation[7] * wy_p + vb.rotation[8] * wz_p +
+                    vb.translation[2];
+  double mx = tx, my = ty, mz = tz, u_px = 0.0, v_px = 0.0, s_b = 0.0;
+  const int steps = vb.rolling ? 4 : 1;
+  const double size_b = vb.axis ? vb.height : vb.width;
+  for (int k = 0; k < steps; ++k) {
+    if (vb.rolling) {
+      const double bx = tx - s_b * vb.motion_trans[0];
+      const double by = ty - s_b * vb.motion_trans[1];
+      const double bz = tz - s_b * vb.motion_trans[2];
+      const double wrx = s_b * vb.motion_rot[0], wry = s_b * vb.motion_rot[1],
+                   wrz = s_b * vb.motion_rot[2];
+      mx = bx + wry * bz - wrz * by;
+      my = by + wrz * bx - wrx * bz;
+      mz = bz + wrx * by - wry * bx;
+    }
+    const double norm = sqrt(mx * mx + my * my + mz * mz);
+    if (mz < view_limit * norm)
+      return;
+    FisheyePixel(mx, my, mz, vb.params, u_px, v_px);
+    if (vb.rolling)
+      s_b = ((vb.axis ? v_px : u_px) - 0.5 * size_b) / size_b;
+  }
+  const int u = int(floor(u_px)), v = int(floor(v_px));
+  if (u < 1 || v < 1 || u >= vb.width - 1 || v >= vb.height - 1)
+    return;
+  uint16_t nearest = 65535;
+  for (int k = 0; k < 9 && nearest; ++k) {
+    const uint16_t val = db[size_t(v + k / 3 - 1) * vb.width + (u + k % 3 - 1)];
+    nearest = val ? (val < nearest ? val : nearest) : uint16_t(0);
+  }
+  if (!nearest)
+    return;
+  ++tested;
+  const double metres = sqrt(mx * mx + my * my + mz * mz);
+  if (metres * 1000.0 * tolerance < double(nearest)) {
+    ++conflicting;
+    own[cell] = 1;
+    const int cell_b = (v / lattice_step) * vb.cw + (u / lattice_step);
+    other[cell_b] = 1;
+  }
+}
+
+__global__ void CheckConflictPairsKernel(const uint16_t* depths_base, size_t depth_stride,
+                                         const ConflictView* views, const double3* rays_cam0,
+                                         const double3* rays_cam1, const ConflictPair* pairs,
+                                         int max_cells, int lattice_step, double view_limit,
+                                         double tolerance, uint8_t* pair_own, uint8_t* pair_other,
+                                         unsigned long long* stats) {
+  __shared__ unsigned long long s_tested[256], s_conflicting[256];
+  const int tid = threadIdx.x;
+  const int cell = blockIdx.x * blockDim.x + tid;
+  const int pair_idx = blockIdx.y;
+  unsigned long long local_tested = 0, local_conflicting = 0;
+  if (cell < max_cells) {
+    const auto pair = pairs[pair_idx];
+    const auto& va = views[pair.id_a];
+    const auto& vb = views[pair.id_b];
+    const uint16_t* da = depths_base + size_t(pair.slot_a) * depth_stride;
+    const uint16_t* db = depths_base + size_t(pair.slot_b) * depth_stride;
+    const double3* ra = va.camera == 0 ? rays_cam0 : rays_cam1;
+    const double3* rb = vb.camera == 0 ? rays_cam0 : rays_cam1;
+    uint8_t* own = pair_own + size_t(pair_idx) * max_cells;
+    uint8_t* other = pair_other + size_t(pair_idx) * max_cells;
+    if (cell < va.cw * va.ch)
+      CheckConflictDirection(da, db, va, vb, ra, cell, lattice_step, view_limit, tolerance, own,
+                             other, local_tested, local_conflicting);
+    if (cell < vb.cw * vb.ch)
+      CheckConflictDirection(db, da, vb, va, rb, cell, lattice_step, view_limit, tolerance, other,
+                             own, local_tested, local_conflicting);
+  }
+  s_tested[tid] = local_tested;
+  s_conflicting[tid] = local_conflicting;
+  __syncthreads();
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      s_tested[tid] += s_tested[tid + stride];
+      s_conflicting[tid] += s_conflicting[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    if (s_tested[0] > 0)
+      atomicAdd(stats, s_tested[0]);
+    if (s_conflicting[0] > 0)
+      atomicAdd(stats + 1, s_conflicting[0]);
+  }
+}
+
+__global__ void AccumulateConflictVotesKernel(const ConflictPair* pairs, int max_cells,
+                                              const uint8_t* pair_own, const uint8_t* pair_other,
+                                              unsigned int* tile_conflicts) {
+  const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+  if (cell >= max_cells)
+    return;
+  const auto pair = pairs[blockIdx.y];
+  const size_t offset = size_t(blockIdx.y) * max_cells + cell;
+  if (pair_own[offset])
+    atomicAdd(tile_conflicts + size_t(pair.slot_a) * max_cells + cell, 1u);
+  if (pair_other[offset])
+    atomicAdd(tile_conflicts + size_t(pair.slot_b) * max_cells + cell, 1u);
+}
+}  // namespace
+
+void SampleMogeShiftGrid(const float* points, const float* mask, const uint8_t* face_valid,
+                         int size, float4* samples, cudaStream_t stream) {
+  SampleMogeShiftGridKernel<<<(64 * 64 + 255) / 256, 256, 0, stream>>>(points, mask, face_valid,
+                                                                        size, samples);
+  CudaCheck(cudaGetLastError());
+}
+
+void BuildMogeFaceEstimates(const float* points, const float* normals, const float* mask,
+                            const uint8_t* face_valid, const double* shifts,
+                            const uint8_t* shift_ok, const float* metric_scales,
+                            const double* to_camera, int faces, int size, double focal,
+                            float* out_distance, float* out_normal, uint32_t* valid_counts,
+                            cudaStream_t stream) {
+  if (faces <= 0)
+    return;
+  const dim3 grid(unsigned((size_t(size) * size + 255) / 256), unsigned(faces));
+  BuildMogeFaceEstimatesKernel<<<grid, 256, 0, stream>>>(
+      points, normals, mask, face_valid, shifts, shift_ok, metric_scales, to_camera, size, focal,
+      out_distance, out_normal, valid_counts);
+  CudaCheck(cudaGetLastError());
+}
+
+void CheckConflictPairs(const uint16_t* depths_base, size_t depth_stride, const ConflictView* views,
+                        const double3* rays_cam0, const double3* rays_cam1,
+                        const ConflictPair* pairs, int num_pairs, int max_cells, int lattice_step,
+                        double view_limit, double tolerance, uint8_t* pair_own,
+                        uint8_t* pair_other, unsigned int* tile_conflicts, unsigned long long* stats,
+                        cudaStream_t stream) {
+  if (num_pairs <= 0 || max_cells <= 0)
+    return;
+  const dim3 grid(unsigned((max_cells + 255) / 256), unsigned(num_pairs));
+  CheckConflictPairsKernel<<<grid, 256, 0, stream>>>(
+      depths_base, depth_stride, views, rays_cam0, rays_cam1, pairs, max_cells, lattice_step,
+      view_limit, tolerance, pair_own, pair_other, stats);
+  CudaCheck(cudaGetLastError());
+  AccumulateConflictVotesKernel<<<grid, 256, 0, stream>>>(pairs, max_cells, pair_own, pair_other,
+                                                          tile_conflicts);
+  CudaCheck(cudaGetLastError());
+}
 }  // namespace geosun::supervision_gpu
