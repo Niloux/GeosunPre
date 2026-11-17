@@ -291,8 +291,8 @@ fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
                   [&](uint32_t id) { return source / (std::to_string(id) + ".png"); },
                   [&](uint32_t id) { return pending / (std::to_string(id) + ".png"); });
   WriteJson(pending / "static_masks.json", {{"request", request}, {"result", result}});
-  fs::remove_all(target);
-  fs::rename(pending, target);
+  RemoveAll(target);
+  PublishDirectory(pending, target);
   return target;
 }
 }  // namespace
@@ -473,7 +473,7 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   timed("reports");
   auto checked = CheckBundle(pending);
   timed("readback");
-  fs::rename(pending, output);
+  PublishDirectory(pending, output);
   return checked;
 }
 Json CheckBundle(const fs::path& output) {

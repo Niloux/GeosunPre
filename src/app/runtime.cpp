@@ -5,9 +5,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
-#include <cstdlib>
+#include <system_error>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -20,6 +21,27 @@
 #endif
 
 namespace geosun {
+namespace {
+#ifdef _WIN32
+bool IsTransientLockError(DWORD code) {
+  return code == ERROR_ACCESS_DENIED || code == ERROR_SHARING_VIOLATION ||
+         code == ERROR_LOCK_VIOLATION;
+}
+void MoveFileRetry(const fs::path& temporary, const fs::path& path, const char* label) {
+  DWORD last_error = ERROR_SUCCESS;
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    if (MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+      return;
+    last_error = GetLastError();
+    if (!IsTransientLockError(last_error))
+      break;
+    Sleep(100);
+  }
+  throw std::system_error(static_cast<int>(last_error), std::system_category(),
+                          std::string(label) + ": " + path.u8string());
+}
+#endif
+}  // namespace
 fs::path ExecutablePath() {
 #ifdef _WIN32
   std::wstring path(32768, L'\0');
@@ -135,8 +157,7 @@ void WriteJson(const fs::path& path, const Json& value) {
   if (!stream)
     throw std::runtime_error("Incomplete write: " + path.u8string());
 #ifdef _WIN32
-  if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
-    throw std::runtime_error("Cannot publish JSON: " + path.u8string());
+  MoveFileRetry(temporary, path, "Cannot publish JSON");
 #else
   fs::rename(temporary, path);
 #endif
@@ -204,10 +225,42 @@ std::vector<std::string> Utf8Arguments(int argc, char** argv) { return {argv, ar
 namespace geosun {
 void PublishFile(const fs::path& temporary, const fs::path& path) {
 #ifdef _WIN32
-  if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
-    throw std::runtime_error("Cannot publish: " + path.u8string());
+  MoveFileRetry(temporary, path, "Cannot publish");
 #else
   fs::rename(temporary, path);
+#endif
+}
+void PublishDirectory(const fs::path& pending, const fs::path& target) {
+#ifdef _WIN32
+  std::error_code ec;
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    fs::rename(pending, target, ec);
+    if (!ec)
+      return;
+    if (!IsTransientLockError(static_cast<DWORD>(ec.value())))
+      break;
+    Sleep(100);
+  }
+  throw fs::filesystem_error("Cannot publish directory", pending, target, ec);
+#else
+  fs::rename(pending, target);
+#endif
+}
+void RemoveAll(const fs::path& path) {
+#ifdef _WIN32
+  std::error_code ec;
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    fs::remove_all(path, ec);
+    if (!ec)
+      return;
+    const auto code = static_cast<DWORD>(ec.value());
+    if (!IsTransientLockError(code) && code != ERROR_DIR_NOT_EMPTY)
+      break;
+    Sleep(100);
+  }
+  throw fs::filesystem_error("Cannot remove directory", path, ec);
+#else
+  fs::remove_all(path);
 #endif
 }
 void ArchiveInterrupted(const fs::path& pending) {
@@ -216,7 +269,7 @@ void ArchiveInterrupted(const fs::path& pending) {
   auto archived = pending;
   archived += ".interrupted-" +
               std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
-  fs::rename(pending, archived);
+  PublishDirectory(pending, archived);
   Log("Interrupted run kept as " + archived.u8string() + "; delete it when no longer needed");
 }
 void Log(const std::string& message) {

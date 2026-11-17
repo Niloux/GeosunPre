@@ -6,8 +6,9 @@
 #include <Eigen/SVD>
 #include <atomic>
 #include <future>
-#include <set>
+#include <optional>
 #include <random>
+#include <set>
 #include <unordered_map>
 namespace geosun {
 namespace {
@@ -142,7 +143,7 @@ std::vector<Residual> Residuals(const Points& points, const Surface& surface, do
   }
   return result;
 }
-Regions Partition(const Points& points) {
+std::optional<Regions> TryPartition(const Points& points) {
   Regions r;
   r.origin = Eigen::Vector3d::Constant(INFINITY);
   double span = 0.;
@@ -155,7 +156,7 @@ Regions Partition(const Points& points) {
     span = std::max(span, Quantile(values, .98) - Quantile(values, .02));
   }
   if (!(span > 0))
-    throw std::runtime_error("Registration points have no spatial extent");
+    return std::nullopt;
   const size_t requested = std::clamp<size_t>(points.size() / 100, 8, 256);
   double low = span / 128, high = span * 2;
   size_t best = SIZE_MAX, best_count = 0;
@@ -191,6 +192,12 @@ Regions Partition(const Points& points) {
               {"points", points.size()},
               {"frozen_in_initial_frame", true}};
   return r;
+}
+Regions Partition(const Points& points) {
+  auto r = TryPartition(points);
+  if (!r)
+    throw std::runtime_error("Registration points have no spatial extent");
+  return *r;
 }
 Similarity RefineSimilarity(const Points& source, const Points& target, Similarity transform,
                             const Regions& regions, const std::vector<double>& voxels,
@@ -520,15 +527,13 @@ std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Recon
     matched_local.push_back(local);
   }
   if (matched_local.size() >= 8) {
-    try {
-      const auto regions = Partition(matched_local);
+    if (const auto regions = TryPartition(matched_local)) {
       std::map<Tile, size_t> counts;
-      for (const auto& tile : regions.tiles)
+      for (const auto& tile : regions->tiles)
         ++counts[tile];
       const double mean = double(planes.size()) / std::max<size_t>(1, counts.size());
       for (size_t i = 0; i < planes.size(); ++i)
-        planes[i].sigma *= std::max(.5, std::sqrt(double(counts[regions.tiles[i]]) / mean));
-    } catch (const std::exception&) {
+        planes[i].sigma *= std::max(.5, std::sqrt(double(counts[regions->tiles[i]]) / mean));
     }
   }
   return planes;

@@ -580,12 +580,12 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
   if (!final)
     throw std::runtime_error("Incomplete PLY write");
   VerifyInitializationPly(pending, vertices);
-  fs::rename(pending, output);
+  PublishFile(pending, output);
   // Only this invocation's newly created scratch directory is removed after
   // publication.
   if (fs::weakly_canonical(workspace).parent_path() != fs::weakly_canonical(output.parent_path()))
     throw std::runtime_error("Unexpected voxel workspace location");
-  fs::remove_all(workspace);
+  RemoveAll(workspace);
   Json result = {{"source", "las"},
                  {"source_las_file", source},
                  {"source_point_count", h.count},

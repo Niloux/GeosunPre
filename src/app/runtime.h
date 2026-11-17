@@ -23,6 +23,8 @@ void WriteJson(const fs::path& path, const Json& value);
 Json FileMetadata(const fs::path& path);
 Json Resources();
 void PublishFile(const fs::path& temporary, const fs::path& path);
+void PublishDirectory(const fs::path& pending, const fs::path& target);
+void RemoveAll(const fs::path& path);
 // Keeps a .pending directory left by an interrupted run under a timestamped name.
 void ArchiveInterrupted(const fs::path& pending);
 void Log(const std::string& message);

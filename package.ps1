@@ -113,6 +113,14 @@ if (($after.Keys -join "`n") -ne ($files.Keys -join "`n") -or
     @($files.Keys | Where-Object { $files[$_] -ne $after[$_] }).Count) {
     throw "Package files changed during verification. Files remain in $pending"
 }
-[IO.Directory]::Move($pending, $destination)
+for ($attempt = 0; ; $attempt++) {
+    try {
+        [IO.Directory]::Move($pending, $destination)
+        break
+    } catch [IO.IOException], [UnauthorizedAccessException] {
+        if ($attempt -ge 49) { throw }
+        Start-Sleep -Milliseconds 100
+    }
+}
 
 Write-Host "Package: $destination"

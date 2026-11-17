@@ -125,6 +125,22 @@ $record = [ordered]@{
 }
 [IO.File]::WriteAllText((Join-Path $pending 'bundle.json'), ($record | ConvertTo-Json -Depth 4), $utf8)
 
+function Move-WithRetry([string]$Source, [string]$Target) {
+    for ($attempt = 0; ; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $Source -PathType Container) {
+                [IO.Directory]::Move($Source, $Target)
+            } else {
+                [IO.File]::Move($Source, $Target)
+            }
+            return
+        } catch [IO.IOException], [UnauthorizedAccessException] {
+            if ($attempt -ge 49) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+}
+
 # Read back the copies and run both programs from the bundle.
 Test-Package (Join-Path $pending 'preprocess') $pre 'Bundled GeosunPre'
 Test-Package (Join-Path $pending 'trainer') $train 'Bundled trainer'
@@ -141,11 +157,11 @@ if (($after.Keys -join "`n") -ne ($before.Keys -join "`n") -or
     @($before.Keys | Where-Object { $before[$_] -ne $after[$_] }).Count) {
     throw "Bundle files changed during verification. Files remain in $pending"
 }
-[IO.Directory]::Move($pending, $destination)
+Move-WithRetry $pending $destination
 
 & "$env:SystemRoot\System32\tar.exe" --format zip -c -f "$archive.pending" -C (Split-Path $destination) (Split-Path $destination -Leaf)
 if ($LASTEXITCODE) { throw "Cannot create archive for $destination" }
-Move-Item -LiteralPath "$archive.pending" -Destination $archive
+Move-WithRetry "$archive.pending" $archive
 [IO.File]::WriteAllText("$archive.sha256", "$(Get-Sha256 $archive)  $(Split-Path $archive -Leaf)`n", $utf8)
 Write-Host "Bundle: $destination"
 Write-Host "Archive: $archive"

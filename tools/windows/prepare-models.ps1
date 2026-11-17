@@ -74,10 +74,16 @@ try {
     Invoke-Tool $python $arguments
     if (-not (Test-Path -LiteralPath $modelRoot)) {
         $pending = $modelRoot + '.pending'
-        try {
-            [IO.Directory]::Move($pending, $modelRoot)
-        } catch [IO.IOException], [UnauthorizedAccessException] {
-            throw "Cannot publish: $($_.Exception.Message) Verified files remain in '$pending'. Close programs using this directory and retry the same command."
+        for ($attempt = 0; ; $attempt++) {
+            try {
+                [IO.Directory]::Move($pending, $modelRoot)
+                break
+            } catch [IO.IOException], [UnauthorizedAccessException] {
+                if ($attempt -ge 49) {
+                    throw "Cannot publish: $($_.Exception.Message) Verified files remain in '$pending'. Close programs using this directory and retry the same command."
+                }
+                Start-Sleep -Milliseconds 100
+            }
         }
         Write-Host $(if ($OnnxBundle) { "ONNX bundle ready: $modelRoot" } else { "Models ready: $modelRoot" })
     }

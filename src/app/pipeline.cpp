@@ -500,7 +500,7 @@ void Run(const Arguments& args) {
   }
   // The lock is released; a published production delivery no longer needs its work directory.
   if (finished && !debug) {
-    fs::remove_all(work);
+    RemoveAll(work);
     Log("Removed work directory " + work.u8string());
   }
   summary["output"] = output.u8string();
