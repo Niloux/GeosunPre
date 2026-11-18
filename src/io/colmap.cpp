@@ -358,7 +358,8 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     request["crop"] = {{"mode", "valid_domain"},
                        {"windows", {(*windows)[0].ToJson(), (*windows)[1].ToJson()}}};
   if (include_ply)
-    request["ply_filter"] = {{"max_range_m", 50.0}, {"max_points", 2500000}};
+    request["ply_filter"] = {
+        {"max_range_m", 50.0}, {"max_points", 2500000}, {"max_visual_supplement_points", 100000}};
   if (options.enabled)
     request["supervision"] = SupervisionRequest(scene, selected, masks, options, rolling);
   timed("request");
@@ -382,9 +383,40 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   fs::create_directories(pending / "sparse/0");
   timed("source checks");
   const auto original = rolling ? OriginalPhotoObservations(selected, motion, 8) : selected;
+  Reconstruction uncropped_visual;
+  if (include_ply) {
+    const auto pre_cleanup_path =
+        rolling ? (work / "cache/shutter.bin") : (work / "cache/aligned.bin");
+    auto pre_cleanup = fs::exists(pre_cleanup_path) ? ReadModel(pre_cleanup_path) : selected;
+    bool stripped = false;
+    for (size_t id = 0; id < pre_cleanup.images.size(); ++id)
+      if (!selected.images[id].registered && pre_cleanup.images[id].registered) {
+        pre_cleanup.images[id].registered = false;
+        stripped = true;
+      }
+    if (stripped) {
+      for (auto& pt : pre_cleanup.points) {
+        pt.track.erase(std::remove_if(pt.track.begin(), pt.track.end(),
+                                      [&](const Observation& o) {
+                                        return !pre_cleanup.images[o.image].registered;
+                                      }),
+                       pt.track.end());
+        if (pt.track.size() < 2)
+          pt.track.clear();
+      }
+      pre_cleanup.RebuildReferences();
+    }
+    uncropped_visual = rolling ? OriginalPhotoObservations(pre_cleanup, motion, 8)
+                               : std::move(pre_cleanup);
+  }
   if (windows && rolling)
     motion = CropMotion(motion, original, *windows);
   const auto model = windows ? CropModel(original, *windows, rolling ? &motion : nullptr) : original;
+  const auto visual_model =
+      include_ply
+          ? (windows ? CropModel(uncropped_visual, *windows, rolling ? &motion : nullptr)
+                     : std::move(uncropped_visual))
+          : Reconstruction{};
   WriteColmap(pending / "sparse/0", scene, model);
   timed("model");
   for (const auto* e : registered) {
@@ -418,12 +450,22 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   for (auto& row : rows)
     photos.push_back(std::move(row));
   timed("photos and masks");
-  // The PLY voxelizes the LAS on the CPU while the supervision projects it on the GPU.
+  // The PLY voxelizes the LAS on the CPU (supplemented with un-covered static visual points) while
+  // the supervision projects it on the GPU. Wait for the job before locals unwind on exception.
   std::future<Json> initialization_job;
+  struct JoinInitialization {
+    std::future<Json>& job;
+    ~JoinInitialization() {
+      if (job.valid())
+        job.wait();
+    }
+  } join_initialization{initialization_job};
   if (include_ply)
     initialization_job = std::async(std::launch::async, [&] {
-      return ExportLasPly(scene.las, ReadSceneLas(scene), pending / "sparse/0/points3D.ply", voxel,
-                          &model);
+      return ExportLasPly(
+          scene.las, ReadSceneLas(scene), pending / "sparse/0/points3D.ply", voxel, &model,
+          &visual_model,
+          [&](uint32_t id) { return pending / "masks" / fs::u8path(scene.images[id].name + ".png"); });
     });
   Json supervision = nullptr;
   if (options.enabled) {

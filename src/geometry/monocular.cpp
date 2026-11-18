@@ -124,19 +124,41 @@ bool SolveShiftFromSamples(const float4* grid, int size, double& shift) {
   shift = s;
   return true;
 }
-cv::Mat Prefiltered(const MonocularLens& lens, const cv::Mat& rgb) {
-  if (rgb.type() != CV_8UC3 || rgb.cols != lens.source.width || rgb.rows != lens.source.height)
+}  // namespace
+cv::Mat MonocularLens::Prefilter(const cv::Mat& rgb) const {
+  if (rgb.type() != CV_8UC3 || rgb.cols != source.width || rgb.rows != source.height)
     throw std::runtime_error("Photo size differs from the lens calibration");
-  if (lens.prefilter >= 1)
+  if (prefilter >= 1)
     return rgb;
   cv::Mat small;
-  cv::resize(rgb, small,
-             cv::Size(int(std::lround(rgb.cols * lens.prefilter)),
-                      int(std::lround(rgb.rows * lens.prefilter))),
-             0, 0, cv::INTER_AREA);
+  cv::resize(rgb, small, cv::Size(prefilter_width, prefilter_height), 0, 0, cv::INTER_AREA);
   return small;
 }
-}  // namespace
+int MonocularLens::SamplesAtRay(const Eigen::Vector3d& ray_ref,
+                                std::array<FaceSample, MaxSamples>& out) const {
+  const double half_width = std::tan(Radians(half_degrees));
+  std::array<FaceSample, 32> found{};
+  int count = 0;
+  for (size_t f = 0; f < faces.size(); ++f) {
+    const Eigen::Vector3d q = faces[f].rotation * ray_ref;
+    if (q.z() <= 0)
+      continue;
+    const double xn = q.x() / q.z(), yn = q.y() / q.z();
+    const double weight = std::pow(
+        std::clamp((1 - std::max(std::abs(xn), std::abs(yn)) / half_width) / FeatherBand, 0., 1.),
+        2);
+    const double x = focal * xn + size / 2. - .5, y = focal * yn + size / 2. - .5;
+    if (weight > 0 && x >= 0 && y >= 0 && x < size - 1 && y < size - 1 &&
+        count < int(found.size()))
+      found[size_t(count++)] = {float(x), float(y), float(weight), uint8_t(f)};
+  }
+  std::sort(found.begin(), found.begin() + count,
+            [](const FaceSample& a, const FaceSample& b) { return a.weight > b.weight; });
+  const int keep = std::min(count, MaxSamples);
+  for (int k = 0; k < keep; ++k)
+    out[size_t(k)] = found[size_t(k)];
+  return keep;
+}
 Json MonocularLens::ToJson() const {
   Json axes = Json::array();
   for (const auto& face : faces) {
@@ -226,81 +248,56 @@ MonocularLens PlanMonocularLens(const Camera& source, const Camera& grid, int si
     }
   }
   lens.prefilter = std::min(1., 2 * lens.focal / source.params[0]);
-  const double sx = std::lround(source.width * lens.prefilter) / double(source.width),
-               sy = std::lround(source.height * lens.prefilter) / double(source.height);
-  const double source_radius = source.Radius(), limit = std::cos(Radians(FieldOfViewDegrees / 2));
-  for (const auto& rotation : rotations) {
-    MonocularFace face{rotation, cv::Mat(size, size, CV_32FC2), cv::Mat::zeros(size, size, CV_8UC1)};
-    const Eigen::Matrix3d to_camera = rotation.transpose();
-    for (int v = 0; v < size; ++v)
-      for (int u = 0; u < size; ++u) {
-        const Eigen::Vector3d ray =
-            (to_camera * Eigen::Vector3d((u + .5 - size / 2.) / lens.focal,
-                                         (v + .5 - size / 2.) / lens.focal, 1))
-                .normalized();
-        auto& target = face.source.at<cv::Vec2f>(v, u);
-        target = cv::Vec2f(-10, -10);
-        if (ray.z() < limit)
-          continue;
-        const auto pixel = source.Project(ray);
-        const double dx = (pixel.x() - source.params[2]) / source.params[0],
-                     dy = (pixel.y() - source.params[3]) / source.params[1];
-        if (pixel.x() < 0 || pixel.y() < 0 || pixel.x() >= source.width ||
-            pixel.y() >= source.height || dx * dx + dy * dy > source_radius * source_radius)
-          continue;
-        target = cv::Vec2f(float(pixel.x() * sx - .5), float(pixel.y() * sy - .5));
-        face.valid.at<uint8_t>(v, u) = 255;
-      }
-    lens.faces.push_back(std::move(face));
-  }
+  lens.prefilter_width =
+      lens.prefilter >= 1 ? source.width : int(std::lround(source.width * lens.prefilter));
+  lens.prefilter_height =
+      lens.prefilter >= 1 ? source.height : int(std::lround(source.height * lens.prefilter));
+  lens.prefilter_sx = double(lens.prefilter_width) / double(source.width);
+  lens.prefilter_sy = double(lens.prefilter_height) / double(source.height);
+  for (const auto& rotation : rotations)
+    lens.faces.push_back({rotation});
   lens.samples.assign(rays.size(), {});
   lens.counts.assign(rays.size(), 0);
   lens.rays = cv::Mat::zeros(h, w, CV_32FC3);
-  const double half_width = std::tan(Radians(half_degrees));
   for (size_t i = 0; i < rays.size(); ++i) {
     if (rays[i].isZero())
       continue;
     lens.rays.at<cv::Vec3f>(int(i / w), int(i % w)) =
         cv::Vec3f(float(rays[i].x()), float(rays[i].y()), float(rays[i].z()));
-    std::vector<FaceSample> found;
-    for (size_t f = 0; f < rotations.size(); ++f) {
-      const Eigen::Vector3d q = rotations[f] * rays[i];
-      if (q.z() <= 0)
-        continue;
-      const double xn = q.x() / q.z(), yn = q.y() / q.z();
-      const double weight = std::pow(
-          std::clamp((1 - std::max(std::abs(xn), std::abs(yn)) / half_width) / FeatherBand, 0., 1.),
-          2);
-      const double x = lens.focal * xn + size / 2. - .5, y = lens.focal * yn + size / 2. - .5;
-      if (weight > 0 && x >= 0 && y >= 0 && x < size - 1 && y < size - 1)
-        found.push_back({float(x), float(y), float(weight), uint8_t(f)});
-    }
-    std::sort(found.begin(), found.end(),
-              [](const FaceSample& a, const FaceSample& b) { return a.weight > b.weight; });
-    const size_t count = std::min<size_t>(found.size(), MonocularLens::MaxSamples);
-    std::copy(found.begin(), found.begin() + count, lens.samples[i].begin());
-    lens.counts[i] = uint8_t(count);
+    lens.counts[i] = uint8_t(lens.SamplesAtRay(rays[i], lens.samples[i]));
   }
   return lens;
 }
 struct MonocularEstimator::Workspace {
   cudaStream_t stream = nullptr;
   int faces = 0;
+  size_t prefiltered_capacity = 0;
   const MonocularLens* cached_lens = nullptr;
-  std::unique_ptr<DeviceBuffer> d_points, d_normals, d_masks, d_face_valid, d_metric_scales,
-      d_shift_samples, d_shifts, d_shift_ok, d_to_camera, d_out_distance, d_out_normal,
-      d_valid_counts;
-  std::unique_ptr<HostBuffer> h_face_valid, h_shift_samples, h_metric_scales, h_shifts, h_shift_ok,
+  std::unique_ptr<DeviceBuffer> d_prefiltered, d_source_params, d_all_face_inputs, d_points,
+      d_normals, d_masks, d_face_valid, d_metric_scales, d_shift_samples, d_shifts, d_shift_ok,
+      d_to_camera, d_out_distance, d_out_normal, d_valid_counts;
+  std::shared_ptr<DeviceBuffer> d_face_input;
+  std::unique_ptr<HostBuffer> h_prefiltered, h_shift_samples, h_metric_scales, h_shifts, h_shift_ok,
       h_to_camera, h_out_distance, h_out_normal, h_valid_counts;
   explicit Workspace(cudaStream_t s) : stream(s) {}
   ~Workspace() {
     if (stream)
       cudaStreamSynchronize(stream);
   }
+  void ReservePrefiltered(size_t bytes) {
+    if (bytes <= prefiltered_capacity)
+      return;
+    d_prefiltered = std::make_unique<DeviceBuffer>(bytes);
+    h_prefiltered = std::make_unique<HostBuffer>(bytes);
+    prefiltered_capacity = bytes;
+  }
   void Reserve(int count, int size) {
     if (count <= faces)
       return;
     const size_t face_pixels = size_t(size) * size, total_pixels = size_t(count) * face_pixels;
+    d_source_params = std::make_unique<DeviceBuffer>(8 * sizeof(double));
+    d_all_face_inputs = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
+    d_face_input = std::make_shared<DeviceBuffer>(face_pixels * 3 * sizeof(float));
     d_points = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
     d_normals = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
     d_masks = std::make_unique<DeviceBuffer>(total_pixels * sizeof(float));
@@ -313,7 +310,6 @@ struct MonocularEstimator::Workspace {
     d_out_distance = std::make_unique<DeviceBuffer>(total_pixels * sizeof(float));
     d_out_normal = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
     d_valid_counts = std::make_unique<DeviceBuffer>(size_t(count) * sizeof(uint32_t));
-    h_face_valid = std::make_unique<HostBuffer>(total_pixels);
     h_shift_samples = std::make_unique<HostBuffer>(size_t(count) * 4096 * sizeof(float4));
     h_metric_scales = std::make_unique<HostBuffer>(size_t(count) * sizeof(float));
     h_shifts = std::make_unique<HostBuffer>(size_t(count) * sizeof(double));
@@ -328,59 +324,70 @@ struct MonocularEstimator::Workspace {
 };
 MonocularEstimator::MonocularEstimator(Models& models)
     : models_(models),
-      pixels_(models.Stream()),
       workspace_(std::make_unique<Workspace>(models.Stream())) {
   const auto& manifest = models.Manifest();
   if (!manifest.at("models").contains("geometry"))
     throw std::runtime_error("Model package has no geometry engine; use run.ps1 prepare-models");
   size_ = manifest.at("geometry_size");
   // Load the engine now, so device memory budgets measured afterwards see it.
-  pixels_.Upload(cv::Mat::zeros(size_, size_, CV_8UC3));
-  models_.Predict("geometry", {pixels_.Normalize(size_, size_)}, true);
+  const std::vector<float> blank(size_t(3) * size_ * size_, 0.f);
+  models_.Predict("geometry",
+                  {Tensor::Float({1, 3, size_, size_}, blank.data(), blank.size())}, true);
 }
 MonocularEstimator::~MonocularEstimator() = default;
-std::vector<cv::Mat> MonocularEstimator::Faces(const MonocularLens& lens, const cv::Mat& rgb) {
-  const auto source = Prefiltered(lens, rgb);
-  std::vector<cv::Mat> faces;
-  for (const auto& face : lens.faces) {
-    cv::Mat sampled;
-    cv::remap(source, sampled, face.source, cv::Mat(), cv::INTER_LINEAR, cv::BORDER_CONSTANT,
-              cv::Scalar::all(0));
-    faces.push_back(std::move(sampled));
-  }
-  return faces;
-}
 std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens,
-                                                       const std::vector<cv::Mat>& images) {
-  if (lens.size != size_ || images.size() != lens.faces.size())
-    throw std::runtime_error("Monocular faces differ from the geometry engine or lens plan");
-  const int size = size_, faces = int(images.size());
+                                                       const cv::Mat& prefiltered,
+                                                       const Eigen::Vector3d& omega, int axis,
+                                                       bool rolling) {
+  if (lens.size != size_ || prefiltered.type() != CV_8UC3 ||
+      prefiltered.cols != lens.prefilter_width || prefiltered.rows != lens.prefilter_height)
+    throw std::runtime_error("Monocular photo differs from the geometry engine or lens plan");
+  const int size = size_, faces = int(lens.faces.size());
   if (!faces)
     return {};
   const size_t face_pixels = size_t(size) * size;
   const auto stream = models_.Stream();
   workspace_->Reserve(faces, size);
+  const cv::Mat contiguous = prefiltered.isContinuous() ? prefiltered : prefiltered.clone();
+  const size_t pref_bytes = contiguous.total() * 3;
+  workspace_->ReservePrefiltered(pref_bytes);
+  std::memcpy(workspace_->h_prefiltered->data, contiguous.data, pref_bytes);
+  CudaCheck(cudaMemcpyAsync(workspace_->d_prefiltered->data, workspace_->h_prefiltered->data,
+                            pref_bytes, cudaMemcpyHostToDevice, stream));
   if (workspace_->cached_lens != &lens) {
-    auto* dst = static_cast<uint8_t*>(workspace_->h_face_valid->data);
+    auto* to_camera = static_cast<double*>(workspace_->h_to_camera->data);
     for (int f = 0; f < faces; ++f) {
-      const auto& v = lens.faces[f].valid;
-      if (v.type() != CV_8UC1 || v.cols != size || v.rows != size)
-        throw std::runtime_error("Unexpected monocular face valid mask");
-      if (v.isContinuous())
-        std::memcpy(dst + size_t(f) * face_pixels, v.data, face_pixels);
-      else {
-        cv::Mat cont = v.clone();
-        std::memcpy(dst + size_t(f) * face_pixels, cont.data, face_pixels);
-      }
+      const Eigen::Matrix3d tc = lens.faces[f].rotation.transpose();
+      for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+          to_camera[f * 9 + r * 3 + c] = tc(r, c);
     }
-    CudaCheck(cudaMemcpyAsync(workspace_->d_face_valid->data, dst, size_t(faces) * face_pixels,
-                              cudaMemcpyHostToDevice, stream));
+    CudaCheck(cudaMemcpyAsync(workspace_->d_to_camera->data, to_camera,
+                              size_t(faces) * 9 * sizeof(double), cudaMemcpyHostToDevice, stream));
+    CudaCheck(cudaMemcpyAsync(workspace_->d_source_params->data, lens.source.params.data(),
+                              8 * sizeof(double), cudaMemcpyHostToDevice, stream));
     workspace_->cached_lens = &lens;
   }
+  const double3 gpu_omega = make_double3(omega.x(), omega.y(), omega.z());
+  const bool use_rolling = rolling && !omega.isZero();
+  supervision_gpu::SampleMogeFaces(
+      static_cast<const uint8_t*>(workspace_->d_prefiltered->data), lens.prefilter_width,
+      lens.prefilter_height, static_cast<const double*>(workspace_->d_source_params->data),
+      lens.source.width, lens.source.height, lens.source.Radius(), lens.prefilter_sx,
+      lens.prefilter_sy, static_cast<const double*>(workspace_->d_to_camera->data), gpu_omega,
+      use_rolling ? 1 : 0, axis, faces, size, lens.focal,
+      static_cast<float*>(workspace_->d_all_face_inputs->data),
+      static_cast<uint8_t*>(workspace_->d_face_valid->data), stream);
   const std::vector<int64_t> map{1, size, size, 3};
   for (int f = 0; f < faces; ++f) {
-    pixels_.Upload(images[f]);
-    const auto outputs = models_.Predict("geometry", {pixels_.Normalize(size, size)}, true);
+    CudaCheck(cudaMemcpyAsync(workspace_->d_face_input->data,
+                              static_cast<const float*>(workspace_->d_all_face_inputs->data) +
+                                  size_t(f) * 3 * face_pixels,
+                              3 * face_pixels * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    Tensor input;
+    input.shape = {1, 3, size, size};
+    input.device = workspace_->d_face_input;
+    const auto outputs = models_.Predict("geometry", {input}, true);
     if (outputs.size() != 4 || outputs[0].shape != map || outputs[1].shape != map ||
         outputs[2].shape != std::vector<int64_t>{1, size, size} ||
         outputs[3].shape != std::vector<int64_t>{1} || !outputs[0].device ||
@@ -415,24 +422,17 @@ std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens
   const auto* samples = static_cast<const float4*>(workspace_->h_shift_samples->data);
   auto* shifts = static_cast<double*>(workspace_->h_shifts->data);
   auto* shift_ok = static_cast<uint8_t*>(workspace_->h_shift_ok->data);
-  auto* to_camera = static_cast<double*>(workspace_->h_to_camera->data);
   for (int f = 0; f < faces; ++f) {
     if (!std::isfinite(metric_scales[f]) || metric_scales[f] <= 0)
       throw std::runtime_error("Geometry engine returned an invalid metric scale");
     double shift = 0;
     shift_ok[f] = SolveShiftFromSamples(samples + size_t(f) * 4096, size, shift) ? 1 : 0;
     shifts[f] = shift;
-    const Eigen::Matrix3d tc = lens.faces[f].rotation.transpose();
-    for (int r = 0; r < 3; ++r)
-      for (int c = 0; c < 3; ++c)
-        to_camera[f * 9 + r * 3 + c] = tc(r, c);
   }
   CudaCheck(cudaMemcpyAsync(workspace_->d_shifts->data, shifts, size_t(faces) * sizeof(double),
                             cudaMemcpyHostToDevice, stream));
   CudaCheck(cudaMemcpyAsync(workspace_->d_shift_ok->data, shift_ok, size_t(faces),
                             cudaMemcpyHostToDevice, stream));
-  CudaCheck(cudaMemcpyAsync(workspace_->d_to_camera->data, to_camera,
-                            size_t(faces) * 9 * sizeof(double), cudaMemcpyHostToDevice, stream));
   CudaCheck(cudaMemsetAsync(workspace_->d_valid_counts->data, 0, size_t(faces) * sizeof(uint32_t),
                             stream));
   supervision_gpu::BuildMogeFaceEstimates(
@@ -493,31 +493,54 @@ bool SampleFace(const FaceEstimate& face, const FaceSample& sample, double& dist
 }
 }  // namespace
 MonocularMaps GatherFaces(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
-                          const std::function<double(const FaceSample&)>& log_scale) {
+                          const std::function<double(const FaceSample&)>& log_scale,
+                          const Eigen::Vector3d* omega, int axis) {
   if (faces.size() != lens.faces.size())
     throw std::runtime_error("Monocular faces differ from the lens plan");
   const int w = lens.grid.width, h = lens.grid.height;
+  const bool rolling = omega && !omega->isZero();
   MonocularMaps maps{cv::Mat::zeros(h, w, CV_32FC1), cv::Mat::zeros(h, w, CV_32FC3)};
-  for (size_t i = 0; i < lens.counts.size(); ++i) {
-    double weights = 0, log_distance = 0;
-    Eigen::Vector3d normal = Eigen::Vector3d::Zero();
-    for (int k = 0; k < lens.counts[i]; ++k) {
-      const auto& sample = lens.samples[i][k];
-      double distance;
-      Eigen::Vector3d n;
-      if (!SampleFace(faces[sample.face], sample, distance, n))
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      const size_t i = size_t(y) * w + x;
+      std::array<FaceSample, MonocularLens::MaxSamples> samples;
+      int count = 0;
+      Eigen::Vector3d w_rot = Eigen::Vector3d::Zero();
+      if (rolling) {
+        const auto& r_cv = lens.rays.at<cv::Vec3f>(y, x);
+        if (r_cv[0] == 0.f && r_cv[1] == 0.f && r_cv[2] == 0.f)
+          continue;
+        const double s = axis ? (y + .5 - .5 * h) / h : (x + .5 - .5 * w) / w;
+        w_rot = s * (*omega);
+        const Eigen::Vector3d r_exp(r_cv[0], r_cv[1], r_cv[2]);
+        const Eigen::Vector3d r_ref =
+            (r_exp - w_rot.cross(r_exp) + w_rot.dot(r_exp) * w_rot).normalized();
+        count = lens.SamplesAtRay(r_ref, samples);
+      } else {
+        samples = lens.samples[i];
+        count = lens.counts[i];
+      }
+      double weights = 0, log_distance = 0;
+      Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+      for (int k = 0; k < count; ++k) {
+        const auto& sample = samples[k];
+        double distance;
+        Eigen::Vector3d n;
+        if (!SampleFace(faces[sample.face], sample, distance, n))
+          continue;
+        weights += sample.weight;
+        log_distance += sample.weight * (std::log(distance) + log_scale(sample));
+        normal += sample.weight * n;
+      }
+      if (weights <= 0 || normal.norm() < 1e-6)
         continue;
-      weights += sample.weight;
-      log_distance += sample.weight * (std::log(distance) + log_scale(sample));
-      normal += sample.weight * n;
+      maps.distance.at<float>(y, x) = float(std::exp(log_distance / weights));
+      normal.normalize();
+      if (rolling)
+        normal = (normal + w_rot.cross(normal)).normalized();
+      maps.normal.at<cv::Vec3f>(y, x) =
+          cv::Vec3f(float(normal.x()), float(normal.y()), float(normal.z()));
     }
-    if (weights <= 0 || normal.norm() < 1e-6)
-      continue;
-    maps.distance.at<float>(int(i / w), int(i % w)) = float(std::exp(log_distance / weights));
-    normal.normalize();
-    maps.normal.at<cv::Vec3f>(int(i / w), int(i % w)) =
-        cv::Vec3f(float(normal.x()), float(normal.y()), float(normal.z()));
-  }
   return maps;
 }
 namespace {
@@ -559,7 +582,8 @@ Json FaceFit::ToJson() const {
           {"field_cells", Cells}, {"scales", scales}, {"faces", faces}};
 }
 FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
-                      const cv::Mat& las, const cv::Mat& las_normal) {
+                      const cv::Mat& las, const cv::Mat& las_normal,
+                      const Eigen::Vector3d* omega, int axis) {
   if (faces.size() != lens.faces.size() || las.type() != CV_16UC1 ||
       las.cols != lens.grid.width || las.rows != lens.grid.height ||
       las_normal.type() != CV_8UC3 || las_normal.size() != las.size())
@@ -575,29 +599,49 @@ FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>
   std::vector<Anchor> anchors;
   std::vector<Tie> ties;
   FaceFit fit;
-  const int w = lens.grid.width;
-  for (int y = 0; y < lens.grid.height; y += FitLattice)
+  const int w = lens.grid.width, h = lens.grid.height;
+  const bool rolling = omega && !omega->isZero();
+  for (int y = 0; y < h; y += FitLattice)
     for (int x = 0; x < w; x += FitLattice) {
       const size_t i = size_t(y) * w + x;
+      std::array<FaceSample, MonocularLens::MaxSamples> samples;
+      int sample_count = 0;
+      Eigen::Vector3d w_rot = Eigen::Vector3d::Zero();
+      if (rolling) {
+        const auto& r_cv = lens.rays.at<cv::Vec3f>(y, x);
+        if (r_cv[0] == 0.f && r_cv[1] == 0.f && r_cv[2] == 0.f)
+          continue;
+        const double s = axis ? (y + .5 - .5 * h) / h : (x + .5 - .5 * w) / w;
+        w_rot = s * (*omega);
+        const Eigen::Vector3d r_exp(r_cv[0], r_cv[1], r_cv[2]);
+        const Eigen::Vector3d r_ref =
+            (r_exp - w_rot.cross(r_exp) + w_rot.dot(r_exp) * w_rot).normalized();
+        sample_count = lens.SamplesAtRay(r_ref, samples);
+      } else {
+        samples = lens.samples[i];
+        sample_count = lens.counts[i];
+      }
       double distance[MonocularLens::MaxSamples];
       bool valid[MonocularLens::MaxSamples];
       Eigen::Vector3d normal[MonocularLens::MaxSamples];
-      for (int k = 0; k < lens.counts[i]; ++k)
-        valid[k] =
-            SampleFace(faces[lens.samples[i][k].face], lens.samples[i][k], distance[k], normal[k]);
+      for (int k = 0; k < sample_count; ++k) {
+        Eigen::Vector3d n_ref;
+        valid[k] = SampleFace(faces[samples[k].face], samples[k], distance[k], n_ref);
+        if (valid[k])
+          normal[k] = rolling ? (n_ref + w_rot.cross(n_ref)).normalized() : n_ref;
+      }
       const double target = las.at<uint16_t>(y, x) / 1000.;
-      for (int a = 0; a < lens.counts[i]; ++a) {
+      for (int a = 0; a < sample_count; ++a) {
         if (!valid[a])
           continue;
         if (target > 0) {
           ++fit.las_samples;
           if (Trusted(las_normal, x, y, normal[a]))
-            anchors.push_back({lens.samples[i][a], float(std::log(target / distance[a]))});
+            anchors.push_back({samples[a], float(std::log(target / distance[a]))});
         }
-        for (int b = a + 1; b < lens.counts[i]; ++b)
+        for (int b = a + 1; b < sample_count; ++b)
           if (valid[b])
-            ties.push_back({lens.samples[i][a], lens.samples[i][b],
-                            float(std::log(distance[b] / distance[a]))});
+            ties.push_back({samples[a], samples[b], float(std::log(distance[b] / distance[a]))});
       }
     }
   const size_t count = faces.size();
@@ -1172,7 +1216,7 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
   std::atomic<uint32_t> next{0};
   std::exception_ptr failure;
   std::mutex failure_lock;
-  std::atomic<uint64_t> dropped_total{0};
+  std::atomic<uint64_t> dropped_total{0}, dropped_normal_total{0};
   auto rewrite = [&] {
     try {
       for (uint32_t i; (i = next++) < n;) {
@@ -1188,7 +1232,7 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
           }
         auto& row = rows.at(i);
         const auto path = output / "depths" / fs::u8path(scene.images[i].name + ".png");
-        uint64_t dropped = 0;
+        uint64_t dropped = 0, dropped_normals = 0;
         if (held_depths) {
           auto depth = std::move((*held_depths)[i]);
           if (any_candidate)
@@ -1228,9 +1272,35 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
             row["depth_size"] = fs::file_size(path);
           }
         }
+        if (any_candidate) {
+          const auto normal_path = output / "normals" / fs::u8path(scene.images[i].name + ".png");
+          auto normal = ReadImage(normal_path, cv::IMREAD_UNCHANGED);
+          const auto& grid = grids[model.images[i].camera];
+          if (normal.type() != CV_8UC3 || normal.cols != grid.width || normal.rows != grid.height)
+            throw std::runtime_error("Unexpected supervision normal map: " + scene.images[i].name);
+          for (int y = 0; y < normal.rows; ++y) {
+            auto* np = normal.ptr<cv::Vec3b>(y);
+            for (int x = 0; x < normal.cols; ++x) {
+              if (!np[x][0] && !np[x][1] && !np[x][2])
+                continue;
+              const size_t k = size_t(y / ConflictLattice) * cw + x / ConflictLattice;
+              if (!verified[i].data[k] && conflicts[i][k] >= ConflictMinimumViews) {
+                np[x] = cv::Vec3b(0, 0, 0);
+                ++dropped_normals;
+              }
+            }
+          }
+          if (dropped_normals) {
+            WriteImage(normal_path, normal);
+            row["normal_size"] = fs::file_size(normal_path);
+          }
+        }
         row["depth_pixels"] = row.at("depth_pixels").get<uint64_t>() - dropped;
+        row["normal_pixels"] = row.at("normal_pixels").get<uint64_t>() - dropped_normals;
         row["monocular"]["view_conflict_pixels"] = dropped;
+        row["monocular"]["view_conflict_normal_pixels"] = dropped_normals;
         dropped_total += dropped;
+        dropped_normal_total += dropped_normals;
       }
     } catch (...) {
       std::lock_guard<std::mutex> guard(failure_lock);
@@ -1253,12 +1323,13 @@ Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Recon
           {"baseline_m", ConflictBaselineMetres},
           {"lattice_pixels", ConflictLattice},
           {"in_front_log", ConflictLog},
-          {"drop", "cell not LAS-verified with at least 2 contradicting views"},
+          {"drop", "cell not LAS-verified with at least 2 contradicting views drops both depth and normal"},
           {"neighbourhood", "3 x 3 nearest depth of the other view, all valid"},
           {"pairs", total_pairs},
           {"tested_samples", tested_total},
           {"conflicting_samples", conflicting_total},
           {"dropped_depth_pixels", dropped_total.load()},
+          {"dropped_normal_pixels", dropped_normal_total.load()},
           {"seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()}};
 }
 }  // namespace geosun

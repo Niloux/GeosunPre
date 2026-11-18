@@ -1,6 +1,8 @@
 #include "io/las.h"
+#include "io/scene.h"
 #include "geometry/model.h"
 
+#include <opencv2/imgcodecs.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -11,6 +13,8 @@
 #include <queue>
 #include <random>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace geosun {
 bool KeepLasPoint(const LasPoint& p) {
@@ -303,7 +307,8 @@ void VerifyInitializationPly(const fs::path& path, uint64_t points) {
   }
 }
 Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& output, double voxel,
-                  const Reconstruction* model) {
+                  const Reconstruction* model, const Reconstruction* visual_model,
+                  const std::function<fs::path(uint32_t)>& static_mask_path) {
   if (!std::isfinite(voxel) || voxel <= 0 || fs::absolute(las) == fs::absolute(output))
     throw std::runtime_error("Invalid PLY voxel size or output");
   if (fs::exists(output))
@@ -336,6 +341,170 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
   }
   constexpr double MaxPlyRange = 50.0;
   constexpr uint64_t MaxPlyPoints = 2500000;
+  constexpr uint64_t MaxVisualSupplementPoints = 100000;
+  constexpr double VisualCoverRadiusM = 0.25;
+  constexpr double MaxVisualRangeM = 250.0;
+  constexpr int64_t VisualCellLimit = int64_t(1) << 20;
+  auto visual_cell_coord = [&](const Eigen::Vector3d& p, double step,
+                               std::array<int64_t, 3>& out) -> bool {
+    for (int k = 0; k < 3; ++k) {
+      const double v = std::floor(p[k] / step);
+      if (!std::isfinite(v) || std::abs(v) >= double(VisualCellLimit - 2))
+        return false;
+      out[k] = int64_t(v);
+    }
+    return true;
+  };
+  auto pack_visual_cell = [&](int64_t cx, int64_t cy, int64_t cz) -> uint64_t {
+    return (uint64_t(cx + VisualCellLimit) << 42) | (uint64_t(cy + VisualCellLimit) << 21) |
+           uint64_t(cz + VisualCellLimit);
+  };
+  struct VisualCandidate {
+    Eigen::Vector3d xyz;
+    std::array<uint8_t, 3> color{127, 127, 127};
+    uint32_t track_size = 0;
+    double error = 0;
+  };
+  std::vector<VisualCandidate> visual_cands;
+  size_t visual_geom_candidates = 0;
+  if (visual_model && static_mask_path) {
+    const double min_parallax_cos = std::cos(2.0 * Pi / 180.0);
+    std::vector<Eigen::Vector3d> cam_centers(visual_model->images.size(), Eigen::Vector3d::Zero());
+    for (size_t id = 0; id < visual_model->images.size(); ++id)
+      if (visual_model->images[id].registered)
+        cam_centers[id] = visual_model->images[id].pose.Center();
+    std::vector<uint64_t> geom_ids;
+    for (uint64_t pid = 0; pid < visual_model->points.size(); ++pid) {
+      const auto& p = visual_model->points[pid];
+      if (p.track.size() < 3 || !p.xyz.allFinite() ||
+          p.xyz.cwiseAbs().maxCoeff() > float32_limit_m || p.error > 1.5)
+        continue;
+      double min_dist = INFINITY;
+      bool valid_obs = true;
+      std::vector<Eigen::Vector3d> dirs;
+      dirs.reserve(p.track.size());
+      for (const auto& o : p.track) {
+        if (o.image >= visual_model->images.size()) {
+          valid_obs = false;
+          break;
+        }
+        const auto& im = visual_model->images[o.image];
+        if (!im.registered || o.feature >= im.pixels.size()) {
+          valid_obs = false;
+          break;
+        }
+        const auto& cam = visual_model->cameras[im.camera];
+        const Eigen::Vector2d& px = im.pixels[o.feature];
+        if (px.x() < 2.0 || px.y() < 2.0 || px.x() > cam.width - 3.0 ||
+            px.y() > cam.height - 3.0) {
+          valid_obs = false;
+          break;
+        }
+        const Eigen::Vector3d v = im.pose.Apply(p.xyz);
+        if (!v.allFinite() || v.z() <= 0.2) {
+          valid_obs = false;
+          break;
+        }
+        min_dist = std::min(min_dist, (p.xyz - cam_centers[o.image]).norm());
+        dirs.push_back((p.xyz - cam_centers[o.image]).normalized());
+      }
+      if (!valid_obs || min_dist < 0.25 || min_dist > MaxVisualRangeM)
+        continue;
+      bool parallax_ok = false;
+      for (size_t i = 0; i < dirs.size() && !parallax_ok; ++i)
+        for (size_t j = i + 1; j < dirs.size(); ++j)
+          if (dirs[i].dot(dirs[j]) <= min_parallax_cos) {
+            parallax_ok = true;
+            break;
+          }
+      if (parallax_ok)
+        geom_ids.push_back(pid);
+    }
+    visual_geom_candidates = geom_ids.size();
+    if (!geom_ids.empty()) {
+      std::vector<uint32_t> zero_center_hits(geom_ids.size(), 0),
+          strict_static_views(geom_ids.size(), 0);
+      std::vector<std::vector<std::pair<uint32_t, Eigen::Vector2d>>> by_image(
+          visual_model->images.size());
+      for (uint32_t gi = 0; gi < uint32_t(geom_ids.size()); ++gi)
+        for (const auto& o : visual_model->points[geom_ids[gi]].track)
+          by_image[o.image].emplace_back(gi, visual_model->images[o.image].pixels[o.feature]);
+      for (uint32_t id = 0; id < uint32_t(by_image.size()); ++id) {
+        if (by_image[id].empty())
+          continue;
+        const auto& cam = visual_model->cameras[visual_model->images[id].camera];
+        const cv::Mat mask = ReadImage(static_mask_path(id), cv::IMREAD_GRAYSCALE);
+        if (mask.type() != CV_8UC1 || mask.cols != cam.width || mask.rows != cam.height)
+          throw std::runtime_error("Static mask dimensions differ during PLY export");
+        for (const auto& [gi, px] : by_image[id]) {
+          const int ix = int(std::floor(px.x())), iy = int(std::floor(px.y()));
+          if (ix < 0 || iy < 0 || ix >= mask.cols || iy >= mask.rows ||
+              mask.at<uint8_t>(iy, ix) == 0) {
+            ++zero_center_hits[gi];
+            continue;
+          }
+          bool all_static = ix >= 2 && iy >= 2 && ix + 2 < mask.cols && iy + 2 < mask.rows;
+          for (int dy = -2; dy <= 2 && all_static; ++dy) {
+            const uint8_t* row = mask.ptr<uint8_t>(iy + dy);
+            for (int dx = -2; dx <= 2; ++dx)
+              if (row[ix + dx] != 255) {
+                all_static = false;
+                break;
+              }
+          }
+          if (all_static)
+            ++strict_static_views[gi];
+        }
+      }
+      for (uint32_t gi = 0; gi < uint32_t(geom_ids.size()); ++gi) {
+        const auto& pt = visual_model->points[geom_ids[gi]];
+        if (zero_center_hits[gi] == 0 && strict_static_views[gi] >= 3 &&
+            uint64_t(strict_static_views[gi]) * 4 >= uint64_t(pt.track.size()) * 3)
+          visual_cands.push_back(
+              {pt.xyz, pt.color, uint32_t(pt.track.size()), pt.error});
+      }
+    }
+  }
+  struct CoverSlot {
+    uint64_t key = UINT64_MAX;
+    uint32_t begin = 0, count = 0;
+  };
+  std::vector<CoverSlot> cover_slots;
+  std::vector<uint32_t> cover_indices;
+  std::vector<uint8_t> visual_covered(visual_cands.size(), 0);
+  size_t uncovered_visual = visual_cands.size();
+  size_t cover_mask = 0;
+  if (!visual_cands.empty()) {
+    std::unordered_map<uint64_t, std::vector<uint32_t>> raw_cells;
+    for (uint32_t ci = 0; ci < uint32_t(visual_cands.size()); ++ci) {
+      std::array<int64_t, 3> c{};
+      if (!visual_cell_coord(visual_cands[ci].xyz, VisualCoverRadiusM, c))
+        continue;
+      for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dx = -1; dx <= 1; ++dx)
+            raw_cells[pack_visual_cell(c[0] + dx, c[1] + dy, c[2] + dz)].push_back(ci);
+    }
+    if (!raw_cells.empty()) {
+      size_t table_size = 16;
+      while (table_size < raw_cells.size() * 2)
+        table_size <<= 1;
+      cover_slots.resize(table_size);
+      cover_mask = table_size - 1;
+      for (const auto& [k, vec] : raw_cells) {
+        const uint32_t begin = uint32_t(cover_indices.size());
+        cover_indices.insert(cover_indices.end(), vec.begin(), vec.end());
+        uint64_t hval = k ^ (k >> 33);
+        hval *= 0xff51afd7ed558ccdULL;
+        hval ^= hval >> 33;
+        size_t pos = size_t(hval) & cover_mask;
+        while (cover_slots[pos].key != UINT64_MAX)
+          pos = (pos + 1) & cover_mask;
+        cover_slots[pos] = {k, begin, uint32_t(vec.size())};
+      }
+    }
+  }
+  const double cover_r2 = VisualCoverRadiusM * VisualCoverRadiusM;
   struct View {
     Eigen::Matrix3d rotation;
     Eigen::Vector3d translation;
@@ -471,6 +640,39 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
         continue;
       }
       ++accepted;
+      if (uncovered_visual && !cover_slots.empty()) {
+        std::array<int64_t, 3> vc{};
+        if (visual_cell_coord(xyz, VisualCoverRadiusM, vc)) {
+          const uint64_t key = pack_visual_cell(vc[0], vc[1], vc[2]);
+          uint64_t hval = key ^ (key >> 33);
+          hval *= 0xff51afd7ed558ccdULL;
+          hval ^= hval >> 33;
+          size_t pos = size_t(hval) & cover_mask;
+          while (cover_slots[pos].key != UINT64_MAX) {
+            if (cover_slots[pos].key == key) {
+              auto& slot = cover_slots[pos];
+              if (slot.count) {
+                bool any_uncovered = false;
+                for (uint32_t idx = 0; idx < slot.count; ++idx) {
+                  const uint32_t cid = cover_indices[slot.begin + idx];
+                  if (visual_covered[cid])
+                    continue;
+                  if ((visual_cands[cid].xyz - xyz).squaredNorm() <= cover_r2) {
+                    visual_covered[cid] = 1;
+                    --uncovered_visual;
+                  } else {
+                    any_uncovered = true;
+                  }
+                }
+                if (!any_uncovered)
+                  slot.count = 0;
+              }
+              break;
+            }
+            pos = (pos + 1) & cover_mask;
+          }
+        }
+      }
       uint64_t linear_key = 0;
       for (int j = 0; j < 3; ++j) {
         const int64_t cell = int64_t(std::floor(xyz[j] / voxel)) - lower[j];
@@ -541,10 +743,42 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
   if (source != FileMetadata(las))
     throw std::runtime_error("LAS changed during initialization");
   const uint64_t voxel_vertices = vertices;
+  std::vector<VisualCandidate> visual_out;
+  if (!visual_cands.empty()) {
+    std::vector<VisualCandidate> uncovered;
+    uncovered.reserve(uncovered_visual);
+    for (size_t i = 0; i < visual_cands.size(); ++i)
+      if (!visual_covered[i])
+        uncovered.push_back(visual_cands[i]);
+    std::sort(uncovered.begin(), uncovered.end(),
+              [](const VisualCandidate& a, const VisualCandidate& b) {
+                if (a.track_size != b.track_size)
+                  return a.track_size > b.track_size;
+                return a.error < b.error;
+              });
+    const double vis_voxel = std::max(voxel, 0.10);
+    std::unordered_set<uint64_t> vis_cells;
+    vis_cells.reserve(std::min<size_t>(uncovered.size(), MaxVisualSupplementPoints));
+    for (const auto& c : uncovered) {
+      std::array<int64_t, 3> vc{};
+      if (!visual_cell_coord(c.xyz, vis_voxel, vc))
+        continue;
+      if (!vis_cells.insert(pack_visual_cell(vc[0], vc[1], vc[2])).second)
+        continue;
+      visual_out.push_back(c);
+      if (visual_out.size() >= MaxVisualSupplementPoints)
+        break;
+    }
+  }
+  const uint64_t visual_vertices = visual_out.size();
+  const uint64_t las_cap = MaxPlyPoints - visual_vertices;
+  const uint64_t las_vertices =
+      (model && voxel_vertices > las_cap) ? las_cap : voxel_vertices;
+  const uint64_t total_vertices = las_vertices + visual_vertices;
   const auto pending = workspace / "points3D.ply";
   std::ofstream final(pending, std::ios::binary);
-  if (model && voxel_vertices > MaxPlyPoints) {
-    final << Header(MaxPlyPoints);
+  final << Header(total_vertices);
+  if (model && voxel_vertices > las_cap) {
     std::ifstream data(payload, std::ios::binary);
     minimum = Eigen::Vector3d::Constant(INFINITY);
     maximum = Eigen::Vector3d::Constant(-INFINITY);
@@ -553,7 +787,7 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
     for (uint64_t i = 0; i < voxel_vertices; ++i) {
       if (!data.read(reinterpret_cast<char*>(vertex.data()), vertex.size()))
         throw std::runtime_error("Truncated PLY vertex cache");
-      acc += MaxPlyPoints;
+      acc += las_cap;
       if (acc >= voxel_vertices) {
         acc -= voxel_vertices;
         float xyz[3];
@@ -567,15 +801,25 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
       }
     }
     data.close();
-    if (emitted != MaxPlyPoints)
+    if (emitted != las_cap)
       throw std::runtime_error("Unexpected PLY subsample count");
-    vertices = emitted;
   } else {
-    final << Header(vertices);
     std::ifstream data(payload, std::ios::binary);
     final << data.rdbuf();
     data.close();
   }
+  for (const auto& vc : visual_out) {
+    std::array<uint8_t, 27> vertex{};
+    for (int j = 0; j < 3; ++j) {
+      const float xyz = float(vc.xyz[j]);
+      std::memcpy(vertex.data() + j * 4, &xyz, 4);
+      minimum[j] = std::min(minimum[j], double(xyz));
+      maximum[j] = std::max(maximum[j], double(xyz));
+      vertex[24 + j] = vc.color[j];
+    }
+    final.write(reinterpret_cast<const char*>(vertex.data()), vertex.size());
+  }
+  vertices = total_vertices;
   final.close();
   if (!final)
     throw std::runtime_error("Incomplete PLY write");
@@ -592,10 +836,16 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
                  {"accepted_records", accepted},
                  {"excluded_withheld_or_noise", rejected},
                  {"points", vertices},
+                 {"las_points", las_vertices},
+                 {"visual_supplement_points", visual_vertices},
                  {"voxel_size_m", voxel},
                  {"sampling",
-                  model ? "registered camera frustums (<=50 m), distance-tiered voxels "
-                          "(1x/2x/4x/8x at 10/20/40/50 m), capped at 2500000"
+                  model ? (visual_model
+                               ? "registered camera frustums (<=50 m) distance-tiered voxels "
+                                 "(1x/2x/4x/8x at 10/20/40/50 m) plus static multi-view visual "
+                                 "anchors beyond LAS cover (>0.25 m, <=250 m), capped at 2500000"
+                               : "registered camera frustums (<=50 m), distance-tiered voxels "
+                                 "(1x/2x/4x/8x at 10/20/40/50 m), capped at 2500000")
                         : "all non-withheld, non-class-7 LAS records; one centroid per voxel"},
                  {"color", "voxel mean of LAS RGB; auto-detect 8/16-bit range; gray if absent"},
                  {"normals", "zero"},
@@ -610,6 +860,13 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
     result["voxel_points_before_cap"] = voxel_vertices;
     result["max_range_m"] = MaxPlyRange;
     result["max_points"] = MaxPlyPoints;
+  }
+  if (visual_model) {
+    result["max_visual_supplement_points"] = MaxVisualSupplementPoints;
+    result["visual_cover_radius_m"] = VisualCoverRadiusM;
+    result["max_visual_range_m"] = MaxVisualRangeM;
+    result["visual_geometry_candidates"] = visual_geom_candidates;
+    result["visual_unmasked_candidates"] = visual_cands.size();
   }
   return result;
 }

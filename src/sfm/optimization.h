@@ -72,5 +72,6 @@ Json Optimize(Reconstruction& model, const std::array<Camera, 2>& initial, const
               const std::vector<PlaneConstraint>& planes = {},
               const std::vector<Eigen::Vector3d>& navigation = {},
               const std::set<uint64_t>& selected_points = {}, ShutterMotion* shutter = nullptr,
-              const std::vector<std::array<uint32_t, 2>>& frames = {});
+              const std::vector<std::array<uint32_t, 2>>& frames = {},
+              const std::set<uint64_t>& fixed_points = {}, bool fixed_rig_and_readout = false);
 }  // namespace geosun

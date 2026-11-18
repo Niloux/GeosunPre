@@ -273,8 +273,8 @@ std::vector<fs::path> CorrectShutter(const Scene& scene, const fs::path& work,
                                      const Json& settings) {
   const auto original = ReadJson(work / "cache/alignment.json");
   const auto model = ReadModel(SelectedModelPath(work, original));
-  auto correction = CorrectRollingShutter(scene, model, settings.at("workers"), Limits(settings),
-                                          settings.at("ba_workers"));
+  auto correction = CorrectRollingShutter(scene, model, work, settings.at("workers"),
+                                          Limits(settings), settings.at("ba_workers"));
   auto& report = correction.report;
   report["enabled"] = true;
   report["source_model"] = original.value("selected_model", std::string("aligned"));

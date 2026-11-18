@@ -379,3 +379,57 @@
 | 有效监督像素（深度 / 法向）/ `points3D.ply` | `225,080,139` / `306,386,746` / `2,500,000` | `224,996,325` / `306,386,023` / `2,500,000` | `-0.04%` / `-0.00%` |
 
 - **当前耗时收敛分析**：经 Phase 1 消除 CPU 编解码、随机小文件 I/O、Ceres 动态求导/大块稀疏与跨视角冲突瓶颈后，全流程剩余耗时已主要收敛至纯 TensorRT `batch = 1` 引擎执行本身（双场景下 `SAM3 grounding` GPU `98.06–107.84 s`、`MoGe geometry` GPU `74.65–81.34 s`、`LoMa matcher` GPU `47.98–59.48 s`，三者合计占总耗时 `~41%–43%`）；在保持零模型改动与零精度损失前提下，已达纯粹 C++/CUDA 工程层面的高性价比上限，下一步可转入面向下游 3DGS 的质量优化阶段（Phase 2）。
+
+---
+
+## 2026-11-18：面向下游 3DGS 实测短板的三项提质（Phase 2）双场景实测
+
+- **测试环境**：Windows x64，`NVIDIA GeForce RTX 4090`（`SM 8.9`，`24564 MiB`），Ninja Release（`/W4` 零新增警告），`LichtFeld-Studio` 与 [trainer.json](file:///D:/Dev/GeosunPre/configs/trainer.json) 零改动。
+- **核心改动（三项提质）**：
+  1. **室外天空 `128/255` 边缘原图引导细化与冠层天孔清理**（[static_masks.cpp](file:///D:/Dev/GeosunPre/src/geometry/static_masks.cpp)）：在 `sky.kept = true` 的室外场景中，围绕 `128/255` 边界 ROI 执行 `O(1)` 盒滤波 + 解析 `3×3` 双精度逆的彩色引导滤波细化（阈值 `0.35` 将粗网格残留的树冠/屋檐白边吃进 `128`），以 `5×5` 腐蚀后的 LAS 有效深度内核硬锁 `255` 保护建筑玻璃幕墙、白色篮板与浅色屋檐，并清理紧邻开阔天空且 `9×9` 外环 `>= 65%` 为暗色枝叶的树冠高亮低饱和天孔。
+  2. **MoGe 子图按 $\omega_i$ 去卷帘重采样 + 跨视角冲突区法向联动置零**（[supervision_kernels.h](file:///D:/Dev/GeosunPre/src/geometry/supervision_kernels.h)、[supervision_kernels.cu](file:///D:/Dev/GeosunPre/src/geometry/supervision_kernels.cu)、[monocular.h](file:///D:/Dev/GeosunPre/src/geometry/monocular.h)、[monocular.cpp](file:///D:/Dev/GeosunPre/src/geometry/monocular.cpp)、[supervision.cpp](file:///D:/Dev/GeosunPre/src/geometry/supervision.cpp)）：GPU 核函数 `SampleMogeFaces` 按每帧读出转角 $\omega_i$ 执行 3 步不动点去卷帘反向映射，直接采样对齐 $s=0$ 参考姿态的针孔子图，并在 `FitFaceScales` / `GatherFaces` 双向换算将融合法向旋回像素读出线相机系（`moge2_vitl_faces_readout_line`）；`FilterViewConflicts` 在删除未获可信 LAS 确认且 `>= 2` 视角矛盾深度的 `4×4` 格内同步将矛盾法向置零 `(0,0,0)`。
+  3. **同步双目 `shutter` 后刚体引导漏帧补注册 + 初始化 `points3D.ply` 补盲区/远景视觉点**（[optimization.h](file:///D:/Dev/GeosunPre/src/sfm/optimization.h)、[optimization.cpp](file:///D:/Dev/GeosunPre/src/sfm/optimization.cpp)、[shutter.h](file:///D:/Dev/GeosunPre/src/sfm/shutter.h)、[shutter.cpp](file:///D:/Dev/GeosunPre/src/sfm/shutter.cpp)、[pipeline.cpp](file:///D:/Dev/GeosunPre/src/app/pipeline.cpp)、[las.h](file:///D:/Dev/GeosunPre/src/io/las.h)、[las.cpp](file:///D:/Dev/GeosunPre/src/io/las.cpp)、[colmap.cpp](file:///D:/Dev/GeosunPre/src/io/colmap.cpp)）：
+     - `PolishAcceptedShutter` 后执行 `RescueSynchronousFrames`：利用已收敛双目外参与 `RigShutterRotation` 为漏帧赋毫米级初值，综合 `matches.bin`、距离感知判歧 2D-3D 投影挂载与同镜头卷帘极线走廊互近邻匹配建立轨迹，经固定背景/外参/读出时间的两阶段局部卷帘 BA 与严格准入（`>= 32` 观测、`>= 8` 覆盖格、重投影限值、外参漂移 `<= 3 cm / 1.5°`、导航 `< 0.25 m`）恢复漏帧。
+     - `ExportLasPly` 从清理前视觉模型筛选 `0.25–250 m` 内无 `0.25 m` 近邻有效 LAS 覆盖的高置信静态多视图点（`>= 3` 视图、重投影 `<= 1.5 px`、视差 `>= 2°`、零 `0` 掩码中心且 `>= 75%` 视图 `5×5 == 255`），按 `0.10 m` 去重（上限 `100,000`）并入 `points3D.ply`（总量仍封顶 `2,500,000`），保持 `points3D.bin` 纯 LAS 锚定口径不变。
+
+### 1. 室内 `展厅` 实测对照（`work\展厅-fast` vs `work\展厅-p2`）
+
+新交付目录 [work\展厅-p2](file:///D:/Dev/GeosunPre/work/展厅-p2) 经 `geosunpre.exe check` 回读校验通过（`"passed": true`）并保留在本地。
+
+| 阶段 / 指标 | 基线 `work\展厅-fast` | Phase 2 `work\展厅-p2` | 变化幅度 / 备注 |
+| --- | --- | --- | --- |
+| **注册情况 / `check` 校验** | `584 / 588`（`complete: false`） / `passed: true` | **`588 / 588`（`complete: true`）** / **`passed: true`** | **`rig_rescue` 补齐 `3/3` 漏帧**（`00214-R`: `762` obs / `0.674 px`；`00215-R`: `842` obs / `0.693 px`；`00301-R`: `315` obs / `1.101 px`；`00216-R` 已于 `sfm` 注册 `478` obs） |
+| SfM 点数 / 观测数 / `>=3` 轨迹 | `151,057` / `732,531` / `70,380` | **`152,333` / `738,242` / `70,483`** | `+1,276` 点 / `+5,711` 观测（`rig_rescue` 耗时 `17.71 s`，`+1,264` 点 `+2,931` 观测） |
+| 重投影误差 `median` / `p90`（`L` / `R` 中位） | `0.8881` / `2.0670 px`（`0.8297` / `0.9550`） | `0.8894` / `2.0697 px`（`0.8331` / `0.9546`） | 补齐全部右目漏帧后精度保持持平 |
+| 卷帘留出 `before -> after` / `polish` 点到面 | `1.4174 -> 1.1414 px` / `5.70 / 16.94 mm` | **`1.4121 -> 1.1353 px`** / `5.74 / 16.81 mm` | 平面 P90 微降至 `16.81 mm` |
+| `static_masks.sky` 室内保护 | `kept: false`（`0` 像素 `128`） | `kept: false`（`edge_refined_images: 0`，`0` 像素 `128`） | 室内发光灯箱与白色天花零误挖 |
+| MoGe 可信 LAS 锚点总数 / 内点率 | `140,387,672` / `94.72%` | **`141,678,230`** / `94.68%` | 去卷帘对齐 + 补齐全帧净增 `+129.1 万` 可信锚点 |
+| 跨视角冲突剔除（深度 / **法向**） | `38,451,798 px` / `0 px` | `38,611,791 px` / **`36,459,152 px`** | 弧形玻璃展柜（如 `00146-R`）表面假法向精准清零 |
+| 有效监督像素（深度 / 法向） | `335,962,013` / `394,345,339` | `338,545,560` / `360,680,178` | 剔除矛盾玻璃法向 `-8.54%`，交付体积 `1803.82 -> 1790.52 MiB` |
+| **`points3D.ply`（总点 / LAS / 视觉补充）** | `881,551`（纯 LAS） | **`882,682`**（`881,578` LAS + **`1,104` 视觉**） | 从 `48,488` 个纯静态多视图点中补齐 `1,104` 个激光盲区锚点 |
+| 全流程总耗时（`shutter` / `supervision`） | `608.94 s`（`73.01 s` / `122.23 s`） | `631.37 s`（`88.32 s` / `124.22 s`） | 含 `rig_rescue`（`17.71 s`）与法向联动重写仅 `+22.43 s`（`+3.7%`） |
+
+### 2. 室外 `篮球场` 实测对照（`work\篮球场-fast` vs `work\篮球场-p2`）
+
+新交付目录 [work\篮球场-p2](file:///D:/Dev/GeosunPre/work/篮球场-p2) 经 `geosunpre.exe check` 回读校验通过（`"passed": true`）并保留在本地。
+
+| 阶段 / 指标 | 基线 `work\篮球场-fast` | Phase 2 `work\篮球场-p2` | 变化幅度 / 备注 |
+| --- | --- | --- | --- |
+| 注册情况 / `check` 校验 | `536 / 536`（`complete: true`） / `passed: true` | **`536 / 536`（`complete: true`）** / **`passed: true`** | 100% 完整通过（`rig_rescue` `attempted: 0` 零开销跳过） |
+| 重投影 `median` / `p90` 与 `polish` 点到面 | `0.7054` / `1.7377 px`，`3.72 / 14.74 mm` | `0.7060` / `1.7402 px`，`3.76 / 14.89 mm` | 几何指标稳定持平 |
+| **室外天空细化（`static_masks.sky`）** | `kept: true`，无原图细化 | `kept: true`，**`edge_refined_images: 520`**（**`+13,341,116` 天空 px**，`+540,068` 静态 px） | 平均每图剥离约 `2.57 万` 像素树冠/屋檐高曝白边及叶隙天孔；目视抽检 `00203-R`、`00244-L`、`00120-R` 确认玻璃幕墙、白色篮板、灯杆与凉亭屋檐完好保持 `255` |
+| **MoGe 可信 LAS 锚点总数 / 冲突深度** | `85,660,199` / `66,711,925 px` | **`85,719,701`** / **`65,131,692 px`** | 静态掩码收缩 `13.34M px` 下可信锚点仍净增 `+5.95 万`，跨视角深度冲突下降 **`-158.0 万 px`（`-2.37%`）**，印证 $\omega_i$ 去卷帘重采样消除了转身错位 |
+| **冲突区法向联动清零（`dropped_normal_pixels`）** | `0 px`（有效法向 `306,386,023`） | **`65,106,698 px`**（有效法向 `238,724,684`） | 同步清零树隙与玻璃幕墙反射区的矛盾法向，交付体积由 `2340.94 MiB` 降至 **`2247.47 MiB`**（`-93.47 MiB`） |
+| **`points3D.ply`（总点 / LAS / 视觉补充）** | `2,500,000`（纯 `<=50 m` LAS） | **`2,500,000`**（`2,495,565` LAS + **`4,435` 视觉**） | 从 `58,236` 个纯静态多视图点中筛出 **`4,435` 个 `> 50 m` 高楼立面与激光盲区初始锚点** |
+| 全流程总耗时（`static_masks` / `supervision`） | `535.43 s`（`26.04 s` / `119.66 s`） | `689.87 s`（`162.83 s` / `125.05 s`） | `supervision` 仅 `+5.39 s`；新增耗时主要来自 `520` 幅原图 ROI 彩色引导滤波细化（`+136.79 s`） |
+
+### 3. 下游 3DGS 闭环评测阻塞说明与宿主机复核命令
+
+- **沙盒环境阻塞说明**：在当前代理受限执行沙盒内调用独立打包的 `geosun_3dgs_train.exe` 时，`cudaDriverGetVersion()` 在受限进程令牌下返回 `0.0`（`[error] main.cpp:70 CUDA 0.0 is too old; the trainer requires CUDA 12.8 or newer`），且 `\\?\` 扩展路径日志适配器无法在沙盒访问默认用户目录或新建子目录。按零修改 `LichtFeld-Studio` 与不绕过沙盒边界约定，保留两份完整校验交付产物，由宿主机常规 PowerShell 终端执行下游 3DGS 训练与同口径 `eval`：
+  ```powershell
+  & "D:\Dev\LichtFeld-Studio\build-delivery\Geosun-3DGS-Trainer-sm80-20261117-190930\bin\geosun_3dgs_train.exe" --config "D:\Dev\GeosunPre\configs\trainer.json" -d "D:\Dev\GeosunPre\work\篮球场-p2" -o "D:\Dev\GeosunPre\work\篮球场-p2-3dgs" --headless
+  & "D:\Dev\LichtFeld-Studio\build-windows-release\LichtFeld-Studio.exe" eval "D:\Dev\GeosunPre\work\篮球场-p2-3dgs\project.licht" -d "D:\Dev\GeosunPre\work\篮球场-p2" -o "D:\Dev\GeosunPre\work\篮球场-p2-3dgs\eval" --eval-all --eval-mask="masks:D:\Dev\GeosunPre\work\篮球场-p2\masks" --eval-mask-report=mask,unmasked
+
+  & "D:\Dev\LichtFeld-Studio\build-delivery\Geosun-3DGS-Trainer-sm80-20261117-190930\bin\geosun_3dgs_train.exe" --config "D:\Dev\GeosunPre\configs\trainer.json" -d "D:\Dev\GeosunPre\work\展厅-p2" -o "D:\Dev\GeosunPre\work\展厅-p2-3dgs" --headless
+  & "D:\Dev\LichtFeld-Studio\build-windows-release\LichtFeld-Studio.exe" eval "D:\Dev\GeosunPre\work\展厅-p2-3dgs\project.licht" -d "D:\Dev\GeosunPre\work\展厅-p2" -o "D:\Dev\GeosunPre\work\展厅-p2-3dgs\eval" --eval-all --eval-mask="masks:D:\Dev\GeosunPre\work\展厅-p2\masks" --eval-mask-report=mask,unmasked
+  ```

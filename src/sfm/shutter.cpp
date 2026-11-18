@@ -1,9 +1,14 @@
 #include "sfm/shutter.h"
 #include "frontend/frontend.h"
 #include "geometry/supervision.h"
+#include "io/cache.h"
+#include <Eigen/Eigenvalues>
+#include <Eigen/SVD>
 #include <algorithm>
+#include <numeric>
 #include <optional>
 #include <set>
+#include <unordered_map>
 
 namespace geosun {
 namespace {
@@ -527,6 +532,7 @@ void PolishAcceptedShutter(const Scene& scene, const Reconstruction& source,
                         {"seconds", Seconds(started)}};
     return;
   }
+  accepted_axis.unrectified = std::move(model);
   accepted_axis.correction.candidate = std::move(rectified);
   accepted_axis.correction.motion = std::move(motion);
   report["readout_s"] = accepted_axis.correction.motion.readout;
@@ -544,10 +550,918 @@ void PolishAcceptedShutter(const Scene& scene, const Reconstruction& source,
                       {"checks", checks},
                       {"seconds", Seconds(started)}};
 }
+
+void UpdateImageVelocity(const Reconstruction& model, const ShutterInputs& inputs,
+                         ShutterMotion& motion, uint32_t id) {
+  const Eigen::Vector3d v_nav = model.images[id].pose.Rotation() * inputs.kinematics.velocity[id];
+  const Eigen::Vector3d r_cam = model.images[id].pose.Rotation() * inputs.kinematics.lever_arm[id];
+  const double tau = motion.readout[model.images[id].camera];
+  motion.velocity[id] =
+      std::abs(tau) > 1e-3 ? Eigen::Vector3d(v_nav - (motion.rotation[id] / tau).cross(r_cam))
+                           : v_nav;
+}
+struct LocalFeatureData {
+  std::vector<float> normalized_descriptors;  // N * 256 L2-normalized floats
+  std::vector<std::array<uint8_t, 3>> colors;
+  int grid_w = 0, grid_h = 0;
+  std::vector<std::vector<uint32_t>> cells;
+  static constexpr int CellSize = 32;
+  void Build(const Camera& cam, FeatureSet&& fs) {
+    const size_t n = fs.pixels.size();
+    if (fs.dimension != 256 || fs.descriptors.size() != n * 256)
+      throw std::runtime_error("Unexpected feature descriptor dimensions during rig rescue");
+    normalized_descriptors.resize(n * 256);
+    for (size_t i = 0; i < n; ++i) {
+      const float* src = fs.descriptors.data() + i * 256;
+      float* dst = normalized_descriptors.data() + i * 256;
+      double norm2 = 0;
+      for (int d = 0; d < 256; ++d)
+        norm2 += double(src[d]) * double(src[d]);
+      const float inv = norm2 > 1e-12 ? float(1.0 / std::sqrt(norm2)) : 0.f;
+      for (int d = 0; d < 256; ++d)
+        dst[d] = src[d] * inv;
+    }
+    colors = std::move(fs.colors);
+    grid_w = std::max(1, (cam.width + CellSize - 1) / CellSize);
+    grid_h = std::max(1, (cam.height + CellSize - 1) / CellSize);
+    cells.assign(size_t(grid_w) * size_t(grid_h), {});
+    for (size_t i = 0; i < n; ++i) {
+      const int cx = std::clamp(int(fs.pixels[i][0]) / CellSize, 0, grid_w - 1);
+      const int cy = std::clamp(int(fs.pixels[i][1]) / CellSize, 0, grid_h - 1);
+      cells[size_t(cy) * size_t(grid_w) + size_t(cx)].push_back(uint32_t(i));
+    }
+  }
+  const float* Descriptor(uint32_t f) const { return normalized_descriptors.data() + size_t(f) * 256; }
+};
+float DescriptorCosine(const float* a, const float* b) {
+  float sum = 0;
+  for (int d = 0; d < 256; ++d)
+    sum += a[d] * b[d];
+  return sum;
+}
+bool ProjectShutter(const Reconstruction& model, const ShutterMotion& motion, uint32_t id,
+                    const Eigen::Vector3d& world_xyz, Eigen::Vector2d& out) {
+  const auto& image = model.images[id];
+  const auto& cam = model.cameras[image.camera];
+  const Eigen::Vector3d p_ref = image.pose.Apply(world_xyz);
+  if (!p_ref.allFinite())
+    return false;
+  double s = 0;
+  Eigen::Vector2d px = Eigen::Vector2d::Zero();
+  for (int it = 0; it < 4; ++it) {
+    const Eigen::Vector3d p_exp = motion.Apply(id, image.camera, s, p_ref);
+    if (!p_exp.allFinite() || p_exp.z() <= 1e-3)
+      return false;
+    px = cam.Project(p_exp);
+    if (!px.allFinite())
+      return false;
+    s = motion.Fraction(cam, px);
+  }
+  const Eigen::Vector3d final_exp = motion.Apply(id, image.camera, s, p_ref);
+  if (!final_exp.allFinite() || final_exp.z() <= 1e-3)
+    return false;
+  px = cam.Project(final_exp);
+  if (!px.allFinite() || px.x() < 0 || px.y() < 0 || px.x() >= cam.width || px.y() >= cam.height)
+    return false;
+  const double dx = (px.x() - cam.params[2]) / cam.params[0],
+               dy = (px.y() - cam.params[3]) / cam.params[1];
+  const double radius = cam.Radius();
+  if (dx * dx + dy * dy > radius * radius)
+    return false;
+  out = px;
+  return true;
+}
+Eigen::Matrix<double, 3, 4> InstantProjection(const Reconstruction& model,
+                                              const ShutterMotion& motion,
+                                              const Observation& o) {
+  const auto& image = model.images[o.image];
+  const auto& cam = model.cameras[image.camera];
+  const double s = motion.Fraction(cam, image.pixels[o.feature]);
+  const Eigen::Matrix3d a = Readout(motion, o.image, s);
+  Eigen::Matrix<double, 3, 4> p;
+  p.leftCols<3>() = a * image.pose.Rotation().toRotationMatrix();
+  p.col(3) =
+      a * (image.pose.Translation() - s * motion.readout[image.camera] * motion.velocity[o.image]);
+  return p;
+}
+bool TriangulateShutterTrack(const Reconstruction& model, const ShutterMotion& motion,
+                             const std::vector<Observation>& track, Eigen::Vector3d& point) {
+  if (track.size() < 2)
+    return false;
+  Eigen::MatrixXd design(2 * track.size(), 4);
+  for (size_t i = 0; i < track.size(); ++i) {
+    const auto& image = model.images[track[i].image];
+    const auto& cam = model.cameras[image.camera];
+    const Eigen::Vector3d ray = cam.Ray(image.pixels[track[i].feature]);
+    const auto p = InstantProjection(model, motion, track[i]);
+    design.row(2 * i) = ray.x() * p.row(2) - ray.z() * p.row(0);
+    design.row(2 * i + 1) = ray.y() * p.row(2) - ray.z() * p.row(1);
+  }
+  const Eigen::Vector4d v = design.jacobiSvd(Eigen::ComputeFullV).matrixV().col(3);
+  if (std::abs(v[3]) < 1e-12)
+    return false;
+  point = v.head<3>() / v[3];
+  if (!point.allFinite())
+    return false;
+  for (const auto& o : track)
+    if (Exposed(model, motion, o, point).z() <= 1e-3)
+      return false;
+  RefineShutterPoint(model, motion, track, point);
+  if (!point.allFinite())
+    return false;
+  for (const auto& o : track) {
+    const double z = Exposed(model, motion, o, point).z();
+    if (!std::isfinite(z) || z <= 1e-3)
+      return false;
+  }
+  return true;
+}
+double TrackParallaxCosine(const Reconstruction& model, const std::vector<Observation>& track,
+                           const Eigen::Vector3d& point) {
+  double best_cos = 1.0;
+  std::vector<Eigen::Vector3d> dirs;
+  dirs.reserve(track.size());
+  for (const auto& o : track)
+    dirs.push_back((point - model.images[o.image].pose.Center()).normalized());
+  for (size_t i = 0; i < dirs.size(); ++i)
+    for (size_t j = i + 1; j < dirs.size(); ++j)
+      best_cos = std::min(best_cos, dirs[i].dot(dirs[j]));
+  return best_cos;
+}
+double FixedShutterPositionSigma(const Reconstruction& model, const ShutterMotion& motion,
+                                 const ModelPoint& point) {
+  Eigen::Matrix3d information = Eigen::Matrix3d::Zero();
+  for (const auto& o : point.track) {
+    const auto& image = model.images[o.image];
+    const auto& cam = model.cameras[image.camera];
+    const double s = motion.Fraction(cam, image.pixels[o.feature]);
+    const Eigen::Vector3d v = motion.Apply(o.image, image.camera, s, image.pose.Apply(point.xyz));
+    if (v.z() <= 1e-6)
+      return INFINITY;
+    const Eigen::Matrix<double, 2, 3> j = cam.ProjectionJacobian(v) * Readout(motion, o.image, s) *
+                                          image.pose.Rotation().toRotationMatrix();
+    information.noalias() += j.transpose() * j;
+  }
+  const auto eigen = Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(information).eigenvalues().eval();
+  return std::max(.5, point.error) / std::sqrt(std::max(eigen[0], 1e-18));
+}
+double PointToSegmentDistSq(const Eigen::Vector2d& p, const Eigen::Vector2d& a,
+                            const Eigen::Vector2d& b) {
+  const Eigen::Vector2d d = b - a;
+  const double len2 = d.squaredNorm();
+  const double t = len2 > 1e-12 ? std::clamp((p - a).dot(d) / len2, 0., 1.) : 0.;
+  return (p - (a + t * d)).squaredNorm();
+}
+// Finds the best descriptor match in image v along the rolling-shutter epipolar ray of feature
+// (u, fu). When margin_px > 0 and ratio_ok is populated, applies Lowe ratio or strong cos guard.
+bool BestAlongEpipolar(const Reconstruction& model, const ShutterMotion& motion, uint32_t u,
+                       uint32_t fu, const LocalFeatureData& fd_u, uint32_t v,
+                       const LocalFeatureData& fd_v, std::vector<uint32_t>& seen_stamp,
+                       uint32_t& stamp, uint32_t& best_fv, float& best_cos) {
+  constexpr int NumDepthSteps = 48;
+  constexpr double InvNear = 1.0 / 0.25, InvFar = 1.0 / 50.0, CorridorPx = 10.0;
+  const auto& img_u = model.images[u];
+  const auto& img_v = model.images[v];
+  const auto& cam_u = model.cameras[img_u.camera];
+  const Eigen::Vector2d& px_u = img_u.pixels[fu];
+  const double s_u = motion.Fraction(cam_u, px_u);
+  const Eigen::Vector3d ray_u = cam_u.Ray(px_u);
+  const Eigen::Matrix3d a_inv_u = Readout(motion, u, s_u).inverse();
+  const Eigen::Matrix3d r_u_t = img_u.pose.Rotation().toRotationMatrix().transpose();
+  const Eigen::Vector3d origin_u =
+      r_u_t * (s_u * motion.readout[img_u.camera] * motion.velocity[u] - img_u.pose.Translation());
+  const Eigen::Vector3d dir_u = r_u_t * (a_inv_u * ray_u);
+
+  std::array<Eigen::Vector2d, NumDepthSteps> poly;
+  std::array<bool, NumDepthSteps> poly_ok{};
+  int valid_count = 0;
+  for (int k = 0; k < NumDepthSteps; ++k) {
+    const double d = 1.0 / (InvNear - double(k) * (InvNear - InvFar) / double(NumDepthSteps - 1));
+    const Eigen::Vector3d world = origin_u + d * dir_u;
+    if (ProjectShutter(model, motion, v, world, poly[size_t(k)])) {
+      poly_ok[size_t(k)] = true;
+      ++valid_count;
+    }
+  }
+  if (!valid_count)
+    return false;
+
+  ++stamp;
+  const float* desc_u = fd_u.Descriptor(fu);
+  float top1 = -1.f, top2 = -1.f;
+  uint32_t top1_id = UINT32_MAX;
+  auto visit_cell = [&](int cx, int cy) {
+    if (cx < 0 || cx >= fd_v.grid_w || cy < 0 || cy >= fd_v.grid_h)
+      return;
+    for (const uint32_t fv : fd_v.cells[size_t(cy) * size_t(fd_v.grid_w) + size_t(cx)]) {
+      if (seen_stamp[fv] == stamp)
+        continue;
+      seen_stamp[fv] = stamp;
+      const Eigen::Vector2d& pv = img_v.pixels[fv];
+      double min_d2 = INFINITY;
+      for (int k = 0; k < NumDepthSteps; ++k) {
+        if (!poly_ok[size_t(k)])
+          continue;
+        if (k + 1 < NumDepthSteps && poly_ok[size_t(k + 1)] &&
+            (poly[size_t(k + 1)] - poly[size_t(k)]).squaredNorm() <= 400.0 * 400.0) {
+          min_d2 = std::min(min_d2, PointToSegmentDistSq(pv, poly[size_t(k)], poly[size_t(k + 1)]));
+        } else {
+          min_d2 = std::min(min_d2, (pv - poly[size_t(k)]).squaredNorm());
+        }
+      }
+      if (min_d2 > CorridorPx * CorridorPx)
+        continue;
+      const float c = DescriptorCosine(desc_u, fd_v.Descriptor(fv));
+      if (c > top1) {
+        top2 = top1;
+        top1 = c;
+        top1_id = fv;
+      } else if (c > top2) {
+        top2 = c;
+      }
+    }
+  };
+  for (int k = 0; k < NumDepthSteps; ++k) {
+    if (!poly_ok[size_t(k)])
+      continue;
+    const auto visit_around = [&](const Eigen::Vector2d& p) {
+      const int cx = int(p.x()) / LocalFeatureData::CellSize,
+                cy = int(p.y()) / LocalFeatureData::CellSize;
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx)
+          visit_cell(cx + dx, cy + dy);
+    };
+    visit_around(poly[size_t(k)]);
+    if (k + 1 < NumDepthSteps && poly_ok[size_t(k + 1)]) {
+      const double len = (poly[size_t(k + 1)] - poly[size_t(k)]).norm();
+      if (len > 16.0 && len <= 400.0) {
+        const int steps = int(std::ceil(len / 16.0));
+        for (int s = 1; s < steps; ++s) {
+          const double alpha = double(s) / double(steps);
+          visit_around((1.0 - alpha) * poly[size_t(k)] + alpha * poly[size_t(k + 1)]);
+        }
+      }
+    }
+  }
+  if (top1_id == UINT32_MAX || top1 < 0.72f)
+    return false;
+  if (top2 > -0.5f && top1 < 0.85f) {
+    const double d1 = std::sqrt(std::max(0., 2.0 - 2.0 * double(top1))),
+                 d2 = std::sqrt(std::max(1e-6, 2.0 - 2.0 * double(top2)));
+    if (d1 / d2 > 0.90)
+      return false;
+  }
+  best_fv = top1_id;
+  best_cos = top1;
+  return true;
+}
+
+void RescueSynchronousFrames(const Scene& scene, const fs::path& work,
+                             const ShutterInputs& inputs, int workers,
+                             const AlignmentLimits& limits, int ba_workers,
+                             EvaluatedAxis& accepted_axis) {
+  const auto started = Clock::now();
+  auto& report = accepted_axis.correction.report;
+  Reconstruction model = accepted_axis.unrectified;
+  ShutterMotion motion = accepted_axis.correction.motion;
+  Pose rig;
+  if (inputs.frames.empty() || model.Registered() == model.images.size() ||
+      !RigExtrinsic(model, inputs.frames, rig)) {
+    report["rig_rescue"] = {{"attempted_images", 0}, {"rescued_images", 0}};
+    return;
+  }
+  struct Candidate {
+    uint32_t missing = 0, known = 0;
+    bool missing_is_right = true;
+  };
+  std::vector<Candidate> candidates;
+  const double tl_global = motion.readout[0], tr_global = motion.readout[1];
+  for (const auto& f : inputs.frames) {
+    const bool r0 = model.images[f[0]].registered, r1 = model.images[f[1]].registered;
+    if (r0 == r1)
+      continue;
+    const uint32_t missing = r0 ? f[1] : f[0], known = r0 ? f[0] : f[1];
+    if ((model.images[known].pose.Center() - inputs.navigation[known]).norm() >= NavigationGate)
+      continue;
+    Pose predicted;
+    Eigen::Vector3d pred_rot = Eigen::Vector3d::Zero();
+    if (!r1) {
+      predicted.Set(
+          (rig.Rotation() * model.images[known].pose.Rotation()).normalized(),
+          rig.Rotation() * model.images[known].pose.Translation() + rig.Translation());
+      if (std::abs(tl_global) > 1e-6)
+        pred_rot = (tr_global / tl_global) * (rig.Rotation() * motion.rotation[known]);
+    } else {
+      predicted.Set(
+          (rig.Rotation().conjugate() * model.images[known].pose.Rotation()).normalized(),
+          rig.Rotation().conjugate() * (model.images[known].pose.Translation() - rig.Translation()));
+      if (std::abs(tr_global) > 1e-6)
+        pred_rot = (tl_global / tr_global) * (rig.Rotation().conjugate() * motion.rotation[known]);
+    }
+    if ((predicted.Center() - inputs.navigation[missing]).norm() >= NavigationGate)
+      continue;
+    for (int k = 0; k < 3; ++k)
+      pred_rot[k] = std::clamp(pred_rot[k], -RotationBound * .98, RotationBound * .98);
+    model.images[missing].pose = predicted;
+    model.images[missing].registered = true;
+    model.images[missing].points.assign(model.images[missing].pixels.size(), NoPoint);
+    motion.rotation[missing] = pred_rot;
+    UpdateImageVelocity(model, inputs, motion, missing);
+    candidates.push_back({missing, known, !r1});
+  }
+  if (candidates.empty()) {
+    report["rig_rescue"] = {{"attempted_images", 0}, {"rescued_images", 0}};
+    return;
+  }
+
+  const Reconstruction saved_model = accepted_axis.unrectified;
+  const ShutterMotion saved_motion = accepted_axis.correction.motion;
+  std::set<uint32_t> cand_set, local_set;
+  for (const auto& c : candidates) {
+    cand_set.insert(c.missing);
+    local_set.insert(c.missing);
+    local_set.insert(c.known);
+  }
+  for (uint32_t id = 0; id < uint32_t(model.images.size()); ++id) {
+    if (!model.images[id].registered || local_set.count(id))
+      continue;
+    const double t_id = ExposureTime(scene.images[id]);
+    const Eigen::Vector3d c_id = model.images[id].pose.Center();
+    for (const auto& cand : candidates) {
+      if (std::abs(ExposureTime(scene.images[cand.missing]) - t_id) <= 8.0 ||
+          (model.images[cand.missing].pose.Center() - c_id).squaredNorm() <= 36.0) {
+        local_set.insert(id);
+        break;
+      }
+    }
+  }
+
+  std::unordered_map<uint32_t, LocalFeatureData> features;
+  for (const uint32_t id : local_set) {
+    auto fs = ReadFeatures(FeaturePath(work, id));
+    if (fs.pixels.size() != model.images[id].pixels.size())
+      throw std::runtime_error("Feature count mismatch during rig rescue");
+    LocalFeatureData lfd;
+    lfd.Build(model.cameras[model.images[id].camera], std::move(fs));
+    features.emplace(id, std::move(lfd));
+  }
+
+  struct RawEdge {
+    uint32_t a = 0, fa = 0, b = 0, fb = 0;
+    float weight = 0;
+  };
+  std::vector<RawEdge> raw_edges;
+  std::map<std::pair<uint32_t, uint32_t>, std::vector<Match>> archive_pairs;
+  {
+    const auto matches_path = MatchesPath(work);
+    const auto index = IndexMatchArchive(matches_path, false);
+    std::ifstream stream(matches_path, std::ios::binary);
+    if (!stream)
+      throw std::runtime_error("Cannot read matches archive during rig rescue");
+    for (const auto& [key, offset] : index) {
+      if (!local_set.count(key.first) || !local_set.count(key.second))
+        continue;
+      if (!cand_set.count(key.first) && !cand_set.count(key.second))
+        continue;
+      auto ms = ReadMatchRecord(stream, offset, key.first, key.second);
+      const auto& fd_a = features.at(key.first);
+      const auto& fd_b = features.at(key.second);
+      for (const auto& m : ms.matches) {
+        const float c = DescriptorCosine(fd_a.Descriptor(m.a), fd_b.Descriptor(m.b));
+        raw_edges.push_back({key.first, m.a, key.second, m.b, std::max(m.score, c)});
+      }
+      archive_pairs.emplace(key, std::move(ms.matches));
+    }
+  }
+
+  const double min_parallax_cos = std::cos(1.5 * Pi / 180.0);
+  // 1) Attach candidates to existing 3D points via guided 2D-3D projection and archive matches.
+  struct AttachProposal {
+    uint32_t img = 0, feat = 0;
+    uint64_t pid = 0;
+    float cosine = 0;
+    double err = 0;
+  };
+  std::vector<AttachProposal> attach_proposals;
+  std::vector<uint8_t> has_local_obs(model.points.size(), 0);
+  for (uint64_t pid = 0; pid < model.points.size(); ++pid)
+    for (const auto& o : model.points[pid].track)
+      if (local_set.count(o.image) && !cand_set.count(o.image)) {
+        has_local_obs[pid] = 1;
+        break;
+      }
+
+  for (const auto& e : raw_edges) {
+    auto check_link = [&](uint32_t u, uint32_t fu, uint32_t v, uint32_t fv) {
+      if (!cand_set.count(u) || cand_set.count(v))
+        return;
+      const uint64_t pid = model.images[v].points[fv];
+      if (pid == NoPoint)
+        return;
+      const auto& pt = model.points[pid];
+      if (pt.track.empty() || Exposed(model, motion, {u, fu}, pt.xyz).z() <= 0.15)
+        return;
+      const double err = ShutterError(model, motion, {u, fu}, pt.xyz);
+      if (err > 6.0)
+        return;
+      const Eigen::Vector3d dir_u = (pt.xyz - model.images[u].pose.Center()).normalized();
+      bool parallax_ok = false;
+      for (const auto& o : pt.track)
+        if (dir_u.dot((pt.xyz - model.images[o.image].pose.Center()).normalized()) <=
+            min_parallax_cos) {
+          parallax_ok = true;
+          break;
+        }
+      if (!parallax_ok)
+        return;
+      const float c = DescriptorCosine(features.at(u).Descriptor(fu), features.at(v).Descriptor(fv));
+      if (c >= 0.55f)
+        attach_proposals.push_back({u, fu, pid, std::max(c, e.weight), err});
+    };
+    check_link(e.a, e.fa, e.b, e.fb);
+    check_link(e.b, e.fb, e.a, e.fa);
+  }
+
+  for (const uint32_t u : cand_set) {
+    const auto& fd_u = features.at(u);
+    const auto& img_u = model.images[u];
+    for (uint64_t pid = 0; pid < model.points.size(); ++pid) {
+      if (!has_local_obs[pid])
+        continue;
+      const auto& pt = model.points[pid];
+      Eigen::Vector2d px_pred;
+      if (!ProjectShutter(model, motion, u, pt.xyz, px_pred))
+        continue;
+      const double dist = (pt.xyz - img_u.pose.Center()).norm();
+      if (dist < 0.15 || dist > 60.0)
+        continue;
+      const Eigen::Vector3d dir_u = (pt.xyz - img_u.pose.Center()).normalized();
+      bool parallax_ok = false;
+      for (const auto& o : pt.track)
+        if (dir_u.dot((pt.xyz - model.images[o.image].pose.Center()).normalized()) <=
+            min_parallax_cos) {
+          parallax_ok = true;
+          break;
+        }
+      if (!parallax_ok)
+        continue;
+      const int cx = int(px_pred.x()) / LocalFeatureData::CellSize,
+                cy = int(px_pred.y()) / LocalFeatureData::CellSize;
+      float best_cos = -1.f, second_cos = -1.f;
+      uint32_t best_fu = UINT32_MAX;
+      double best_err = 9.0, second_err = 9.0;
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int gx = cx + dx, gy = cy + dy;
+          if (gx < 0 || gx >= fd_u.grid_w || gy < 0 || gy >= fd_u.grid_h)
+            continue;
+          for (const uint32_t fu : fd_u.cells[size_t(gy) * size_t(fd_u.grid_w) + size_t(gx)]) {
+            const double err = (img_u.pixels[fu] - px_pred).norm();
+            if (err > 8.0)
+              continue;
+            const float* du = fd_u.Descriptor(fu);
+            float max_c = -1.f;
+            for (const auto& o : pt.track) {
+              const auto it = features.find(o.image);
+              if (it != features.end())
+                max_c = std::max(max_c, DescriptorCosine(du, it->second.Descriptor(o.feature)));
+            }
+            if (max_c > best_cos) {
+              second_cos = best_cos;
+              second_err = best_err;
+              best_cos = max_c;
+              best_fu = fu;
+              best_err = err;
+            } else if (max_c > second_cos) {
+              second_cos = max_c;
+              second_err = err;
+            }
+          }
+        }
+      if (best_fu == UINT32_MAX || best_cos < 0.72f)
+        continue;
+      if (second_cos > best_cos - 0.03f && second_err <= best_err + 2.5 &&
+          !(best_cos >= 0.88f && best_err <= 2.5))
+        continue;
+      attach_proposals.push_back({u, best_fu, pid, best_cos, best_err});
+    }
+  }
+
+  std::sort(attach_proposals.begin(), attach_proposals.end(),
+            [](const AttachProposal& a, const AttachProposal& b) {
+              if (a.cosine != b.cosine)
+                return a.cosine > b.cosine;
+              return a.err < b.err;
+            });
+  std::set<std::pair<uint32_t, uint64_t>> img_has_point;
+  std::set<uint64_t> touched_existing;
+  size_t attached_obs = 0;
+  for (const auto& ap : attach_proposals) {
+    if (model.images[ap.img].points[ap.feat] != NoPoint)
+      continue;
+    if (img_has_point.count({ap.img, ap.pid}))
+      continue;
+    auto& pt = model.points[ap.pid];
+    bool already_in_track = false;
+    for (const auto& o : pt.track)
+      if (o.image == ap.img) {
+        already_in_track = true;
+        break;
+      }
+    if (already_in_track)
+      continue;
+    pt.track.push_back({ap.img, ap.feat});
+    model.images[ap.img].points[ap.feat] = ap.pid;
+    img_has_point.emplace(ap.img, ap.pid);
+    touched_existing.insert(ap.pid);
+    ++attached_obs;
+  }
+
+  // 2) Same-lens guided rolling-shutter epipolar-corridor matching on close neighbor pairs.
+  std::set<std::pair<uint32_t, uint32_t>> corridor_pairs;
+  for (const uint32_t u : cand_set) {
+    for (const uint32_t v : local_set) {
+      if (u == v || model.images[u].camera != model.images[v].camera)
+        continue;
+      const double dt = std::abs(ExposureTime(scene.images[u]) - ExposureTime(scene.images[v]));
+      const double dist = (model.images[u].pose.Center() - model.images[v].pose.Center()).norm();
+      if (dt > 5.0 && dist > 4.5)
+        continue;
+      const auto p = std::make_pair(std::min(u, v), std::max(u, v));
+      if (!corridor_pairs.insert(p).second)
+        continue;
+      // Skip corridor search if the existing archive matches already have abundant valid links.
+      size_t valid_raw = 0;
+      std::set<int> cells;
+      const auto it = archive_pairs.find(p);
+      if (it != archive_pairs.end()) {
+        for (const auto& m : it->second) {
+          const Observation oa{p.first, m.a}, ob{p.second, m.b};
+          Eigen::Vector3d xyz;
+          if (TriangulateShutterTrack(model, motion, {oa, ob}, xyz) &&
+              ShutterError(model, motion, oa, xyz) <= 4.0 &&
+              ShutterError(model, motion, ob, xyz) <= 4.0 &&
+              TrackParallaxCosine(model, {oa, ob}, xyz) <= min_parallax_cos) {
+            ++valid_raw;
+            cells.insert(model.cameras[model.images[u].camera].CoverageCell(
+                model.images[u].pixels[p.first == u ? m.a : m.b]));
+          }
+        }
+      }
+      if (valid_raw >= 120 && cells.size() >= 16)
+        continue;
+      const auto& fd_a = features.at(p.first);
+      const auto& fd_b = features.at(p.second);
+      const size_t na = model.images[p.first].pixels.size(), nb = model.images[p.second].pixels.size();
+      std::vector<uint32_t> stamp_b(nb, 0), stamp_a(na, 0);
+      uint32_t cur_sb = 0, cur_sa = 0;
+      std::vector<int64_t> fwd_best(na, -1);
+      std::vector<float> fwd_cos(na, 0.f);
+      std::unordered_map<uint32_t, std::pair<uint32_t, float>> rev_cache;
+      for (uint32_t fa = 0; fa < uint32_t(na); ++fa) {
+        if (model.images[p.first].points[fa] != NoPoint)
+          continue;
+        uint32_t fb = UINT32_MAX;
+        float fc = 0.f;
+        if (BestAlongEpipolar(model, motion, p.first, fa, fd_a, p.second, fd_b, stamp_b, cur_sb,
+                              fb, fc)) {
+          fwd_best[fa] = fb;
+          fwd_cos[fa] = fc;
+        }
+      }
+      for (uint32_t fa = 0; fa < uint32_t(na); ++fa) {
+        if (fwd_best[fa] < 0)
+          continue;
+        const uint32_t fb = uint32_t(fwd_best[fa]);
+        if (model.images[p.second].points[fb] != NoPoint)
+          continue;
+        auto rit = rev_cache.find(fb);
+        if (rit == rev_cache.end()) {
+          uint32_t back_fa = UINT32_MAX;
+          float back_cos = 0.f;
+          if (!BestAlongEpipolar(model, motion, p.second, fb, fd_b, p.first, fd_a, stamp_a, cur_sa,
+                                 back_fa, back_cos))
+            back_fa = UINT32_MAX;
+          rit = rev_cache.emplace(fb, std::make_pair(back_fa, back_cos)).first;
+        }
+        if (rit->second.first == fa)
+          raw_edges.push_back({p.first, fa, p.second, fb, std::max(fwd_cos[fa], rit->second.second)});
+      }
+    }
+  }
+
+  // 3) Triangulate new multi-view tracks among unattached features.
+  std::sort(raw_edges.begin(), raw_edges.end(), [](const RawEdge& a, const RawEdge& b) {
+    return a.weight > b.weight;
+  });
+  std::vector<RawEdge> verified_edges;
+  for (const auto& e : raw_edges) {
+    if (!cand_set.count(e.a) && !cand_set.count(e.b))
+      continue;
+    if (model.images[e.a].points[e.fa] != NoPoint || model.images[e.b].points[e.fb] != NoPoint)
+      continue;
+    const Observation oa{e.a, e.fa}, ob{e.b, e.fb};
+    Eigen::Vector3d xyz;
+    if (!TriangulateShutterTrack(model, motion, {oa, ob}, xyz))
+      continue;
+    const double za = Exposed(model, motion, oa, xyz).z(),
+                 zb = Exposed(model, motion, ob, xyz).z();
+    if (za < 0.15 || za > 50.0 || zb < 0.15 || zb > 50.0)
+      continue;
+    if (ShutterError(model, motion, oa, xyz) > 4.0 || ShutterError(model, motion, ob, xyz) > 4.0)
+      continue;
+    if (TrackParallaxCosine(model, {oa, ob}, xyz) > min_parallax_cos)
+      continue;
+    verified_edges.push_back(e);
+  }
+
+  std::vector<uint32_t> local_list(local_set.begin(), local_set.end());
+  std::unordered_map<uint32_t, size_t> local_offset;
+  size_t total_feats = 0;
+  for (const uint32_t id : local_list) {
+    local_offset[id] = total_feats;
+    total_feats += model.images[id].pixels.size();
+  }
+  std::vector<uint32_t> node_image(total_feats);
+  for (const uint32_t id : local_list)
+    std::fill_n(node_image.begin() + std::ptrdiff_t(local_offset[id]),
+                model.images[id].pixels.size(), id);
+  std::vector<size_t> parent(total_feats), comp_size(total_feats, 1);
+  std::iota(parent.begin(), parent.end(), 0);
+  std::unordered_map<size_t, std::vector<uint32_t>> comp_images;
+  auto uf_root = [&](size_t x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+  auto get_imgs = [&](size_t r) -> std::vector<uint32_t> {
+    const auto it = comp_images.find(r);
+    return it != comp_images.end() ? it->second : std::vector<uint32_t>{node_image[r]};
+  };
+  for (const auto& e : verified_edges) {
+    const size_t na = local_offset.at(e.a) + e.fa, nb = local_offset.at(e.b) + e.fb;
+    size_t ra = uf_root(na), rb = uf_root(nb);
+    if (ra == rb)
+      continue;
+    auto ia = get_imgs(ra), ib = get_imgs(rb);
+    bool conflict = false;
+    for (const uint32_t id : ia)
+      if (std::binary_search(ib.begin(), ib.end(), id)) {
+        conflict = true;
+        break;
+      }
+    if (conflict)
+      continue;
+    if (comp_size[ra] < comp_size[rb]) {
+      std::swap(ra, rb);
+      std::swap(ia, ib);
+    }
+    std::vector<uint32_t> merged;
+    std::merge(ia.begin(), ia.end(), ib.begin(), ib.end(), std::back_inserter(merged));
+    parent[rb] = ra;
+    comp_size[ra] += comp_size[rb];
+    comp_images[ra] = std::move(merged);
+    comp_images.erase(rb);
+  }
+
+  std::unordered_map<size_t, std::vector<Observation>> cand_tracks;
+  for (const uint32_t id : local_list) {
+    const size_t off = local_offset[id];
+    for (uint32_t k = 0; k < uint32_t(model.images[id].pixels.size()); ++k) {
+      if (model.images[id].points[k] != NoPoint)
+        continue;
+      const size_t r = uf_root(off + k);
+      if (comp_size[r] >= 2)
+        cand_tracks[r].push_back({id, k});
+    }
+  }
+  const uint64_t new_point_start = model.points.size();
+  std::set<uint64_t> new_points;
+  for (auto& [root_id, track] : cand_tracks) {
+    (void)root_id;
+    const bool touches_cand = std::any_of(track.begin(), track.end(), [&](const Observation& o) {
+      return cand_set.count(o.image) != 0;
+    });
+    if (!touches_cand)
+      continue;
+    Eigen::Vector3d xyz;
+    if (!TriangulateShutterTrack(model, motion, track, xyz))
+      continue;
+    if (TrackParallaxCosine(model, track, xyz) > min_parallax_cos)
+      continue;
+    ModelPoint mp;
+    mp.xyz = xyz;
+    mp.track = std::move(track);
+    mp.error = ShutterPointError(model, motion, mp);
+    double max_err = 0;
+    bool depth_ok = true;
+    std::array<uint64_t, 3> rgb_sum{};
+    for (const auto& o : mp.track) {
+      const double z = Exposed(model, motion, o, mp.xyz).z();
+      if (z < 0.15 || z > 50.0) {
+        depth_ok = false;
+        break;
+      }
+      max_err = std::max(max_err, ShutterError(model, motion, o, mp.xyz));
+      const auto& col = features.at(o.image).colors[o.feature];
+      for (int c = 0; c < 3; ++c)
+        rgb_sum[c] += col[c];
+    }
+    if (!depth_ok || max_err > 3.5 || mp.error > 2.5 ||
+        FixedShutterPositionSigma(model, motion, mp) > 0.05)
+      continue;
+    for (int c = 0; c < 3; ++c)
+      mp.color[c] = uint8_t(rgb_sum[c] / mp.track.size());
+    const uint64_t pid = model.points.size();
+    model.points.push_back(std::move(mp));
+    new_points.insert(pid);
+  }
+  model.RebuildReferences();
+
+  std::set<uint64_t> selected_points = touched_existing;
+  selected_points.insert(new_points.begin(), new_points.end());
+  auto sanitize_tracks = [&](double max_cand_err, bool strict_new) {
+    for (auto it = selected_points.begin(); it != selected_points.end();) {
+      const uint64_t pid = *it;
+      auto& pt = model.points[pid];
+      if (pt.track.empty()) {
+        it = selected_points.erase(it);
+        continue;
+      }
+      pt.track.erase(
+          std::remove_if(pt.track.begin(), pt.track.end(),
+                         [&](const Observation& o) {
+                           if (!model.images[o.image].registered)
+                             return true;
+                           if (Exposed(model, motion, o, pt.xyz).z() <= 1e-3)
+                             return true;
+                           if (cand_set.count(o.image) &&
+                               ShutterError(model, motion, o, pt.xyz) > max_cand_err)
+                             return true;
+                           return false;
+                         }),
+          pt.track.end());
+      if (pid >= new_point_start) {
+        pt.error = ShutterPointError(model, motion, pt);
+        bool keep = pt.track.size() >= 2 && TrackParallaxCosine(model, pt.track, pt.xyz) <= min_parallax_cos;
+        if (keep && strict_new)
+          keep = pt.error <= 2.5 && FixedShutterPositionSigma(model, motion, pt) <= 0.05;
+        if (!keep)
+          pt.track.clear();
+      } else if (pt.track.size() < 2) {
+        pt.track.clear();
+      }
+      if (pt.track.empty())
+        it = selected_points.erase(it);
+      else
+        ++it;
+    }
+    model.RebuildReferences();
+  };
+
+  sanitize_tracks(6.0, false);
+  if (!selected_points.empty()) {
+    std::set<uint32_t> active_cands;
+    for (const uint32_t u : cand_set)
+      if (std::any_of(model.images[u].points.begin(), model.images[u].points.end(),
+                      [](uint64_t pid) { return pid != NoPoint; }))
+        active_cands.insert(u);
+    if (!active_cands.empty()) {
+      Optimize(model, scene.cameras, "fixed", ba_workers, 40, active_cands, {}, inputs.navigation,
+               selected_points, &motion, inputs.frames, selected_points, true);
+      for (const uint32_t u : active_cands)
+        UpdateImageVelocity(model, inputs, motion, u);
+      sanitize_tracks(4.0, false);
+      if (!selected_points.empty()) {
+        Optimize(model, scene.cameras, "fixed", ba_workers, 30, active_cands, {},
+                 inputs.navigation, selected_points, &motion, inputs.frames, touched_existing, true);
+        for (const uint32_t u : active_cands)
+          UpdateImageVelocity(model, inputs, motion, u);
+        sanitize_tracks(3.0, true);
+      }
+    }
+  }
+
+  // 4) Strict per-frame acceptance and rollback of failed candidates.
+  std::set<uint32_t> rejected_cands, rescued_cands;
+  std::vector<std::string> rescued_names;
+  for (const auto& cand : candidates) {
+    const uint32_t id = cand.missing;
+    const auto& image = model.images[id];
+    const auto& cam = model.cameras[image.camera];
+    std::vector<double> errs;
+    std::set<int> cells;
+    for (size_t k = 0; k < image.points.size(); ++k)
+      if (image.points[k] != NoPoint) {
+        const double e = ShutterError(model, motion, {id, uint32_t(k)},
+                                      model.points[image.points[k]].xyz);
+        if (std::isfinite(e)) {
+          errs.push_back(e);
+          cells.insert(cam.CoverageCell(image.pixels[k]));
+        }
+      }
+    Pose expected;
+    if (cand.missing_is_right) {
+      expected.Set(
+          (rig.Rotation() * model.images[cand.known].pose.Rotation()).normalized(),
+          rig.Rotation() * model.images[cand.known].pose.Translation() + rig.Translation());
+    } else {
+      expected.Set(
+          (rig.Rotation().conjugate() * model.images[cand.known].pose.Rotation()).normalized(),
+          rig.Rotation().conjugate() *
+              (model.images[cand.known].pose.Translation() - rig.Translation()));
+    }
+    const double pos_drift = (image.pose.Center() - expected.Center()).norm();
+    const double rot_drift = image.pose.Rotation().angularDistance(expected.Rotation());
+    const double nav_err = (image.pose.Center() - inputs.navigation[id]).norm();
+    const bool ok = errs.size() >= MinimumImageObservations && cells.size() >= MinimumImageCells &&
+                    Quantile(errs, .5) <= limits.median_px && Quantile(errs, .9) <= limits.p90_px &&
+                    pos_drift <= 0.03 && rot_drift <= 1.5 * Pi / 180.0 && nav_err < NavigationGate;
+    if (ok) {
+      rescued_cands.insert(id);
+      rescued_names.push_back(scene.images[id].name);
+    } else {
+      rejected_cands.insert(id);
+      model.images[id].registered = false;
+      model.images[id].points.assign(model.images[id].pixels.size(), NoPoint);
+      motion.rotation[id].setZero();
+      motion.velocity[id].setZero();
+    }
+  }
+  if (!rejected_cands.empty())
+    sanitize_tracks(3.0, true);
+  if (rescued_cands.empty()) {
+    accepted_axis.unrectified = saved_model;
+    accepted_axis.correction.motion = saved_motion;
+    report["rig_rescue"] = {{"attempted_images", candidates.size()},
+                            {"rescued_images", 0},
+                            {"names", Json::array()},
+                            {"added_points", 0},
+                            {"added_observations", 0},
+                            {"seconds", Seconds(started)}};
+    return;
+  }
+
+  for (const uint64_t pid : selected_points)
+    model.points[pid].error = ShutterPointError(model, motion, model.points[pid]);
+
+  std::vector<double> shift;
+  auto rectified = RectifyModel(model, motion, workers, shift);
+  const auto quality = rectified.Quality(scene, limits.median_px, limits.p90_px);
+  bool consistent = false;
+  const auto consistency = ReadoutConsistency(scene, rectified, motion, consistent);
+  std::vector<double> rotation, translation;
+  const bool bounded = MotionStats(model, motion, rotation, translation);
+  if (!quality.at("passed").get<bool>() || !consistent || !bounded) {
+    accepted_axis.unrectified = saved_model;
+    accepted_axis.correction.motion = saved_motion;
+    Log("Rig rescue rejected after global check (" + std::to_string(rescued_cands.size()) +
+        " candidate images rolled back)");
+    report["rig_rescue"] = {{"attempted_images", candidates.size()},
+                            {"rescued_images", 0},
+                            {"names", Json::array()},
+                            {"added_points", 0},
+                            {"added_observations", 0},
+                            {"seconds", Seconds(started)}};
+    return;
+  }
+
+  size_t added_points = 0, added_obs = 0;
+  for (uint64_t pid = new_point_start; pid < model.points.size(); ++pid)
+    if (!model.points[pid].track.empty()) {
+      ++added_points;
+      added_obs += model.points[pid].track.size();
+    }
+  for (const uint64_t pid : touched_existing)
+    for (const auto& o : model.points[pid].track)
+      if (rescued_cands.count(o.image))
+        ++added_obs;
+
+  accepted_axis.unrectified = std::move(model);
+  accepted_axis.correction.candidate = std::move(rectified);
+  accepted_axis.correction.motion = std::move(motion);
+  report["readout_rotation_deg"] = Statistics(rotation);
+  report["readout_translation_m"] = Statistics(translation);
+  report["readout_consistency"] = consistency;
+  report["observation_shift_px"] = Statistics(shift);
+  report["candidate_quality"] = quality;
+  report["rig_rescue"] = {{"attempted_images", candidates.size()},
+                          {"rescued_images", rescued_names.size()},
+                          {"names", rescued_names},
+                          {"added_points", added_points},
+                          {"added_observations", added_obs},
+                          {"attached_existing_candidates", attached_obs},
+                          {"seconds", Seconds(started)}};
+  Log("Rig rescue: recovered " + std::to_string(rescued_names.size()) + "/" +
+      std::to_string(candidates.size()) + " synchronous frames (+" + std::to_string(added_points) +
+      " points, +" + std::to_string(added_obs) + " obs)");
+}
 }  // namespace
 ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction& source,
-                                        int workers, const AlignmentLimits& limits,
-                                        int ba_workers) {
+                                        const fs::path& work, int workers,
+                                        const AlignmentLimits& limits, int ba_workers) {
   if (!ba_workers)
     ba_workers = workers;
   const auto started = Clock::now();
@@ -647,8 +1561,10 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
                           {"seconds", s.seconds}});
     }
   }
-  if (best.correction.accepted)
+  if (best.correction.accepted) {
     PolishAcceptedShutter(scene, source, inputs, workers, limits, ba_workers, best);
+    RescueSynchronousFrames(scene, work, inputs, workers, limits, ba_workers, best);
+  }
   auto& report = best.correction.report;
   report["method"] = "per-image readout rotation and per-lens readout time with the navigation "
                      "velocity, jointly with cameras, points and intrinsics, screened along rows "

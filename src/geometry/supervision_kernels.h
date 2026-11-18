@@ -65,6 +65,11 @@ void EncodeMaps(const Blend* blends, int w, int h, int boundary, float focal, co
                 const float3* rays, float* raw_depth, unsigned* codes, float* filtered,
                 float* scratch, uint8_t* limit, uint8_t* dilated, float* seeds, uint8_t* edge,
                 uint16_t* millimetres, uchar3* normals, cudaStream_t stream);
+void SampleMogeFaces(const uint8_t* prefiltered, int pre_w, int pre_h, const double* source_params,
+                     int src_w, int src_h, double source_radius, double sx, double sy,
+                     const double* to_camera, double3 omega, int rolling, int axis, int faces,
+                     int face_size, double focal, float* out_chw, uint8_t* out_face_valid,
+                     cudaStream_t stream);
 void SampleMogeShiftGrid(const float* points, const float* mask, const uint8_t* face_valid,
                          int size, float4* samples, cudaStream_t stream);
 void BuildMogeFaceEstimates(const float* points, const float* normals, const float* mask,

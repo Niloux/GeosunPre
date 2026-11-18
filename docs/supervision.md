@@ -22,4 +22,4 @@
 .\build-windows-release\LichtFeld-Studio.exe --headless -d "交付目录" -o "训练输出" --gut --mask-mode segment_and_ignore --use-depth-loss --use-normal-loss
 ```
 
-MoGe 导出完成后进行跨视角深度一致性检查，每次最多并行处理 8 幅主视图，每个线程最多同时解码两张深度图。
+MoGe 导出在 GPU 重采样阶段按帧读出转角 `ω` 将透视子图对齐至参考姿态（拟合后将法向旋回读出线相机系，记录为 `moge2_vitl_faces_readout_line`）；完成后执行跨视角深度一致性检查，每次最多并行处理 8 幅主视图，每个线程最多同时解码两张深度图，对未获可信 LAS 确认且至少 2 个视角冲突的格子同步清零深度与法向。

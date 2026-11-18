@@ -35,6 +35,8 @@ void ScanLas(const fs::path& path, const LasHeader& header,
 std::vector<Eigen::Vector3d> SampleLas(const fs::path& path, const LasHeader& header,
                                        Json& metadata, size_t maximum = 1500000);
 Json ExportLasPly(const fs::path& las, const LasHeader& header, const fs::path& output,
-                  double voxel = .05, const Reconstruction* model = nullptr);
+                  double voxel = .05, const Reconstruction* model = nullptr,
+                  const Reconstruction* visual_model = nullptr,
+                  const std::function<fs::path(uint32_t)>& static_mask_path = {});
 void VerifyInitializationPly(const fs::path& path, uint64_t points);
 }  // namespace geosun

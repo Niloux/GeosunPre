@@ -721,6 +721,87 @@ void EncodeMaps(const Blend* blends, int w, int h, int boundary, float focal,
 }
 
 namespace {
+__global__ void SampleMogeFacesKernel(const uint8_t* prefiltered, int pre_w, int pre_h,
+                                      const double* source_params, int src_w, int src_h,
+                                      double source_radius, double sx, double sy,
+                                      const double* to_camera, double3 omega, int rolling, int axis,
+                                      int face_size, double focal, float* out_chw,
+                                      uint8_t* out_face_valid) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int f = blockIdx.y;
+  const size_t face_pixels = size_t(face_size) * face_size;
+  if (idx >= int(face_pixels))
+    return;
+  const int v = idx / face_size, u = idx % face_size;
+  const double rx0 = (u + 0.5 - face_size * 0.5) / focal;
+  const double ry0 = (v + 0.5 - face_size * 0.5) / focal;
+  const double* tc = to_camera + size_t(f) * 9;
+  double rx = tc[0] * rx0 + tc[1] * ry0 + tc[2];
+  double ry = tc[3] * rx0 + tc[4] * ry0 + tc[5];
+  double rz = tc[6] * rx0 + tc[7] * ry0 + tc[8];
+  const double rlen = sqrt(rx * rx + ry * ry + rz * rz);
+  rx /= rlen;
+  ry /= rlen;
+  rz /= rlen;
+  double px = rx, py = ry, pz = rz;
+  if (rolling) {
+    const double axis_size = axis ? double(src_h) : double(src_w);
+    for (int k = 0; k < 3; ++k) {
+      if (pz <= 0.0)
+        break;
+      double u_src = 0.0, v_src = 0.0;
+      FisheyePixel(px, py, pz, source_params, u_src, v_src);
+      double s = ((axis ? v_src : u_src) - 0.5 * axis_size) / axis_size;
+      s = fmax(-0.5, fmin(0.5, s));
+      const double wx = s * omega.x, wy = s * omega.y, wz = s * omega.z;
+      px = rx + wy * rz - wz * ry;
+      py = ry + wz * rx - wx * rz;
+      pz = rz + wx * ry - wy * rx;
+    }
+  }
+  bool valid = pz > 0.0;
+  double u_src = 0.0, v_src = 0.0;
+  if (valid) {
+    const double r = hypot(px, py);
+    const double theta = atan2(r, pz);
+    if (theta > MaxTheta)
+      valid = false;
+    else {
+      FisheyePixel(px, py, pz, source_params, u_src, v_src);
+      const double dx = (u_src - source_params[2]) / source_params[0];
+      const double dy = (v_src - source_params[3]) / source_params[1];
+      if (!(u_src >= 0.0 && v_src >= 0.0 && u_src < double(src_w) && v_src < double(src_h) &&
+            dx * dx + dy * dy <= source_radius * source_radius))
+        valid = false;
+    }
+  }
+  const size_t out_base = size_t(f) * 3 * face_pixels + size_t(idx);
+  if (!valid) {
+    out_face_valid[size_t(f) * face_pixels + size_t(idx)] = 0;
+    out_chw[out_base] = 0.f;
+    out_chw[out_base + face_pixels] = 0.f;
+    out_chw[out_base + 2 * face_pixels] = 0.f;
+    return;
+  }
+  const double fx = fmax(0.0, fmin(double(pre_w - 1), u_src * sx - 0.5));
+  const double fy = fmax(0.0, fmin(double(pre_h - 1), v_src * sy - 0.5));
+  const int x0 = int(floor(fx)), y0 = int(floor(fy));
+  const int x1 = min(x0 + 1, pre_w - 1), y1 = min(y0 + 1, pre_h - 1);
+  const float tx = float(fx - x0), ty = float(fy - y0);
+  const float w00 = (1.f - tx) * (1.f - ty), w10 = tx * (1.f - ty), w01 = (1.f - tx) * ty,
+              w11 = tx * ty;
+  const size_t i00 = (size_t(y0) * pre_w + x0) * 3;
+  const size_t i10 = (size_t(y0) * pre_w + x1) * 3;
+  const size_t i01 = (size_t(y1) * pre_w + x0) * 3;
+  const size_t i11 = (size_t(y1) * pre_w + x1) * 3;
+  for (int c = 0; c < 3; ++c) {
+    const float val = w00 * prefiltered[i00 + c] + w10 * prefiltered[i10 + c] +
+                      w01 * prefiltered[i01 + c] + w11 * prefiltered[i11 + c];
+    out_chw[out_base + size_t(c) * face_pixels] = val * (1.f / 255.f);
+  }
+  out_face_valid[size_t(f) * face_pixels + size_t(idx)] = 255;
+}
+
 __global__ void SampleMogeShiftGridKernel(const float* points, const float* mask,
                                           const uint8_t* face_valid, int size, float4* samples) {
   const int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -934,6 +1015,20 @@ __global__ void AccumulateConflictVotesKernel(const ConflictPair* pairs, int max
     atomicAdd(tile_conflicts + size_t(pair.slot_b) * max_cells + cell, 1u);
 }
 }  // namespace
+
+void SampleMogeFaces(const uint8_t* prefiltered, int pre_w, int pre_h, const double* source_params,
+                     int src_w, int src_h, double source_radius, double sx, double sy,
+                     const double* to_camera, double3 omega, int rolling, int axis, int faces,
+                     int face_size, double focal, float* out_chw, uint8_t* out_face_valid,
+                     cudaStream_t stream) {
+  if (faces <= 0)
+    return;
+  const dim3 grid(unsigned((size_t(face_size) * face_size + 255) / 256), unsigned(faces));
+  SampleMogeFacesKernel<<<grid, 256, 0, stream>>>(
+      prefiltered, pre_w, pre_h, source_params, src_w, src_h, source_radius, sx, sy, to_camera,
+      omega, rolling, axis, face_size, focal, out_chw, out_face_valid);
+  CudaCheck(cudaGetLastError());
+}
 
 void SampleMogeShiftGrid(const float* points, const float* mask, const uint8_t* face_valid,
                          int size, float4* samples, cudaStream_t stream) {

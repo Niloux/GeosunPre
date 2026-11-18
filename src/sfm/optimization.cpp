@@ -375,7 +375,8 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
               int workers, int iterations, const std::set<uint32_t>& variable_images,
               const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav,
               const std::set<uint64_t>& selected_points, ShutterMotion* shutter,
-              const std::vector<std::array<uint32_t, 2>>& frames) {
+              const std::vector<std::array<uint32_t, 2>>& frames,
+              const std::set<uint64_t>& fixed_points, bool fixed_rig_and_readout) {
   const auto started = Clock::now();
   ceres::Problem problem;
   auto ordering = std::make_shared<ceres::ParameterBlockOrdering>();
@@ -384,6 +385,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   size_t observations = 0;
   const bool metric = !nav.empty();
   size_t variable_count = 0;
+  bool has_variable_points = false;
   std::vector<std::array<double, 10>> shutter_images;
   std::array<std::array<double, 9>, 2> shutter_cameras{};
   if (shutter) {
@@ -399,13 +401,15 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   }
   for (auto& p : m.points)
     if (p.track.size() >= 2) {
-      if (!selected_points.empty() && !selected_points.count(uint64_t(&p - m.points.data())))
+      const uint64_t pid = uint64_t(&p - m.points.data());
+      if (!selected_points.empty() && !selected_points.count(pid))
         continue;
       if (!variable_images.empty() &&
           std::none_of(p.track.begin(), p.track.end(),
                        [&](const auto& o) { return variable_images.count(o.image) != 0; }))
         continue;
-      const bool need_depth_guard = !metric || p.track.size() == 2;
+      const bool point_fixed = fixed_points.count(pid) != 0;
+      const bool need_depth_guard = !point_fixed && (!metric || p.track.size() == 2);
       for (const auto& o : p.track) {
         ++observations;
         auto& image = m.images[o.image];
@@ -432,8 +436,25 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         used_images.insert(o.image);
         used_cameras.insert(image.camera);
       }
-      ordering->AddElementToGroup(p.xyz.data(), 0);
+      if (point_fixed) {
+        problem.SetParameterBlockConstant(p.xyz.data());
+      } else {
+        ordering->AddElementToGroup(p.xyz.data(), 0);
+        has_variable_points = true;
+      }
     }
+  if (fixed_rig_and_readout && !frames.empty()) {
+    for (const auto& f : frames) {
+      if (!m.images[f[0]].registered || !m.images[f[1]].registered)
+        continue;
+      if (variable_images.count(f[0]) || variable_images.count(f[1])) {
+        used_images.insert(f[0]);
+        used_images.insert(f[1]);
+        used_cameras.insert(m.images[f[0]].camera);
+        used_cameras.insert(m.images[f[1]].camera);
+      }
+    }
+  }
   const double observation_build_seconds = Seconds(started);
   if (used_images.size() < 2)
     throw std::runtime_error("Insufficient BA observations");
@@ -442,8 +463,12 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         (!metric && id == m.gauge_image) || (!variable_images.empty() && !variable_images.count(id));
     if (shutter) {
       auto* block = shutter_images[id].data();
+      if (!problem.HasParameterBlock(block))
+        problem.AddParameterBlock(block, 10);
       ordering->AddElementToGroup(block, 1);
-      if (fixed_pose) {
+      if (fixed_pose && fixed_rig_and_readout) {
+        problem.SetParameterBlockConstant(block);
+      } else if (fixed_pose) {
         problem.SetManifold(block, new ceres::SubsetManifold(10, {0, 1, 2, 3, 4, 5, 6}));
       } else {
         problem.SetManifold(
@@ -451,12 +476,16 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
                                               ceres::EuclideanManifold<6>>());
         ++variable_count;
       }
-      for (int i = 7; i < 10; ++i) {
-        problem.SetParameterLowerBound(block, i, -.05);
-        problem.SetParameterUpperBound(block, i, .05);
+      if (!(fixed_pose && fixed_rig_and_readout)) {
+        for (int i = 7; i < 10; ++i) {
+          problem.SetParameterLowerBound(block, i, -.05);
+          problem.SetParameterUpperBound(block, i, .05);
+        }
       }
     } else {
       auto* pose = m.images[id].pose.params.data();
+      if (!problem.HasParameterBlock(pose))
+        problem.AddParameterBlock(pose, 7);
       problem.SetManifold(
           pose,
           new ceres::ProductManifold<ceres::EigenQuaternionManifold, ceres::EuclideanManifold<3>>());
@@ -481,8 +510,12 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   for (uint32_t cid : used_cameras) {
     double* params = shutter ? shutter_cameras[cid].data() : m.cameras[cid].params.data();
     const int dim = shutter ? 9 : 8;
+    if (!problem.HasParameterBlock(params))
+      problem.AddParameterBlock(params, dim);
     ordering->AddElementToGroup(params, 1);
-    if (stage == "fixed") {
+    if (fixed_rig_and_readout) {
+      problem.SetParameterBlockConstant(params);
+    } else if (stage == "fixed") {
       if (shutter)
         problem.SetManifold(params, new ceres::SubsetManifold(9, {0, 1, 2, 3, 4, 5, 6, 7}));
       else
@@ -503,7 +536,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         problem.SetParameterUpperBound(params, i, initial[cid].params[i] + delta[i]);
       }
     }
-    if (shutter) {
+    if (shutter && !fixed_rig_and_readout) {
       problem.SetParameterLowerBound(params, 8, -.05);
       problem.SetParameterUpperBound(params, 8, .05);
     }
@@ -526,7 +559,20 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   Pose rig;
   size_t rig_frames = 0;
   ceres::LossFunction* rig_shutter_loss = nullptr;
-  if (!frames.empty() && RigExtrinsic(m, frames, rig))
+  bool have_rig = false;
+  if (!frames.empty()) {
+    if (fixed_rig_and_readout && !variable_images.empty()) {
+      std::vector<std::array<uint32_t, 2>> anchor_frames;
+      anchor_frames.reserve(frames.size());
+      for (const auto& f : frames)
+        if (!variable_images.count(f[0]) && !variable_images.count(f[1]))
+          anchor_frames.push_back(f);
+      have_rig = RigExtrinsic(m, anchor_frames, rig) || RigExtrinsic(m, frames, rig);
+    } else {
+      have_rig = RigExtrinsic(m, frames, rig);
+    }
+  }
+  if (have_rig) {
     for (const auto& f : frames)
       if (used_images.count(f[0]) && used_images.count(f[1])) {
         if (shutter) {
@@ -556,17 +602,22 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           ordering->AddElementToGroup(rig.params.data(), 1);
         }
       }
+    if (rig_frames && fixed_rig_and_readout)
+      problem.SetParameterBlockConstant(rig.params.data());
+  }
   ceres::Solver::Options options;
   options.num_threads = workers;
   options.max_num_iterations = iterations;
   options.logging_type = ceres::SILENT;
-  const bool iterative = variable_images.empty() && used_images.size() >= 64;
-  options.linear_solver_type = iterative ? ceres::ITERATIVE_SCHUR : ceres::SPARSE_SCHUR;
+  const bool iterative = has_variable_points && variable_images.empty() && used_images.size() >= 64;
+  options.linear_solver_type = !has_variable_points
+                                   ? ceres::DENSE_QR
+                                   : (iterative ? ceres::ITERATIVE_SCHUR : ceres::SPARSE_SCHUR);
   if (iterative)
     options.preconditioner_type = ceres::SCHUR_JACOBI;
   options.use_explicit_schur_complement = iterative && used_images.size() <= 1024;
   options.sparse_linear_algebra_library_type = ceres::EIGEN_SPARSE;
-  options.linear_solver_ordering = ordering;
+  options.linear_solver_ordering = has_variable_points ? ordering : nullptr;
   // Below 1e-6 the final refinements only creep: in the shutter BA the last half of the
   // iterations moved camera centres by under 5 um and changed held-out error by 3e-5 px.
   options.function_tolerance = iterations <= 100 && planes.empty() ? 1e-5 : 1e-6;

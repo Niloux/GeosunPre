@@ -479,6 +479,7 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
     request["crop_windows"] = {(*options.crop)[0].ToJson(), (*options.crop)[1].ToJson()};
   if (monocular) {
     request["source"] = "moge";
+    request["rolling_shutter"] = rolling;
     request["geometry"] = GeometryIdentity(options.geometry_models);
   }
   return request;
@@ -642,7 +643,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   struct LoadedMask {
     cv::Mat pixels;
     int count;
-    std::vector<cv::Mat> faces;  // MoGe faces of the photo for monocular supervision
+    cv::Mat prefiltered;  // Prefiltered RGB photo for rolling-shutter GPU MoGe resampling
   };
   // Lens plans outlive their camera's loop: the monocular fits run with the pending writes.
   std::array<std::optional<MonocularLens>, 2> lens_plans;
@@ -716,7 +717,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
               photo = photo(cv::Rect(window.x, window.y, window.width, window.height)).clone();
             }
             cv::cvtColor(photo, photo, cv::COLOR_BGR2RGB);
-            loaded.faces = MonocularEstimator::Faces(*lens, photo);
+            loaded.prefiltered = lens->Prefilter(photo);
           }
           return loaded;
         }));
@@ -768,14 +769,19 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         }
         CudaCheck(cudaStreamSynchronize(stream));
         // MoGe faces replace the maps; the LAS depth only scales them and gates their depth. The
-        // GPU estimates the faces here; the fit and encoding run with the write on the CPU.
+        // GPU estimates the faces here (un-rotated along omega when rolling-shutter is active);
+        // the fit and encoding run with the write on the CPU.
         std::vector<FaceEstimate> estimates;
         cv::Mat allowed;
+        const bool rolling_moge = motion != nullptr;
+        const Eigen::Vector3d omega = motion ? motion->rotation[id] : Eigen::Vector3d::Zero();
+        const int axis = motion ? motion->axis : 1;
         if (monocular) {
           allowed = static_mask.pixels.clone();
           allowed.setTo(0, semantic);
           const auto estimating = Clock::now();
-          estimates = estimator->Estimate(*lens, static_mask.faces);
+          estimates =
+              estimator->Estimate(*lens, static_mask.prefiltered, omega, axis, rolling_moge);
           estimate_seconds += Seconds(estimating);
         }
         const MonocularLens* plan = monocular ? &*lens : nullptr;
@@ -790,10 +796,12 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                                                          static_pixels = static_mask.count]() mutable {
           Json monocular_row;
           if (plan) {
-            const auto fit = FitFaceScales(*plan, estimates, depth, normal);
-            const auto maps = GatherFaces(*plan, estimates, [&](const FaceSample& sample) {
-              return fit.LogScale(sample, plan->size);
-            });
+            const Eigen::Vector3d* omega_ptr = rolling_moge ? &omega : nullptr;
+            const auto fit = FitFaceScales(*plan, estimates, depth, normal, omega_ptr, axis);
+            const auto maps = GatherFaces(
+                *plan, estimates,
+                [&](const FaceSample& sample) { return fit.LogScale(sample, plan->size); },
+                omega_ptr, axis);
             cv::Mat monocular_depth, monocular_normal, confirmed;
             monocular_row = EncodeMonocular(*plan, maps, depth, normal, allowed, fit.accepted,
                                             MinIncidence, monocular_depth, monocular_normal,
@@ -842,9 +850,12 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     view_conflicts = FilterViewConflicts(output, scene, model, motion, options.max_size,
                                          verified_cells, rows, held_out);
     depth_pixels = 0;
+    normal_pixels = 0;
     for (const auto& row : rows)
-      if (!row.is_null())
+      if (!row.is_null()) {
         depth_pixels += row.at("depth_pixels").get<uint64_t>();
+        normal_pixels += row.at("normal_pixels").get<uint64_t>();
+      }
     Log("MoGe view conflicts: " + view_conflicts.dump());
   }
   if (!depth_pixels || !normal_pixels)
@@ -899,8 +910,11 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     summary["depth_validity"] =
         "accepted face fit, static mask off the semantic margin, no blended depth step, "
         "agreement with trusted LAS depth, no free-space conflict with neighbouring views";
-    summary["normal_estimator"] = "moge2_vitl_faces";
-    summary["normal_validity"] = "static mask off the semantic margin, incidence";
+    summary["normal_estimator"] =
+        motion ? "moge2_vitl_faces_readout_line" : "moge2_vitl_faces";
+    summary["normal_validity"] =
+        "static mask off the semantic margin, incidence, no free-space conflict with neighbouring "
+        "views";
     summary["monocular"] = {{"fit", "per-face 12 x 12 bilinear log-scale field, Cauchy IRLS in log "
                                     "distance, scale 0.03, inliers within 0.05, overlap weight 0.25, "
                                     "node first difference 0.1 x mean anchors per node, lattice 2 px"},
