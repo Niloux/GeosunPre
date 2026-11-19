@@ -1,5 +1,6 @@
 #include "geometry/static_masks.h"
 #include "geometry/supervision.h"
+#include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
@@ -245,19 +246,34 @@ struct ApplyCounts {
   uint64_t sky_edge_to_sky = 0;
   uint64_t sky_edge_to_static = 0;
 };
-// Smooth local per-channel mean and variance over seed_mask != 0, blending to global seed
-// statistics where local seed support falls below 64 pixels.
+// Smooth local per-channel mean and variance over seed_mask != 0 using 4x block accumulation
+// (exact squared-sum accumulation before smoothing avoids downsampling variance bias), blending
+// to global seed statistics where local seed support falls below 64 pixels.
 void LocalColorStats(const std::array<cv::Mat, 3>& ch, const cv::Mat& seed_mask, int box_size,
                      float min_var, std::array<cv::Mat, 3>& mean_out,
                      std::array<cv::Mat, 3>& var_out) {
   const int rows = seed_mask.rows, cols = seed_mask.cols;
+  constexpr int ds = 4;
+  const int rows_ds = (rows + ds - 1) / ds, cols_ds = (cols + ds - 1) / ds;
+  cv::Mat ds_w = cv::Mat::zeros(rows_ds, cols_ds, CV_64FC1);
+  std::array<cv::Mat, 3> ds_c, ds_c2;
+  for (int c = 0; c < 3; ++c) {
+    ds_c[c] = cv::Mat::zeros(rows_ds, cols_ds, CV_64FC1);
+    ds_c2[c] = cv::Mat::zeros(rows_ds, cols_ds, CV_64FC1);
+  }
   std::array<double, 3> g_sum{}, g_sum2{};
   size_t g_count = 0;
   for (int y = 0; y < rows; ++y) {
+    const int by = y / ds;
     const uint8_t* m = seed_mask.ptr<uint8_t>(y);
     const float* p0 = ch[0].ptr<float>(y);
     const float* p1 = ch[1].ptr<float>(y);
     const float* p2 = ch[2].ptr<float>(y);
+    double* wp = ds_w.ptr<double>(by);
+    double *c0p = ds_c[0].ptr<double>(by), *c1p = ds_c[1].ptr<double>(by),
+           *c2p = ds_c[2].ptr<double>(by);
+    double *s0p = ds_c2[0].ptr<double>(by), *s1p = ds_c2[1].ptr<double>(by),
+           *s2p = ds_c2[2].ptr<double>(by);
     for (int x = 0; x < cols; ++x)
       if (m[x]) {
         const double v0 = p0[x], v1 = p1[x], v2 = p2[x];
@@ -268,6 +284,14 @@ void LocalColorStats(const std::array<cv::Mat, 3>& ch, const cv::Mat& seed_mask,
         g_sum2[1] += v1 * v1;
         g_sum2[2] += v2 * v2;
         ++g_count;
+        const int bx = x / ds;
+        wp[bx] += 1.0;
+        c0p[bx] += v0;
+        c1p[bx] += v1;
+        c2p[bx] += v2;
+        s0p[bx] += v0 * v0;
+        s1p[bx] += v1 * v1;
+        s2p[bx] += v2 * v2;
       }
   }
   std::array<float, 3> g_mean{.5f, .5f, .5f}, g_var{.25f, .25f, .25f};
@@ -278,47 +302,45 @@ void LocalColorStats(const std::array<cv::Mat, 3>& ch, const cv::Mat& seed_mask,
       g_var[c] = std::max(min_var, float(g_sum2[c] / double(g_count) - m * m));
     }
   }
-  cv::Mat w, sw;
-  seed_mask.convertTo(w, CV_32FC1, 1.0 / 255.0);
-  cv::boxFilter(w, sw, CV_32F, {box_size, box_size}, {-1, -1}, true, cv::BORDER_REFLECT_101);
-  const float area = float(box_size) * float(box_size);
+  const int box_ds = std::max(3, ((box_size + ds / 2) / ds) | 1);
+  const cv::Size ksize_ds(box_ds, box_ds);
+  cv::Mat sw;
+  cv::boxFilter(ds_w, sw, CV_64F, ksize_ds, {-1, -1}, false, cv::BORDER_REFLECT_101);
   for (int c = 0; c < 3; ++c) {
-    cv::Mat wc = w.mul(ch[c]), wc2 = wc.mul(ch[c]);
     cv::Mat sm, sm2;
-    cv::boxFilter(wc, sm, CV_32F, {box_size, box_size}, {-1, -1}, true, cv::BORDER_REFLECT_101);
-    cv::boxFilter(wc2, sm2, CV_32F, {box_size, box_size}, {-1, -1}, true, cv::BORDER_REFLECT_101);
-    mean_out[c].create(rows, cols, CV_32FC1);
-    var_out[c].create(rows, cols, CV_32FC1);
-    for (int y = 0; y < rows; ++y) {
-      const float* swp = sw.ptr<float>(y);
-      const float* smp = sm.ptr<float>(y);
-      const float* sm2p = sm2.ptr<float>(y);
-      float* mo = mean_out[c].ptr<float>(y);
-      float* vo = var_out[c].ptr<float>(y);
-      for (int x = 0; x < cols; ++x) {
-        const float wv = swp[x];
-        const float cnt = wv * area;
-        if (cnt >= 64.f) {
-          const float m = smp[x] / wv;
-          mo[x] = m;
-          vo[x] = std::max(min_var, sm2p[x] / wv - m * m);
-        } else if (cnt > 1.f) {
-          const float m_loc = smp[x] / wv;
-          const float v_loc = std::max(min_var, sm2p[x] / wv - m_loc * m_loc);
-          const float blend = cnt / 64.f;
-          mo[x] = blend * m_loc + (1.f - blend) * g_mean[c];
-          vo[x] = std::max(min_var, blend * v_loc + (1.f - blend) * g_var[c]);
+    cv::boxFilter(ds_c[c], sm, CV_64F, ksize_ds, {-1, -1}, false, cv::BORDER_REFLECT_101);
+    cv::boxFilter(ds_c2[c], sm2, CV_64F, ksize_ds, {-1, -1}, false, cv::BORDER_REFLECT_101);
+    cv::Mat mean_ds(rows_ds, cols_ds, CV_32FC1), var_ds(rows_ds, cols_ds, CV_32FC1);
+    for (int by = 0; by < rows_ds; ++by) {
+      const double* swp = sw.ptr<double>(by);
+      const double* smp = sm.ptr<double>(by);
+      const double* sm2p = sm2.ptr<double>(by);
+      float* mo = mean_ds.ptr<float>(by);
+      float* vo = var_ds.ptr<float>(by);
+      for (int bx = 0; bx < cols_ds; ++bx) {
+        const double cnt = swp[bx];
+        if (cnt >= 64.0) {
+          const double m = smp[bx] / cnt;
+          mo[bx] = float(m);
+          vo[bx] = std::max(min_var, float(sm2p[bx] / cnt - m * m));
+        } else if (cnt > 1.0) {
+          const double m_loc = smp[bx] / cnt;
+          const float v_loc = std::max(min_var, float(sm2p[bx] / cnt - m_loc * m_loc));
+          const float blend = float(cnt / 64.0);
+          mo[bx] = blend * float(m_loc) + (1.f - blend) * g_mean[c];
+          vo[bx] = std::max(min_var, blend * v_loc + (1.f - blend) * g_var[c]);
         } else {
-          mo[x] = g_mean[c];
-          vo[x] = g_var[c];
+          mo[bx] = g_mean[c];
+          vo[bx] = g_var[c];
         }
       }
     }
+    cv::resize(mean_ds, mean_out[c], {cols, rows}, 0, 0, cv::INTER_LINEAR);
+    cv::resize(var_ds, var_out[c], {cols, rows}, 0, 0, cv::INTER_LINEAR);
   }
 }
-// 3-channel color guided filter implemented directly with O(1) cv::boxFilter.
-cv::Mat GuidedFilterColor(const std::array<cv::Mat, 3>& ch, const cv::Mat& p, int radius,
-                          float eps) {
+void GuidedFilterCoefficients(const std::array<cv::Mat, 3>& ch, const cv::Mat& p, int radius,
+                              float eps, std::array<cv::Mat, 3>& ma, cv::Mat& mb) {
   const cv::Size ksize(2 * radius + 1, 2 * radius + 1);
   auto box = [&](const cv::Mat& m) {
     cv::Mat out;
@@ -372,15 +394,43 @@ cv::Mat GuidedFilterColor(const std::array<cv::Mat, 3>& ch, const cv::Mat& p, in
       bp[x] = float(double(mp[x]) - av0 * m0[x] - av1 * m1[x] - av2 * m2[x]);
     }
   }
-  const cv::Mat ma0 = box(a[0]), ma1 = box(a[1]), ma2 = box(a[2]), mb = box(b);
-  cv::Mat q(rows, cols, CV_32FC1);
+  ma = {box(a[0]), box(a[1]), box(a[2])};
+  mb = box(b);
+}
+// 3-channel Fast Guided Filter: solves linear model coefficients at 2x downsample when radius >= 6,
+// then evaluates at full resolution strictly inside the boundary band.
+cv::Mat GuidedFilterColor(const std::array<cv::Mat, 3>& ch, const cv::Mat& p, const cv::Mat& band,
+                          int radius, float eps) {
+  const int rows = p.rows, cols = p.cols;
+  std::array<cv::Mat, 3> ma;
+  cv::Mat mb;
+  if (radius >= 6 && cols >= 64 && rows >= 64) {
+    const cv::Size sub_size(cols / 2, rows / 2);
+    const int r_sub = std::max(2, (radius + 1) / 2);
+    std::array<cv::Mat, 3> ch_sub;
+    for (int c = 0; c < 3; ++c)
+      cv::resize(ch[c], ch_sub[c], sub_size, 0, 0, cv::INTER_AREA);
+    cv::Mat p_sub;
+    cv::resize(p, p_sub, sub_size, 0, 0, cv::INTER_AREA);
+    std::array<cv::Mat, 3> ma_sub;
+    cv::Mat mb_sub;
+    GuidedFilterCoefficients(ch_sub, p_sub, r_sub, eps, ma_sub, mb_sub);
+    for (int c = 0; c < 3; ++c)
+      cv::resize(ma_sub[c], ma[c], {cols, rows}, 0, 0, cv::INTER_LINEAR);
+    cv::resize(mb_sub, mb, {cols, rows}, 0, 0, cv::INTER_LINEAR);
+  } else {
+    GuidedFilterCoefficients(ch, p, radius, eps, ma, mb);
+  }
+  cv::Mat q = cv::Mat::zeros(rows, cols, CV_32FC1);
   for (int y = 0; y < rows; ++y) {
-    const float *p0 = ma0.ptr<float>(y), *p1 = ma1.ptr<float>(y), *p2 = ma2.ptr<float>(y),
+    const uint8_t* bp = band.ptr<uint8_t>(y);
+    const float *p0 = ma[0].ptr<float>(y), *p1 = ma[1].ptr<float>(y), *p2 = ma[2].ptr<float>(y),
                 *pb = mb.ptr<float>(y);
     const float *i0 = ch[0].ptr<float>(y), *i1 = ch[1].ptr<float>(y), *i2 = ch[2].ptr<float>(y);
     float* qo = q.ptr<float>(y);
     for (int x = 0; x < cols; ++x)
-      qo[x] = std::clamp(p0[x] * i0[x] + p1[x] * i1[x] + p2[x] * i2[x] + pb[x], 0.f, 1.f);
+      if (bp[x])
+        qo[x] = std::clamp(p0[x] * i0[x] + p1[x] * i1[x] + p2[x] * i2[x] + pb[x], 0.f, 1.f);
   }
   return q;
 }
@@ -408,10 +458,10 @@ void RefineOutdoorSkyBoundary(const Context& context, uint32_t id, cv::Mat& mask
   const int y1 = std::min(camera.height, sky_box.y + sky_box.height + pad);
   const cv::Rect roi(x0, y0, x1 - x0, y1 - y0);
   const cv::Mat sky_roi = sky(roi);
-  cv::Mat sky_core;
-  cv::erode(sky_roi, sky_core,
-            cv::getStructuringElement(cv::MORPH_ELLIPSE, {2 * r_in + 1, 2 * r_in + 1}),
-            cv::Point(-1, -1), 1, cv::BORDER_CONSTANT, cv::Scalar(0));
+  cv::Mat sky_padded, dist_in;
+  cv::copyMakeBorder(sky_roi, sky_padded, 1, 1, 1, 1, cv::BORDER_CONSTANT, cv::Scalar(0));
+  cv::distanceTransform(sky_padded, dist_in, cv::DIST_L2, cv::DIST_MASK_5);
+  const cv::Mat sky_core = dist_in(cv::Rect(1, 1, roi.width, roi.height)) > float(r_in);
   if (cv::countNonZero(sky_core) < 64)
     return;
   const cv::Mat bgr = ReadImage(context.scene.images[id].source, cv::IMREAD_COLOR);
@@ -427,13 +477,11 @@ void RefineOutdoorSkyBoundary(const Context& context, uint32_t id, cv::Mat& mask
   cv::Mat mask_roi = mask(roi);
   const cv::Mat dom_roi = context.full_domains[cam_idx](roi);
   const cv::Mat editable = (dom_roi != 0) & (mask_roi != 0) & (las_lock == 0);
-  cv::Mat sky_outer, sky_fg_shell, sky_canopy;
-  cv::dilate(sky_roi, sky_outer,
-             cv::getStructuringElement(cv::MORPH_ELLIPSE, {2 * r_out + 1, 2 * r_out + 1}));
-  cv::dilate(sky_roi, sky_fg_shell,
-             cv::getStructuringElement(cv::MORPH_ELLIPSE, {2 * r_fg + 1, 2 * r_fg + 1}));
-  cv::dilate(sky_roi, sky_canopy,
-             cv::getStructuringElement(cv::MORPH_ELLIPSE, {2 * r_canopy + 1, 2 * r_canopy + 1}));
+  cv::Mat dist_out;
+  cv::distanceTransform(sky_roi == 0, dist_out, cv::DIST_L2, cv::DIST_MASK_5);
+  const cv::Mat sky_outer = dist_out <= float(r_out);
+  const cv::Mat sky_fg_shell = dist_out <= float(r_fg);
+  const cv::Mat sky_canopy = dist_out <= float(r_canopy);
   cv::Mat fg_seed =
       ((sky_fg_shell & ~sky_outer) & (mask_roi == 255)) | (sky_outer & (mask_roi == 255) & (las_lock != 0));
   if (cv::countNonZero(fg_seed) < 64)
@@ -488,7 +536,7 @@ void RefineOutdoorSkyBoundary(const Context& context, uint32_t id, cv::Mat& mask
       }
     }
   }
-  const cv::Mat alpha_sky = GuidedFilterColor(ch, p0, r_gf, 1e-3f);
+  const cv::Mat alpha_sky = GuidedFilterColor(ch, p0, band, r_gf, 1e-3f);
   for (int y = 0; y < roi.height; ++y) {
     const uint8_t* bp = band.ptr<uint8_t>(y);
     const float* ap = alpha_sky.ptr<float>(y);
@@ -767,10 +815,17 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
   // Pass 3: the new masks, on the same grid as pass 1.
   const auto map_camera = [&](uint32_t id) { return MapCamera(model.cameras[model.images[id].camera], MapSize); };
   std::vector<ApplyCounts> applied(model.images.size());
-  ParallelFor(written.size(), workers, 1, [&](size_t i) {
-    const auto grid = map_camera(written[i]);
-    applied[written[i]] = Apply(context, written[i], {grid.width, grid.height});
-  });
+  {
+    struct OpenCvThreadsGuard {
+      int previous = cv::getNumThreads();
+      explicit OpenCvThreadsGuard(int threads) { cv::setNumThreads(threads); }
+      ~OpenCvThreadsGuard() { cv::setNumThreads(previous); }
+    } opencv_threads_guard(1);
+    ParallelFor(written.size(), workers, 1, [&](size_t i) {
+      const auto grid = map_camera(written[i]);
+      applied[written[i]] = Apply(context, written[i], {grid.width, grid.height});
+    });
+  }
   Json rows = Json::array();
   std::map<std::string, size_t> reasons;
   uint64_t pixels = 0, sky_pixels = 0, sky_edge_to_sky = 0, sky_edge_to_static = 0;

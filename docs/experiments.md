@@ -450,3 +450,74 @@
    - `篮球场-p2` 注入的 `4,435` 个高置信视觉锚点（最高 `90.68 m`、最远 `145.07 m`）使 `00244-L`、`00036-L` 中 `> 50 m` 弧形玻璃高楼顶层幕墙横梁与轮廓完整收敛、对黑底无破洞飘点。
 4. **残余边界观察（非回归，供后续演进参考）**：
    - `篮球场` 部分视角边角（R 镜头左上如 `00203-R`、L 镜头右上如 `00036-L`）存在少量伸入 `160°` 有效圆内的采集设备遮光罩/机壳边缘，SAM3 与静态掩码均标为 `255`（Phase 2 已剥离其紧邻天空的亮边），而多视角 3DGS 将随动遮挡渲染为黑色透明，构成剩余单图边界扣分项之一；此外 `~235 m × 180 m` 大园区在 `3M` SH0 高斯上限下远景树叶高频纹理仍受容量平滑限制，个别 `60–80 m` 紧邻天空的退台建筑侧角（如 `00181-R`）受邻近视角天空不透明度惩罚存在轻微暗化。整体三项改动均准确命中设计目标并通过全链路核验。
+
+---
+
+## 2026-11-19：面向大场景（古建筑）与异步双目的 P0 三项改进双场景实测
+
+### 1. 背景与改动摘要
+
+针对 1,438 帧大图幅室外异步双目大场景 `古建筑`（`D:\Data\古建筑原始数据`，`GS200G` / `3600×3600`，左右镜头错拍约 `56 ms`）暴露出的大图 BA 线性求解退化、全图导出掩码算子瓶颈及异步双目缺失刚体/IMU 约束问题，本轮完成三项 P0 改进并同步文档（[`input.md`](file:///d:/Dev/GeosunPre/docs/input.md)、[`reconstruction.md`](file:///d:/Dev/GeosunPre/docs/reconstruction.md)）：
+
+1. **放宽 Ceres BA 显式 Schur 阈值**（[`optimization.cpp`](file:///d:/Dev/GeosunPre/src/sfm/optimization.cpp)）：将 `use_explicit_schur_complement` 的图像数阈值由 `<= 1024` 提高到 `<= 4096`，保持 `preconditioner_type = ceres::SCHUR_JACOBI`，消除超过 1,024 帧后在 `sfm` / `joint` / `shutter` / `polish` 中触发大矩阵隐式 CG 的耗时悬崖。
+2. **加速 `static_masks` 室外天空边缘细化**（[`static_masks.cpp`](file:///d:/Dev/GeosunPre/src/geometry/static_masks.cpp)）：在 Pass 3 中以两次 $O(W\cdot H)$ `cv::distanceTransform`（`DIST_L2`、`DIST_MASK_5`）替换 4 次大核 `MORPH_ELLIPSE` 形态学卷积；`LocalColorStats` 改为 `CV_64F` 4× 块累加精确方差后降采样；`GuidedFilterCoefficients` / `GuidedFilterColor` 改为 2× Fast Guided Filter 仅在 `band != 0` 边缘带回算全分辨率透射前景均值；对 Pass 3 增加 `cv::setNumThreads(1)`（RAII 保护）避免多线程过度切分核。
+3. **200 Hz POS 姿态接入、异步双目刚体链接与 IMU 卷帘旋转先验**（[`scene.h`](file:///d:/Dev/GeosunPre/src/io/scene.h)、[`scene.cpp`](file:///d:/Dev/GeosunPre/src/io/scene.cpp)、[`optimization.h`](file:///d:/Dev/GeosunPre/src/sfm/optimization.h)、[`optimization.cpp`](file:///d:/Dev/GeosunPre/src/sfm/optimization.cpp)、[`shutter.cpp`](file:///d:/Dev/GeosunPre/src/sfm/shutter.cpp)）：
+   - 扩展 `NavigationRow` 与 `ReadNavigation`，严格按 `_pos.txt` 时间戳（不混用带时延偏移的 `_pos_ENH.txt`）解析第 6–11 列姿态角（`Z-X-Y` 欧拉约定 `Rz(yaw)*Rx(pitch)*Ry(roll)`）并在 `ReadExposureKinematics` 做球面线性插值（SLERP），写入 `ExposureKinematics`（`body_position`、`body_rotation`、`omega_world`、`has_attitude`）。
+   - `shutter` 新增 `VerifyImuAttitude`（左/右镜头 boresight 残差中位均 `<= 2.0°` 门控）；将原同步约束泛化为 `RigFrame` / `BuildRigFrames`（支持触发间隔 `<= 0.2 s` 异步双目 200 Hz 位姿与角速度运动补偿）、`RescueRigFrames`；引入 `ImuShutterRotation` 先验（$\sigma = 0.15^\circ$、`HuberLoss(3.)`），仅当 `f.synchronous` 为真时叠加 `RigShutterRotation`，并在报告中记录 `rig_mode` 与 `imu_attitude`。
+
+---
+
+### 2. 主实验：`古建筑`（1,438 帧，异步双目 ~56 ms）对比
+
+基线 `work\古建筑`（`47bb4fb`）与改进后 `work\古建筑-p0`（`47bb4fb-dirty`）实测结果对照如下：
+
+| 指标 | 基线 (`work\古建筑`) | P0 (`work\古建筑-p0`) | 变化 / 结论 |
+| :--- | :---: | :---: | :--- |
+| 注册完成度 / `check` | `1438/1438`（`passed: true`） | `1438/1438`（`passed: true`） | 保持完整闭环，无掉帧 |
+| 稀疏点数 / 观测数 | `431,158` / `1,998,736` | `431,014` / `2,000,011` | 基本持平 |
+| `sfm` 总耗时 / BA / 最慢单轮 | `665.46 s` / `535.90 s` / `304.89 s` (`exp=False`) | `353.28 s` / `218.08 s` / `72.10 s` (`exp=True`) | **`sfm -46.9%` / BA `-59.3%`** |
+| `joint` 总耗时 / 线性求解 | `60.11 s` / `49.07 s` (`exp=False`) | `36.88 s` / `25.28 s` (`exp=True`) | **`-38.6%`** |
+| `shutter` 总耗时 / 主 BA / `polish` | `292.88 s` / `144.78 s` (`lin=121.84 s`, `exp=False`, `rig=0`) / `138.54 s` (`BA=129.81 s`) | `142.40 s` / `60.80 s` (`lin=41.15 s`, `exp=True`, `rig=719`) / `67.98 s` (`BA=60.97 s`) | **`-51.4%`**，接入 `719` 对异步 `RigFrame` |
+| `static_masks` 耗时 | `379.46 s` | `179.39 s` | **`-52.7%`（提速约 2.1×）** |
+| `static_masks` 细化像素统计 | `refined=1180`，`+sky=27,537,671`，`+static=1,447,248` | `refined=1180`，`+sky=28,139,536`，`+static=1,436,053` | `+sky +2.2%`、`+static -0.8%`，语义几乎等价 |
+| 阶段累计耗时（墙钟） | `2237.59 s`（`37.3 min`） | `1585.22 s`（`26.4 min`；墙钟 `1649.16 s`） | **累计 `-652.37 s / -29.2%`** |
+| `rig_mode` / `imu_attitude` | 无（`rig_frames=0`） | `asynchronous`（`719` 对），`verified=true`（boresight 中位 `[0.155°, 0.165°]`） | 200 Hz IMU 姿态高精度验证通过 |
+| `explained_rotation` (`L / R`) | `[0.190, 0.364]` | `[0.269, 0.381]` | 左镜头旋转解释度提升 `+0.079` |
+| `L` 主点偏移 `[cx, cy]` | `[+6.56, -1.70] px` | `[+4.13, -1.78] px` | 左镜头水平主点偏移显著收敛 |
+| `L` 帧内滚转偏置 `rz mean / med` | `+0.494° / +0.499°` | `+0.301° / +0.307°` | **降低约 `39%`** |
+| `readout_s` (`L / R`) | `[-45.58, +26.19] ms` | `[-45.03, +27.82] ms` | 与 `rot_fit [-37.32, +39.12] ms` 同向 |
+| 卷帘留出验证 `val_after` | `0.8953 / 2.4943 px` | `0.8963 / 2.5031 px` | 通过全部验收检查 |
+| `polish reassoc` / `cleanup` 点面误差 | `5.84 / 22.30 mm` / `5.94 / 22.44 mm` | `5.78 / 22.31 mm` / `5.89 / 22.39 mm` | 略有改善，保持高精度 |
+| 全量重投影 / 导航位置误差 | `0.7456 / 1.8144 px` / `25.71 / 37.71 mm` | `0.7471 / 1.8168 px` / `25.60 / 37.48 mm` | 基本持平 |
+
+`check` 核验输出（`work\古建筑-p0`）：`passed: true`，`images: 1438`，`observations: 2,000,011`，`points: 431,014`，`depth_pixels: 785,909,987`，`normal_pixels: 827,360,773`。
+
+---
+
+### 3. 同步双目回归：`篮球场`（536 帧，同步双目）对比
+
+验证异步扩展与掩码/BA 优化不退化既有同步双目链路，基线 `work\篮球场-p2`（`334a366-dirty`）与 `work\篮球场-p0` 对照如下：
+
+| 指标 | 基线 (`work\篮球场-p2`) | P0 (`work\篮球场-p0`) | 变化 / 结论 |
+| :--- | :---: | :---: | :--- |
+| 注册完成度 / `check` | `536/536`（`passed: true`） | `536/536`（`passed: true`） | 保持零掉帧（`obs=500,330`、`pts=122,390`） |
+| `static_masks` 耗时 | `157.20 s` | `70.32 s` | **`-55.3%`（提速约 2.2×）** |
+| `static_masks` 细化像素统计 | `refined=520`，`+sky=13,341,116`，`+static=540,068` | `refined=520`，`+sky=13,421,683`，`+static=539,128` | `+sky +0.60%`、`+static -0.17%` |
+| `shutter` 耗时 / 模式 | `61.36 s`（`rig=268`） | `58.04 s`（`synchronous`，`268` 对） | `imu_attitude.verified=true`（boresight 中位 `[0.169°, 0.188°]`） |
+| `readout_s` / `explained_rotation` | `[+33.02, -31.27] ms` / `[0.298, 0.306]` | `[+32.09, -30.53] ms` / `[0.308, 0.314]` | 旋转解释度稳步提升 |
+| `val_after` / `polish reassoc` | `0.9812 / 2.8382 px` / `3.76 / 14.89 mm` | `0.9782 / 2.8630 px` / `3.76 / 14.86 mm` | 通过全部验收检查，零退化 |
+| 全量重投影 / 导航误差 | `0.7060 / 1.7402 px` / `21.28 / 39.69 mm` | `0.7064 / 1.7427 px` / `20.01 / 37.90 mm` | 导航误差与点面精度略优 |
+| 阶段累计耗时（墙钟） | `658.57 s`（`10.98 min`） | `584.52 s`（`9.74 min`；墙钟 `616.34 s`） | **累计 `-11.2%`**（注：`sfm 104.81 -> 130.88 s` 属 `<1024` 帧本已启用显式 Schur 时的增量 SfM 正常波动） |
+
+`check` 核验输出（`work\篮球场-p0`）：`passed: true`，`images: 536`，`observations: 500,330`，`points: 122,390`，`depth_pixels: 224,307,162`，`normal_pixels: 238,573,975`。
+
+---
+
+### 4. 视觉抽检与后续演进观察
+
+1. **天空边缘细化抽检无回归**：
+   - `古建筑-p0`（`00350-L`、`00472-R`、`00199-L`）与 `篮球场-p0`（`00203-R`、`00181-R`）掩码轮廓锐利贴合，古建飞檐斗拱、细屋顶栏杆、弯曲高杆灯杆及树冠天孔均完整保留 `255`/`128` 边界且无过蚀。
+2. **异步双目残余偏置分析与 P1/P2 方向**：
+   - 接入 200 Hz IMU 与异步 `RigFrame` 后，`古建筑-p0` 左镜头 `cx` 偏移与 `rz` 偏置已显著收敛（`rz` 降 `39%`），但因单图约 `1,724` 条像素观测相对单条 `ImuShutterRotation` 残差（$\sigma = 0.15^\circ$）仍占主导，且 `古建筑` 镜头存在固有 `fy - fx ≈ +5.6 px` 纵横比与 L/R `readout_s` 不对称残余，后续如需进一步抑制单镜头主点/滚转漂移可结合 P1/P2 评估权重或内参耦合策略。
+   - **尚未验证项**：本轮按计划仅交付预处理与 `check` 验收，未运行下游 3DGS 训练（留待实训确认渲染 PSNR/SSIM/几何提升）。
+   - **P1/P2 待推进方向**：大场景下大面积静止阴影与随行采集员手臂的静态掩码误判、`supervision` 阶段 `hold_depths` `1.5 GiB` 上限导致的磁盘二次解码、初始化 `points3D.ply` 250 m 远距视觉外点约束，以及面向 1,400+ 帧大场景的 [`trainer.json`](file:///d:/Dev/GeosunPre/configs/trainer.json) 训练尺度配比。

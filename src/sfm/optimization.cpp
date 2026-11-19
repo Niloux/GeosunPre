@@ -217,23 +217,34 @@ struct Position {
     return true;
   }
 };
-// A synchronous frame: the R pose is the rig extrinsic applied to the L pose. Residuals are the
-// rotation (rad) and translation (m, R camera frame) differences over their sigmas.
+// A rig frame: the R pose is the rig extrinsic applied to the L pose (propagated by delta_T_w
+// across asynchronous L/R trigger offsets). Residuals are the rotation (rad) and translation
+// (m, R camera frame) differences over their sigmas.
 struct RigLink {
+  Eigen::Quaterniond delta_q = Eigen::Quaterniond::Identity();
+  Eigen::Vector3d delta_t = Eigen::Vector3d::Zero();
+  double rot_sigma = RigRotationSigma;
+  double pos_sigma = RigPositionSigma;
   template <class T>
   bool operator()(const T* left, const T* right, const T* rig, T* r) const {
     const T ql[] = {left[3], left[0], left[1], left[2]},
             qr[] = {right[3], right[0], right[1], right[2]},
-            qe[] = {rig[3], rig[0], rig[1], rig[2]};
-    T predicted[4], difference[4], moved[3];
-    ceres::QuaternionProduct(qe, ql, predicted);
+            qe[] = {rig[3], rig[0], rig[1], rig[2]},
+            dq[] = {T(delta_q.w()), T(delta_q.x()), T(delta_q.y()), T(delta_q.z())};
+    const T dt[] = {T(delta_t.x()), T(delta_t.y()), T(delta_t.z())};
+    T ql_tilde[4], rotated_dt[3], tl_tilde[3], predicted[4], difference[4], moved[3];
+    ceres::QuaternionProduct(ql, dq, ql_tilde);
+    ceres::QuaternionRotatePoint(ql, dt, rotated_dt);
+    for (int i = 0; i < 3; ++i)
+      tl_tilde[i] = rotated_dt[i] + left[4 + i];
+    ceres::QuaternionProduct(qe, ql_tilde, predicted);
     const T inverse[] = {predicted[0], -predicted[1], -predicted[2], -predicted[3]};
     ceres::QuaternionProduct(qr, inverse, difference);
     const T sign = difference[0] < T(0) ? T(-2) : T(2);
-    ceres::UnitQuaternionRotatePoint(qe, left + 4, moved);
+    ceres::QuaternionRotatePoint(qe, tl_tilde, moved);
     for (int i = 0; i < 3; ++i) {
-      r[i] = sign * difference[i + 1] / T(RigRotationSigma);
-      r[i + 3] = (right[4 + i] - moved[i] - rig[4 + i]) / T(RigPositionSigma);
+      r[i] = sign * difference[i + 1] / T(rot_sigma);
+      r[i + 3] = (right[4 + i] - moved[i] - rig[4 + i]) / T(pos_sigma);
     }
     return true;
   }
@@ -254,6 +265,21 @@ struct RigShutterRotation {
     const T scale = ceres::sqrt(tl * tl + tr * tr + T(1e-6));
     for (int i = 0; i < 3; ++i)
       r[i] = (tl * wr[i] - tr * predicted[i]) / (scale * T(RigShutterRotationSigma));
+    return true;
+  }
+};
+// Weak IMU angular-rate prior tying per-image readout rotation to tau * R_w2c * omega_world.
+struct ImuShutterRotation {
+  Eigen::Vector3d omega_world;
+  template <class T>
+  bool operator()(const T* image, const T* cam, T* r) const {
+    const T q[] = {image[3], image[0], image[1], image[2]};
+    const T w_world[] = {T(omega_world.x()), T(omega_world.y()), T(omega_world.z())};
+    T w_cam[3];
+    ceres::QuaternionRotatePoint(q, w_world, w_cam);
+    const T tau = cam[8];
+    for (int i = 0; i < 3; ++i)
+      r[i] = (image[7 + i] - tau * w_cam[i]) / T(ImuShutterRotationSigma);
     return true;
   }
 };
@@ -321,18 +347,20 @@ void RefinePose(const Camera& camera, Pose& pose, const std::vector<Eigen::Vecto
   if (!summary.IsSolutionUsable())
     throw std::runtime_error("Pose refinement failed: " + summary.BriefReport());
 }
-bool RigExtrinsic(const Reconstruction& m, const std::vector<std::array<uint32_t, 2>>& frames,
-                  Pose& rig) {
+bool RigExtrinsic(const Reconstruction& m, const std::vector<RigFrame>& frames, Pose& rig) {
   std::vector<Eigen::Quaterniond> rotations;
   std::vector<Eigen::Vector3d> translations;
   for (const auto& f : frames) {
-    const auto& left = m.images[f[0]];
-    const auto& right = m.images[f[1]];
+    const auto& left = m.images[f.left];
+    const auto& right = m.images[f.right];
     if (!left.registered || !right.registered)
       continue;
-    const Eigen::Quaterniond q = right.pose.Rotation() * left.pose.Rotation().conjugate();
+    const Eigen::Quaterniond q_l_tilde = (left.pose.Rotation() * f.delta_rotation).normalized();
+    const Eigen::Vector3d t_l_tilde =
+        left.pose.Rotation() * f.delta_translation + left.pose.Translation();
+    const Eigen::Quaterniond q = (right.pose.Rotation() * q_l_tilde.conjugate()).normalized();
     rotations.push_back(q);
-    translations.push_back(right.pose.Translation() - q * left.pose.Translation());
+    translations.push_back(right.pose.Translation() - q * t_l_tilde);
   }
   if (rotations.size() < 4)
     return false;
@@ -375,8 +403,8 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
               int workers, int iterations, const std::set<uint32_t>& variable_images,
               const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav,
               const std::set<uint64_t>& selected_points, ShutterMotion* shutter,
-              const std::vector<std::array<uint32_t, 2>>& frames,
-              const std::set<uint64_t>& fixed_points, bool fixed_rig_and_readout) {
+              const std::vector<RigFrame>& frames, const std::set<uint64_t>& fixed_points,
+              bool fixed_rig_and_readout, const std::vector<Eigen::Vector3d>& imu_omega) {
   const auto started = Clock::now();
   ceres::Problem problem;
   auto ordering = std::make_shared<ceres::ParameterBlockOrdering>();
@@ -445,13 +473,13 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
     }
   if (fixed_rig_and_readout && !frames.empty()) {
     for (const auto& f : frames) {
-      if (!m.images[f[0]].registered || !m.images[f[1]].registered)
+      if (!m.images[f.left].registered || !m.images[f.right].registered)
         continue;
-      if (variable_images.count(f[0]) || variable_images.count(f[1])) {
-        used_images.insert(f[0]);
-        used_images.insert(f[1]);
-        used_cameras.insert(m.images[f[0]].camera);
-        used_cameras.insert(m.images[f[1]].camera);
+      if (variable_images.count(f.left) || variable_images.count(f.right)) {
+        used_images.insert(f.left);
+        used_images.insert(f.right);
+        used_cameras.insert(m.images[f.left].camera);
+        used_cameras.insert(m.images[f.right].camera);
       }
     }
   }
@@ -556,16 +584,34 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
             new ceres::AutoDiffCostFunction<Position, 3, 7>(new Position{nav.at(id)}), loss,
             m.images[id].pose.params.data());
     }
+  if (shutter && !imu_omega.empty()) {
+    if (imu_omega.size() != m.images.size())
+      throw std::runtime_error("IMU angular velocity count differs from image count");
+    ceres::LossFunction* imu_shutter_loss = nullptr;
+    for (uint32_t id : used_images) {
+      const bool fixed_pose = (!metric && id == m.gauge_image) ||
+                              (!variable_images.empty() && !variable_images.count(id));
+      if ((fixed_pose && fixed_rig_and_readout) || !imu_omega[id].allFinite())
+        continue;
+      if (!imu_shutter_loss)
+        imu_shutter_loss = new ceres::HuberLoss(3.);
+      problem.AddResidualBlock(
+          new ceres::AutoDiffCostFunction<ImuShutterRotation, 3, 10, 9>(
+              new ImuShutterRotation{imu_omega[id]}),
+          imu_shutter_loss, shutter_images[id].data(),
+          shutter_cameras[m.images[id].camera].data());
+    }
+  }
   Pose rig;
   size_t rig_frames = 0;
   ceres::LossFunction* rig_shutter_loss = nullptr;
   bool have_rig = false;
   if (!frames.empty()) {
     if (fixed_rig_and_readout && !variable_images.empty()) {
-      std::vector<std::array<uint32_t, 2>> anchor_frames;
+      std::vector<RigFrame> anchor_frames;
       anchor_frames.reserve(frames.size());
       for (const auto& f : frames)
-        if (!variable_images.count(f[0]) && !variable_images.count(f[1]))
+        if (!variable_images.count(f.left) && !variable_images.count(f.right))
           anchor_frames.push_back(f);
       have_rig = RigExtrinsic(m, anchor_frames, rig) || RigExtrinsic(m, frames, rig);
     } else {
@@ -574,25 +620,32 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   }
   if (have_rig) {
     for (const auto& f : frames)
-      if (used_images.count(f[0]) && used_images.count(f[1])) {
+      if (used_images.count(f.left) && used_images.count(f.right)) {
+        const double rot_sigma = f.synchronous ? RigRotationSigma : AsyncRigRotationSigma;
+        const double pos_sigma = f.synchronous ? RigPositionSigma : AsyncRigPositionSigma;
         if (shutter) {
           problem.AddResidualBlock(
-              new ceres::AutoDiffCostFunction<RigLink, 6, 10, 10, 7>(new RigLink), loss,
-              shutter_images[f[0]].data(), shutter_images[f[1]].data(), rig.params.data());
-          if (m.images[f[0]].camera != m.images[f[1]].camera) {
+              new ceres::AutoDiffCostFunction<RigLink, 6, 10, 10, 7>(
+                  new RigLink{f.delta_rotation.normalized(), f.delta_translation, rot_sigma,
+                              pos_sigma}),
+              loss, shutter_images[f.left].data(), shutter_images[f.right].data(),
+              rig.params.data());
+          if (f.synchronous && m.images[f.left].camera != m.images[f.right].camera) {
             if (!rig_shutter_loss)
               rig_shutter_loss = new ceres::HuberLoss(4);
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<RigShutterRotation, 3, 10, 10, 9, 9, 7>(
                     new RigShutterRotation),
-                rig_shutter_loss, shutter_images[f[0]].data(), shutter_images[f[1]].data(),
-                shutter_cameras[m.images[f[0]].camera].data(),
-                shutter_cameras[m.images[f[1]].camera].data(), rig.params.data());
+                rig_shutter_loss, shutter_images[f.left].data(), shutter_images[f.right].data(),
+                shutter_cameras[m.images[f.left].camera].data(),
+                shutter_cameras[m.images[f.right].camera].data(), rig.params.data());
           }
         } else {
           problem.AddResidualBlock(
-              new ceres::AutoDiffCostFunction<RigLink, 6, 7, 7, 7>(new RigLink), loss,
-              m.images[f[0]].pose.params.data(), m.images[f[1]].pose.params.data(),
+              new ceres::AutoDiffCostFunction<RigLink, 6, 7, 7, 7>(
+                  new RigLink{f.delta_rotation.normalized(), f.delta_translation, rot_sigma,
+                              pos_sigma}),
+              loss, m.images[f.left].pose.params.data(), m.images[f.right].pose.params.data(),
               rig.params.data());
         }
         if (!rig_frames++) {
@@ -615,7 +668,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
                                    : (iterative ? ceres::ITERATIVE_SCHUR : ceres::SPARSE_SCHUR);
   if (iterative)
     options.preconditioner_type = ceres::SCHUR_JACOBI;
-  options.use_explicit_schur_complement = iterative && used_images.size() <= 1024;
+  options.use_explicit_schur_complement = iterative && used_images.size() <= 4096;
   options.sparse_linear_algebra_library_type = ceres::EIGEN_SPARSE;
   options.linear_solver_ordering = has_variable_points ? ordering : nullptr;
   // Below 1e-6 the final refinements only creep: in the shutter BA the last half of the

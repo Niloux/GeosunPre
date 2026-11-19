@@ -38,11 +38,12 @@ std::vector<Eigen::Vector3d> NavigationVelocities(const Scene& scene);
 struct ExposureKinematics {
   std::vector<Eigen::Vector3d> velocity;
   std::vector<Eigen::Vector3d> lever_arm;
+  std::vector<Eigen::Vector3d> body_position;
+  std::vector<Eigen::Quaterniond> body_rotation;
+  std::vector<Eigen::Vector3d> omega_world;
+  bool has_attitude = false;
 };
-// High-precision ENH trajectory velocity (+-20 ms) and rigid lever arm (lens minus trajectory)
-// in the LAS frame at every exposure, for rolling-shutter readout motion.
+// High-precision ENH trajectory velocity (+-20 ms), rigid lever arm (lens minus trajectory),
+// and 200 Hz IMU attitude/angular velocity in the LAS frame at every exposure.
 ExposureKinematics ReadExposureKinematics(const Scene& scene);
-// (L, R) image indices of each frame number exposed by both lenses when every such pair was
-// exposed within 2 ms; empty when the lenses are not synchronized.
-std::vector<std::array<uint32_t, 2>> SynchronousFrames(const Scene& scene);
 }  // namespace geosun

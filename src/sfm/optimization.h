@@ -60,11 +60,21 @@ constexpr double NavigationSigma = .03, NavigationGate = .25;
 // Synchronous L/R exposures share one body pose: R = extrinsic * L. Independent solutions on 室内
 // and 展厅 scatter about the mean extrinsic by 0.03-0.06 degrees and 2 mm (median).
 constexpr double RigRotationSigma = Pi / 180 * .01, RigPositionSigma = .001;
+constexpr double AsyncRigRotationSigma = Pi / 180 * .08, AsyncRigPositionSigma = .003;
 constexpr double RigShutterRotationSigma = Pi / 180 * .02;
+constexpr double ImuShutterRotationSigma = Pi / 180 * .15;
+struct RigFrame {
+  uint32_t left = 0, right = 0;
+  double dt_seconds = 0;
+  bool synchronous = true;
+  // delta_T_w = T_b2w(t_left) * T_b2w(t_right)^(-1), identity when synchronous.
+  // Virtual L pose at t_right is T_w2L(t_left) * delta_T_w, then T_w2R = T_rig * T_w2L_at_tR.
+  Eigen::Quaterniond delta_rotation = Eigen::Quaterniond::Identity();
+  Eigen::Vector3d delta_translation = Eigen::Vector3d::Zero();
+};
 // Robust mean extrinsic (R from L) of the frames with both exposures registered; false with
 // fewer than four such frames.
-bool RigExtrinsic(const Reconstruction& model, const std::vector<std::array<uint32_t, 2>>& frames,
-                  Pose& rig);
+bool RigExtrinsic(const Reconstruction& model, const std::vector<RigFrame>& frames, Pose& rig);
 // Navigation positions give the metric gauge: without them the gauge image is held and the
 // gauge baseline kept.
 Json Optimize(Reconstruction& model, const std::array<Camera, 2>& initial, const std::string& stage,
@@ -72,6 +82,7 @@ Json Optimize(Reconstruction& model, const std::array<Camera, 2>& initial, const
               const std::vector<PlaneConstraint>& planes = {},
               const std::vector<Eigen::Vector3d>& navigation = {},
               const std::set<uint64_t>& selected_points = {}, ShutterMotion* shutter = nullptr,
-              const std::vector<std::array<uint32_t, 2>>& frames = {},
-              const std::set<uint64_t>& fixed_points = {}, bool fixed_rig_and_readout = false);
+              const std::vector<RigFrame>& frames = {}, const std::set<uint64_t>& fixed_points = {},
+              bool fixed_rig_and_readout = false,
+              const std::vector<Eigen::Vector3d>& imu_omega = {});
 }  // namespace geosun

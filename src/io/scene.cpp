@@ -398,6 +398,8 @@ struct NavigationRow {
   int week;
   double time;
   Eigen::Vector3d point;
+  bool has_attitude = false;
+  Eigen::Quaterniond body_to_enh = Eigen::Quaterniond::Identity();
 };
 // Navigation rows and the fitted ECEF-to-LAS-frame conversion of their positions.
 struct Navigation {
@@ -425,6 +427,21 @@ Navigation ReadNavigation(const Scene& scene) {
       r.point = {x, y, z};
       if (!r.point.allFinite() || !std::isfinite(r.time))
         throw std::runtime_error("Nonfinite navigation row");
+      double vx, vy, vz, pitch_deg, roll_deg, yaw_deg;
+      if (fields >> vx >> vy >> vz >> pitch_deg >> roll_deg >> yaw_deg) {
+        if (!std::isfinite(pitch_deg) || !std::isfinite(roll_deg) || !std::isfinite(yaw_deg))
+          throw std::runtime_error("Nonfinite navigation attitude");
+        const double rx = pitch_deg * Pi / 180.0;
+        const double ry = roll_deg * Pi / 180.0;
+        const double rz = yaw_deg * Pi / 180.0;
+        const Eigen::Matrix3d rot =
+            (Eigen::AngleAxisd(rz, Eigen::Vector3d::UnitZ()) *
+             Eigen::AngleAxisd(rx, Eigen::Vector3d::UnitX()) *
+             Eigen::AngleAxisd(ry, Eigen::Vector3d::UnitY()))
+                .toRotationMatrix();
+        r.body_to_enh = Eigen::Quaterniond(rot).normalized();
+        r.has_attitude = true;
+      }
       rows.push_back(r);
     }
     return rows;
@@ -480,6 +497,21 @@ Eigen::Vector3d InterpolateNavigation(const std::vector<NavigationRow>& rows, Ac
   const double alpha = (time - rows[lo].time) / (rows[hi].time - rows[lo].time);
   return point_at(lo) + (point_at(hi) - point_at(lo)) * alpha;
 }
+Eigen::Quaterniond InterpolateAttitude(const std::vector<NavigationRow>& rows, double time) {
+  if (time < rows.front().time || time > rows.back().time)
+    throw std::runtime_error("Exposure time outside navigation trajectory");
+  const auto next = std::upper_bound(rows.begin(), rows.end(), time,
+                                     [](double t, const NavigationRow& r) { return t < r.time; });
+  if (next == rows.end())
+    return rows.back().body_to_enh;
+  const size_t hi = size_t(next - rows.begin()), lo = hi - 1;
+  const double alpha = (time - rows[lo].time) / (rows[hi].time - rows[lo].time);
+  const Eigen::Quaterniond q0 = rows[lo].body_to_enh;
+  Eigen::Quaterniond q1 = rows[hi].body_to_enh;
+  if (q0.dot(q1) < 0)
+    q1.coeffs() = -q1.coeffs();
+  return q0.slerp(alpha, q1).normalized();
+}
 }  // namespace
 std::vector<Eigen::Vector3d> NavigationPositions(const Scene& scene) {
   const auto navigation = ReadNavigation(scene);
@@ -505,23 +537,6 @@ LasHeader ReadSceneLas(const Scene& scene) {
   ConvertLasFrame(header, frame, "ecef_to_navigation_enh");
   header.metadata["frame_exposures_inside"] = inside;
   return header;
-}
-std::vector<std::array<uint32_t, 2>> SynchronousFrames(const Scene& scene) {
-  std::map<int, std::array<uint32_t, 2>> lenses;
-  for (uint32_t i = 0; i < scene.images.size(); ++i)
-    lenses.try_emplace(scene.images[i].frame, std::array<uint32_t, 2>{UINT32_MAX, UINT32_MAX})
-        .first->second[scene.images[i].camera] = i;
-  std::vector<std::array<uint32_t, 2>> frames;
-  for (const auto& [frame, ids] : lenses) {
-    if (ids[0] == UINT32_MAX || ids[1] == UINT32_MAX)
-      continue;
-    const auto& a = scene.images[ids[0]];
-    const auto& b = scene.images[ids[1]];
-    if (a.week != b.week || std::abs(a.seconds - b.seconds) > .002)
-      return {};
-    frames.push_back(ids);
-  }
-  return frames;
 }
 std::vector<Eigen::Vector3d> NavigationVelocities(const Scene& scene) {
   constexpr double half_window = .05;
@@ -551,15 +566,34 @@ ExposureKinematics ReadExposureKinematics(const Scene& scene) {
   ExposureKinematics result;
   result.velocity.reserve(scene.images.size());
   result.lever_arm.reserve(scene.images.size());
+  result.body_position.reserve(scene.images.size());
+  result.has_attitude =
+      std::all_of(rows.begin(), rows.end(), [](const NavigationRow& r) { return r.has_attitude; });
+  if (result.has_attitude) {
+    result.body_rotation.reserve(scene.images.size());
+    result.omega_world.reserve(scene.images.size());
+  }
   for (const auto& image : scene.images) {
     const double low = std::max(rows.front().time, image.pose_seconds - half_window),
                  high = std::min(rows.back().time, image.pose_seconds + half_window);
     if (high - low < half_window)
       throw std::runtime_error("Navigation trajectory does not bracket exposure: " + image.name);
+    const Eigen::Vector3d body = at(image.pose_seconds);
     result.velocity.push_back((at(high) - at(low)) / (high - low));
     const Eigen::Vector3d lens =
         navigation.conversion.Apply(image.navigation_raw - navigation.center);
-    result.lever_arm.push_back(lens - at(image.pose_seconds));
+    result.lever_arm.push_back(lens - body);
+    result.body_position.push_back(body);
+    if (result.has_attitude) {
+      result.body_rotation.push_back(InterpolateAttitude(rows, image.pose_seconds));
+      const Eigen::Quaterniond q_lo = InterpolateAttitude(rows, low);
+      const Eigen::Quaterniond q_hi = InterpolateAttitude(rows, high);
+      Eigen::Quaterniond q_rel = (q_lo * q_hi.conjugate()).normalized();
+      if (q_rel.w() < 0)
+        q_rel.coeffs() = -q_rel.coeffs();
+      const Eigen::AngleAxisd aa(q_rel);
+      result.omega_world.push_back(aa.angle() * aa.axis() / (high - low));
+    }
   }
   return result;
 }

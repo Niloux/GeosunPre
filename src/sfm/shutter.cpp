@@ -184,8 +184,134 @@ struct ShutterInputs {
   std::vector<PlaneConstraint> planes, training_planes;
   std::set<uint64_t> training;
   std::vector<uint64_t> validation;
-  std::vector<std::array<uint32_t, 2>> frames;
+  std::vector<RigFrame> frames;
+  bool imu_attitude_verified = false;
+  std::array<double, 2> imu_boresight_median_deg{-1., -1.};
+  std::vector<Eigen::Vector3d> imu_omega;
+  std::string rig_mode = "none";
 };
+std::array<double, 2> VerifyImuAttitude(const Reconstruction& model,
+                                        const ExposureKinematics& kinematics, bool& verified) {
+  std::array<double, 2> medians{-1., -1.};
+  verified = false;
+  if (!kinematics.has_attitude || kinematics.body_rotation.size() != model.images.size())
+    return medians;
+  size_t verified_lenses = 0;
+  for (uint32_t cid = 0; cid < 2; ++cid) {
+    std::vector<Eigen::Quaterniond> samples;
+    for (uint32_t i = 0; i < model.images.size(); ++i)
+      if (model.images[i].registered && model.images[i].camera == cid)
+        samples.push_back(
+            (model.images[i].pose.Rotation() * kinematics.body_rotation[i]).normalized());
+    if (samples.size() < 8)
+      continue;
+    std::vector<uint8_t> inlier(samples.size(), 1);
+    Eigen::Quaterniond q_mean = Eigen::Quaterniond::Identity();
+    for (int pass = 0; pass < 3; ++pass) {
+      Eigen::Matrix4d sum = Eigen::Matrix4d::Zero();
+      size_t count = 0;
+      for (size_t k = 0; k < samples.size(); ++k)
+        if (inlier[k]) {
+          sum += samples[k].coeffs() * samples[k].coeffs().transpose();
+          ++count;
+        }
+      if (count < 4)
+        return medians;
+      const Eigen::Vector4d eig =
+          Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d>(sum).eigenvectors().col(3);
+      q_mean = Eigen::Quaterniond(eig[3], eig[0], eig[1], eig[2]).normalized();
+      for (size_t k = 0; k < samples.size(); ++k)
+        inlier[k] = samples[k].angularDistance(q_mean) <= 5.0 * Pi / 180.0;
+    }
+    std::vector<double> errors_deg;
+    errors_deg.reserve(samples.size());
+    for (const auto& q : samples)
+      errors_deg.push_back(q.angularDistance(q_mean) * 180.0 / Pi);
+    medians[cid] = Quantile(errors_deg, .5);
+    if (medians[cid] > 2.0)
+      return medians;
+    ++verified_lenses;
+  }
+  verified = verified_lenses > 0;
+  return medians;
+}
+std::vector<RigFrame> BuildRigFrames(const Scene& scene, const Reconstruction& model,
+                                     const ShutterInputs& inputs, std::string& rig_mode) {
+  rig_mode = "none";
+  std::map<int, std::array<uint32_t, 2>> lenses;
+  for (uint32_t i = 0; i < scene.images.size(); ++i)
+    lenses.try_emplace(scene.images[i].frame, std::array<uint32_t, 2>{UINT32_MAX, UINT32_MAX})
+        .first->second[scene.images[i].camera] = i;
+  std::vector<std::array<uint32_t, 2>> paired;
+  double max_abs_dt = 0;
+  for (const auto& [frame, ids] : lenses) {
+    (void)frame;
+    if (ids[0] == UINT32_MAX || ids[1] == UINT32_MAX)
+      continue;
+    const auto& a = scene.images[ids[0]];
+    const auto& b = scene.images[ids[1]];
+    if (a.week != b.week)
+      return {};
+    max_abs_dt = std::max(max_abs_dt, std::abs(a.seconds - b.seconds));
+    paired.push_back(ids);
+  }
+  if (paired.empty())
+    return {};
+  std::vector<RigFrame> frames;
+  frames.reserve(paired.size());
+  if (max_abs_dt <= .002) {
+    rig_mode = "synchronous";
+    for (const auto& ids : paired)
+      frames.push_back({ids[0], ids[1],
+                        ExposureTime(scene.images[ids[0]]) - ExposureTime(scene.images[ids[1]]),
+                        true, Eigen::Quaterniond::Identity(), Eigen::Vector3d::Zero()});
+    return frames;
+  }
+  if (!inputs.imu_attitude_verified || max_abs_dt > .2)
+    return {};
+  std::array<std::vector<double>, 3> offsets;
+  for (uint32_t i = 0; i < model.images.size(); ++i)
+    if (model.images[i].registered) {
+      const Eigen::Vector3d diff = model.images[i].pose.Center() - inputs.navigation[i];
+      for (int k = 0; k < 3; ++k)
+        offsets[k].push_back(diff[k]);
+    }
+  if (offsets[0].empty())
+    return {};
+  const Eigen::Vector3d c_offset(Quantile(offsets[0], .5), Quantile(offsets[1], .5),
+                                 Quantile(offsets[2], .5));
+  rig_mode = "asynchronous";
+  for (const auto& ids : paired) {
+    const uint32_t l = ids[0], r = ids[1];
+    const Eigen::Quaterniond dR =
+        (inputs.kinematics.body_rotation[l] * inputs.kinematics.body_rotation[r].conjugate())
+            .normalized();
+    const Eigen::Vector3d p_l = inputs.kinematics.body_position[l] + c_offset;
+    const Eigen::Vector3d p_r = inputs.kinematics.body_position[r] + c_offset;
+    const Eigen::Vector3d dt = p_l - dR * p_r;
+    frames.push_back({l, r, ExposureTime(scene.images[l]) - ExposureTime(scene.images[r]), false,
+                      dR, dt});
+  }
+  return frames;
+}
+Pose PredictCompanionPose(const Pose& known, const Pose& rig, const RigFrame& f,
+                          bool missing_is_right) {
+  Pose predicted;
+  if (missing_is_right) {
+    const Eigen::Quaterniond q_lt = (known.Rotation() * f.delta_rotation).normalized();
+    const Eigen::Vector3d t_lt = known.Rotation() * f.delta_translation + known.Translation();
+    predicted.Set((rig.Rotation() * q_lt).normalized(),
+                  rig.Rotation() * t_lt + rig.Translation());
+  } else {
+    const Eigen::Quaterniond q_lt = (rig.Rotation().conjugate() * known.Rotation()).normalized();
+    const Eigen::Vector3d t_lt =
+        rig.Rotation().conjugate() * (known.Translation() - rig.Translation());
+    const Eigen::Quaterniond q_l = (q_lt * f.delta_rotation.conjugate()).normalized();
+    const Eigen::Vector3d t_l = t_lt - q_l * f.delta_translation;
+    predicted.Set(q_l, t_l);
+  }
+  return predicted;
+}
 struct EvaluatedAxis {
   ShutterCorrection correction;
   Reconstruction unrectified;
@@ -297,7 +423,8 @@ AxisScreen ScreenAlongAxis(const Scene& scene, const Reconstruction& source,
   motion.rotation.assign(source.images.size(), Eigen::Vector3d::Zero());
   motion.velocity = inputs.velocity;
   const auto opt = Optimize(model, scene.cameras, "fixed", ba_workers, 3, {}, screen_planes,
-                            inputs.navigation, screen_tracks, &motion, inputs.frames);
+                            inputs.navigation, screen_tracks, &motion, inputs.frames, {}, false,
+                            inputs.imu_omega);
   const auto consistency = ReadoutConsistency(scene, model, motion, screen.consistent);
   screen.readout = motion.readout;
   for (const auto& lens : consistency)
@@ -332,7 +459,8 @@ EvaluatedAxis CorrectAlongAxis(const Scene& scene, const Reconstruction& source,
   // Synchronous L/R reference (middle-line) poses are rigid; this is the only BA given the rig.
   report["optimization"] =
       Optimize(model, scene.cameras, "principal", ba_workers, 150, {}, inputs.training_planes,
-               inputs.navigation, inputs.training, &motion, inputs.frames);
+               inputs.navigation, inputs.training, &motion, inputs.frames, {}, false,
+               inputs.imu_omega);
   // Held-out reprojection with every camera fixed: the source projection against the
   // rolling-shutter projection, each with its points refit to the same observations.
   auto before = source;
@@ -480,7 +608,7 @@ void PolishAcceptedShutter(const Scene& scene, const Reconstruction& source,
       std::to_string(polish_planes.size()) + " LAS planes");
   const auto polish_opt =
       Optimize(model, scene.cameras, "principal", ba_workers, 100, {}, polish_planes,
-               inputs.navigation, all_tracks, &motion, inputs.frames);
+               inputs.navigation, all_tracks, &motion, inputs.frames, {}, false, inputs.imu_omega);
   std::vector<double> shift;
   auto rectified = RectifyModel(model, motion, workers, shift);
   const auto quality = rectified.Quality(scene, limits.median_px, limits.p90_px);
@@ -816,10 +944,9 @@ bool BestAlongEpipolar(const Reconstruction& model, const ShutterMotion& motion,
   return true;
 }
 
-void RescueSynchronousFrames(const Scene& scene, const fs::path& work,
-                             const ShutterInputs& inputs, int workers,
-                             const AlignmentLimits& limits, int ba_workers,
-                             EvaluatedAxis& accepted_axis) {
+void RescueRigFrames(const Scene& scene, const fs::path& work, const ShutterInputs& inputs,
+                     int workers, const AlignmentLimits& limits, int ba_workers,
+                     EvaluatedAxis& accepted_axis) {
   const auto started = Clock::now();
   auto& report = accepted_axis.correction.report;
   Reconstruction model = accepted_axis.unrectified;
@@ -831,31 +958,29 @@ void RescueSynchronousFrames(const Scene& scene, const fs::path& work,
     return;
   }
   struct Candidate {
+    size_t frame_index = 0;
     uint32_t missing = 0, known = 0;
     bool missing_is_right = true;
   };
   std::vector<Candidate> candidates;
   const double tl_global = motion.readout[0], tr_global = motion.readout[1];
-  for (const auto& f : inputs.frames) {
-    const bool r0 = model.images[f[0]].registered, r1 = model.images[f[1]].registered;
+  for (size_t fi = 0; fi < inputs.frames.size(); ++fi) {
+    const auto& f = inputs.frames[fi];
+    const bool r0 = model.images[f.left].registered, r1 = model.images[f.right].registered;
     if (r0 == r1)
       continue;
-    const uint32_t missing = r0 ? f[1] : f[0], known = r0 ? f[0] : f[1];
+    const uint32_t missing = r0 ? f.right : f.left, known = r0 ? f.left : f.right;
     if ((model.images[known].pose.Center() - inputs.navigation[known]).norm() >= NavigationGate)
       continue;
-    Pose predicted;
+    const Pose predicted = PredictCompanionPose(model.images[known].pose, rig, f, !r1);
     Eigen::Vector3d pred_rot = Eigen::Vector3d::Zero();
-    if (!r1) {
-      predicted.Set(
-          (rig.Rotation() * model.images[known].pose.Rotation()).normalized(),
-          rig.Rotation() * model.images[known].pose.Translation() + rig.Translation());
-      if (std::abs(tl_global) > 1e-6)
+    if (inputs.imu_attitude_verified && inputs.imu_omega[missing].allFinite()) {
+      const double tau_missing = motion.readout[model.images[missing].camera];
+      pred_rot = tau_missing * (predicted.Rotation() * inputs.imu_omega[missing]);
+    } else if (f.synchronous) {
+      if (!r1 && std::abs(tl_global) > 1e-6)
         pred_rot = (tr_global / tl_global) * (rig.Rotation() * motion.rotation[known]);
-    } else {
-      predicted.Set(
-          (rig.Rotation().conjugate() * model.images[known].pose.Rotation()).normalized(),
-          rig.Rotation().conjugate() * (model.images[known].pose.Translation() - rig.Translation()));
-      if (std::abs(tr_global) > 1e-6)
+      else if (r1 && std::abs(tr_global) > 1e-6)
         pred_rot = (tl_global / tr_global) * (rig.Rotation().conjugate() * motion.rotation[known]);
     }
     if ((predicted.Center() - inputs.navigation[missing]).norm() >= NavigationGate)
@@ -867,7 +992,7 @@ void RescueSynchronousFrames(const Scene& scene, const fs::path& work,
     model.images[missing].points.assign(model.images[missing].pixels.size(), NoPoint);
     motion.rotation[missing] = pred_rot;
     UpdateImageVelocity(model, inputs, motion, missing);
-    candidates.push_back({missing, known, !r1});
+    candidates.push_back({fi, missing, known, !r1});
   }
   if (candidates.empty()) {
     report["rig_rescue"] = {{"attempted_images", 0}, {"rescued_images", 0}};
@@ -1330,13 +1455,14 @@ void RescueSynchronousFrames(const Scene& scene, const fs::path& work,
         active_cands.insert(u);
     if (!active_cands.empty()) {
       Optimize(model, scene.cameras, "fixed", ba_workers, 40, active_cands, {}, inputs.navigation,
-               selected_points, &motion, inputs.frames, selected_points, true);
+               selected_points, &motion, inputs.frames, selected_points, true, inputs.imu_omega);
       for (const uint32_t u : active_cands)
         UpdateImageVelocity(model, inputs, motion, u);
       sanitize_tracks(4.0, false);
       if (!selected_points.empty()) {
         Optimize(model, scene.cameras, "fixed", ba_workers, 30, active_cands, {},
-                 inputs.navigation, selected_points, &motion, inputs.frames, touched_existing, true);
+                 inputs.navigation, selected_points, &motion, inputs.frames, touched_existing,
+                 true, inputs.imu_omega);
         for (const uint32_t u : active_cands)
           UpdateImageVelocity(model, inputs, motion, u);
         sanitize_tracks(3.0, true);
@@ -1351,6 +1477,7 @@ void RescueSynchronousFrames(const Scene& scene, const fs::path& work,
     const uint32_t id = cand.missing;
     const auto& image = model.images[id];
     const auto& cam = model.cameras[image.camera];
+    const auto& f = inputs.frames[cand.frame_index];
     std::vector<double> errs;
     std::set<int> cells;
     for (size_t k = 0; k < image.points.size(); ++k)
@@ -1362,23 +1489,16 @@ void RescueSynchronousFrames(const Scene& scene, const fs::path& work,
           cells.insert(cam.CoverageCell(image.pixels[k]));
         }
       }
-    Pose expected;
-    if (cand.missing_is_right) {
-      expected.Set(
-          (rig.Rotation() * model.images[cand.known].pose.Rotation()).normalized(),
-          rig.Rotation() * model.images[cand.known].pose.Translation() + rig.Translation());
-    } else {
-      expected.Set(
-          (rig.Rotation().conjugate() * model.images[cand.known].pose.Rotation()).normalized(),
-          rig.Rotation().conjugate() *
-              (model.images[cand.known].pose.Translation() - rig.Translation()));
-    }
+    const Pose expected =
+        PredictCompanionPose(model.images[cand.known].pose, rig, f, cand.missing_is_right);
     const double pos_drift = (image.pose.Center() - expected.Center()).norm();
     const double rot_drift = image.pose.Rotation().angularDistance(expected.Rotation());
     const double nav_err = (image.pose.Center() - inputs.navigation[id]).norm();
+    const double max_pos_drift = f.synchronous ? 0.03 : 0.05;
     const bool ok = errs.size() >= MinimumImageObservations && cells.size() >= MinimumImageCells &&
                     Quantile(errs, .5) <= limits.median_px && Quantile(errs, .9) <= limits.p90_px &&
-                    pos_drift <= 0.03 && rot_drift <= 1.5 * Pi / 180.0 && nav_err < NavigationGate;
+                    pos_drift <= max_pos_drift && rot_drift <= 1.5 * Pi / 180.0 &&
+                    nav_err < NavigationGate;
     if (ok) {
       rescued_cands.insert(id);
       rescued_names.push_back(scene.images[id].name);
@@ -1455,7 +1575,7 @@ void RescueSynchronousFrames(const Scene& scene, const fs::path& work,
                           {"attached_existing_candidates", attached_obs},
                           {"seconds", Seconds(started)}};
   Log("Rig rescue: recovered " + std::to_string(rescued_names.size()) + "/" +
-      std::to_string(candidates.size()) + " synchronous frames (+" + std::to_string(added_points) +
+      std::to_string(candidates.size()) + " rig frames (+" + std::to_string(added_points) +
       " points, +" + std::to_string(added_obs) + " obs)");
 }
 }  // namespace
@@ -1470,10 +1590,18 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   if (!inputs.source_quality.at("passed").get<bool>())
     throw std::runtime_error("Rolling-shutter source reconstruction failed visual acceptance");
   inputs.kinematics = ReadExposureKinematics(scene);
+  inputs.imu_boresight_median_deg =
+      VerifyImuAttitude(source, inputs.kinematics, inputs.imu_attitude_verified);
+  if (inputs.imu_attitude_verified)
+    inputs.imu_omega = inputs.kinematics.omega_world;
   inputs.velocity.assign(source.images.size(), Eigen::Vector3d::Zero());
   for (uint32_t i = 0; i < source.images.size(); ++i)
-    if (source.images[i].registered)
-      inputs.velocity[i] = source.images[i].pose.Rotation() * inputs.kinematics.velocity[i];
+    if (source.images[i].registered) {
+      Eigen::Vector3d v_world = inputs.kinematics.velocity[i];
+      if (inputs.imu_attitude_verified)
+        v_world -= inputs.kinematics.omega_world[i].cross(inputs.kinematics.lever_arm[i]);
+      inputs.velocity[i] = source.images[i].pose.Rotation() * v_world;
+    }
   inputs.navigation = NavigationPositions(scene);
   Log("Rolling-shutter correction: " + std::to_string(source.Registered()) + " images");
   inputs.planes = LasPlaneConstraints(scene, source, workers);
@@ -1487,7 +1615,10 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
     else
       inputs.training.insert(id);
   }
-  inputs.frames = SynchronousFrames(scene);
+  inputs.frames = BuildRigFrames(scene, source, inputs, inputs.rig_mode);
+  Log("Rolling-shutter rig mode: " + inputs.rig_mode + " (" +
+      std::to_string(inputs.frames.size()) + " pairs), imu_attitude=" +
+      std::string(inputs.imu_attitude_verified ? "verified" : "unavailable"));
   for (const auto& plane : inputs.planes)
     if (inputs.training.count(plane.point)) {
       inputs.training_planes.push_back(plane);
@@ -1563,12 +1694,19 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   }
   if (best.correction.accepted) {
     PolishAcceptedShutter(scene, source, inputs, workers, limits, ba_workers, best);
-    RescueSynchronousFrames(scene, work, inputs, workers, limits, ba_workers, best);
+    RescueRigFrames(scene, work, inputs, workers, limits, ba_workers, best);
   }
   auto& report = best.correction.report;
+  Json boresight_json = Json::array();
+  for (double deg : inputs.imu_boresight_median_deg)
+    boresight_json.push_back(deg >= 0 ? Json(deg) : Json(nullptr));
   report["method"] = "per-image readout rotation and per-lens readout time with the navigation "
                      "velocity, jointly with cameras, points and intrinsics, screened along rows "
                      "and columns";
+  report["rig_mode"] = inputs.rig_mode;
+  report["imu_attitude"] = {{"available", inputs.kinematics.has_attitude},
+                            {"verified", inputs.imu_attitude_verified},
+                            {"boresight_median_deg", boresight_json}};
   report["holdout_rule"] = "whole tracks of at least three views with IDs divisible by five";
   report["training_tracks"] = inputs.training.size();
   report["validation_tracks"] = inputs.validation.size();
