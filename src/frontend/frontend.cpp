@@ -413,8 +413,15 @@ constexpr float kGroundingScore = .5f;
 // A shadow is transient only within this many mask cells (about 8% of the photo side) of a
 // person: static furniture and exhibit shadows are seen in every view and stay static.
 constexpr int kShadowReach = 24;
+// Oversized shadows (> 8% of the grounding grid, or > 3% and > 3x the touching person component
+// area) are clipped to kShadowReach around people so one pedestrian stepping onto a building
+// shadow does not mask an entire courtyard floor.
+constexpr double kShadowMaxFullShare = .08;
+constexpr double kShadowSmallShare = .03;
+constexpr double kShadowMaxPersonAreaRatio = 3.;
 struct GroundingCounts {
-  size_t persons = 0, robots = 0, shadows = 0, distant_shadows = 0, skies = 0, sky_images = 0;
+  size_t persons = 0, robots = 0, shadows = 0, clipped_shadows = 0, distant_shadows = 0,
+         skies = 0, sky_images = 0;
 };
 int GroundingSize(const Json& manifest) {
   if (manifest.at("grounding_prompts") != Json{"person", "shadow", "robot", "sky"} ||
@@ -462,17 +469,53 @@ GroundingResult GroundingMask(const std::vector<Tensor>& outputs, int width, int
   }
   cv::Mat transient = people.clone();
   if (!shadows.empty()) {
-    cv::Mat reach;
-    cv::dilate(people, reach,
-               cv::getStructuringElement(cv::MORPH_ELLIPSE,
-                                         {2 * kShadowReach + 1, 2 * kShadowReach + 1}));
-    for (const auto& [score, mask] : shadows)
-      if (cv::countNonZero(mask & reach)) {
+    cv::Mat people_labels, people_stats, people_centroids;
+    const int people_count =
+        cv::connectedComponentsWithStats(people, people_labels, people_stats, people_centroids, 8);
+    if (people_count <= 1) {
+      counts.distant_shadows += shadows.size();
+    } else {
+      const cv::Mat reach_kernel = cv::getStructuringElement(
+          cv::MORPH_ELLIPSE, {2 * kShadowReach + 1, 2 * kShadowReach + 1});
+      cv::Mat reach;
+      cv::dilate(people, reach, reach_kernel);
+      const int max_full_cells = int(std::lround(kShadowMaxFullShare * size * size));
+      const int small_cells = int(std::lround(kShadowSmallShare * size * size));
+      for (const auto& [score, mask] : shadows) {
+        const cv::Mat near = mask & reach;
+        if (!cv::countNonZero(near)) {
+          ++counts.distant_shadows;
+          continue;
+        }
+        const int shadow_area = cv::countNonZero(mask);
+        bool oversized = shadow_area > max_full_cells;
+        if (!oversized && shadow_area > small_cells) {
+          cv::Mat mask_reach;
+          cv::dilate(mask, mask_reach, reach_kernel);
+          std::vector<uint8_t> hit(size_t(people_count), 0);
+          for (int y = 0; y < size; ++y) {
+            const uint8_t* m = mask_reach.ptr<uint8_t>(y);
+            const int* l = people_labels.ptr<int>(y);
+            for (int x = 0; x < size; ++x)
+              if (m[x] && l[x] > 0)
+                hit[size_t(l[x])] = 1;
+          }
+          int touching_person_area = 0;
+          for (int label = 1; label < people_count; ++label)
+            if (hit[size_t(label)])
+              touching_person_area += people_stats.at<int>(label, cv::CC_STAT_AREA);
+          oversized =
+              double(shadow_area) > kShadowMaxPersonAreaRatio * double(touching_person_area);
+        }
         ++counts.shadows;
-        transient |= mask;
-      } else {
-        ++counts.distant_shadows;
+        if (oversized) {
+          ++counts.clipped_shadows;
+          transient |= near;
+        } else {
+          transient |= mask;
+        }
       }
+    }
   }
   // One cell of margin covers the coarse mask boundary and the soft shadow edge.
   cv::dilate(transient, transient, cv::Mat::ones(3, 3, CV_8UC1));
@@ -684,9 +727,13 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
   auto report = timing.Report(started, &models);
   report["grounding"] = {{"score_threshold", kGroundingScore},
                          {"shadow_reach_cells", kShadowReach},
+                         {"shadow_max_full_share", kShadowMaxFullShare},
+                         {"shadow_small_share", kShadowSmallShare},
+                         {"shadow_max_person_area_ratio", kShadowMaxPersonAreaRatio},
                          {"persons", counts.persons},
                          {"persons_kept_as_robots", counts.robots},
                          {"shadows", counts.shadows},
+                         {"shadows_clipped", counts.clipped_shadows},
                          {"shadows_far_from_persons", counts.distant_shadows},
                          {"skies", counts.skies},
                          {"images_with_sky", counts.sky_images}};

@@ -521,3 +521,72 @@
    - 接入 200 Hz IMU 与异步 `RigFrame` 后，`古建筑-p0` 左镜头 `cx` 偏移与 `rz` 偏置已显著收敛（`rz` 降 `39%`），但因单图约 `1,724` 条像素观测相对单条 `ImuShutterRotation` 残差（$\sigma = 0.15^\circ$）仍占主导，且 `古建筑` 镜头存在固有 `fy - fx ≈ +5.6 px` 纵横比与 L/R `readout_s` 不对称残余，后续如需进一步抑制单镜头主点/滚转漂移可结合 P1/P2 评估权重或内参耦合策略。
    - **尚未验证项**：本轮按计划仅交付预处理与 `check` 验收，未运行下游 3DGS 训练（留待实训确认渲染 PSNR/SSIM/几何提升）。
    - **P1/P2 待推进方向**：大场景下大面积静止阴影与随行采集员手臂的静态掩码误判、`supervision` 阶段 `hold_depths` `1.5 GiB` 上限导致的磁盘二次解码、初始化 `points3D.ply` 250 m 远距视觉外点约束，以及面向 1,400+ 帧大场景的 [`trainer.json`](file:///d:/Dev/GeosunPre/configs/trainer.json) 训练尺度配比。
+
+---
+
+## 2026-11-19：面向掩码质量与大场景监督缓存弹性的 P1 改进双场景实测
+
+### 1. 前置实证排查与改动摘要
+
+动手实施 P1 前，对 `work\古建筑-p0` 全量掩码/深度与监督日志做了像素级叠加实测：
+- **放弃采集员衣袖启发式（实证已覆盖）**：原以为暴露在静态区域的采集员蓝色衣袖，经叠加 `160°` 有效域与最终掩码后实测 `00199-L` 约 `99.3%`、`00233-R` 约 `99.9%`、`00350-R` `100.0%` 已被标为 `0`，代表样张 `00140-L`、`00434-L` 下角整条蓝色衣袖亦已完整 `0` 掩码，极少量跨界弧缘在 `supervision` 中以实际远距/地面激光点覆盖、未出现 `< 0.8 m` 误投影；且按“边角无近距 LAS + 多视角冲突”泛化清零误判走廊柱墙风险高，故明确跳过，不做脆弱启发式。
+
+聚焦 3 项真实确凿问题完成改动并同步契约文档（[`output.md`](file:///d:/Dev/GeosunPre/docs/output.md)、[`supervision.md`](file:///d:/Dev/GeosunPre/docs/supervision.md)）：
+
+1. **超大建筑物阴影按连通人物邻域局部裁剪**（[`frontend.cpp`](file:///d:/Dev/GeosunPre/src/frontend/frontend.cpp)）：在 `GroundingMask` 中若单个 `shadow` 检测在 `288×288` 格网覆盖超过 `8%`（`kShadowMaxFullShare`），或处于 `(3%, 8%]` 且面积超过接触 `people` 连通块总面积的 `3` 倍（`kShadowMaxPersonAreaRatio`），则仅将落入 `people` 膨胀 `kShadowReach = 24` 格邻域 `near` 的部分并入 `transient`，不再整块吞并庭院/大厅建筑大阴影；`<= 3%` 的小影子（如操作员地面投影及室内近距人影）保持完整并入，并在 `masks_profile.json` 记录 `shadows_clipped`。
+2. **`supervision` 跨视角冲突 `hold_depths` 自适应内存上限**（[`supervision.cpp`](file:///d:/Dev/GeosunPre/src/geometry/supervision.cpp)）：`HoldDepthBudgetBytes()` 通过 `GlobalMemoryStatusEx` 查询主机实时可用物理内存，上限取 `min(ullAvailPhys / 4, 8 GiB)`（失败回退 `1.5 GiB`），按已注册镜头真实像素尺寸累加计算 `held_depth_bytes`，并在 `monocular.view_conflicts` 记录 `hold_depths`、`held_depth_bytes` 与 `hold_depth_budget_bytes`。
+3. **超大 LAS 相机射程预裁剪与分块 AABB 投影剔除**（[`supervision.h`](file:///d:/Dev/GeosunPre/src/geometry/supervision.h)、[`supervision.cpp`](file:///d:/Dev/GeosunPre/src/geometry/supervision.cpp)、[`colmap.cpp`](file:///d:/Dev/GeosunPre/src/io/colmap.cpp)）：
+   - `--supervision-cache-mb` 默认上限由 `2048 MiB` 提升为 `4096 MiB`（范围 `1–8192`，运行期仍受 `free_vram / 4` 约束）；
+   - `LasSurfelCache` 传入 `Reconstruction` 模型后，`ScanLas` 按已注册相机中心包络向外扩 `MaxDepth + 2.5 m`（`68.035 m`）预裁剪射程外 LAS 点并紧缩分片直方图范围（`culled_out_of_reach`）；
+   - 面元缓存按 `PointChunk`（`500,000` 点）切片并记录原始坐标 `RawBounds`，在 `ProjectNearest` 与 `Project` 中无论是 GPU 常驻还是文件流式（`seekg` 按偏移跳过）均先以当批相机 `BatchReachBounds`（`MaxDepth + 2.0 + 1.5 * max_shift`）过滤无重叠分块（`chunks_total`、`chunks_projected`、`chunks_skipped`）。
+
+---
+
+### 2. 主实验：`古建筑`（1,438 帧室外大阴影+大内存持留）对比
+
+`work\古建筑-p0`（`47bb4fb-dirty`）与 `work\古建筑-p1`（`0bdb67f-dirty`）对照如下：
+
+| 指标 | P0 (`work\古建筑-p0`) | P1 (`work\古建筑-p1`) | 变化 / 结论 |
+| :--- | :---: | :---: | :--- |
+| 注册完成度 / `check` | `1438/1438`（`passed: true`） | `1438/1438`（`passed: true`） | 保持完整闭环 |
+| Grounding 影子裁剪数 | `shadows=272`（未裁剪） | `shadows=272`，**`shadows_clipped=35`** | 仅命中 35 个超大建筑连带阴影 |
+| 有效域被遮 `> 30% / > 20%` 图数 | `22` / `31` 张 | **`0` / `1` 张** | **`> 30%` 误抹大图完全清零** |
+| `00035-L` 静态 / 有效深度像素 | `222,657`（`21.4%`） / `96,866` | **`480,909`（`46.1%`） / `337,315`** | **静态 `+116%`，深度 `+248%`** |
+| `00472-R` 静态 / 有效深度像素 | `228,384`（`21.9%`） / `140,620` | **`414,352`（`39.7%`） / `316,873`** | **静态 `+81%`，深度 `+125%`** |
+| `00350-R` 静态像素（随动小影对照） | `740,100` | `740,115` | 采集者紧凑地面阴影完整保留 |
+| 总交付深度 / 法向像素 | `785,909,987` / `827,360,773` | **`791,665,885` / `832,946,346`** | **净增 `+576 万` 深度 / `+559 万` 法向** |
+| `hold_depths` / 预算 | 未启用（`> 1.5 GiB` 硬上限） | **`true`（`2.79 GiB <= 3.58 GiB`）** | 全量深度驻留内存免落盘二次解码 |
+| `view_conflicts` 耗时 | `31.98 s` | **`11.30 s`** | **`-64.7%`（提速 `2.8×`）** |
+| `supervision` 总耗时 | `347.39 s` | **`322.79 s`** | 减少 `24.60 s` |
+| `point_cache` 配置与分块 | `budget=2 GiB`, `gpu`（`0.94 GiB`） | `budget=4 GiB`, `gpu`, `chunks=103`, `projected=10,506` | 39×38 m 场景全在 65.5 m 射程内（`skipped=0`） |
+| 稀疏点 / 观测 / 重投影 | `431,014` / `2,000,011` / `0.7471/1.8168 px` | `433,776` / `2,009,824` / **`0.7455/1.8140 px`** | 石板地面有效观测增加、重投影略优 |
+| `polish reassoc` / 导航误差 | `5.78/22.31 mm` / `25.60/37.48 mm` | **`5.73/22.14 mm` / `25.59/36.94 mm`** | 精度小幅改善 |
+| 阶段累计耗时（墙钟） | `1585.22 s` | **`1523.79 s`**（墙钟 `1586.56 s`） | 同步降耗 `61.43 s` |
+
+`check` 核验输出（`work\古建筑-p1`）：`passed: true`，`images: 1438`，`observations: 2,009,824`，`points: 433,776`，`depth_pixels: 791,665,885`，`normal_pixels: 832,946,346`。
+
+---
+
+### 3. 室内阴影与文件流式缓存回归：`展厅`（`--supervision-cache-mb 64`）对比
+
+在 `588` 帧室内场景 `展厅` 上显式指定 `--supervision-cache-mb 64`，强制 `LasPointCache` 走磁盘紧凑面元文件、双缓冲异步 H2D 上传与 `seekg` 路径，同时核验室内近距人影不被误放过：
+
+| 指标 | 基线 (`work\展厅-p2`) | P1 (`work\展厅-p1`, `cache=64 MiB`) | 变化 / 结论 |
+| :--- | :---: | :---: | :--- |
+| 注册完成度 / `check` | `588/588`（`passed: true`） | `588/588`（`passed: true`） | 流式缓存全链路零出错 |
+| `point_cache` 模式与传输 | `storage=gpu`, `h2d=0` | **`storage=file` (`64 MiB`)**, `h2d=27.84 GB`, `transfer=20 MB`, `chunks=64`, `projected=2,816` | 验证文件分块流式投影正常 |
+| `las_proj` / `supervision` 耗时 | `14.28 s` / `124.22 s` | `18.21 s` / `126.66 s` | 双缓冲流式仅增 `+2.44 s`（约 `+2%`） |
+| `hold_depths` / `vc` | `—` / `4.72 s` | `true` (`1.13 <= 3.88 GiB`) / `4.70 s` | 与原内存驻留路径一致 |
+| Grounding 影子裁剪数 | `shadows=81` | `shadows=81`, `shadows_clipped=2` | 几乎无触发 |
+| `00051-R` / `00052-R` / `00306-L` 静态像素 | `462,956` / `536,926` / `570,284` | **`462,956` / `536,926` / `570,284`** | **静态像素数完全一致（零损失）** |
+| 总有效深度 / 法向像素 | `338,545,560` / `360,680,178` | `338,637,245` / `360,752,429` | 偏差 `< +0.03%`（原子加正常抖动） |
+| 重投影 / `polish` / 导航 | `0.8894/2.0697 px` / `5.74/16.81 mm` / `20.69/37.20 mm` | `0.8872/2.0666 px` / `5.61/16.99 mm` / `21.32/35.25 mm` | 零退化 |
+
+`check` 核验输出（`work\展厅-p1`）：`passed: true`，`images: 588`，`observations: 737,257`，`points: 152,679`，`depth_pixels: 338,637,245`，`normal_pixels: 360,752,429`。
+
+---
+
+### 4. 视觉抽检与未验证项
+
+- **掩码视觉抽检**：对照 `古建筑-p1` [00035-L](file:///d:/Dev/GeosunPre/work/古建筑-p1/masks/2411-357849-840_00035-L.JPG.png)、[00472-R](file:///d:/Dev/GeosunPre/work/古建筑-p1/masks/2411-358199-484_00472-R.JPG.png) 与 [00350-R](file:///d:/Dev/GeosunPre/work/古建筑-p1/masks/2411-358101-834_00350-R.JPG.png)，大面积廊檐阴影吞并已被精确剥离、庭院地面完整恢复为 `255`，同时行人及 `24` 格邻域局部影子、`00350-R` 采集员随动地影均保持 `0`；`展厅-p1` [00051-R](file:///d:/Dev/GeosunPre/work/展厅-p1/masks/R/0000/2436-213993-428_00051-R.JPG.png) 近景展馆参观者与地面影轮廓完全保持。
+- **已知验证边界**：现有三套测试场景最大空间尺度为 `50×93×20 m`（`< 2 * 65.5 m` 射程盒），`chunks_skipped > 0` 与 `culled_out_of_reach > 0` 分支将在百米级以上更广域场景中实际触发（本次通过代码走读与流式路径全量投影核对）；下游 3DGS 训练仍留待用户按大场景需求执行。

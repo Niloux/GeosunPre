@@ -6,11 +6,13 @@
 #include "io/las.h"
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <Windows.h>
 #include <algorithm>
 #include <cmath>
 #include <deque>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <numeric>
 
 namespace geosun {
@@ -26,6 +28,94 @@ constexpr size_t Lookahead = 6;
 constexpr size_t SlabPointBytes = 192;
 constexpr size_t MaxSlabPoints = 64 * 1000 * 1000;
 constexpr int SlabBins = 1 << 16;
+struct RawBounds {
+  int3 min, max;
+};
+bool Overlaps(const RawBounds& a, const RawBounds& b) {
+  return a.min.x <= b.max.x && a.max.x >= b.min.x && a.min.y <= b.max.y &&
+         a.max.y >= b.min.y && a.min.z <= b.max.z && a.max.z >= b.min.z;
+}
+bool Contains(const RawBounds& b, const std::array<int32_t, 3>& raw) {
+  return raw[0] >= b.min.x && raw[0] <= b.max.x && raw[1] >= b.min.y && raw[1] <= b.max.y &&
+         raw[2] >= b.min.z && raw[2] <= b.max.z;
+}
+Eigen::Vector3d WorkingToFile(const LasHeader& header, const Eigen::Vector3d& world) {
+  if (!header.converted)
+    return world;
+  return (header.frame.rotation.conjugate() * (world - header.frame.translation)) /
+         header.frame.scale;
+}
+int32_t ClampRawCoord(double value) {
+  constexpr double lo = double(std::numeric_limits<int32_t>::lowest());
+  constexpr double hi = double(std::numeric_limits<int32_t>::max());
+  if (!std::isfinite(value))
+    return value < 0 ? std::numeric_limits<int32_t>::lowest()
+                     : std::numeric_limits<int32_t>::max();
+  return int32_t(std::clamp(value, lo, hi));
+}
+RawBounds WorldBoxToRawBounds(const LasHeader& header, const Eigen::Vector3d& lo,
+                              const Eigen::Vector3d& hi) {
+  Eigen::Vector3d file_lo = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity()),
+                  file_hi = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+  for (int mask = 0; mask < 8; ++mask) {
+    const Eigen::Vector3d corner(mask & 1 ? hi.x() : lo.x(), mask & 2 ? hi.y() : lo.y(),
+                                 mask & 4 ? hi.z() : lo.z());
+    const Eigen::Vector3d f = WorkingToFile(header, corner);
+    file_lo = file_lo.cwiseMin(f);
+    file_hi = file_hi.cwiseMax(f);
+  }
+  Eigen::Array3d r_lo, r_hi;
+  for (int k = 0; k < 3; ++k) {
+    const double a = (file_lo[k] - header.origin[k]) / header.scale[k],
+                 b = (file_hi[k] - header.origin[k]) / header.scale[k];
+    r_lo[k] = std::floor(std::min(a, b));
+    r_hi[k] = std::ceil(std::max(a, b));
+  }
+  return {make_int3(ClampRawCoord(r_lo[0]), ClampRawCoord(r_lo[1]), ClampRawCoord(r_lo[2])),
+          make_int3(ClampRawCoord(r_hi[0]), ClampRawCoord(r_hi[1]), ClampRawCoord(r_hi[2]))};
+}
+std::optional<RawBounds> ModelReachBounds(const LasHeader& header, const Reconstruction& model,
+                                          double reach_m) {
+  Eigen::Vector3d lo = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity()),
+                  hi = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+  bool any = false;
+  for (const auto& img : model.images)
+    if (img.registered) {
+      const auto c = img.pose.Center();
+      lo = lo.cwiseMin(c);
+      hi = hi.cwiseMax(c);
+      any = true;
+    }
+  if (!any)
+    return std::nullopt;
+  return WorldBoxToRawBounds(header, lo - Eigen::Vector3d::Constant(reach_m),
+                             hi + Eigen::Vector3d::Constant(reach_m));
+}
+RawBounds BatchReachBounds(const LasHeader& header, const Reconstruction& model,
+                           const ShutterMotion* motion, const std::vector<uint32_t>& images,
+                           size_t first, size_t count, uint32_t cid) {
+  Eigen::Vector3d lo = Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity()),
+                  hi = Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+  double max_shift = 0;
+  for (size_t j = 0; j < count; ++j) {
+    const uint32_t id = images[first + j];
+    const auto c = model.images[id].pose.Center();
+    lo = lo.cwiseMin(c);
+    hi = hi.cwiseMax(c);
+    if (motion)
+      max_shift = std::max(max_shift, (motion->readout[cid] * motion->velocity[id]).norm());
+  }
+  const double reach = MaxDepth + 2.0 + 1.5 * max_shift;
+  return WorldBoxToRawBounds(header, lo - Eigen::Vector3d::Constant(reach),
+                             hi + Eigen::Vector3d::Constant(reach));
+}
+uint64_t HoldDepthBudgetBytes() {
+  MEMORYSTATUSEX status{};
+  status.dwLength = sizeof(status);
+  if (GlobalMemoryStatusEx(&status) && status.ullAvailPhys > 0)
+    return std::min<uint64_t>(uint64_t(status.ullAvailPhys) / 4, 8192ULL << 20);
+  return 1536ULL << 20;
+}
 struct Stream {
   cudaStream_t value = nullptr;
   Stream() { CudaCheck(cudaStreamCreateWithFlags(&value, cudaStreamNonBlocking)); }
@@ -54,15 +144,22 @@ struct PointTransfer {
   explicit PointTransfer(bool streaming) : device(streaming ? PointChunk * sizeof(Surfel) : 0) {}
 };
 class LasPointCache {
+  struct SurfelChunk {
+    uint64_t offset = 0;
+    uint32_t count = 0;
+    RawBounds bounds{};
+  };
   std::unique_ptr<DeviceBuffer> resident_;
   std::array<std::unique_ptr<PointTransfer>, 2> transfers_;
   // Drain both streams before releasing any buffers, including constructor failure.
   Stream compute_, upload_;
   fs::path coordinates_file_, file_;
-  uint64_t count_ = 0, excluded_ = 0, uploaded_bytes_ = 0;
+  uint64_t count_ = 0, excluded_ = 0, culled_out_of_reach_ = 0, uploaded_bytes_ = 0,
+           chunks_projected_ = 0, chunks_skipped_ = 0;
   size_t budget_ = 0, batches_ = 0, slabs_ = 0;
   double prepare_seconds_ = 0, surfel_seconds_ = 0;
   SurfelStats stats_;
+  std::vector<SurfelChunk> chunks_;
 
  public:
   ~LasPointCache() {
@@ -76,8 +173,8 @@ class LasPointCache {
     if (!file_.empty())
       fs::remove(file_, ec);
   }
-  LasPointCache(const fs::path& las, const LasHeader& header, const fs::path& output,
-                int cache_mb) {
+  LasPointCache(const fs::path& las, const LasHeader& header, const fs::path& output, int cache_mb,
+                const Reconstruction* model = nullptr) {
     const auto started = Clock::now();
     fs::create_directories(output);
     // Kept coordinates go to a compact file with a histogram along the longest axis, which
@@ -88,11 +185,25 @@ class LasPointCache {
     for (int k = 1; k < 3; ++k)
       if (extent[k] > extent[axis])
         axis = k;
-    const double lower = std::floor((header.file_lower[axis] - header.origin[axis]) /
-                                    header.scale[axis]),
-                 upper = std::ceil((header.file_upper[axis] - header.origin[axis]) /
-                                   header.scale[axis]),
-                 bin_width = std::max(1., (upper - lower + 1) / SlabBins);
+    double lower = std::floor((header.file_lower[axis] - header.origin[axis]) /
+                              header.scale[axis]),
+           upper = std::ceil((header.file_upper[axis] - header.origin[axis]) /
+                             header.scale[axis]);
+    const auto reach_bounds = model ? ModelReachBounds(header, *model, MaxDepth + 2.5)
+                                    : std::nullopt;
+    if (reach_bounds) {
+      const int32_t rlo = axis == 0 ? reach_bounds->min.x
+                        : axis == 1 ? reach_bounds->min.y
+                                    : reach_bounds->min.z;
+      const int32_t rhi = axis == 0 ? reach_bounds->max.x
+                        : axis == 1 ? reach_bounds->max.y
+                                    : reach_bounds->max.z;
+      lower = std::max(lower, double(rlo));
+      upper = std::min(upper, double(rhi));
+      if (upper < lower)
+        upper = lower;
+    }
+    const double bin_width = std::max(1., (upper - lower + 1) / SlabBins);
     std::vector<uint64_t> histogram(SlabBins);
     auto bin = [&](int raw) {
       return std::clamp(int(std::floor((raw - lower) / bin_width)), 0, SlabBins - 1);
@@ -107,11 +218,16 @@ class LasPointCache {
       ScanLas(las, header, [&](uint64_t, const std::vector<LasPoint>& chunk) {
         kept.clear();
         for (const auto& point : chunk) {
-          if (KeepLasPoint(point)) {
-            kept.push_back(make_int3(point.raw[0], point.raw[1], point.raw[2]));
-            ++histogram[bin(point.raw[axis])];
-          } else
+          if (!KeepLasPoint(point)) {
             ++excluded_;
+            continue;
+          }
+          if (reach_bounds && !Contains(*reach_bounds, point.raw)) {
+            ++culled_out_of_reach_;
+            continue;
+          }
+          kept.push_back(make_int3(point.raw[0], point.raw[1], point.raw[2]));
+          ++histogram[bin(point.raw[axis])];
         }
         packed.write(reinterpret_cast<const char*>(kept.data()),
                      std::streamsize(kept.size() * sizeof(int3)));
@@ -123,6 +239,8 @@ class LasPointCache {
       if (!packed)
         throw std::runtime_error("Incomplete LAS coordinate cache write");
     }
+    if (!count_)
+      throw std::runtime_error("No valid LAS points within camera reach");
     size_t free, total;
     CudaCheck(cudaMemGetInfo(&free, &total));
     budget_ = std::min(size_t(cache_mb) * 1024 * 1024, free / 4);
@@ -193,6 +311,18 @@ class LasPointCache {
       const auto scale =
           make_float3(float(header.scale.x()), float(header.scale.y()), float(header.scale.z()));
       const auto result = SlabSurfels(own, mine, origin, scale, compute_.value, stats_);
+      for (size_t base = 0; base < result.size(); base += PointChunk) {
+        const size_t n = std::min(PointChunk, result.size() - base);
+        int3 cmin = result[base].raw, cmax = result[base].raw;
+        for (size_t k = 1; k < n; ++k) {
+          const auto& raw = result[base + k].raw;
+          cmin = make_int3(std::min(cmin.x, raw.x), std::min(cmin.y, raw.y),
+                           std::min(cmin.z, raw.z));
+          cmax = make_int3(std::max(cmax.x, raw.x), std::max(cmax.y, raw.y),
+                           std::max(cmax.z, raw.z));
+        }
+        chunks_.push_back({stored + base, uint32_t(n), {cmin, cmax}});
+      }
       if (resident_)
         CudaCheck(cudaMemcpy(static_cast<Surfel*>(resident_->data) + stored, result.data(),
                              result.size() * sizeof(Surfel), cudaMemcpyHostToDevice));
@@ -225,18 +355,19 @@ class LasPointCache {
   uint64_t Count() const { return count_; }
   uint64_t Excluded() const { return excluded_; }
   void ProjectNearest(const Projection* cameras, const float3* rays, float* nearest, int width,
-                      int height, size_t images) {
-    Project(cameras, rays, nearest, nullptr, width, height, images, false);
+                      int height, size_t images, const RawBounds* batch_bounds = nullptr) {
+    Project(cameras, rays, nearest, nullptr, width, height, images, false, batch_bounds);
     ++batches_;
   }
   void Project(const Projection* cameras, const float3* rays, float* nearest, Blend* blends,
-               int width, int height, size_t images) {
+               int width, int height, size_t images, const RawBounds* batch_bounds = nullptr) {
     for (const bool accumulate : {false, true})
-      Project(cameras, rays, nearest, blends, width, height, images, accumulate);
+      Project(cameras, rays, nearest, blends, width, height, images, accumulate, batch_bounds);
     ++batches_;
   }
   void Project(const Projection* cameras, const float3* rays, float* nearest, Blend* blends,
-               int width, int height, size_t images, bool accumulate) {
+               int width, int height, size_t images, bool accumulate,
+               const RawBounds* batch_bounds) {
     std::ifstream packed;
     if (!resident_) {
       packed.open(file_, std::ios::binary);
@@ -244,19 +375,31 @@ class LasPointCache {
         throw std::runtime_error("Cannot read LAS surfel cache");
     }
     size_t index = 0;
-    for (uint64_t first = 0; first < count_; first += PointChunk) {
-      const size_t count = size_t(std::min<uint64_t>(PointChunk, count_ - first));
+    uint64_t file_offset = 0;
+    for (const auto& chunk : chunks_) {
+      if (batch_bounds && !Overlaps(chunk.bounds, *batch_bounds)) {
+        ++chunks_skipped_;
+        continue;
+      }
+      ++chunks_projected_;
       const Surfel* points;
       PointTransfer* transfer = nullptr;
       if (resident_)
-        points = static_cast<const Surfel*>(resident_->data) + first;
+        points = static_cast<const Surfel*>(resident_->data) + chunk.offset;
       else {
         transfer = transfers_[index++ % transfers_.size()].get();
         if (transfer->used)
           CudaCheck(cudaEventSynchronize(transfer->copied.value));
-        const size_t bytes = count * sizeof(Surfel);
+        if (file_offset != chunk.offset) {
+          packed.seekg(std::streamoff(chunk.offset * sizeof(Surfel)), std::ios::beg);
+          if (!packed)
+            throw std::runtime_error("Cannot seek LAS surfel cache");
+          file_offset = chunk.offset;
+        }
+        const size_t bytes = size_t(chunk.count) * sizeof(Surfel);
         if (!packed.read(reinterpret_cast<char*>(transfer->host.data), std::streamsize(bytes)))
           throw std::runtime_error("Truncated LAS surfel cache");
+        file_offset += chunk.count;
         if (transfer->used)
           CudaCheck(cudaStreamWaitEvent(upload_.value, transfer->consumed.value, 0));
         CudaCheck(cudaMemcpyAsync(transfer->device.data, transfer->host.data, bytes,
@@ -266,7 +409,7 @@ class LasPointCache {
         points = static_cast<const Surfel*>(transfer->device.data);
         uploaded_bytes_ += bytes;
       }
-      supervision_gpu::Project(points, count, images, cameras, rays, nearest, blends, width,
+      supervision_gpu::Project(points, chunk.count, images, cameras, rays, nearest, blends, width,
                                height, accumulate, compute_.value);
       if (transfer) {
         CudaCheck(cudaEventRecord(transfer->consumed.value, compute_.value));
@@ -317,6 +460,10 @@ class LasPointCache {
             {"las_scans", 1},
             {"budget_bytes", budget_},
             {"surfel_bytes", count_ * sizeof(Surfel)},
+            {"culled_out_of_reach", culled_out_of_reach_},
+            {"chunks_total", chunks_.size()},
+            {"chunks_projected", chunks_projected_},
+            {"chunks_skipped", chunks_skipped_},
             {"gpu_cache_bytes", resident_ ? resident_->bytes : 0},
             {"transfer_buffer_bytes", resident_ ? 0 : 2 * PointChunk * sizeof(Surfel)},
             {"host_to_device_bytes", uploaded_bytes_},
@@ -416,13 +563,13 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   options.static_masks = args.Get("--no-static-masks") != "true";
   options.max_size = args.Integer("--supervision-max-size", 1024);
   options.boundary = args.Integer("--supervision-boundary", 4);
-  options.cache_mb = args.Integer("--supervision-cache-mb", 2048);
+  options.cache_mb = args.Integer("--supervision-cache-mb", 4096);
   if (!args.Get("--supervision-mask-dir").empty())
     options.mask_dir = args.Path("--supervision-mask-dir");
   if (options.max_size < 128 || options.max_size > 4096 || options.boundary > 32)
     throw std::runtime_error("Supervision max size must be 128-4096 and boundary 1-32 pixels");
-  if (options.cache_mb > 4096)
-    throw std::runtime_error("Supervision cache budget must be 1-4096 MiB");
+  if (options.cache_mb < 1 || options.cache_mb > 8192)
+    throw std::runtime_error("Supervision cache budget must be 1-8192 MiB");
   if (!options.enabled &&
       (args.values.count("--supervision-max-size") || args.values.count("--supervision-boundary") ||
        args.values.count("--supervision-cache-mb") || !options.mask_dir.empty() ||
@@ -540,8 +687,8 @@ struct LasSurfelCache::Implementation : LasPointCache {
   using LasPointCache::LasPointCache;
 };
 LasSurfelCache::LasSurfelCache(const fs::path& las, const LasHeader& header, const fs::path& scratch,
-                               int cache_mb)
-    : impl_(std::make_unique<Implementation>(las, header, scratch, cache_mb)) {}
+                               int cache_mb, const Reconstruction* model)
+    : impl_(std::make_unique<Implementation>(las, header, scratch, cache_mb, model)) {}
 LasSurfelCache::~LasSurfelCache() = default;
 void LasSurfelCache::Finish() { impl_->Finish(); }
 void ProjectLasDepths(LasSurfelCache& cache, const LasHeader& header, const Reconstruction& model,
@@ -582,9 +729,11 @@ void ProjectLasDepths(LasSurfelCache& cache, const LasHeader& header, const Reco
       CudaCheck(cudaMemcpyAsync(cameras.data, projection.data(), count * sizeof(Projection),
                                 cudaMemcpyHostToDevice, stream));
       CudaCheck(cudaMemsetAsync(nearest.data, 0x7f, count * size * sizeof(float), stream));
+      const auto batch_bounds =
+          BatchReachBounds(header, model, motion, images, first, count, cid);
       points.ProjectNearest(static_cast<const Projection*>(cameras.data),
                             static_cast<const float3*>(rays.data),
-                            static_cast<float*>(nearest.data), w, h, count);
+                            static_cast<float*>(nearest.data), w, h, count, &batch_bounds);
       ResolveNearest(static_cast<float*>(nearest.data), count * size_t(size), stream);
       for (size_t j = 0; j < count; ++j) {
         cv::Mat result(h, w, CV_32FC1);
@@ -649,10 +798,18 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   std::array<std::optional<MonocularLens>, 2> lens_plans;
   // Cells of each photo whose MoGe depth the trusted LAS confirmed, for the cross-view check; each
   // pending write fills its own image.
-  const bool hold_depths =
-      monocular && uint64_t(model.Registered()) * uint64_t(options.max_size) *
-                           uint64_t(options.max_size) * sizeof(uint16_t) <=
-                       (1536ULL << 20);
+  uint64_t held_depth_bytes = 0;
+  if (monocular) {
+    const std::array<Camera, 2> grids{MapCamera(model.cameras[0], options.max_size),
+                                      MapCamera(model.cameras[1], options.max_size)};
+    for (const auto& img : model.images)
+      if (img.registered) {
+        const auto& g = grids[img.camera];
+        held_depth_bytes += uint64_t(g.width) * uint64_t(g.height) * sizeof(uint16_t);
+      }
+  }
+  const uint64_t hold_depth_budget_bytes = monocular ? HoldDepthBudgetBytes() : 0;
+  const bool hold_depths = monocular && held_depth_bytes <= hold_depth_budget_bytes;
   std::vector<cv::Mat> verified_cells(model.images.size());
   std::vector<cv::Mat> held_depths(hold_depths ? model.images.size() : 0);
   auto* verified_out = &verified_cells;
@@ -732,10 +889,12 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
                                 cudaMemcpyHostToDevice, stream));
       CudaCheck(cudaMemsetAsync(nearest.data, 0x7f, count * size * sizeof(float), stream));
       CudaCheck(cudaMemsetAsync(blends.data, 0, count * size * sizeof(Blend), stream));
+      const auto batch_bounds =
+          BatchReachBounds(header, model, motion, images, first, count, cid);
       const auto projecting = Clock::now();
       points.Project(static_cast<const Projection*>(cameras.data),
                      static_cast<const float3*>(rays.data), static_cast<float*>(nearest.data),
-                     static_cast<Blend*>(blends.data), w, h, count);
+                     static_cast<Blend*>(blends.data), w, h, count, &batch_bounds);
       CudaCheck(cudaStreamSynchronize(stream));
       project_seconds += Seconds(projecting);
       for (size_t j = 0; j < count; ++j) {
@@ -849,6 +1008,9 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   if (monocular) {
     view_conflicts = FilterViewConflicts(output, scene, model, motion, options.max_size,
                                          verified_cells, rows, held_out);
+    view_conflicts["hold_depths"] = hold_depths;
+    view_conflicts["held_depth_bytes"] = held_depth_bytes;
+    view_conflicts["hold_depth_budget_bytes"] = hold_depth_budget_bytes;
     depth_pixels = 0;
     normal_pixels = 0;
     for (const auto& row : rows)

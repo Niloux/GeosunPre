@@ -285,7 +285,8 @@ fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
   ArchiveInterrupted(pending);
   fs::create_directories(pending);
   const auto header = ReadSceneLas(scene);
-  surfel_cache = std::make_unique<LasSurfelCache>(scene.las, header, work / "cache", cache_mb);
+  surfel_cache =
+      std::make_unique<LasSurfelCache>(scene.las, header, work / "cache", cache_mb, &selected);
   const auto result =
       StaticMasks(scene, selected, motion, header, *surfel_cache,
                   [&](uint32_t id) { return source / (std::to_string(id) + ".png"); },
@@ -471,7 +472,7 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   if (options.enabled) {
     if (!surfel_cache)
       surfel_cache = std::make_unique<LasSurfelCache>(scene.las, ReadSceneLas(scene),
-                                                      work / "cache", options.cache_mb);
+                                                      work / "cache", options.cache_mb, &model);
     supervision = ExportLasSupervision(scene, model, masks, pending, options, *surfel_cache,
                                        rolling ? &motion : nullptr);
     surfel_cache->Finish();

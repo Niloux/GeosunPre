@@ -9,7 +9,7 @@ struct SupervisionOptions {
   // Persistent people (pictures, posters, seated) are made static in the masks; needs the LAS.
   bool static_masks = true;
   int max_size = 1024, boundary = 4;
-  int cache_mb = 2048;
+  int cache_mb = 4096;
   fs::path mask_dir;
   // moge (default): MoGe-2 faces of the photo scaled to the LAS projection, with the geometry
   // engine of the geometry_models package; las: maps projected from the LAS.
@@ -25,7 +25,7 @@ class LasSurfelCache {
   struct Implementation;
 
   LasSurfelCache(const fs::path& las, const LasHeader& header, const fs::path& scratch,
-                 int cache_mb);
+                 int cache_mb, const Reconstruction* model = nullptr);
   ~LasSurfelCache();
   LasSurfelCache(const LasSurfelCache&) = delete;
   LasSurfelCache& operator=(const LasSurfelCache&) = delete;
