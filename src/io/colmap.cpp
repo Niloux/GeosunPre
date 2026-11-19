@@ -2,6 +2,7 @@
 #include "io/cache.h"
 #include "io/crop.h"
 #include "io/las.h"
+#include "io/roi.h"
 #include "geometry/static_masks.h"
 #include "sfm/shutter.h"
 #include <algorithm>
@@ -299,7 +300,8 @@ fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
 }  // namespace
 Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
-                  const SupervisionOptions& supervision_options, bool crop) {
+                  const SupervisionOptions& supervision_options, bool crop, bool include_roi) {
+  const bool generate_roi = include_ply && include_roi;
   // A rolling-shutter corrected model describes photos at its reference poses; they are delivered
   // original, with the readout motion beside the model.
   const bool rolling = report.contains("shutter") && report.at("shutter").value("used", false);
@@ -361,6 +363,10 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   if (include_ply)
     request["ply_filter"] = {
         {"max_range_m", 50.0}, {"max_points", 2500000}, {"max_visual_supplement_points", 100000}};
+  request["roi"] =
+      generate_roi
+          ? Json{{"enabled", true}, {"source", "las_camera_seeded_occupancy"}, {"version", 1}}
+          : Json{{"enabled", false}};
   if (options.enabled)
     request["supervision"] = SupervisionRequest(scene, selected, masks, options, rolling);
   timed("request");
@@ -461,12 +467,14 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
         job.wait();
     }
   } join_initialization{initialization_job};
+  Json roi_json;
   if (include_ply)
     initialization_job = std::async(std::launch::async, [&] {
       return ExportLasPly(
           scene.las, ReadSceneLas(scene), pending / "sparse/0/points3D.ply", voxel, &model,
           &visual_model,
-          [&](uint32_t id) { return pending / "masks" / fs::u8path(scene.images[id].name + ".png"); });
+          [&](uint32_t id) { return pending / "masks" / fs::u8path(scene.images[id].name + ".png"); },
+          generate_roi ? &roi_json : nullptr);
     });
   Json supervision = nullptr;
   if (options.enabled) {
@@ -480,6 +488,8 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   } else if (surfel_cache)
     surfel_cache->Finish();
   const Json initialization = include_ply ? initialization_job.get() : Json(nullptr);
+  if (generate_roi)
+    WriteJson(pending / "roi.json", roi_json);
   timed("PLY and supervision");
   const auto registration = model.Registration(scene);
   auto quality = report.at("quality");
@@ -512,6 +522,9 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   if (rolling)
     manifest["rolling_shutter"] = {{"file", "rolling_shutter.json"},
                                    {"size_bytes", fs::file_size(pending / "rolling_shutter.json")}};
+  if (generate_roi)
+    manifest["roi"] = {{"file", "roi.json"},
+                       {"size_bytes", fs::file_size(pending / "roi.json")}};
   WriteJson(pending / "manifest.json", manifest);
   timed("reports");
   auto checked = CheckBundle(pending);
@@ -539,6 +552,10 @@ Json CheckBundle(const fs::path& output) {
       throw std::runtime_error("Rolling-shutter file size differs");
     shutter = ReadJson(output / "rolling_shutter.json");
   }
+  const bool has_roi = manifest.contains("roi");
+  const bool roi_requested = request.contains("roi") && request.at("roi").value("enabled", false);
+  if (has_roi != roi_requested || has_roi != fs::exists(output / "roi.json"))
+    throw std::runtime_error("ROI delivery files differ from the request");
   ShutterMotion motion;
   const auto model = ReadColmap(sparse, scene, rolling ? &shutter : nullptr, motion);
   if (manifest.at("images").size() != scene.images.size())
@@ -562,6 +579,17 @@ Json CheckBundle(const fs::path& output) {
   }
   if (!manifest.at("initialization").is_null())
     VerifyInitializationPly(sparse / "points3D.ply", manifest.at("initialization").at("points"));
+  std::optional<RoiPolygon> checked_roi;
+  if (has_roi) {
+    if (manifest.at("initialization").is_null())
+      throw std::runtime_error("ROI delivery requires initialization PLY metadata");
+    if (fs::file_size(output / "roi.json") !=
+        manifest.at("roi").at("size_bytes").get<uint64_t>())
+      throw std::runtime_error("ROI file size differs");
+    checked_roi = ValidateRoiJson(
+        ReadJson(output / "roi.json"), model,
+        manifest.at("initialization").at("coordinate_frame").get<std::string>());
+  }
   if (manifest.contains("supervision")) {
     if (ReadJson(output / "supervision.json") != manifest.at("supervision") ||
         manifest.at("supervision").at("request") != manifest.at("request").at("supervision"))
@@ -589,8 +617,15 @@ Json CheckBundle(const fs::path& output) {
   if (manifest.contains("supervision")) {
     const auto& supervision = manifest.at("supervision");
     checked["supervision"] = {{"images", supervision.at("images").size()},
-                               {"depth_pixels", supervision.at("depth_pixels")},
-                               {"normal_pixels", supervision.at("normal_pixels")}};
+                              {"depth_pixels", supervision.at("depth_pixels")},
+                              {"normal_pixels", supervision.at("normal_pixels")}};
+  }
+  if (checked_roi) {
+    checked["roi"] = {{"vertices", checked_roi->vertices_xy.size()},
+                      {"area_m2", checked_roi->area_m2},
+                      {"z_min", checked_roi->z_min},
+                      {"z_max", checked_roi->z_max},
+                      {"cameras_inside", checked_roi->cameras_inside}};
   }
   return checked;
 }

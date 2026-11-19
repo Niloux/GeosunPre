@@ -590,3 +590,63 @@
 
 - **掩码视觉抽检**：对照 `古建筑-p1` [00035-L](file:///d:/Dev/GeosunPre/work/古建筑-p1/masks/2411-357849-840_00035-L.JPG.png)、[00472-R](file:///d:/Dev/GeosunPre/work/古建筑-p1/masks/2411-358199-484_00472-R.JPG.png) 与 [00350-R](file:///d:/Dev/GeosunPre/work/古建筑-p1/masks/2411-358101-834_00350-R.JPG.png)，大面积廊檐阴影吞并已被精确剥离、庭院地面完整恢复为 `255`，同时行人及 `24` 格邻域局部影子、`00350-R` 采集员随动地影均保持 `0`；`展厅-p1` [00051-R](file:///d:/Dev/GeosunPre/work/展厅-p1/masks/R/0000/2436-213993-428_00051-R.JPG.png) 近景展馆参观者与地面影轮廓完全保持。
 - **已知验证边界**：现有三套测试场景最大空间尺度为 `50×93×20 m`（`< 2 * 65.5 m` 射程盒），`chunks_skipped > 0` 与 `culled_out_of_reach > 0` 分支将在百米级以上更广域场景中实际触发（本次通过代码走读与流式路径全量投影核对）；下游 3DGS 训练仍留待用户按大场景需求执行。
+
+---
+
+## 2026-11-19：引入 LAS 相机种子占空多边形 ROI（`roi.json` 方案 B）及 3DGS / Mesh / OSGB 消融验证
+
+针对手持双鱼眼 + LiDAR 扫描场景“雷达不可达远背景无需重建却白白消耗 3DGS 高斯配额、TSDF 体积及 OSGB 瓦片/纹理页”的问题，在 `GeosunPre` 与定制 `LichtFeld-Studio` 中联合引入自动 2D 简化多边形棱柱 ROI（`roi.json`，`CropPolygon` 路径）：
+
+### 1. 工程改动摘要
+1. **`GeosunPre`（`src/io/roi.{h,cpp}`、`las.{h,cpp}`、`colmap.{h,cpp}`、`app/{runtime,pipeline,main}.cpp`）**：
+   - `export` 阶段对 `ScanLas` 原始 LAS 按 `1 m²` 网格累计点数（阈值 `>= 30` 点），并以已注册相机轨迹中心栅格为连通种子，经 `2 m` 圆形膨胀 + 外轮廓 `approxPolyDP` / 凸包回退生成 `3..64` 顶点的世界坐标非自交简单闭合多边形，`Z` 范围按内部点 `[p0.1%, p99.9%]` 结合相机高程包络收紧为 `[z_min, z_max]`；
+   - 新增交付文件 [roi.json](file:///d:/Dev/GeosunPre/docs/output.md)（纳入 `manifest.json`、`request["roi"]` 与 `check` 严格拓扑/相机包含回读校验），并在 `2.5M` `points3D.ply` 采样上限处优先分配 ROI 内点（ROI 外最多保留 `5%`）；新增 `--no-roi` 关闭；
+   - 更新 [trainer.json](file:///d:/Dev/GeosunPre/configs/trainer.json) 默认启用 `crop_to_cropbox: true` 与 `cropbox_growth_inside: 0.7`（保留 `0.1` 的 `cropbox_loss_weight` / `cropbox_lr_scale`）。
+2. **`LichtFeld-Studio`（`src/training/roi_sidecar.{hpp,cpp}`、`training_setup.cpp`、`argument_parser.cpp`、`FreeSpace.{h,cu}`、`metrics.{hpp,cpp}`、`trainer.cpp`）**：
+   - 数据集加载（`attachDatasetPointCloud`）在未显式传 `--no-roi` / `--cropbox` 且非恢复模式时，自动将 `roi.json` 中心化挂载为可交互 `Model_crop_polygon`；支持 `--no-roi`、允许 `--crop` 与 `roi.json` 联用；
+   - `gsplat_lfs::free_space_loss` 增加可选 `pixel_weight`，训练期接入 `roi_weight`；
+   - `--eval-mask cropbox` 支持 `CropPolygon` 及 `roi.json` 回退，并以渲染 `(depth, alpha)` 计算 `ROI ∩ mask==255` 静态前景有效像素集，在报告与 `metrics_report.txt` 中输出 `Region of interest:`；
+   - 修复初版实测暴露的两项耦合问题：（a）`MaskMode::SegmentAndIgnore` 下不把 `roi_weight` 传给 `fuse_mask_opacity_penalty`，避免相机位于 ROI 内、边缘像素 `alpha < 0.5` 时天空透明惩罚被稀释 `10×` 而残留紫白雾影；（b）`prepare_evaluation_view` 使用渲染 `(depth, alpha)` 判定表面落点而不再用单目 `depths/*.png` 覆盖，避免超越 LiDAR 射程的高楼玻璃顶被单目深度低估而误计入已裁除 ROI 外的评分区域。
+3. **构建与单元测试验证**：
+   - `GeosunPre`：`tools/windows/build.ps1` Ninja Release（`/W4`）零新增警告通过；
+   - `LichtFeld-Studio`：`gsplat_tests --gtest_filter="*FreeSpace*"` 3/3 通过；`lichtfeld_tests` ROI / `CropPolygon` / `EvalMask` / `ArgumentParserTest` / `TrainerMaskSupervisionTest` 相关过滤套件 212/212 通过。
+
+---
+
+### 2. `GeosunPre` 实景 `export` + `check` 验收
+
+在既有重建工程 [展厅-p2.work](file:///d:/Dev/GeosunPre/work/展厅-p2.work) 与 [篮球场-p2.work](file:///d:/Dev/GeosunPre/work/篮球场-p2.work) 上重新执行 `export` 与 `check`：
+
+| 场景 / 产物 | 相机含纳 (`cameras_inside`) | 多边形顶点数 | 面积 (`m²`) | `Z` 范围 (`m`) | `kept_las_fraction` | 初始化点云 (`roi / out_roi / supplement`) | `check` 状态 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| [展厅-roi](file:///d:/Dev/GeosunPre/work/展厅-roi/roi.json) | `588 / 588` | `52` | `1208.0` | `[-3.41, 8.55]` | `0.999939` (`99.994%`) | `881,043 / 535 / 1,104`（共 `882,682`） | `passed: true` |
+| [篮球场-roi](file:///d:/Dev/GeosunPre/work/篮球场-roi/roi.json) | `536 / 536` | `48` | `8738.0` | `[-2.56, 49.87]` | `0.999962` (`99.996%`) | `2,492,312 / 3,253 / 4,435`（共 `2,500,000`） | `passed: true` |
+| [篮球场-noroi](file:///d:/Dev/GeosunPre/work/篮球场-noroi)（`--no-roi`） | `536 / 536`（无 `roi.json`） | `—` | `—` | `—` | `—` | `2,495,565 + 4,435`（共 `2,500,000`） | `passed: true` |
+
+说明：`篮球场` 原始三维点云跨越 `[-91.1, -96.4, -6.2] ~ [144.4, 84.2, 90.7] m`（含百米外玻璃塔楼与视觉稀疏远点），自动 ROI 精确聚焦至约 `8,738 m²` 的有效作业廊区与球场主体并保留 `99.996%` 原始激光点。
+
+---
+
+### 3. `篮球场` 下游 30k 3DGS 训练 + `cropbox` 评测 + Mesh / OSGB 消融对比
+
+基于 [篮球场-roi](file:///d:/Dev/GeosunPre/work/篮球场-roi) 与 [trainer.json](file:///d:/Dev/GeosunPre/configs/trainer.json) 在 RTX 4090 上对比基线（`--no-roi`）与自动 ROI（`roi-v2`，含 `SegmentAndIgnore` 天空全权重修正与 `--crop`）：
+
+| 阶段 / 指标 | 基线（`--no-roi`，[noroi-train](file:///d:/Dev/GeosunPre/work/篮球场-noroi-train) / [noroi-eval2](file:///d:/Dev/GeosunPre/work/篮球场-noroi-eval2/metrics_report.txt) / [noroi-mesh](file:///d:/Dev/GeosunPre/work/篮球场-noroi-mesh)） | 自动 ROI v2（`roi.json` + `--crop`，[roi-v2-train](file:///d:/Dev/GeosunPre/work/篮球场-roi-v2-train) / [roi-v2-eval](file:///d:/Dev/GeosunPre/work/篮球场-roi-v2-eval/metrics_report.txt) / [roi-v2-mesh](file:///d:/Dev/GeosunPre/work/篮球场-roi-v2-mesh)） | 变化 / 结论 |
+| :--- | :---: | :---: | :--- |
+| 30k 训练耗时 / 速率 | `458.489 s` (`65.4 iter/s`) | `459.083 s` (`65.3 iter/s`) | 基本持平（`+0.6 s`） |
+| 终态高斯数 / `project.licht` | `3,000,000` / `420.71 MiB` | **`2,919,206`**（裁除 `80,794` 外点）/ `411.74 MiB` | 外围杂散高斯已自动清理 |
+| `eval` 口径与覆盖 (`536/536` 卷帘) | `Mask` 平均有效像素占比 `0.619497` | `Mask` 平均有效像素占比 `0.619009`（最大单图差 `0.0052`） | 同口径公平对齐 |
+| `Mask` (`ROI ∩ mask==255`) PSNR / SSIM / LPIPS | `20.2917` / `0.5617` / `0.3536` | `20.2007` / `0.5588` / `0.3563` | 仅 `-0.091 dB`（视觉抽检干净无雾边） |
+| 法线角误差 `normal_angle_deg` | `14.1099°` | **`13.8834°`** | **`-0.2265°` 几何法线更贴合先验** |
+| 先验深度误差 (`median / p90`, mm) | `16.9872` / `1034.2051` | `16.9795` / **`810.6697`** | **`p90` 误差骤降 `223.5 mm` (`-21.6%`)** |
+| TSDF 稀疏块数 / 体素内存 | `3,468,381` 块 (`16.58 GB`, `3 chunks`) | **`2,252,192` 块 (`10.76 GB`, `2 chunks`)** | **`-35.1%` TSDF 体素分配** |
+| MC 融合体素数 / RAM 峰值 | `89,920,829` (`~5.7 GB`) | **`63,990,385` (`~4.2 GB`)** | **`-28.8%` 体素与内存开销** |
+| 网格顶点数 / 面片数 | `24,728,632` / `44,817,540` | **`18,139,374` / `32,527,423`** | **`-26.6%` 顶点 / `-27.4%` 面数** |
+| `splats.ply` 磁盘体积 | `1,250,301,381 B` (`1192.38 MiB`) | **`912,619,894 B` (`870.34 MiB`)** | **`-27.0%` 网格体积极速瘦身** |
+| OSGB 瓦片数 / LOD 层级 / 纹理页 / 纹素 | `518` tiles / `2,038` levels / `7,740` pages (`138.53M`) | **`256` tiles / `1,018` levels / `4,473` pages (`95.31M`)** | **瓦片与层级数减半 (`-50%`)，纹理页 `-42.2%`** |
+| `splats_osgb/` 总文件数与磁盘体积 | `2,039` files / `2,085,684,218 B` (`1989.06 MiB`) | **`1,019` files / `1,492,099,792 B` (`1422.98 MiB`)** | **`-28.5%` OSGB 体积（省 `566 MiB`）** |
+| `mesh + osgb` 总墙钟耗时 | `939.353 s` (`15m39s`) | **`728.134 s` (`12m08s`)** | **提速 `211.2 s`（`-22.5%`）** |
+
+- **抽检对比（[2435-353235-065_00272-L](file:///d:/Dev/GeosunPre/work/篮球场-roi-v2-eval/eval_step_30000/2435-353235-065_00272-L.png)、[2435-353047-182_00084-R](file:///d:/Dev/GeosunPre/work/篮球场-roi-v2-eval/eval_step_30000/2435-353047-182_00084-R.png)）**：修复初版天空透明惩罚稀释后，建筑高楼边缘与走廊藤架空隙处紫白雾影彻底消失；初版 `roi-train`（`20.1678 -> 19.6214`）及对应对照目录保留在 `work\篮球场-roi-train` / `work\篮球场-roi-eval` 作为复盘留档。
+- **取舍结论**：对于存在远景不可达建筑/背景的多视角手持扫描场景，自动 `roi.json` + `CropPolygon` 方案在保持主作业区外观保真（PSNR 偏差仅 `0.09 dB`）、显著压低远区几何噪点（`p90` 深度误差 `-21.6%`）的同时，对下游 TSDF 网格提取与 OSGB 分级瓦片烘培带来了显著工程收益（TSDF 块 `-35.1%`、网格/OSGB 体积减少约 `27%–28.5%`、OSGB 瓦片数减半、导出提速 `22.5%`），确立为 `GeosunPre + LichtFeld-Studio` 联合默认链路。
+

@@ -30,7 +30,7 @@ const Command Commands[] = {
      "prepare|masks|features|matches|sfm|align|shutter|cleanup|export]",
      RunCommand},
     {"prepare", "--input INPUT [--output OUT] [--work WORK] [--debug]", RunCommand},
-    {"export", "--work WORK --output OUT [--no-ply] [--ply-voxel METRES] [--no-las-supervision]",
+    {"export", "--work WORK --output OUT [--no-ply] [--no-roi] [--ply-voxel METRES] [--no-las-supervision]",
      Export},
     {"check", "--output DIR",
      [](const Arguments& args) {
@@ -78,7 +78,7 @@ void Help(const Arguments&) {
                "  Delivery options: [--supervision-source moge|las] [--supervision-models MODELS]\n"
                "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS]\n"
                "    [--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"
-               "    [--no-static-masks] [--no-crop-valid-domain]\n"
+               "    [--no-static-masks] [--no-crop-valid-domain] [--no-roi]\n"
                "  See README.md and docs/output.md for defaults and delivery details.\n";
 }
 }  // namespace

@@ -7,6 +7,7 @@ namespace geosun {
 // With crop, each lens's photos, masks and model are cut to the window of its valid domain.
 Json ExportBundle(const Scene& scene, const Reconstruction& model, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
-                  const SupervisionOptions& supervision = {}, bool crop = true);
+                  const SupervisionOptions& supervision = {}, bool crop = true,
+                  bool include_roi = true);
 Json CheckBundle(const fs::path& output);
 }  // namespace geosun

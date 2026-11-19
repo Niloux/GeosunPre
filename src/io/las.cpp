@@ -1,4 +1,5 @@
 #include "io/las.h"
+#include "io/roi.h"
 #include "io/scene.h"
 #include "geometry/model.h"
 
@@ -308,7 +309,7 @@ void VerifyInitializationPly(const fs::path& path, uint64_t points) {
 }
 Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& output, double voxel,
                   const Reconstruction* model, const Reconstruction* visual_model,
-                  const std::function<fs::path(uint32_t)>& static_mask_path) {
+                  const std::function<fs::path(uint32_t)>& static_mask_path, Json* roi_out) {
   if (!std::isfinite(voxel) || voxel <= 0 || fs::absolute(las) == fs::absolute(output))
     throw std::runtime_error("Invalid PLY voxel size or output");
   if (fs::exists(output))
@@ -624,6 +625,8 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
   std::vector<std::ofstream> buckets;
   for (unsigned i = 0; i < 128; ++i)
     buckets.emplace_back(workspace / (Number(i) + ".bin"), std::ios::binary);
+  const RoiParams roi_params;
+  std::unordered_map<uint64_t, uint32_t> raw_cell_counts;
   uint64_t accepted = 0, rejected = 0, culled = 0, rgb_max = 0, vertices = 0;
   ScanLas(las, h, [&](uint64_t start, const std::vector<LasPoint>& block) {
     std::vector<Aggregate> values;
@@ -640,6 +643,11 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
         continue;
       }
       ++accepted;
+      if (model && roi_out) {
+        int32_t rx = 0, ry = 0;
+        if (GridCellCoord2D(xyz.x(), xyz.y(), roi_params.cell_size_m, rx, ry))
+          ++raw_cell_counts[PackGridCell2D(rx, ry)];
+      }
       if (uncovered_visual && !cover_slots.empty()) {
         std::array<int64_t, 3> vc{};
         if (visual_cell_coord(xyz, VisualCoverRadiusM, vc)) {
@@ -743,6 +751,39 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
   if (source != FileMetadata(las))
     throw std::runtime_error("LAS changed during initialization");
   const uint64_t voxel_vertices = vertices;
+  std::optional<RoiPolygon> roi;
+  uint64_t roi_in_total = 0;
+  uint64_t roi_out_total = 0;
+  if (model && roi_out) {
+    roi = BuildRoiPolygon2D(raw_cell_counts, *model, roi_params);
+    raw_cell_counts.clear();
+    std::vector<float> inside_z;
+    std::ifstream data(payload, std::ios::binary);
+    std::vector<uint8_t> chunk(500000 * 27);
+    for (uint64_t start = 0; start < voxel_vertices; start += 500000) {
+      const size_t count = size_t(std::min<uint64_t>(500000, voxel_vertices - start));
+      if (!data.read(reinterpret_cast<char*>(chunk.data()), std::streamsize(count * 27)))
+        throw std::runtime_error("Truncated PLY vertex cache");
+      for (size_t k = 0; k < count; ++k) {
+        float xyz[3];
+        std::memcpy(xyz, chunk.data() + k * 27, sizeof(xyz));
+        if (std::isfinite(xyz[2]) &&
+            PointInPolygon2D(roi->vertices_xy, double(xyz[0]), double(xyz[1])))
+          inside_z.push_back(xyz[2]);
+      }
+    }
+    data.close();
+    FinalizeRoiZRange(*roi, inside_z, *model, roi_params);
+    for (float z : inside_z) {
+      const double zd = double(z);
+      if (zd >= roi->z_min && zd <= roi->z_max)
+        ++roi_in_total;
+    }
+    roi_out_total = voxel_vertices - roi_in_total;
+    const std::string coordinate_frame =
+        h.converted ? h.metadata.at("frame").get<std::string>() : std::string("input_las_xyz");
+    *roi_out = RoiToJson(*roi, roi_params, coordinate_frame);
+  }
   std::vector<VisualCandidate> visual_out;
   if (!visual_cands.empty()) {
     std::vector<VisualCandidate> uncovered;
@@ -778,35 +819,89 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
   const auto pending = workspace / "points3D.ply";
   std::ofstream final(pending, std::ios::binary);
   final << Header(total_vertices);
+  uint64_t roi_las_written = 0;
+  uint64_t outside_roi_las_written = 0;
   if (model && voxel_vertices > las_cap) {
     std::ifstream data(payload, std::ios::binary);
     minimum = Eigen::Vector3d::Constant(INFINITY);
     maximum = Eigen::Vector3d::Constant(-INFINITY);
-    uint64_t acc = 0, emitted = 0;
-    std::array<uint8_t, 27> vertex{};
-    for (uint64_t i = 0; i < voxel_vertices; ++i) {
-      if (!data.read(reinterpret_cast<char*>(vertex.data()), vertex.size()))
-        throw std::runtime_error("Truncated PLY vertex cache");
-      acc += las_cap;
-      if (acc >= voxel_vertices) {
-        acc -= voxel_vertices;
-        float xyz[3];
-        std::memcpy(xyz, vertex.data(), sizeof(xyz));
-        for (int j = 0; j < 3; ++j) {
-          minimum[j] = std::min(minimum[j], double(xyz[j]));
-          maximum[j] = std::max(maximum[j], double(xyz[j]));
+    if (roi) {
+      uint64_t out_target = std::min<uint64_t>(roi_out_total, las_cap / 20);
+      const uint64_t in_target = std::min<uint64_t>(roi_in_total, las_cap - out_target);
+      if (in_target + out_target < las_cap)
+        out_target = std::min<uint64_t>(roi_out_total, las_cap - in_target);
+      uint64_t in_acc = 0, out_acc = 0;
+      std::vector<uint8_t> chunk(500000 * 27);
+      for (uint64_t start = 0; start < voxel_vertices; start += 500000) {
+        const size_t count = size_t(std::min<uint64_t>(500000, voxel_vertices - start));
+        if (!data.read(reinterpret_cast<char*>(chunk.data()), std::streamsize(count * 27)))
+          throw std::runtime_error("Truncated PLY vertex cache");
+        for (size_t k = 0; k < count; ++k) {
+          const uint8_t* v = chunk.data() + k * 27;
+          float xyz[3];
+          std::memcpy(xyz, v, sizeof(xyz));
+          const bool inside = double(xyz[2]) >= roi->z_min && double(xyz[2]) <= roi->z_max &&
+                              PointInPolygon2D(roi->vertices_xy, double(xyz[0]), double(xyz[1]));
+          bool take = false;
+          if (inside) {
+            in_acc += in_target;
+            if (in_acc >= roi_in_total) {
+              in_acc -= roi_in_total;
+              take = true;
+              ++roi_las_written;
+            }
+          } else {
+            out_acc += out_target;
+            if (out_acc >= roi_out_total) {
+              out_acc -= roi_out_total;
+              take = true;
+              ++outside_roi_las_written;
+            }
+          }
+          if (take) {
+            for (int j = 0; j < 3; ++j) {
+              minimum[j] = std::min(minimum[j], double(xyz[j]));
+              maximum[j] = std::max(maximum[j], double(xyz[j]));
+            }
+            final.write(reinterpret_cast<const char*>(v), 27);
+          }
         }
-        final.write(reinterpret_cast<const char*>(vertex.data()), vertex.size());
-        ++emitted;
       }
+      data.close();
+      if (roi_las_written != in_target || outside_roi_las_written != out_target ||
+          roi_las_written + outside_roi_las_written != las_cap)
+        throw std::runtime_error("Unexpected ROI-prioritized PLY subsample count");
+    } else {
+      uint64_t acc = 0, emitted = 0;
+      std::array<uint8_t, 27> vertex{};
+      for (uint64_t i = 0; i < voxel_vertices; ++i) {
+        if (!data.read(reinterpret_cast<char*>(vertex.data()), vertex.size()))
+          throw std::runtime_error("Truncated PLY vertex cache");
+        acc += las_cap;
+        if (acc >= voxel_vertices) {
+          acc -= voxel_vertices;
+          float xyz[3];
+          std::memcpy(xyz, vertex.data(), sizeof(xyz));
+          for (int j = 0; j < 3; ++j) {
+            minimum[j] = std::min(minimum[j], double(xyz[j]));
+            maximum[j] = std::max(maximum[j], double(xyz[j]));
+          }
+          final.write(reinterpret_cast<const char*>(vertex.data()), vertex.size());
+          ++emitted;
+        }
+      }
+      data.close();
+      if (emitted != las_cap)
+        throw std::runtime_error("Unexpected PLY subsample count");
     }
-    data.close();
-    if (emitted != las_cap)
-      throw std::runtime_error("Unexpected PLY subsample count");
   } else {
     std::ifstream data(payload, std::ios::binary);
     final << data.rdbuf();
     data.close();
+    if (roi) {
+      roi_las_written = roi_in_total;
+      outside_roi_las_written = roi_out_total;
+    }
   }
   for (const auto& vc : visual_out) {
     std::array<uint8_t, 27> vertex{};
@@ -860,6 +955,10 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
     result["voxel_points_before_cap"] = voxel_vertices;
     result["max_range_m"] = MaxPlyRange;
     result["max_points"] = MaxPlyPoints;
+  }
+  if (roi) {
+    result["roi_las_points"] = roi_las_written;
+    result["outside_roi_las_points"] = outside_roi_las_written;
   }
   if (visual_model) {
     result["max_visual_supplement_points"] = MaxVisualSupplementPoints;

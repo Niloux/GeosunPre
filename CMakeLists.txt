@@ -17,6 +17,7 @@ find_package(CUDAToolkit REQUIRED)
 set(GEOSUN_SOURCES
   src/app/main.cpp src/app/pipeline.cpp src/app/runtime.cpp
   src/io/scene.cpp src/io/cache.cpp src/io/las.cpp src/io/colmap.cpp src/io/crop.cpp
+  src/io/roi.cpp
   src/geometry/camera.cpp src/geometry/model.cpp src/geometry/monocular.cpp
   src/geometry/supervision.cpp src/geometry/supervision_kernels.cu src/geometry/static_masks.cpp
   src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/preprocessing.cu src/frontend/frontend.cpp

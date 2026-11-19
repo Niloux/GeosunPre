@@ -120,6 +120,7 @@ AlignmentLimits Limits(const Json& settings) {
 // Delivery options shared by run and export.
 struct Delivery {
   bool ply;
+  bool roi;
   double voxel;
   SupervisionOptions supervision;
   bool crop;
@@ -127,7 +128,7 @@ struct Delivery {
 // The options ParseDelivery reads, accepted by every command that writes a delivery.
 std::vector<std::string> WithDeliveryOptions(std::vector<std::string> options) {
   for (const auto* option :
-       {"--no-ply", "--ply-voxel", "--no-las-supervision", "--supervision-max-size",
+       {"--no-ply", "--no-roi", "--ply-voxel", "--no-las-supervision", "--supervision-max-size",
         "--supervision-boundary", "--supervision-mask-dir", "--supervision-cache-mb",
         "--supervision-source", "--supervision-models", "--no-crop-valid-domain",
         "--no-static-masks"})
@@ -135,8 +136,9 @@ std::vector<std::string> WithDeliveryOptions(std::vector<std::string> options) {
   return options;
 }
 Delivery ParseDelivery(const Arguments& args) {
-  return {args.Get("--no-ply") != "true", args.Number("--ply-voxel", .05),
-          ParseSupervisionOptions(args), args.Get("--no-crop-valid-domain") != "true"};
+  return {args.Get("--no-ply") != "true", args.Get("--no-roi") != "true",
+          args.Number("--ply-voxel", .05), ParseSupervisionOptions(args),
+          args.Get("--no-crop-valid-domain") != "true"};
 }
 // Key of a product: relative to the work directory, or absolute when no relative path exists
 // (another drive). Verify resolves both, since work / absolute is the absolute path.
@@ -200,7 +202,7 @@ Json ExportSelected(const Scene& scene, const fs::path& work, const fs::path& ou
                     const Delivery& delivery) {
   const auto result = ReadJson(work / "result.json");
   return ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, delivery.ply,
-                      delivery.voxel, result, delivery.supervision, delivery.crop);
+                      delivery.voxel, result, delivery.supervision, delivery.crop, delivery.roi);
 }
 std::vector<fs::path> ReconstructVisual(const Scene& scene, const fs::path& work,
                                         const fs::path& root, const Json& settings,

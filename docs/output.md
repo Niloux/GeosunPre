@@ -10,6 +10,7 @@ OUTPUT/
   normals/{L,R}/**.JPG.png      # 默认生成，--no-las-supervision 省略
   sparse/0/{cameras,images,points3D,rigs,frames}.bin
   sparse/0/points3D.ply
+  roi.json                    # 默认随 PLY 生成，--no-roi 或 --no-ply 时省略
   manifest.json
   quality.json
   initialization.json
@@ -25,7 +26,9 @@ COLMAP 小端二进制，`OPENCV_FISHEYE` 模型编号 5、8 个参数。相机 
 
 points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重投影距离，单位像素；联合优化后重新计算，交付回读时验证。
 
-相机和稀疏点已在局部 LAS 坐标（局部 LAS 即输入坐标，ECEF LAS 为其转换后的导航 ENH 局部坐标，见[输入约定](input.md)），下游不再应用配准变换。`points3D.bin` 是清理并验证后的视觉稀疏点及轨迹（保持纯 LAS 锚定口径）；`points3D.ply` 主体保留已注册相机 50 m 视锥范围内的有效 LAS 点，按到最近相机的距离分档体素均值采样（10 m 内 1×、20 m 内 2×、40 m 内 4×、50 m 内 8× 基准体素；基准体素默认 0.05 m），并从清理前视觉模型补充距已注册图像 0.25–250 m、0.25 m 内无有效 LAS 覆盖的高置信静态多视图视觉点（不少于 3 视图、均值重投影不超过 1.5 px、视差至少 2°、无 0 掩码中心且至少 75% 且不少于 3 个视图的 5×5 邻域全为 255，按至少 0.10 m 网格去重并限制补充最多 10 万点），LAS 随同调整上限使 PLY 总点仍封顶 250 万，`initialization.json` 另记录 `las_points` 与 `visual_supplement_points`。文件为二进制小端，每点 float32 XYZ、零法向量 XYZ、uint8 RGB，共 27 字节。PLY 与相机同一坐标，`initialization.coordinate_frame` 为 `input_las_xyz` 或 `ecef_to_navigation_enh`。LAS 头部范围（ECEF LAS 为转换后范围）的坐标绝对值须不超过 16777 m，使 float32 舍入不超过 1 mm，否则明确报错。下游需明确选择此 PLY 初始化 3DGS。
+相机和稀疏点已在局部 LAS 坐标（局部 LAS 即输入坐标，ECEF LAS 为其转换后的导航 ENH 局部坐标，见[输入约定](input.md)），下游不再应用配准变换。`points3D.bin` 是清理并验证后的视觉稀疏点及轨迹（保持纯 LAS 锚定口径）；`points3D.ply` 主体保留已注册相机 50 m 视锥范围内的有效 LAS 点，按到最近相机的距离分档体素均值采样（10 m 内 1×、20 m 内 2×、40 m 内 4×、50 m 内 8× 基准体素；基准体素默认 0.05 m），并从清理前视觉模型补充距已注册图像 0.25–250 m、0.25 m 内无有效 LAS 覆盖的高置信静态多视图视觉点（不少于 3 视图、均值重投影不超过 1.5 px、视差至少 2°、无 0 掩码中心且至少 75% 且不少于 3 个视图的 5×5 邻域全为 255，按至少 0.10 m 网格去重并限制补充最多 10 万点），LAS 随同调整上限使 PLY 总点仍封顶 250 万；当启用 `roi.json` 且体素点超出该上限需要抽稀时，外围最多保留 5%（不超过 12.5 万点）作背景支撑，其余优先分配给 ROI 内部点，`initialization.json` 另记录 `las_points`、`visual_supplement_points`（启用 ROI 时另记录 `roi_las_points` 与 `outside_roi_las_points`）。文件为二进制小端，每点 float32 XYZ、零法向量 XYZ、uint8 RGB，共 27 字节。PLY 与相机同一坐标，`initialization.coordinate_frame` 为 `input_las_xyz` 或 `ecef_to_navigation_enh`。LAS 头部范围（ECEF LAS 为转换后范围）的坐标绝对值须不超过 16777 m，使 float32 舍入不超过 1 mm，否则明确报错。下游需明确选择此 PLY 初始化 3DGS。
+
+`roi.json` 默认随初始化 PLY 在 `export` 阶段自动生成（`--no-roi` 或 `--no-ply` 时省略）：基于 50 m 视锥内有效 LAS 在 1 m×1 m XY 格网的原始点占据（单格不少于 30 点），结合全部已注册相机轨迹连通光栅，经 2 m 圆形膨胀并从相机种子做 4 邻域连通筛选后提取外轮廓（多块时取外凸包），迭代 `approxPolyDP` 简化为 3–64 顶点的简单非自交 2D 多边形（兜底外切凸包或包围框），保证 100% 已注册相机严格落入内部；Z 范围取多边形内体素 LAS 分布与相机高度的稳健包络（`z_min = min(p001, cam_z_min - 2) - 1`，`z_max = min(max(p999, cam_z_max) + 15, max(p999 + 3, las_max + 1, cam_z_max + 3))`）。文件记录 `version: 1`、`type: "polygon_prism"`、`coordinate_frame`、`z_min`/`z_max`、`vertices_xy`（工作坐标二维顶点）、`bounds_min`/`bounds_max`、`params` 与 `stats`；定制 LFS 加载数据集时自动挂载为训练模型 `CropPolygon`，配合 [trainer.json](../configs/trainer.json) 在训练期降权外围并默认终态 `--crop` 裁切输出。`manifest.json` 的 `request.roi` 与顶层 `roi` 记录该文件身份，`check` 回读校验文件尺寸、多边形几何合法性与 100% 相机包含性。
 
 掩码为与交付照片同尺寸的单通道 PNG：静态 255、天空 128、人物及有效域外 0。SAM3 grounding 在整幅照片上决定人物与天空：person、shadow、robot、sky 检测分数 ≥ 0.5 时有效；人物检测有一半以上被分数不低于它的机器人检测覆盖时视为人形展品，保持静态；影子在 288 格掩码上须与保留人物相距不超过 24 格，且若单个影子检测面积超过整格网的 8% 或（超过 3% 且）超过接触人物连通块总面积的 3 倍，仅裁剪保留距人物 24 格内的局部区域，防止行人踩入建筑大阴影后连带抹掉整片静态地面（并在 `masks_profile.json` 记录 `shadows_clipped`）；远离人物的家具和展品阴影保持静态；人物与影子的并集外扩 1 格后放大到原图。天空为 sky 检测掩码的并集，不外扩，放大到原图后在有效域内置 128，人物与影子优先置 0。监督导出前，持续出现的人物及天空误检会在同一份面元缓存的 1024 长边网格单遍最近 LAS 深度投影（无累加与法向混合缓冲）上重新核验并置回静态 255（`--no-static-masks` 或 `--no-las-supervision` 时不做，交付的是上述 SAM3 掩码）：
 - 人物/影子静态恢复：每个人物/影子连通块（面积不少于 16 个 1024 长边网格像素）取其 LAS 点的世界坐标中位数作为位置，统计能看到该位置（0.8–12 m、在有效域 80% 半径内，不判遮挡）的其他视图中有多大比例在该处被掩码标为 0，及这些视图的曝光时间跨度；比例不低于 0.2 且跨度不低于 40 s、至少 8 幅视图能看到时视为静态（画框、海报里的人物，一直坐着不动的人），块内 0 置回 255。走动的人只在经过时被标，采集操作员只在设备所在处被标，均不满足。静态块 8% 图宽内若有继续被遮的块，它也保持被遮（影子跟随所属人物）。LAS 点少于 12 个或不足块面积 30% 的块、可见视图不足 8 幅的块保持被遮。
