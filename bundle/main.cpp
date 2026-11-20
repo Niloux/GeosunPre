@@ -13,7 +13,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -22,8 +21,10 @@ namespace fs = std::filesystem;
 using Args = std::vector<std::wstring>;
 
 void Help() {
-  std::cout << "Usage: Geosun.exe --scene PATH --output PATH\n"
-               "  --project FILE.pro                  (default: most recently modified .pro)\n"
+  std::cout << "Usage: Geosun.exe --output DIR [options]\n"
+               "  New preprocessing requires:\n"
+               "    --project FILE.pro --images DIR [--images DIR ...]\n"
+               "    --camera-pos FILE --pos FILE --pos-enh FILE --las FILE\n"
                "  --step all|preprocess|train|export  (default: all)\n"
                "  --texel-size NUMBER                 (default: 0.02)\n"
                "  --preprocess-arg VALUE              (repeat for each argument)\n"
@@ -432,40 +433,15 @@ fs::path ExistingAncestor(fs::path path) {
   return path;
 }
 
-bool IsBundleOutputDirectory(const fs::path& name) {
-  for (const auto* dir : {L"delivery", L"delivery.work", L"delivery.pending", L"train",
-                          L"train.pending", L"export", L"export.pending", L"logs",
-                          L".geosun-publish"})
-    if (_wcsicmp(name.c_str(), dir) == 0)
-      return true;
-  for (const std::wstring_view prefix : {L"delivery.pending.interrupted-", L"train.pending.interrupted-",
-                                        L"export.pending.interrupted-"})
-    if (_wcsnicmp(name.c_str(), prefix.data(), prefix.size()) == 0)
-      return true;
-  return false;
-}
-
-std::uint64_t DirectoryBytes(const fs::path& scene, const fs::path& out) {
-  const auto root = fs::weakly_canonical(scene), output = fs::weakly_canonical(out);
-  const bool same_root = _wcsicmp(root.c_str(), output.c_str()) == 0;
+std::uint64_t PhotoDirectoryBytes(const fs::path& folder) {
+  if (!fs::is_directory(folder))
+    return 0;
   std::uint64_t total = 0;
-  std::error_code ec;
-  for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec),
-       end; it != end; ++it) {
-    if (ec)
-      break;
-    const auto& entry = *it;
-    // A rerun can already have caches and deliveries under the scene root.
-    if (same_root ? it.depth() == 0 && IsBundleOutputDirectory(entry.path().filename())
-                  : _wcsicmp(entry.path().c_str(), output.c_str()) == 0) {
-      it.disable_recursion_pending();
-      continue;
-    }
-    if (entry.is_regular_file(ec)) {
-      const auto bytes = entry.file_size(ec);
-      if (!ec)
-        total += static_cast<std::uint64_t>(bytes);
-    }
+  for (const auto& entry : fs::recursive_directory_iterator(folder)) {
+    const auto ext = entry.path().extension();
+    if ((_wcsicmp(ext.c_str(), L".jpg") == 0 || _wcsicmp(ext.c_str(), L".jpeg") == 0) &&
+        entry.is_regular_file())
+      total += entry.file_size();
   }
   return total;
 }
@@ -478,11 +454,15 @@ std::string FormatGiB(std::uint64_t bytes) {
   return out.str();
 }
 
-void CheckDiskSpace(const fs::path& out, const fs::path& scene, const std::wstring& step,
-                    bool need_preprocess) {
+void CheckDiskSpace(const fs::path& out, const Args& photo_dirs, const fs::path& las,
+                    const std::wstring& step, bool need_preprocess) {
   std::uint64_t required = 0;
-  if (need_preprocess)
-    required += std::max<std::uint64_t>(8ULL << 30, DirectoryBytes(scene, out) * 3 / 2);
+  if (need_preprocess) {
+    std::uint64_t input_bytes = fs::is_regular_file(las) ? fs::file_size(las) : 0;
+    for (const auto& folder : photo_dirs)
+      input_bytes += PhotoDirectoryBytes(folder);
+    required += std::max<std::uint64_t>(8ULL << 30, input_bytes * 3 / 2);
+  }
   if (step == L"all" || step == L"train")
     required += 6ULL << 30;
   if (step == L"all" || step == L"export")
@@ -501,19 +481,24 @@ void CheckDiskSpace(const fs::path& out, const fs::path& scene, const std::wstri
 }
 
 void Pipeline(int argc, wchar_t** argv) {
-  fs::path scene, out;
+  fs::path out, las;
   std::wstring pcc_project, step = L"all", texel = L"0.02";
-  Args preprocess_args, train_args;
+  Args photo_dirs, inputs, preprocess_args, train_args;
   for (int i = 1; i < argc; ++i) {
     const std::wstring option = argv[i];
     if (++i == argc)
       throw std::runtime_error("Missing value for " + fs::path(option).u8string());
     const std::wstring value = argv[i];
-    if (option == L"--scene")
-      scene = value;
-    else if (option == L"--project")
-      pcc_project = value;
-    else if (option == L"--output")
+    if (option == L"--project" || option == L"--images" || option == L"--camera-pos" ||
+        option == L"--pos" || option == L"--pos-enh" || option == L"--las") {
+      inputs.insert(inputs.end(), {option, value});
+      if (option == L"--project")
+        pcc_project = value;
+      if (option == L"--images")
+        photo_dirs.push_back(value);
+      if (option == L"--las")
+        las = value;
+    } else if (option == L"--output")
       out = value;
     else if (option == L"--step")
       step = value;
@@ -567,12 +552,6 @@ void Pipeline(int argc, wchar_t** argv) {
   const bool run_preprocess = step == L"all" || step == L"preprocess";
   const bool delivery_ready = fs::exists(delivery) && !fs::exists(out / L"delivery.work");
   const bool need_preprocess = run_preprocess && !delivery_ready;
-  if (need_preprocess) {
-    if (scene.empty())
-      throw std::runtime_error("Specify --scene with the scene directory.");
-    if (!fs::is_directory(scene))
-      throw std::runtime_error("Scene directory does not exist: " + scene.u8string());
-  }
   if (step == L"train")
     RequireFile(delivery / L"result.json");
   if (step == L"export")
@@ -580,18 +559,17 @@ void Pipeline(int argc, wchar_t** argv) {
 
   LogSink geosun_log(logs / L"geosun.log");
   geosun_log.WriteLine("Session start: step=" + fs::path(step).u8string() +
-                       " scene=" + (scene.empty() ? std::string("<none>") : scene.u8string()) +
                        " output=" + out.u8string() +
                        " texel_size=" + fs::path(texel).u8string());
   try {
-    CheckDiskSpace(out, scene, step, need_preprocess);
+    CheckDiskSpace(out, photo_dirs, las, step, need_preprocess);
     geosun_log.WriteLine("Disk space check passed.");
 
     const Args project_args = pcc_project.empty() ? Args{} : Args{L"--project", pcc_project};
     if (need_preprocess) {
-      preprocess_args.insert(preprocess_args.end(), project_args.begin(), project_args.end());
-      RunTee(geosunpre, {L"run", L"--input", scene.native(), L"--output", delivery.native()},
-             preprocess_args, "Preprocess", geosun_log, logs / L"preprocess.log");
+      inputs.insert(inputs.begin(), {L"run", L"--output", delivery.native()});
+      RunTee(geosunpre, std::move(inputs), preprocess_args, "Preprocess", geosun_log,
+             logs / L"preprocess.log");
     } else if (run_preprocess || !project_args.empty()) {
       const std::string line = "Delivery already exists: " + delivery.u8string();
       std::cout << line << '\n';

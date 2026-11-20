@@ -4,25 +4,19 @@
 
 Windows x64，需算力 ≥ 8.0 的 NVIDIA GPU（RTX 30/40/50、RTX A 系列等）、显存 ≥ 12 GB（推荐 16 GB 及以上），驱动支持 CUDA 12.8（建议 R570 及以上）。无需安装 Python、CUDA Toolkit、Visual Studio 或联网。
 
-磁盘空间要求：`Geosun.exe` 启动时会自动检查 `--output` 所在卷的可用空间。全流程需要 `max(18 GiB, 1.5 × 输入场景体积 + 10 GiB)`，单步预处理需要 `max(8 GiB, 1.5 × 输入场景体积)`，单步训练需要 6 GiB，单步导出需要 4 GiB。
+`Geosun.exe` 会检查 `--output` 所在卷的可用空间。预处理需要 `max(8 GiB, 1.5 × 输入体积)`，输入体积按指定照片目录中的 JPEG 与指定 LAS 的大小估算。训练需要 6 GiB，导出需要 4 GiB，全流程按执行的阶段累加。
 
 ## 使用
 
 将 ZIP 解压到纯 ASCII 路径（例如 `D:\Geosun`），以便训练器使用 GPU 解码 JPEG。保持解压后的目录结构，在 `Geosun.exe` 所在目录打开 PowerShell 或 CMD，运行全流程。
 
 ```powershell
-.\Geosun.exe --scene "D:/数据/场景" --output "D:/成果/场景"
+.\Geosun.exe --project "D:/数据/场景/场景.pro" --images "D:/数据/场景/Image/L" --images "D:/数据/场景/Image/R" --camera-pos "D:/数据/场景/场景_CameraPos_C2E.txt" --pos "D:/数据/场景/场景_pos.txt" --pos-enh "D:/数据/场景/场景_pos_ENH.txt" --las "D:/数据/场景/ResultOut/场景.las" --output "D:/成果/场景"
 ```
 
-`--output` 也可以设为场景目录本身，或场景下的新目录。磁盘空间估算会排除本次的成果和工作缓存。
+从 1.1.3 起，新建预处理任务需要显式指定 `.pro`、照片目录、CameraPos、两份导航表和 LAS。照片平铺在同一目录时，传一个 `--images` 即可。完整规则见 `preprocess/docs/input.md`。
 
-新建预处理任务时，默认使用场景根目录中修改时间最新的 PCC `.pro`。可用 `--project 1110.pro` 手动改选。多份 `.pro` 并列最新时，程序会列出候选，需用 `--project` 指定。
-
-```powershell
-.\Geosun.exe --scene "D:/数据/场景" --output "D:/数据/场景"
-```
-
-此例把 `delivery/`、`train/`、`export/` 和 `logs/` 放在场景根目录。预处理根据选中的项目名读取同名的 CameraPos、导航表及默认 LAS。LAS 存于其他位置或使用了自定义文件名时，追加 `--preprocess-arg --las --preprocess-arg "D:/点云/办公室0918.las"`。续跑沿用已选项目。
+`--output` 也可以设为场景目录本身，或场景下的新目录。请选择照片目录以外的位置存放结果。
 
 `--output` 下生成 `delivery/`（训练数据）、`train/project.licht`、`export/`（含 `splats.ply`、`mesh.ply` 和 `mesh_osgb/`）以及 `logs/`（含总控日志 `geosun.log`、预处理日志 `preprocess.log`、训练日志 `train.log`、导出日志 `export.log` 与训练器运行期崩溃诊断目录 `runtime/logs/`，全程不写入系统用户目录 `%USERPROFILE%`；排障时可直接打包 `logs/` 目录）。导出由包内训练器完成。默认纹理像素尺寸为 0.02 场景单位，可用 `--texel-size` 调整。
 
