@@ -12,16 +12,21 @@ struct Exposure {
   Eigen::Vector3d navigation_raw;
   Json source_file;
 };
-struct Scene {
-  fs::path input, project, las;
+// Caller-given source files; nothing is discovered from a directory layout.
+struct SceneInputs {
+  fs::path project, camera_positions, navigation, enh, las;
+  std::vector<fs::path> photos;  // directories holding the pose-bound L/R JPEGs
+  Json ToJson() const;
+  static SceneInputs FromJson(const Json& value);
+};
+struct Scene : SceneInputs {
   std::array<Camera, 2> cameras;
   std::vector<Exposure> images;
   Json sources;
-  bool enhanced = false;  // Image/enhanced copies replace same-name originals
   Json ToJson() const;
   static Scene FromJson(const Json& value);
 };
-Scene ReadScene(const fs::path& input, const fs::path& project, const fs::path& las, bool enhanced);
+Scene ReadScene(const SceneInputs& inputs);
 cv::Mat ReadImage(const fs::path& path, int mode);
 void WriteImage(const fs::path& path, const cv::Mat& image, int png_compression = -1);
 struct ResizeCoefficients {

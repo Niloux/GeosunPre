@@ -100,10 +100,25 @@ Arguments::Arguments(const std::vector<std::string>& args) {
     } else {
       if (name.rfind("--", 0) != 0 || i + 1 == args.size())
         throw std::invalid_argument("Expected --option value: " + name);
-      if (!values.emplace(name, args[++i]).second)
+      // --images may name several photo directories.
+      if (name == "--images") {
+        lists[name].push_back(args[++i]);
+        values[name] = "list";
+      } else if (!values.emplace(name, args[++i]).second)
         throw std::invalid_argument("Repeated option: " + name);
     }
   }
+}
+std::vector<fs::path> Arguments::Paths(const std::string& name) const {
+  std::vector<fs::path> paths;
+  const auto it = lists.find(name);
+  if (it != lists.end())
+    for (const auto& value : it->second) {
+      if (value.empty())
+        throw std::invalid_argument("Empty " + name);
+      paths.push_back(fs::absolute(fs::u8path(value)));
+    }
+  return paths;
 }
 std::string Arguments::Get(const std::string& name, const std::string& fallback) const {
   const auto it = values.find(name);

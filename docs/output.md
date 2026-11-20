@@ -22,7 +22,7 @@ OUTPUT/
 
 COLMAP 小端二进制，`OPENCV_FISHEYE` 模型编号 5、8 个参数。相机 ID 1、2；每幅图像独立 frame，使用镜头对应的一传感器 rig。内部索引从 0 开始；仅导出已注册照片，按原输入顺序将图像/frame ID 连续重编号为 1 到注册数量，轨迹中的图像引用同步转换，内部缓存编号保持不变。
 
-位姿 world-to-camera，COLMAP 四元数顺序 `w x y z`。图像名相对于 images，保留原图名、鱼眼畸变与全部特征编号。照片和掩码不做重采样：默认无损裁到各镜头有效域窗口（见“有效域裁剪交付”），`--no-crop-valid-domain` 时为整幅输入照片拷贝；默认为 L/R 原图，配置 `"enhanced_photos": true` 且输入有 `Image/enhanced` 同名图时为该 enhanced 图。卷帘快门校正被采用时，位姿为读出中线时刻的参考位姿，并附 `rolling_shutter.json`，见下节。点轨迹与图像引用相互一致，无三维点的特征用 uint64 最大值。下游须支持原生鱼眼模型。
+位姿 world-to-camera，COLMAP 四元数顺序 `w x y z`。图像名相对于 images，保留原图名、鱼眼畸变与全部特征编号。照片和掩码不做重采样：默认无损裁到各镜头有效域窗口（见“有效域裁剪交付”），`--no-crop-valid-domain` 时为整幅输入照片拷贝；来源为 `--images` 所给目录中的照片。图像名统一为 `镜头/文件名`（如 `L/xxx.JPG`）。卷帘快门校正被采用时，位姿为读出中线时刻的参考位姿，并附 `rolling_shutter.json`，见下节。点轨迹与图像引用相互一致，无三维点的特征用 uint64 最大值。下游须支持原生鱼眼模型。
 
 points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重投影距离，单位像素；联合优化后重新计算，交付回读时验证。
 
@@ -78,7 +78,7 @@ quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 
 
 同级 `.pending` 中完成写入及回读后重命名发布。同一请求的完整包可复用，不同请求拒绝覆盖。`check --output` 只依赖交付包，检查结构、引用、尺寸、PLY 和几何拟合，不代表独立精度或渲染效果。
 
-`manifest.json` 的 `project` 记录选中的 PCC `.pro` 文件名。`check --output DIR --project FILE.pro` 同时核对交付包是否来自指定解算项目。
+`manifest.json` 的 `project` 记录选中的 PCC `.pro` 文件名。`check --output DIR --project FILE.pro`（可给路径，按文件名比较）同时核对交付包是否来自指定解算项目。
 
 格式依据：[COLMAP output format](https://colmap.github.io/format.html)。
 

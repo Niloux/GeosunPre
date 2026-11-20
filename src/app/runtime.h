@@ -50,9 +50,11 @@ void ParallelFor(size_t count, int workers, size_t chunk, Function function) {
 struct Arguments {
   std::string command;
   std::map<std::string, std::string> values;
+  std::map<std::string, std::vector<std::string>> lists;  // repeatable options
   explicit Arguments(const std::vector<std::string>& args);
   std::string Get(const std::string& name, const std::string& fallback = "") const;
   fs::path Path(const std::string& name) const;
+  std::vector<fs::path> Paths(const std::string& name) const;
   int Integer(const std::string& name, int fallback) const;
   double Number(const std::string& name, double fallback) const;
   void Validate(const std::vector<std::string>& options) const;

@@ -12,7 +12,7 @@
 
 | 用途 | 命令 |
 | --- | --- |
-| 本地调试 | `.\run.ps1 run --input "D:/数据/场景" --output "D:/成果/场景"`，自动增量编译并使用本机模型 |
+| 本地调试 | `.\run.ps1 run <输入参数> --output "D:/成果/场景"`（输入参数见下），自动增量编译并使用本机模型 |
 | 发给别人 | `.\package.ps1`，提交源码后执行，自动编译并打包跨显卡模型 |
 
 构建使用 Ninja Release，首次下载固定依赖到 `build/ninja/_deps/`，之后复用缓存。需要单独调整并行数或强制重新配置时，可调用 `tools/windows/build.ps1` 的 `-Jobs` 或 `-Configure`。
@@ -22,25 +22,30 @@
 ## 日常运行
 
 ```powershell
-.\run.ps1 run --input "D:/数据/场景" --output "D:/成果/场景"
-.\run.ps1 run --input "D:/数据/场景" --output "D:/成果/场景" --work "work/场景" --debug
+$in = @('--project', 'D:/数据/场景/场景.pro', '--images', 'D:/数据/场景/Image/L', '--images', 'D:/数据/场景/Image/R',
+        '--camera-pos', 'D:/数据/场景/场景_CameraPos_C2E.txt', '--pos', 'D:/数据/场景/场景_pos.txt',
+        '--pos-enh', 'D:/数据/场景/场景_pos_ENH.txt', '--las', 'D:/数据/场景/ResultOut/场景.las')
+.\run.ps1 run @in --output "D:/成果/场景"
+.\run.ps1 run @in --output "D:/成果/场景" --work "work/场景" --debug
 .\run.ps1 run --work "work/场景"
 .\run.ps1 export --work "work/场景" --output "D:/成果/场景-重新导出"
 .\run.ps1 check --output "D:/成果/场景"
 .\run.ps1 info
 ```
 
-交付直接写入 `--output` 根目录（默认 `output/<输入目录名>`）。
+输入全部显式给出，不自动查找；照片目录可分 L/R 或平铺，规则见[输入约定](docs/input.md)。新任务必须给 `--output`，交付直接写入其根目录。
+
+本地开发快捷方式：`run.ps1` 额外接受 `--input "D:/数据/场景" [--project 名称.pro]`，按常规 PCC 场景布局（最新 `.pro` 及同名 CameraPos/导航表、`Image/L`+`Image/R` 或平铺 `Image/`、`ResultOut/场景.las` 或根目录 `场景.las`）展开成上述显式参数并打印展开结果，未给 `--output`/`--work` 时默认 `output/<场景目录名>`。该展开只在开发脚本中进行，程序和运行包不接受 `--input`。
 
 **生产模式**（默认）：工作目录及缓存放在 `OUT.work`（或 `--work` 指定的目录），交付发布并回读校验后整个删除，最后只剩交付目录。中途失败时保留工作目录，以相同命令重跑即可续跑，成功后再删除。交付目录已存在而没有对应工作目录时拒绝重跑。
 
-**调试模式**（`--debug`）：工作目录（默认 `work/<输入目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。
+**调试模式**（`--debug`）：工作目录（默认 `work/<输出目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。
 
 交付包含照片（采用卷帘校正时另附读出运动参数）、掩码、鱼眼 COLMAP 模型、50 m 视锥内分档体素 LAS 初始化 PLY（基准体素默认 5 cm，上限 250 万点），以及深度和法向监督图：默认最长边 1024 px，由 MoGe-2 单路 90° 子图同时估计深度和法向，按法向与之一致的可信 LAS 定尺度；`--supervision-source las` 改为 LAS 投影监督。`--no-ply` 省略 PLY，`--ply-voxel` 调整基准体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着 LAS 监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人），以及有 LAS 表面支撑的天空误检块和封闭室内场景残余天空误检均在掩码里改回静态 `255`（配合 `configs/trainer.json` 统一的 `segment_and_ignore`），`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
 
 监督尺寸、额外几何掩码、显存预算及 LFS 训练示例见[深度与法向监督](docs/supervision.md)。已有调试工作目录可直接导出到新目录，无需重跑重建。
 
-默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。配置 `"rolling_shutter": false` 去掉卷帘校正阶段，默认 `true`。配置 `"enhanced_photos": true` 改用 `Image/enhanced` 照片，默认 `false` 只用原图。这些选择随配置冻结，续跑自动沿用，改变选择须使用新工作目录。
+默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。配置 `"rolling_shutter": false` 去掉卷帘校正阶段，默认 `true`。这些选择随配置冻结，续跑自动沿用，改变选择须使用新工作目录。
 
 `run --work WORK` 复用已完成阶段并恢复检查点；`run --work WORK --stage 阶段` 单独执行指定阶段，须先完成前置阶段。`prepare` 检查真实输入、相机和导航转换，不加载模型。
 

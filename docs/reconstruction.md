@@ -4,7 +4,7 @@
 
 ## 阶段与产物
 
-默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。配置 `"rolling_shutter": false` 去掉卷帘校正阶段，默认 `true`。配置 `"enhanced_photos": true` 改用 `Image/enhanced` 照片，默认 `false` 只用原图。这些选择随配置冻结，续跑自动沿用，改变选择须使用新工作目录。
+默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。配置 `"rolling_shutter": false` 去掉卷帘校正阶段，默认 `true`。这些选择随配置冻结，续跑自动沿用，改变选择须使用新工作目录。
 
 `run --work WORK` 复用已完成阶段并恢复检查点；`run --work WORK --stage 阶段` 单独执行指定阶段，须先完成前置阶段。`prepare` 检查真实输入、相机和导航转换，不加载模型。
 

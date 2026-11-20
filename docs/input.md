@@ -1,21 +1,21 @@
 # 输入与相机坐标
 
-```text
-INPUT/
-  场景.pro
-  场景_CameraPos_C2E.txt
-  场景_pos.txt
-  场景_pos_ENH.txt
-  Image/L/**/*.JPG
-  Image/R/**/*.JPG
-  Image/*.JPG               无 L、R 目录时的平铺原图
-  Image/enhanced/**/*.JPG   可选
-  ResultOut/场景.las        也可放在 INPUT/场景.las
-```
+调用方显式给出全部输入路径，程序不按目录结构或文件名配对自动查找：
 
-新建预处理任务时，默认使用场景根目录中修改时间最新的 PCC `.pro`，也可用 `--project 1119.pro` 手动指定。多份 `.pro` 并列最新时，程序会列出候选文件，需用 `--project` 选择。CameraPos、两份导航表和默认 LAS 均按选中的 `.pro` 文件名配对，缺少配套文件时报出对应路径。若 LAS 的路径或文件名不同，用 `--las` 显式指定。
+| 参数 | 内容 |
+| --- | --- |
+| `--project FILE.pro` | PCC 解算项目（L/R 鱼眼标定） |
+| `--images DIR` | 照片目录，可重复给出多个 |
+| `--camera-pos FILE` | 逐张曝光位置（通常为 `场景_CameraPos_C2E.txt`） |
+| `--pos FILE` | ECEF 导航表（通常为 `场景_pos.txt`） |
+| `--pos-enh FILE` | ENH 导航表（通常为 `场景_pos_ENH.txt`） |
+| `--las FILE` | 点云 |
 
-仅使用 `.pro` 中 L/R 相机及 CameraPos 有精确同名记录的 JPEG，M 不参与。照片默认只从 `Image/L`、`Image/R`（各自只能放对应镜头）读取原图；两者都不存在时改读 `Image/` 根目录下的平铺原图，不递归子目录；忽略 `Image/enhanced`：enhanced 是逐图不同的非线性增强，原图曝光固定、颜色一致，更适合 3DGS 外观建模。配置 `"enhanced_photos": true` 时另读 `Image/enhanced`，同名时优先使用 enhanced，交付图像名仍按 L/R 原图的相对路径，原图缺失时为 `镜头/文件名`。输入中完全没有原图（`Image/L`、`Image/R` 和平铺的 `Image/` 都没有所用的 JPEG）时，自动改读 `Image/enhanced`，并记入 `photos`，日志给出提示；部分原图缺失仍按上述规则报错。各目录内图像名和各镜头帧号须唯一，Pose 绑定图像在所读目录中都缺失时报错。照片来源随配置冻结并记入 scene.json 的 `photos`，改变须使用新工作目录。所用照片尺寸须等于 `.pro`，EXIF orientation 须为 1。按 GPS 周、文件名时间、镜头和图像名排序；L/R 同帧号本身不表示同步：同时具有 L、R 的全部帧号的文件名时间相差不超过 2 ms 时按同步刚性 rig 处理（如室内、展厅）；超过 2 ms 且不超过 0.2 s 的异步错拍（如生产车间 R 先于 L 约 65 ms、古建筑约 56 ms），在 200 Hz 导航姿态通过视轴一致性自检时，按经 POS 运动补偿后的异步刚性 rig 处理。
+新任务六项必须全部给出，缺少任意一项或文件不存在时报出对应参数和路径；只给 `--work` 续跑时沿用 `scene.json` 记录的路径。路径与源文件身份随工作目录冻结，改变须使用新工作目录。
+
+仅使用 `.pro` 中 L/R 相机及 CameraPos 有精确同名记录的 JPEG，M 不参与；不在 CameraPos 中的 JPEG 直接忽略。镜头只由文件名后缀 `-L`/`-R` 决定，与所在目录无关，因此 `Image/L`、`Image/R` 分目录和全部平铺在同一目录均可：分目录时给 `--images Image/L --images Image/R`（或给其共同父目录），平铺时给该目录。每个 `--images` 目录若顶层直接含有所用 JPEG，按平铺目录只读顶层，其子目录（如 `enhanced/`、`Imageout/` 的派生副本）不读；顶层没有时递归读取整个目录树（如 `Image/L/0000/`）。同一图像名在所给目录中出现多次时报 `Ambiguous exposure` 并列出两个路径，CameraPos 中的 L/R 图像在所给目录都缺失时报错。建议传原图：enhanced 是逐图不同的非线性增强，原图曝光固定、颜色一致，更适合 3DGS 外观建模；需要时可直接把 enhanced 目录作为 `--images`。交付图像名统一为 `镜头/文件名`（如 `L/xxx.JPG`），不保留调用方的目录层级；各镜头帧号须唯一。
+
+所用照片尺寸须等于 `.pro`，EXIF orientation 须为 1。按 GPS 周、文件名时间、镜头和图像名排序；L/R 同帧号本身不表示同步：同时具有 L、R 的全部帧号的文件名时间相差不超过 2 ms 时按同步刚性 rig 处理（如室内、展厅）；超过 2 ms 且不超过 0.2 s 的异步错拍（如生产车间 R 先于 L 约 65 ms、古建筑约 56 ms），在 200 Hz 导航姿态通过视轴一致性自检时，按经 POS 运动补偿后的异步刚性 rig 处理。
 
 文件名为 `GPS周-秒-毫秒_帧号-L或R.JPG`。CameraPos 每行 11 字段：文件名、设备编号、GPS 周、秒、XYZ、四元数四分量。仅使用位置，四元数不用于视觉初始化；不改写时间戳。
 
@@ -37,7 +37,7 @@ LAS 对齐后默认执行卷帘快门校正和独立稀疏点清理。
 
 相机优化的三视图要求不作为初始化点云的最低轨迹长度。稀疏点清理允许双视图点，但仍须通过重投影、至少 1.5° 视差、固定相机下的深度不确定度及 LAS 距离检查；抽样 LAS 判远的点在删除前须按 50 万记录分块复核完整有效 LAS，距离门限不变，不要求点属于平面。SfM 最终标定后还会对已验证匹配分量中未分配的观测单独三角化，保留通过几何过滤的独立轨迹。
 
-LAS 支持未压缩 1.2、点格式 0–3；默认读取 `ResultOut/场景.las`，该文件不存在而 `INPUT/场景.las` 存在时读取后者，其他文件使用 `--las` 选择。排除 withheld 和 class-7 噪声，RGB 支持 uint16 中的 8-bit/16-bit 范围，无 RGB 时灰色 127。
+LAS 支持未压缩 1.2、点格式 0–3，由 `--las` 指定。排除 withheld 和 class-7 噪声，RGB 支持 uint16 中的 8-bit/16-bit 范围，无 RGB 时灰色 127。
 
 配准继承 `LAS XYZ ≈ ENH 减首个 ENH 位置` 假设，单位按米解释；拟合不能确认绝对 CRS 或独立地理精度。LAS 头部范围（外扩 2 m）包含过半照片的 CameraPos ECEF 位置时，按 ECEF LAS 处理：读取时以导航的同一 ECEF→ENH 转换换到上述局部坐标，头部范围取转换后八个角点的包围盒，各阶段报告的 LAS 元数据记录 `frame: ecef_to_navigation_enh` 及 `frame_from_input` 变换；否则按局部 LAS 原样读取。计算使用局部原点，输出恢复局部 LAS 坐标（局部 LAS 即输入坐标）。
 

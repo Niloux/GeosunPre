@@ -24,12 +24,16 @@ void Help(const Arguments&);
 
 const Command Commands[] = {
     {"run",
-     "--input INPUT [--output OUT] [--work WORK] [--debug] [--models MODELS] "
-     "[--project FILE.pro] [--config JSON] [--no-las-supervision]\n"
+     "--project FILE.pro --images DIR [--images DIR ...] --camera-pos FILE --pos FILE "
+     "--pos-enh FILE --las FILE --output OUT\n"
+     "      [--work WORK] [--debug] [--models MODELS] [--config JSON] [--no-las-supervision]\n"
      "  geosunpre run --work WORK [--stage "
      "prepare|masks|features|matches|sfm|align|shutter|cleanup|export]",
      RunCommand},
-    {"prepare", "--input INPUT [--project FILE.pro] [--output OUT] [--work WORK] [--debug]", RunCommand},
+    {"prepare",
+     "--project FILE.pro --images DIR [--images DIR ...] --camera-pos FILE --pos FILE "
+     "--pos-enh FILE --las FILE --output OUT [--work WORK] [--debug]",
+     RunCommand},
     {"export", "--work WORK --output OUT [--no-ply] [--no-roi] [--ply-voxel METRES] [--no-las-supervision]",
      Export},
     {"check", "--output DIR [--project FILE.pro]",
@@ -75,7 +79,7 @@ void Help(const Arguments&) {
                 << '\n';
   }
   std::cout << "  Use --debug to keep the work directory for stage resume or export.\n"
-               "  New runs use the most recently modified .pro by default.\n"
+               "  Photo directories with pose-bound JPEGs at the top are read flat, else recursively.\n"
                "  Delivery options: [--supervision-source moge|las] [--supervision-models MODELS]\n"
                "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS]\n"
                "    [--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"

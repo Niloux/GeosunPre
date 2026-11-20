@@ -186,24 +186,38 @@ Json Scene::ToJson() const {
          {"pose_seconds", e.pose_seconds},
          {"navigation_raw", {e.navigation_raw.x(), e.navigation_raw.y(), e.navigation_raw.z()}},
          {"source_file", e.source_file}});
-  return {{"input", input.u8string()},
-          {"project", project.u8string()},
-          {"las", las.u8string()},
+  return {{"inputs", SceneInputs::ToJson()},
           {"cameras", {cameras[0].ToJson(), cameras[1].ToJson()}},
           {"images", exposures},
-          {"photos", enhanced ? "enhanced" : "original"},
           {"sources", sources}};
+}
+Json SceneInputs::ToJson() const {
+  Json folders = Json::array();
+  for (const auto& folder : photos)
+    folders.push_back(folder.u8string());
+  return {{"project", project.u8string()},
+          {"photos", folders},
+          {"camera_positions", camera_positions.u8string()},
+          {"navigation", navigation.u8string()},
+          {"enh", enh.u8string()},
+          {"las", las.u8string()}};
+}
+SceneInputs SceneInputs::FromJson(const Json& v) {
+  auto path = [&](const char* key) { return fs::u8path(v.at(key).get<std::string>()); };
+  SceneInputs s;
+  s.project = path("project");
+  s.camera_positions = path("camera_positions");
+  s.navigation = path("navigation");
+  s.enh = path("enh");
+  s.las = path("las");
+  for (const auto& folder : v.at("photos"))
+    s.photos.push_back(fs::u8path(folder.get<std::string>()));
+  return s;
 }
 Scene Scene::FromJson(const Json& v) {
   Scene s;
-  s.input = fs::u8path(v.at("input").get<std::string>());
-  s.project = fs::u8path(v.at("project").get<std::string>());
-  s.las = fs::u8path(v.at("las").get<std::string>());
+  static_cast<SceneInputs&>(s) = SceneInputs::FromJson(v.at("inputs"));
   s.sources = v.at("sources");
-  const auto photos = v.at("photos").get<std::string>();
-  if (photos != "enhanced" && photos != "original")
-    throw std::runtime_error("Unknown scene photos: " + photos);
-  s.enhanced = photos == "enhanced";
   for (int i = 0; i < 2; ++i)
     s.cameras[i] = Camera::FromJson(v.at("cameras")[i]);
   for (const auto& row : v.at("images")) {
@@ -216,47 +230,30 @@ Scene Scene::FromJson(const Json& v) {
   return s;
 }
 namespace {
-bool IsProjectName(const fs::path& name) {
-  return _wcsicmp(name.extension().c_str(), L".pro") == 0;
-}
-fs::path SelectProject(const fs::path& input, const fs::path& chosen) {
-  if (!chosen.empty()) {
-    if (chosen != chosen.filename() || !IsProjectName(chosen))
-      throw std::runtime_error("--project must be a .pro filename in the input directory");
-    if (!fs::is_regular_file(input / chosen))
-      throw std::runtime_error("Missing .pro project: " + (input / chosen).u8string());
-    return input / chosen;
-  }
-  fs::file_time_type latest_time{};
-  std::vector<fs::path> latest;
-  for (const auto& row : fs::directory_iterator(input)) {
-    if (!IsProjectName(row.path()) || !row.is_regular_file())
-      continue;
-    const auto modified = row.last_write_time();
-    if (latest.empty() || modified > latest_time) {
-      latest_time = modified;
-      latest.clear();
-    }
-    if (modified == latest_time)
-      latest.push_back(row.path());
-  }
-  if (latest.empty())
-    throw std::runtime_error("Missing .pro project");
-  if (latest.size() > 1) {
-    std::sort(latest.begin(), latest.end());
-    std::string message = "PCC projects share the latest modification time. Use --project to select one.";
-    for (const auto& path : latest)
-      message += "\n  " + path.filename().u8string();
-    throw std::runtime_error(message);
-  }
-  return latest.front();
+fs::path RequireFile(const fs::path& path, const char* what) {
+  if (path.empty())
+    throw std::runtime_error(std::string("Missing ") + what + " path");
+  if (!fs::is_regular_file(path))
+    throw std::runtime_error(std::string("Missing ") + what + ": " + path.u8string());
+  return fs::weakly_canonical(path);
 }
 }  // namespace
-Scene ReadScene(const fs::path& input, const fs::path& chosen_project, const fs::path& chosen_las,
-                bool enhanced_photos) {
+Scene ReadScene(const SceneInputs& inputs) {
   Scene s;
-  s.input = fs::weakly_canonical(input);
-  s.project = SelectProject(input, chosen_project);
+  s.project = RequireFile(inputs.project, ".pro project");
+  if (_wcsicmp(s.project.extension().c_str(), L".pro") != 0)
+    throw std::runtime_error("Expected a .pro project: " + s.project.u8string());
+  s.camera_positions = RequireFile(inputs.camera_positions, "CameraPos");
+  s.navigation = RequireFile(inputs.navigation, "navigation (_pos.txt)");
+  s.enh = RequireFile(inputs.enh, "ENH navigation (_pos_ENH.txt)");
+  s.las = RequireFile(inputs.las, "LAS");
+  if (inputs.photos.empty())
+    throw std::runtime_error("Missing photo directory");
+  for (const auto& folder : inputs.photos) {
+    if (!fs::is_directory(folder))
+      throw std::runtime_error("Missing photo directory: " + folder.u8string());
+    s.photos.push_back(fs::weakly_canonical(folder));
+  }
   Log("PCC project: " + s.project.u8string());
   const auto pro = ReadJson(s.project);
   std::set<std::string> labels;
@@ -292,8 +289,7 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_project, const fs:
   }
   if (labels.size() != 2)
     throw std::runtime_error("Missing L/R calibration");
-  const auto stem = s.project.stem().u8string();
-  const auto pos = input / fs::u8path(stem + "_CameraPos_C2E.txt");
+  const auto& pos = s.camera_positions;
   std::ifstream stream(pos);
   if (!stream)
     throw std::runtime_error("Cannot read camera positions: " + pos.u8string());
@@ -326,51 +322,42 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_project, const fs:
     if (!positions.emplace(name, Position{week, sec, {x, y, z}}).second)
       throw std::runtime_error("Duplicate camera position: " + name);
   }
-  // Pose-bound JPEGs by file name; Image/L and Image/R hold only their own lens.
-  auto index = [&](const fs::path& folder, const std::string& lens, bool recursive = true) {
-    std::map<std::string, fs::path> files;
-    if (!fs::is_directory(folder))
-      return files;
-    std::vector<fs::directory_entry> rows;
-    if (recursive)
-      rows.assign(fs::recursive_directory_iterator(folder), fs::recursive_directory_iterator());
-    else
-      rows.assign(fs::directory_iterator(folder), fs::directory_iterator());
-    for (const auto& row : rows) {
-      if (!row.is_regular_file())
-        continue;
-      auto ext = row.path().extension().u8string();
-      std::transform(ext.begin(), ext.end(), ext.begin(),
-                     [](unsigned char c) { return char(std::tolower(c)); });
-      if (ext != ".jpg" && ext != ".jpeg")
-        continue;
-      const auto name = row.path().filename().u8string();
-      int frame;
-      std::string label;
-      TimeName(name, frame, label);
-      if ((label != "L" && label != "R") || !positions.count(name))
-        continue;
-      if (!lens.empty() && label != lens)
-        throw std::runtime_error("Image in wrong lens folder: " + row.path().u8string());
-      if (!files.emplace(name, row.path()).second)
-        throw std::runtime_error("Ambiguous exposure: " + name);
-    }
-    return files;
+  // Pose-bound JPEGs by file name; the lens comes from the name, not from the folder. A photo
+  // directory holding pose-bound JPEGs at its top level is read flat, which keeps derived
+  // copies in its subfolders (enhanced/, Imageout/) out; otherwise its whole tree is read.
+  auto pose_bound = [&](const fs::directory_entry& row, std::string& name) {
+    if (!row.is_regular_file())
+      return false;
+    auto ext = row.path().extension().u8string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    name = row.path().filename().u8string();
+    if ((ext != ".jpg" && ext != ".jpeg") || !positions.count(name))
+      return false;
+    int frame;
+    std::string label;
+    TimeName(name, frame, label);
+    return label == "L" || label == "R";
   };
-  const auto originals = [&] {
-    // Without lens folders the originals lie flat in Image/, beside enhanced/ and Imageout/.
-    if (!fs::is_directory(input / "Image/L") && !fs::is_directory(input / "Image/R"))
-      return index(input / "Image", "", false);
-    auto files = index(input / "Image/L", "L");
-    files.merge(index(input / "Image/R", "R"));
-    return files;
-  }();
-  // Without any original photo the enhanced ones are the only source.
-  s.enhanced = enhanced_photos || originals.empty();
-  if (s.enhanced && !enhanced_photos)
-    Log("No original photos in " + (input / "Image").u8string() + "; using Image/enhanced");
-  const auto enhanced = s.enhanced ? index(input / "Image/enhanced", "")
-                                   : std::map<std::string, fs::path>{};
+  std::map<std::string, fs::path> files;
+  for (const auto& folder : s.photos) {
+    std::vector<std::pair<std::string, fs::path>> found;
+    std::string name;
+    for (const auto& row : fs::directory_iterator(folder))
+      if (pose_bound(row, name))
+        found.emplace_back(name, row.path());
+    const bool flat = !found.empty();
+    if (!flat)
+      for (const auto& row : fs::recursive_directory_iterator(folder))
+        if (pose_bound(row, name))
+          found.emplace_back(name, row.path());
+    Log("Photos: " + std::to_string(found.size()) + (flat ? " flat in " : " under ") +
+        folder.u8string());
+    for (const auto& [file, path] : found)
+      if (!files.emplace(file, path).second)
+        throw std::runtime_error("Ambiguous exposure: " + path.u8string() + " and " +
+                                 files.at(file).u8string());
+  }
   std::set<std::pair<std::string, int>> frames;
   for (const auto& [name, position] : positions) {
     int frame;
@@ -378,14 +365,10 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_project, const fs:
     const auto [week, seconds] = TimeName(name, frame, label);
     if (label != "L" && label != "R")
       continue;
-    // Enabled enhanced photos take precedence; the delivered name keeps the lens folder layout.
-    const auto original = originals.find(name), better = enhanced.find(name);
-    if (original == originals.end() && better == enhanced.end())
+    const auto found = files.find(name);
+    if (found == files.end())
       throw std::runtime_error("Pose-bound image missing: " + name);
-    const auto path = better != enhanced.end() ? better->second : original->second;
-    const auto relative = original != originals.end()
-                              ? fs::relative(original->second, input / "Image").generic_u8string()
-                              : label + "/" + name;
+    const auto& path = found->second;
     if (!frames.emplace(label, frame).second)
       throw std::runtime_error("Ambiguous exposure: " + name);
     if (position.week != week)
@@ -395,7 +378,8 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_project, const fs:
     const auto& c = s.cameras[cid];
     if (header.width != c.width || header.height != c.height || header.orientation != 1)
       throw std::runtime_error("Unexpected JPEG size/orientation: " + path.u8string());
-    s.images.push_back({0, cid, relative, fs::absolute(path), frame, week, seconds,
+    // Delivered names depend only on the lens, never on the caller's folder layout.
+    s.images.push_back({0, cid, label + "/" + name, fs::absolute(path), frame, week, seconds,
                         position.seconds, position.center, FileMetadata(path)});
   }
   if (s.images.size() < 3)
@@ -406,22 +390,10 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_project, const fs:
   });
   for (uint32_t i = 0; i < s.images.size(); ++i)
     s.images[i].id = i;
-  if (chosen_las.empty()) {
-    const auto nested = input / "ResultOut" / fs::u8path(stem + ".las"),
-               flat = input / fs::u8path(stem + ".las");
-    s.las = !fs::is_regular_file(nested) && fs::is_regular_file(flat) ? flat : nested;
-  } else {
-    s.las = chosen_las;
-  }
-  if (!fs::is_regular_file(s.las))
-    throw std::runtime_error("Missing LAS: " + s.las.u8string());
-  s.las = fs::absolute(s.las);
-  const auto nav = input / fs::u8path(stem + "_pos.txt"),
-             enh = input / fs::u8path(stem + "_pos_ENH.txt");
   s.sources = {{"project", FileMetadata(s.project)},
-               {"camera_positions", FileMetadata(pos)},
-               {"navigation", FileMetadata(nav)},
-               {"enh", FileMetadata(enh)},
+               {"camera_positions", FileMetadata(s.camera_positions)},
+               {"navigation", FileMetadata(s.navigation)},
+               {"enh", FileMetadata(s.enh)},
                {"las", FileMetadata(s.las)}};
   return s;
 }
@@ -478,9 +450,7 @@ Navigation ReadNavigation(const Scene& scene) {
     }
     return rows;
   };
-  const auto stem = scene.project.stem().u8string();
-  const auto a = read(scene.input / fs::u8path(stem + "_pos.txt")),
-             b = read(scene.input / fs::u8path(stem + "_pos_ENH.txt"));
+  const auto a = read(scene.navigation), b = read(scene.enh);
   if (a.size() != b.size() || a.size() < 3)
     throw std::runtime_error("Navigation row identities differ");
   Eigen::Vector3d center = Eigen::Vector3d::Zero();

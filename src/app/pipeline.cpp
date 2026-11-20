@@ -12,6 +12,7 @@
 #include <set>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <Windows.h>
 
 namespace geosun {
@@ -40,16 +41,52 @@ fs::path NormalizeDirectory(const fs::path& path) {
     normalized = normalized.parent_path();
   return normalized;
 }
-void ValidateDeliveryPaths(const fs::path& input, const fs::path& work, const fs::path& output) {
+// Work and delivery folders stay apart from every source photo directory and input file.
+void ValidateSourcePaths(const SceneInputs& inputs, const fs::path& folder, const char* what) {
+  for (const auto& photos : inputs.photos)
+    if (Contains(folder, photos) || Contains(photos, folder))
+      throw std::runtime_error(std::string("Use a separate ") + what +
+                               " directory outside the photo directory " + photos.u8string());
+  for (const auto& file : {inputs.project, inputs.camera_positions, inputs.navigation, inputs.enh,
+                           inputs.las})
+    if (Contains(folder, file))
+      throw std::runtime_error(std::string("The ") + what + " directory must not contain input " +
+                               file.u8string());
+}
+void ValidateDeliveryPaths(const SceneInputs& inputs, const fs::path& work, const fs::path& output) {
   auto pending = output;
   pending += ".pending";
-  const auto photos = input / "Image";
+  ValidateSourcePaths(inputs, work, "work");
   for (const auto& folder : {output, pending}) {
-    if (Contains(folder, input) || Contains(photos, folder) || Contains(folder, photos))
-      throw std::runtime_error("Use a separate output directory outside the input Image tree");
+    ValidateSourcePaths(inputs, folder, "output");
     if (Contains(work, folder) || Contains(folder, work))
       throw std::runtime_error("Output and work directories must be separate");
   }
+}
+// All source paths, or none to reuse those recorded in an existing work directory.
+std::optional<SceneInputs> ParseInputs(const Arguments& args) {
+  static const char* const options[] = {"--project", "--images", "--camera-pos",
+                                        "--pos",     "--pos-enh", "--las"};
+  std::string missing;
+  int given = 0;
+  for (const auto* option : options) {
+    if (args.Get(option).empty())
+      missing += std::string(" ") + option;
+    else
+      ++given;
+  }
+  if (!given)
+    return std::nullopt;
+  if (!missing.empty())
+    throw std::invalid_argument("Missing input option(s):" + missing);
+  SceneInputs inputs;
+  inputs.project = args.Path("--project");
+  inputs.photos = args.Paths("--images");
+  inputs.camera_positions = args.Path("--camera-pos");
+  inputs.navigation = args.Path("--pos");
+  inputs.enh = args.Path("--pos-enh");
+  inputs.las = args.Path("--las");
+  return inputs;
 }
 class Lock {
   HANDLE handle;
@@ -89,7 +126,6 @@ Json Settings(const fs::path& file) {
       {"ba_workers", Kind::Integer, 1, 32},
       {"sfm_repair_rounds", Kind::Integer, 0, 2},
       {"rolling_shutter", Kind::Boolean},
-      {"enhanced_photos", Kind::Boolean},
       {"quality_median_px", Kind::Positive},
       {"quality_p90_px", Kind::Positive},
       {"las_support_fraction", Kind::Positive},
@@ -283,7 +319,7 @@ std::vector<fs::path> AlignVisual(const Scene& scene, const fs::path& work, cons
     result["frontend"][name] = ReadJson(work / "cache" / (std::string(name) + "_profile.json"));
   result["runtime"] = "C++/CUDA/TensorRT";
   result["build"] = BuildInfo();
-  result["input"] = scene.input.u8string();
+  result["inputs"] = scene.SceneInputs::ToJson();
   WriteModel(work / "cache/aligned.bin", model);
   WriteJson(work / "cache/alignment.json", result);
   return {work / "cache/aligned.bin", work / "cache/alignment.json"};
@@ -388,44 +424,44 @@ fs::path ProductionWork(const fs::path& output) {
 }
 }  // namespace
 void Run(const Arguments& args) {
-  args.Validate(WithDeliveryOptions({"--input", "--work", "--models", "--config", "--stage",
-                                     "--output", "--project", "--las", "--debug"}));
+  args.Validate(WithDeliveryOptions({"--work", "--models", "--config", "--stage", "--output",
+                                     "--project", "--images", "--camera-pos", "--pos", "--pos-enh",
+                                     "--las", "--debug"}));
   auto delivery = ParseDelivery(args);
-  // Without --input, an existing work directory supplies the input and output.
+  auto inputs = ParseInputs(args);
+  // Without inputs, an existing work directory supplies the inputs and output.
   auto output = args.Get("--output").empty() ? fs::path()
                                              : NormalizeDirectory(args.Path("--output"));
   fs::path work;
   if (!args.Get("--work").empty())
     work = args.Path("--work");
   else {
-    const auto name = NormalizeDirectory(args.Path("--input")).filename();
     if (output.empty())
-      output = fs::absolute(fs::path("output") / name);
-    work = args.Get("--debug") == "true" ? fs::absolute(fs::path("work") / name)
+      throw std::invalid_argument("Missing --output");
+    work = args.Get("--debug") == "true" ? fs::absolute(fs::path("work") / output.filename())
                                          : ProductionWork(output);
   }
   const auto state_path = work / "state.json";
   const bool fresh = !fs::exists(state_path);
-  const bool recorded_input = !fresh && args.Get("--input").empty();
-  const auto saved = !fresh && (output.empty() || recorded_input) ? ReadJson(state_path) : Json();
-  const auto input = recorded_input ? fs::u8path(saved.at("input").get<std::string>())
-                                    : args.Path("--input");
-  if (output.empty() && !fresh) {
+  if (fresh && !inputs)
+    throw std::invalid_argument(
+        "A new run needs --project, --images, --camera-pos, --pos, --pos-enh and --las");
+  if (fresh && output.empty())
+    throw std::invalid_argument("Missing --output");
+  const auto saved = fresh ? Json() : ReadJson(state_path);
+  if (!inputs)
+    inputs = SceneInputs::FromJson(saved.at("scene").at("inputs"));
+  if (output.empty()) {
     if (!saved.contains("output"))
       throw std::runtime_error("Work directory has no recorded output; specify --output");
     output = NormalizeDirectory(fs::u8path(saved.at("output").get<std::string>()));
   }
-  if (output.empty())
-    output = fs::absolute(fs::path("output") / NormalizeDirectory(input).filename());
-  const auto photos = input / "Image";
-  if (Contains(work, input) || Contains(photos, work) || Contains(work, photos))
-    throw std::runtime_error("Use a separate work directory outside the input Image tree");
-  ValidateDeliveryPaths(input, work, output);
+  ValidateDeliveryPaths(*inputs, work, output);
   // A finished production run leaves no work directory; do not repeat it over its delivery.
   if (fresh && fs::exists(output))
     throw std::runtime_error("Output already exists; choose a new output directory");
-  // A production run will remove its work directory. Do not adopt input data as fresh work.
-  if (fresh && Contains(input, work) && fs::is_directory(work)) {
+  // A production run will remove its work directory. Do not adopt existing files as fresh work.
+  if (fresh && fs::is_directory(work)) {
     for (const auto& entry : fs::directory_iterator(work)) {
       const auto name = entry.path().filename();
       if (name != ".lock" && name != "state.json.writing")
@@ -444,22 +480,11 @@ void Run(const Arguments& args) {
     auto settings = args.Get("--config").empty()
                         ? (state.value.empty() ? Settings({}) : state.value.at("settings"))
                         : Settings(args.Path("--config"));
-    auto project = fs::u8path(args.Get("--project"));
-    if (project.empty() && !state.value.empty())
-      project = fs::u8path(state.value.at("scene").at("project").get<std::string>()).filename();
-    const auto las = args.Get("--las").empty()
-                         ? (state.value.empty()
-                                ? fs::path()
-                                : fs::u8path(state.value.at("scene").at("las").get<std::string>()))
-                         : args.Path("--las");
-    const Scene scene = ReadScene(input, project, las, settings.at("enhanced_photos"));
+    const Scene scene = ReadScene(*inputs);
     ReadSceneLas(scene);
     const auto prepared = scene.ToJson();
     if (state.value.empty()) {
-      state.value = {{"input", scene.input.u8string()},
-                     {"settings", settings},
-                     {"scene", prepared},
-                     {"stages", Json::object()}};
+      state.value = {{"settings", settings}, {"scene", prepared}, {"stages", Json::object()}};
     } else if (state.value.at("scene") != prepared || state.value.at("settings") != settings)
       throw std::runtime_error("Inputs/settings changed; choose a new work directory");
     const auto root = args.Get("--models").empty()
@@ -553,10 +578,9 @@ void Export(const Arguments& args) {
   Verify(work, state.at("stages").at("cleanup").at("files"));
   const auto scene = Scene::FromJson(ReadJson(work / "scene.json"));
   const auto output = NormalizeDirectory(args.Path("--output"));
-  ValidateDeliveryPaths(scene.input, work, output);
+  ValidateDeliveryPaths(scene, work, output);
   // The ECEF frame conversion is refitted from the navigation file: it must be the one reconstructed.
-  if (ReadScene(scene.input, scene.project.filename(), scene.las, scene.enhanced).ToJson() !=
-      scene.ToJson())
+  if (ReadScene(scene).ToJson() != scene.ToJson())
     throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
   std::cout << ExportSelected(scene, work, output, delivery).dump() << '\n';
 }

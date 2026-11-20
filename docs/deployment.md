@@ -7,17 +7,17 @@ Windows x64，需算力 ≥ 8.0 的 NVIDIA GPU（RTX 30/40/50、RTX A 系列等�
 ```powershell
 .\geosunpre.exe info
 .\geosunpre.exe check-models --image "D:/照片/样例.JPG"
-.\geosunpre.exe run --input "D:/数据/场景" --output "D:/成果/场景"
+.\geosunpre.exe run --project "D:/数据/场景/场景.pro" --images "D:/数据/场景/Image/L" --images "D:/数据/场景/Image/R" --camera-pos "D:/数据/场景/场景_CameraPos_C2E.txt" --pos "D:/数据/场景/场景_pos.txt" --pos-enh "D:/数据/场景/场景_pos_ENH.txt" --las "D:/数据/场景/ResultOut/场景.las" --output "D:/成果/场景"
 .\geosunpre.exe check --output "D:/成果/场景"
 ```
 
-预处理的 `--output` 可以指向场景内的独立子目录（避开 `Image/`），例如 `D:/数据/场景/3DGS-1119`。新任务默认选用修改时间最新的 PCC `.pro`，可以在 `run` 或 `prepare` 中用 `--project 1119.pro` 改选。
+`.pro`、照片目录、CameraPos、两份导航表和 LAS 均由调用方显式给出，程序不自动查找；照片目录可以是 L/R 分目录（重复 `--images`）或平铺目录，规则见 `docs/input.md`。`--output` 必填，可以指向场景内的独立子目录，但不能与照片目录互相包含，也不能包含任何输入文件，例如 `D:/数据/场景/3DGS-1119`。
 
 模型默认读取 EXE 同级的 `models/`；`--models` 可显式指定其他模型包，续跑使用工作目录记录的模型位置。更新程序时从当前源码重新编译并打包，将完整运行包放到新目录。
 
 `info` 显示程序路径、构建版本、GPU 和默认模型目录。`check-models` 使用指定的真实照片执行五个模型，照片仅用于本次检查，不会写入模型或运行包。检测器支持动态宽高，检查报告包含实际检测输入尺寸；换场景分辨率或宽高比无需重建模型。
 
-交付直接写入 `--output` 根目录。默认生产模式在交付发布后删除工作目录 `OUT.work` 及其缓存，中途失败时保留，以相同命令续跑；`--debug` 保留工作目录（默认 `work/<输入目录名>`，或 `--work` 指定），用于续跑单阶段及独立 `export`。输入、配置或模型改变时使用新工作目录，保留已有成果。默认交付原图、掩码、鱼眼 COLMAP 模型、50 m 视锥内分档体素 LAS 初始化 PLY（基准体素 5 cm、上限 250 万点），以及深度和法向监督图（默认最长边 1024 px、由 MoGe-2 单路生成、LAS 定尺度）；下游需支持 OPENCV_FISHEYE。`--no-ply` 省略 PLY，`--ply-voxel 0.1` 调整基准体素，`--no-las-supervision` 省略监督图，`--no-static-masks` 保留 SAM3 掩码（默认持续人物改回静态，需要 LAS），`--supervision-source las` 改为 LAS 投影监督，`--supervision-models MODELS` 指定含 geometry 引擎的模型包。交付目录直接作为定制 LFS 的训练数据路径；监督深度为沿视线距离，须用 `--gut` 训练。已有调试工作目录可直接 `export --work WORK --output NEW` 生成新交付，保留原交付包。
+交付直接写入 `--output` 根目录。默认生产模式在交付发布后删除工作目录 `OUT.work` 及其缓存，中途失败时保留，以相同命令续跑；`--debug` 保留工作目录（默认 `work/<输出目录名>`，或 `--work` 指定），用于续跑单阶段及独立 `export`。输入、配置或模型改变时使用新工作目录，保留已有成果。默认交付原图、掩码、鱼眼 COLMAP 模型、50 m 视锥内分档体素 LAS 初始化 PLY（基准体素 5 cm、上限 250 万点），以及深度和法向监督图（默认最长边 1024 px、由 MoGe-2 单路生成、LAS 定尺度）；下游需支持 OPENCV_FISHEYE。`--no-ply` 省略 PLY，`--ply-voxel 0.1` 调整基准体素，`--no-las-supervision` 省略监督图，`--no-static-masks` 保留 SAM3 掩码（默认持续人物改回静态，需要 LAS），`--supervision-source las` 改为 LAS 投影监督，`--supervision-models MODELS` 指定含 geometry 引擎的模型包。交付目录直接作为定制 LFS 的训练数据路径；监督深度为沿视线距离，须用 `--gut` 训练。已有调试工作目录可直接 `export --work WORK --output NEW` 生成新交付，保留原交付包。
 
 `run` 默认在 LAS 对齐后执行卷帘快门校正并独立清理稀疏点，再导出通过验收的所选模型；交付照片始终为原图拷贝；卷帘校正被采用时另附 `rolling_shutter.json`，未采用的原因见交付目录 `result.json` 的 shutter 及调试工作目录的 `cache/shutter.json`。候选未通过时仍对上一步所选模型继续处理；未采用原因分别见 `cache/shutter.json` 与 `cache/cleanup.json`。
 

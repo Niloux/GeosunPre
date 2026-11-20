@@ -539,9 +539,10 @@ Json CheckBundle(const fs::path& output, const std::string& project) {
     const auto recorded = manifest.value("project", "");
     if (recorded.empty())
       throw std::runtime_error("Existing delivery has no recorded PCC project. Choose a new output.");
-    if (_wcsicmp(fs::u8path(recorded).c_str(), fs::u8path(project).c_str()) != 0)
+    const auto name = fs::u8path(project).filename();
+    if (_wcsicmp(fs::u8path(recorded).c_str(), name.c_str()) != 0)
       throw std::runtime_error("Existing delivery was made from " + recorded +
-                               ". Choose a new output for " + project + ".");
+                               ". Choose a new output for " + name.u8string() + ".");
   }
   const auto sparse = output / "sparse/0";
   for (const auto& [name, size] : manifest.at("model_files").items())
