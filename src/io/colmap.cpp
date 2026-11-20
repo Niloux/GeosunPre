@@ -509,7 +509,8 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   Json sizes = Json::object();
   for (const auto* file : {"cameras.bin", "images.bin", "points3D.bin", "rigs.bin", "frames.bin"})
     sizes[file] = fs::file_size(pending / "sparse/0" / file);
-  Json manifest = {{"request", request},
+  Json manifest = {{"project", scene.project.filename().u8string()},
+                   {"request", request},
                    {"registration", registration},
                    {"images", photos},
                    {"model_files", sizes},
@@ -532,8 +533,16 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   PublishDirectory(pending, output);
   return checked;
 }
-Json CheckBundle(const fs::path& output) {
+Json CheckBundle(const fs::path& output, const std::string& project) {
   const auto manifest = ReadJson(output / "manifest.json");
+  if (!project.empty()) {
+    const auto recorded = manifest.value("project", "");
+    if (recorded.empty())
+      throw std::runtime_error("Existing delivery has no recorded PCC project. Choose a new output.");
+    if (_wcsicmp(fs::u8path(recorded).c_str(), fs::u8path(project).c_str()) != 0)
+      throw std::runtime_error("Existing delivery was made from " + recorded +
+                               ". Choose a new output for " + project + ".");
+  }
   const auto sparse = output / "sparse/0";
   for (const auto& [name, size] : manifest.at("model_files").items())
     if (fs::file_size(sparse / fs::u8path(name)) != size.get<uint64_t>())

@@ -9,5 +9,5 @@ Json ExportBundle(const Scene& scene, const Reconstruction& model, const fs::pat
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
                   const SupervisionOptions& supervision = {}, bool crop = true,
                   bool include_roi = true);
-Json CheckBundle(const fs::path& output);
+Json CheckBundle(const fs::path& output, const std::string& project = {});
 }  // namespace geosun

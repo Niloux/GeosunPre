@@ -21,7 +21,7 @@ namespace {
 bool Contains(const fs::path& parent, const fs::path& child) {
   const auto p = fs::weakly_canonical(parent), c = fs::weakly_canonical(child);
   auto a = p.begin(), b = c.begin();
-  for (; a != p.end(); ++a, ++b) {
+  for (; a != p.end() && !a->empty(); ++a, ++b) {
     if (b == c.end())
       return false;
 #ifdef _WIN32
@@ -33,6 +33,23 @@ bool Contains(const fs::path& parent, const fs::path& child) {
 #endif
   }
   return true;
+}
+fs::path NormalizeDirectory(const fs::path& path) {
+  auto normalized = path.lexically_normal();
+  if (!normalized.has_filename() && normalized.has_relative_path())
+    normalized = normalized.parent_path();
+  return normalized;
+}
+void ValidateDeliveryPaths(const fs::path& input, const fs::path& work, const fs::path& output) {
+  auto pending = output;
+  pending += ".pending";
+  const auto photos = input / "Image";
+  for (const auto& folder : {output, pending}) {
+    if (Contains(folder, input) || Contains(photos, folder) || Contains(folder, photos))
+      throw std::runtime_error("Use a separate output directory outside the input Image tree");
+    if (Contains(work, folder) || Contains(folder, work))
+      throw std::runtime_error("Output and work directories must be separate");
+  }
 }
 class Lock {
   HANDLE handle;
@@ -372,57 +389,70 @@ fs::path ProductionWork(const fs::path& output) {
 }  // namespace
 void Run(const Arguments& args) {
   args.Validate(WithDeliveryOptions({"--input", "--work", "--models", "--config", "--stage",
-                                     "--output", "--las", "--debug"}));
+                                     "--output", "--project", "--las", "--debug"}));
   auto delivery = ParseDelivery(args);
   // Without --input, an existing work directory supplies the input and output.
-  auto output = args.Get("--output").empty() ? fs::path() : args.Path("--output");
+  auto output = args.Get("--output").empty() ? fs::path()
+                                             : NormalizeDirectory(args.Path("--output"));
   fs::path work;
   if (!args.Get("--work").empty())
     work = args.Path("--work");
   else {
-    const auto name = args.Path("--input").filename();
+    const auto name = NormalizeDirectory(args.Path("--input")).filename();
     if (output.empty())
       output = fs::absolute(fs::path("output") / name);
     work = args.Get("--debug") == "true" ? fs::absolute(fs::path("work") / name)
                                          : ProductionWork(output);
   }
-  const bool fresh = !fs::exists(work / "state.json");
+  const auto state_path = work / "state.json";
+  const bool fresh = !fs::exists(state_path);
+  const bool recorded_input = !fresh && args.Get("--input").empty();
+  const auto saved = !fresh && (output.empty() || recorded_input) ? ReadJson(state_path) : Json();
+  const auto input = recorded_input ? fs::u8path(saved.at("input").get<std::string>())
+                                    : args.Path("--input");
   if (output.empty() && !fresh) {
-    const auto saved = ReadJson(work / "state.json");
     if (!saved.contains("output"))
       throw std::runtime_error("Work directory has no recorded output; specify --output");
-    output = fs::u8path(saved.at("output").get<std::string>());
+    output = NormalizeDirectory(fs::u8path(saved.at("output").get<std::string>()));
   }
   if (output.empty())
-    output = fs::absolute(fs::path("output") / args.Path("--input").filename());
-  if (Contains(work, output) || Contains(output, work))
-    throw std::runtime_error("Output and work directories must be separate");
+    output = fs::absolute(fs::path("output") / NormalizeDirectory(input).filename());
+  const auto photos = input / "Image";
+  if (Contains(work, input) || Contains(photos, work) || Contains(work, photos))
+    throw std::runtime_error("Use a separate work directory outside the input Image tree");
+  ValidateDeliveryPaths(input, work, output);
   // A finished production run leaves no work directory; do not repeat it over its delivery.
   if (fresh && fs::exists(output))
     throw std::runtime_error("Output already exists; choose a new output directory");
+  // A production run will remove its work directory. Do not adopt input data as fresh work.
+  if (fresh && Contains(input, work) && fs::is_directory(work)) {
+    for (const auto& entry : fs::directory_iterator(work)) {
+      const auto name = entry.path().filename();
+      if (name != ".lock" && name != "state.json.writing")
+        throw std::runtime_error("Work directory contains existing files. Choose a new directory.");
+    }
+  }
   bool debug = false, finished = false;
   Json summary;
   const auto started = Clock::now();
   {
     fs::create_directories(work);
     Lock lock(work);
-    WorkState state{work / "state.json", Json::object()};
+    WorkState state{state_path, Json::object()};
     if (fs::exists(state.path))
       state.value = ReadJson(state.path);
-    const auto input = args.Get("--input").empty()
-                           ? fs::u8path(state.value.at("input").get<std::string>())
-                           : args.Path("--input");
-    if (Contains(input, work) || Contains(work, input))
-      throw std::runtime_error("Input and work directories must be separate");
     auto settings = args.Get("--config").empty()
                         ? (state.value.empty() ? Settings({}) : state.value.at("settings"))
                         : Settings(args.Path("--config"));
+    auto project = fs::u8path(args.Get("--project"));
+    if (project.empty() && !state.value.empty())
+      project = fs::u8path(state.value.at("scene").at("project").get<std::string>()).filename();
     const auto las = args.Get("--las").empty()
                          ? (state.value.empty()
                                 ? fs::path()
                                 : fs::u8path(state.value.at("scene").at("las").get<std::string>()))
                          : args.Path("--las");
-    const Scene scene = ReadScene(input, las, settings.at("enhanced_photos"));
+    const Scene scene = ReadScene(input, project, las, settings.at("enhanced_photos"));
     ReadSceneLas(scene);
     const auto prepared = scene.ToJson();
     if (state.value.empty()) {
@@ -430,7 +460,6 @@ void Run(const Arguments& args) {
                      {"settings", settings},
                      {"scene", prepared},
                      {"stages", Json::object()}};
-      WriteJson(work / "scene.json", prepared);
     } else if (state.value.at("scene") != prepared || state.value.at("settings") != settings)
       throw std::runtime_error("Inputs/settings changed; choose a new work directory");
     const auto root = args.Get("--models").empty()
@@ -443,9 +472,7 @@ void Run(const Arguments& args) {
     // Only runs that reach the export need the geometry engine; fail before reconstruction.
     if (requested == "all" || requested == "export")
       ResolveSupervisionModels(delivery.supervision, root);
-    if (Contains(input, output) || Contains(output, input))
-      throw std::runtime_error("Output must be separate from input");
-    debug = args.Get("--debug") == "true" || (!fresh && state.value.at("debug").get<bool>());
+    debug = args.Get("--debug") == "true" || state.value.value("debug", false);
     state.value["debug"] = debug;
     state.value["output"] = output.u8string();
     state.value["status"] = "running";
@@ -453,6 +480,8 @@ void Run(const Arguments& args) {
     state.value["error"] = nullptr;
     state.Save();
     try {
+      if (!state.value.at("stages").contains("prepare"))
+        WriteJson(work / "scene.json", prepared);
       for (const auto& stage : stages) {
         if (requested != "all" && stage != requested)
           continue;
@@ -523,14 +552,12 @@ void Export(const Arguments& args) {
     throw std::runtime_error("Run prerequisite stage: cleanup");
   Verify(work, state.at("stages").at("cleanup").at("files"));
   const auto scene = Scene::FromJson(ReadJson(work / "scene.json"));
+  const auto output = NormalizeDirectory(args.Path("--output"));
+  ValidateDeliveryPaths(scene.input, work, output);
   // The ECEF frame conversion is refitted from the navigation file: it must be the one reconstructed.
-  if (ReadScene(scene.input, scene.las, scene.enhanced).ToJson() != scene.ToJson())
+  if (ReadScene(scene.input, scene.project.filename(), scene.las, scene.enhanced).ToJson() !=
+      scene.ToJson())
     throw std::runtime_error("Source inputs changed; reconstruct in a new work directory");
-  const auto output = args.Path("--output");
-  if (Contains(scene.input, output) || Contains(output, scene.input))
-    throw std::runtime_error("Output must be separate from input");
-  if (Contains(work, output) || Contains(output, work))
-    throw std::runtime_error("Output and work directories must be separate");
   std::cout << ExportSelected(scene, work, output, delivery).dump() << '\n';
 }
 }  // namespace geosun

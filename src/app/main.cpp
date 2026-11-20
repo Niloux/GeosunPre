@@ -25,17 +25,17 @@ void Help(const Arguments&);
 const Command Commands[] = {
     {"run",
      "--input INPUT [--output OUT] [--work WORK] [--debug] [--models MODELS] "
-     "[--config JSON] [--no-las-supervision]\n"
+     "[--project FILE.pro] [--config JSON] [--no-las-supervision]\n"
      "  geosunpre run --work WORK [--stage "
      "prepare|masks|features|matches|sfm|align|shutter|cleanup|export]",
      RunCommand},
-    {"prepare", "--input INPUT [--output OUT] [--work WORK] [--debug]", RunCommand},
+    {"prepare", "--input INPUT [--project FILE.pro] [--output OUT] [--work WORK] [--debug]", RunCommand},
     {"export", "--work WORK --output OUT [--no-ply] [--no-roi] [--ply-voxel METRES] [--no-las-supervision]",
      Export},
-    {"check", "--output DIR",
+    {"check", "--output DIR [--project FILE.pro]",
      [](const Arguments& args) {
-       args.Validate({"--output"});
-       std::cout << CheckBundle(args.Path("--output")).dump(2) << '\n';
+       args.Validate({"--output", "--project"});
+       std::cout << CheckBundle(args.Path("--output"), args.Get("--project")).dump(2) << '\n';
      }},
     {"info", "",
      [](const Arguments& args) {
@@ -75,6 +75,7 @@ void Help(const Arguments&) {
                 << '\n';
   }
   std::cout << "  Use --debug to keep the work directory for stage resume or export.\n"
+               "  New runs use the most recently modified .pro by default.\n"
                "  Delivery options: [--supervision-source moge|las] [--supervision-models MODELS]\n"
                "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS]\n"
                "    [--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"

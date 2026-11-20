@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -22,6 +23,7 @@ using Args = std::vector<std::wstring>;
 
 void Help() {
   std::cout << "Usage: Geosun.exe --scene PATH --output PATH\n"
+               "  --project FILE.pro                  (default: most recently modified .pro)\n"
                "  --step all|preprocess|train|export  (default: all)\n"
                "  --texel-size NUMBER                 (default: 0.02)\n"
                "  --preprocess-arg VALUE              (repeat for each argument)\n"
@@ -280,7 +282,7 @@ void RunTrainer(const fs::path& program, Args args, const Args& extra, const cha
   startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};
   const auto started = std::chrono::steady_clock::now();
-  if (!CreateProcessW(program.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+  if (!CreateProcessW(program.c_str(), command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr,
                       &startup, &process))
     ProcessError("Cannot start", program, GetLastError());
   UniqueHandle thread_handle(process.hThread);
@@ -294,20 +296,10 @@ void RequireFile(const fs::path& path) {
     throw std::runtime_error("Missing file: " + path.u8string());
 }
 
-void RequireAbsent(const fs::path& path) {
-  if (fs::exists(path))
-    throw std::runtime_error("Path already exists: " + path.u8string());
-}
-
-void CreatePending(const fs::path& path) {
-  if (!fs::create_directory(path))
-    throw std::runtime_error("Path already exists: " + path.u8string());
-}
-
-void PublishPending(const fs::path& pending, const fs::path& target) {
+void MoveResult(const fs::path& source, const fs::path& target) {
   std::error_code ec;
   for (int attempt = 0; attempt < 50; ++attempt) {
-    fs::rename(pending, target, ec);
+    fs::rename(source, target, ec);
     if (!ec)
       return;
     const auto code = ec.value();
@@ -316,7 +308,108 @@ void PublishPending(const fs::path& pending, const fs::path& target) {
       break;
     Sleep(100);
   }
-  throw fs::filesystem_error("Cannot publish output directory", pending, target, ec);
+  throw fs::filesystem_error("Cannot move result directory", source, target, ec);
+}
+
+fs::path PendingResult(fs::path result) {
+  result += ".pending";
+  return result;
+}
+
+void StartPending(const fs::path& path, const LogSink& log) {
+  if (fs::exists(path)) {
+    auto archived = path;
+    archived += ".interrupted-" +
+                std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+    MoveResult(path, archived);
+    log.WriteLine("Kept interrupted results at " + archived.u8string());
+  }
+  if (!fs::create_directory(path))
+    throw std::runtime_error("Path already exists: " + path.u8string());
+}
+
+struct ResultDirectory {
+  fs::path path;
+  const wchar_t* marker;
+
+  void CheckDestination() const {
+    if (!fs::exists(path))
+      return;
+    const auto attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+      ProcessError("Cannot inspect result directory", path, GetLastError());
+    if (!(attributes & FILE_ATTRIBUTE_DIRECTORY) || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+        (!fs::is_regular_file(path / marker) && !fs::is_empty(path)))
+      throw std::runtime_error("Existing path is not a Geosun result directory: " + path.u8string());
+  }
+};
+
+// Each record is created before moving its old result. A missing .pending then means its
+// replacement has been installed. Keep the committed marker until all old results are removed.
+void RecoverPublish(const fs::path& output) {
+  const auto journal = output / L".geosun-publish";
+  if (!fs::exists(journal))
+    return;
+  const auto committed = journal / L"committed";
+  const bool published = fs::is_directory(committed);
+  for (const auto* name : {L"export", L"train"}) {
+    const auto record = journal / name;
+    if (!fs::exists(record))
+      continue;
+    const auto previous = record / L"previous";
+    if (published) {
+      fs::remove_all(previous);
+    } else {
+      const auto result = output / name;
+      const auto pending = PendingResult(result);
+      if (!fs::exists(pending) && fs::exists(result))
+        MoveResult(result, pending);
+      if (fs::exists(previous))
+        MoveResult(previous, result);
+    }
+    fs::remove(record);
+  }
+  fs::remove(committed);
+  fs::remove(journal);
+}
+
+void PublishResults(const fs::path& output, const std::vector<ResultDirectory>& results,
+                    const LogSink& log) {
+  const auto journal = output / L".geosun-publish";
+  if (!fs::create_directory(journal))
+    throw std::runtime_error("Cannot start publishing results at " + journal.u8string());
+  try {
+    for (const auto& result : results) {
+      result.CheckDestination();
+      const auto record = journal / result.path.filename();
+      fs::create_directory(record);
+      if (fs::exists(result.path))
+        MoveResult(result.path, record / L"previous");
+      MoveResult(PendingResult(result.path), result.path);
+    }
+    fs::create_directory(journal / L"committed");
+  } catch (const std::exception& error) {
+    try {
+      RecoverPublish(output);
+    } catch (const std::exception& recovery) {
+      throw std::runtime_error(std::string(error.what()) + "\nCannot restore prior results: " +
+                               recovery.what());
+    }
+    throw;
+  }
+  try {
+    RecoverPublish(output);
+  } catch (const fs::filesystem_error& error) {
+    const std::string warning = "Results published. Previous files could not be cleaned up: " +
+                                std::string(error.what());
+    std::cerr << warning << '\n';
+    log.WriteLine(warning);
+  }
+  for (const auto& result : results) {
+    const auto message = "Published " + result.path.u8string();
+    log.WriteLine(message);
+    std::cout << message << '\n';
+  }
 }
 
 void CheckOsgb(const fs::path& path) {
@@ -339,13 +432,35 @@ fs::path ExistingAncestor(fs::path path) {
   return path;
 }
 
-std::uint64_t DirectoryBytes(const fs::path& root) {
+bool IsBundleOutputDirectory(const fs::path& name) {
+  for (const auto* dir : {L"delivery", L"delivery.work", L"delivery.pending", L"train",
+                          L"train.pending", L"export", L"export.pending", L"logs",
+                          L".geosun-publish"})
+    if (_wcsicmp(name.c_str(), dir) == 0)
+      return true;
+  for (const std::wstring_view prefix : {L"delivery.pending.interrupted-", L"train.pending.interrupted-",
+                                        L"export.pending.interrupted-"})
+    if (_wcsnicmp(name.c_str(), prefix.data(), prefix.size()) == 0)
+      return true;
+  return false;
+}
+
+std::uint64_t DirectoryBytes(const fs::path& scene, const fs::path& out) {
+  const auto root = fs::weakly_canonical(scene), output = fs::weakly_canonical(out);
+  const bool same_root = _wcsicmp(root.c_str(), output.c_str()) == 0;
   std::uint64_t total = 0;
   std::error_code ec;
-  for (const auto& entry :
-       fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec)) {
+  for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec),
+       end; it != end; ++it) {
     if (ec)
       break;
+    const auto& entry = *it;
+    // A rerun can already have caches and deliveries under the scene root.
+    if (same_root ? it.depth() == 0 && IsBundleOutputDirectory(entry.path().filename())
+                  : _wcsicmp(entry.path().c_str(), output.c_str()) == 0) {
+      it.disable_recursion_pending();
+      continue;
+    }
     if (entry.is_regular_file(ec)) {
       const auto bytes = entry.file_size(ec);
       if (!ec)
@@ -367,7 +482,7 @@ void CheckDiskSpace(const fs::path& out, const fs::path& scene, const std::wstri
                     bool need_preprocess) {
   std::uint64_t required = 0;
   if (need_preprocess)
-    required += std::max<std::uint64_t>(8ULL << 30, DirectoryBytes(scene) * 3 / 2);
+    required += std::max<std::uint64_t>(8ULL << 30, DirectoryBytes(scene, out) * 3 / 2);
   if (step == L"all" || step == L"train")
     required += 6ULL << 30;
   if (step == L"all" || step == L"export")
@@ -387,7 +502,7 @@ void CheckDiskSpace(const fs::path& out, const fs::path& scene, const std::wstri
 
 void Pipeline(int argc, wchar_t** argv) {
   fs::path scene, out;
-  std::wstring step = L"all", texel = L"0.02";
+  std::wstring pcc_project, step = L"all", texel = L"0.02";
   Args preprocess_args, train_args;
   for (int i = 1; i < argc; ++i) {
     const std::wstring option = argv[i];
@@ -396,6 +511,8 @@ void Pipeline(int argc, wchar_t** argv) {
     const std::wstring value = argv[i];
     if (option == L"--scene")
       scene = value;
+    else if (option == L"--project")
+      pcc_project = value;
     else if (option == L"--output")
       out = value;
     else if (option == L"--step")
@@ -425,14 +542,28 @@ void Pipeline(int argc, wchar_t** argv) {
   const auto trainer = root / L"trainer/bin/geosun_3dgs_train.exe";
   const auto config = root / L"trainer/config/trainer.json";
   const auto delivery = out / L"delivery";
-  const auto train = out / L"train";
-  const auto export_dir = out / L"export";
-  const auto export_pending = out / L"export.pending";
+  const auto logs = out / L"logs";
+  fs::create_directories(logs);
+  // A child still writing after the launcher is closed must keep the output locked.
+  SECURITY_ATTRIBUTES lock_attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+  UniqueHandle output_lock(CreateFileW((logs / L"geosun.lock").c_str(), GENERIC_READ | GENERIC_WRITE,
+                                      0, &lock_attributes, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                      nullptr));
+  if (!output_lock.Valid())
+    ProcessError("Cannot lock output directory", out, GetLastError());
+  RecoverPublish(out);
+
+  const ResultDirectory train{out / L"train", L"project.licht"};
+  const ResultDirectory exported{out / L"export", L"splats.ply"};
+  const auto train_pending = PendingResult(train.path);
+  const auto export_pending = PendingResult(exported.path);
+  const bool train_results = step == L"all" || step == L"train";
   const bool export_results = step == L"all" || step == L"export";
-  if (export_results) {
-    RequireAbsent(export_dir);
-    RequireAbsent(export_pending);
-  }
+  const bool replace_together = step == L"all" && (fs::exists(train.path) || fs::exists(exported.path));
+  if (train_results)
+    train.CheckDestination();
+  if (export_results)
+    exported.CheckDestination();
   const bool run_preprocess = step == L"all" || step == L"preprocess";
   const bool delivery_ready = fs::exists(delivery) && !fs::exists(out / L"delivery.work");
   const bool need_preprocess = run_preprocess && !delivery_ready;
@@ -442,14 +573,11 @@ void Pipeline(int argc, wchar_t** argv) {
     if (!fs::is_directory(scene))
       throw std::runtime_error("Scene directory does not exist: " + scene.u8string());
   }
-  if (step == L"all" || step == L"train")
-    RequireAbsent(train);
   if (step == L"train")
     RequireFile(delivery / L"result.json");
   if (step == L"export")
-    RequireFile(train / L"project.licht");
+    RequireFile(train.path / train.marker);
 
-  const auto logs = out / L"logs";
   LogSink geosun_log(logs / L"geosun.log");
   geosun_log.WriteLine("Session start: step=" + fs::path(step).u8string() +
                        " scene=" + (scene.empty() ? std::string("<none>") : scene.u8string()) +
@@ -459,23 +587,21 @@ void Pipeline(int argc, wchar_t** argv) {
     CheckDiskSpace(out, scene, step, need_preprocess);
     geosun_log.WriteLine("Disk space check passed.");
 
-    if (run_preprocess) {
-      if (delivery_ready) {
-        const std::string line = "Delivery already exists: " + delivery.u8string();
-        std::cout << line << '\n';
-        geosun_log.WriteLine(line);
-        RunTee(geosunpre, {L"check", L"--output", delivery.native()}, {}, "Delivery check",
-               geosun_log, logs / L"preprocess.log");
-      } else {
-        RunTee(geosunpre, {L"run", L"--input", scene.native(), L"--output", delivery.native()},
-               preprocess_args, "Preprocess", geosun_log, logs / L"preprocess.log");
-      }
+    const Args project_args = pcc_project.empty() ? Args{} : Args{L"--project", pcc_project};
+    if (need_preprocess) {
+      preprocess_args.insert(preprocess_args.end(), project_args.begin(), project_args.end());
+      RunTee(geosunpre, {L"run", L"--input", scene.native(), L"--output", delivery.native()},
+             preprocess_args, "Preprocess", geosun_log, logs / L"preprocess.log");
+    } else if (run_preprocess || !project_args.empty()) {
+      const std::string line = "Delivery already exists: " + delivery.u8string();
+      std::cout << line << '\n';
+      geosun_log.WriteLine(line);
+      RunTee(geosunpre, {L"check", L"--output", delivery.native()}, project_args, "Delivery check",
+             geosun_log, logs / L"preprocess.log");
     }
 
-    if (step == L"all" || step == L"train") {
+    if (train_results) {
       RequireFile(delivery / L"result.json");
-      RequireAbsent(train);
-      const auto pending = out / L"train.pending";
       for (const auto ch : root.native()) {
         if (ch > 127) {
           const std::string warning =
@@ -485,29 +611,30 @@ void Pipeline(int argc, wchar_t** argv) {
           break;
         }
       }
-      CreatePending(pending);
-      RunTrainer(trainer, {L"--config", config.native(), L"-d", delivery.native(), L"-o", pending.native()},
+      StartPending(train_pending, geosun_log);
+      RunTrainer(trainer, {L"--config", config.native(), L"-d", delivery.native(), L"-o",
+                           train_pending.native()},
                  train_args, "Training", geosun_log, logs, logs / L"train.log");
-      PublishPending(pending, train);
-      geosun_log.WriteLine("Published training output: " + train.u8string());
-      std::cout << "Training: " << train.u8string() << '\n';
+      RequireFile(train_pending / train.marker);
+      if (!replace_together)
+        PublishResults(out, {train}, geosun_log);
     }
 
     if (export_results) {
-      const auto project = train / L"project.licht";
-      RequireFile(project);
-      CreatePending(export_pending);
+      const auto project = (replace_together ? train_pending : train.path) / train.marker;
+      StartPending(export_pending, geosun_log);
       const auto mesh = export_pending / L"mesh.ply";
       RunTrainer(trainer, {L"mesh", project.native(), L"-d", delivery.native(), L"-o", mesh.native(),
                            L"--texel-size", texel, L"--export", L"ply", L"--output-name", L"splats"},
                  {}, "Export 3DGS PLY, mesh and OSGB", geosun_log, logs, logs / L"export.log");
-      RequireFile(export_pending / L"splats.ply");
+      RequireFile(export_pending / exported.marker);
       RequireFile(mesh);
       CheckOsgb(export_pending / L"mesh_osgb");
-      PublishPending(export_pending, export_dir);
-      geosun_log.WriteLine("Published export output: " + export_dir.u8string());
-      std::cout << "Export: " << export_dir.u8string() << '\n';
+      if (!replace_together)
+        PublishResults(out, {exported}, geosun_log);
     }
+    if (replace_together)
+      PublishResults(out, {train, exported}, geosun_log);
     geosun_log.WriteLine("Session completed successfully.");
   } catch (const std::exception& error) {
     geosun_log.WriteLine(std::string("ERROR: ") + error.what());

@@ -10,10 +10,10 @@ INPUT/
   Image/R/**/*.JPG
   Image/*.JPG               无 L、R 目录时的平铺原图
   Image/enhanced/**/*.JPG   可选
-  ResultOut/场景.las        无 ResultOut 时为 INPUT/场景.las
+  ResultOut/场景.las        也可放在 INPUT/场景.las
 ```
 
-输入目录须且仅有一份 `.pro`（PCC 解算项目），其文件名即场景名：CameraPos、两份导航表和默认 LAS 均按该名称读取，不按目录中其他同类文件推断；`--las` 可显式改选。
+新建预处理任务时，默认使用场景根目录中修改时间最新的 PCC `.pro`，也可用 `--project 1119.pro` 手动指定。多份 `.pro` 并列最新时，程序会列出候选文件，需用 `--project` 选择。CameraPos、两份导航表和默认 LAS 均按选中的 `.pro` 文件名配对，缺少配套文件时报出对应路径。若 LAS 的路径或文件名不同，用 `--las` 显式指定。
 
 仅使用 `.pro` 中 L/R 相机及 CameraPos 有精确同名记录的 JPEG，M 不参与。照片默认只从 `Image/L`、`Image/R`（各自只能放对应镜头）读取原图；两者都不存在时改读 `Image/` 根目录下的平铺原图，不递归子目录；忽略 `Image/enhanced`：enhanced 是逐图不同的非线性增强，原图曝光固定、颜色一致，更适合 3DGS 外观建模。配置 `"enhanced_photos": true` 时另读 `Image/enhanced`，同名时优先使用 enhanced，交付图像名仍按 L/R 原图的相对路径，原图缺失时为 `镜头/文件名`。输入中完全没有原图（`Image/L`、`Image/R` 和平铺的 `Image/` 都没有所用的 JPEG）时，自动改读 `Image/enhanced`，并记入 `photos`，日志给出提示；部分原图缺失仍按上述规则报错。各目录内图像名和各镜头帧号须唯一，Pose 绑定图像在所读目录中都缺失时报错。照片来源随配置冻结并记入 scene.json 的 `photos`，改变须使用新工作目录。所用照片尺寸须等于 `.pro`，EXIF orientation 须为 1。按 GPS 周、文件名时间、镜头和图像名排序；L/R 同帧号本身不表示同步：同时具有 L、R 的全部帧号的文件名时间相差不超过 2 ms 时按同步刚性 rig 处理（如室内、展厅）；超过 2 ms 且不超过 0.2 s 的异步错拍（如生产车间 R 先于 L 约 65 ms、古建筑约 56 ms），在 200 Hz 导航姿态通过视轴一致性自检时，按经 POS 运动补偿后的异步刚性 rig 处理。
 

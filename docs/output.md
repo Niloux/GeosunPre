@@ -78,6 +78,8 @@ quality.track_lengths 保存有效三维点的轨迹长度数量、中位数和 
 
 同级 `.pending` 中完成写入及回读后重命名发布。同一请求的完整包可复用，不同请求拒绝覆盖。`check --output` 只依赖交付包，检查结构、引用、尺寸、PLY 和几何拟合，不代表独立精度或渲染效果。
 
+`manifest.json` 的 `project` 记录选中的 PCC `.pro` 文件名。`check --output DIR --project FILE.pro` 同时核对交付包是否来自指定解算项目。
+
 格式依据：[COLMAP output format](https://colmap.github.io/format.html)。
 
 ## 卷帘快门交付

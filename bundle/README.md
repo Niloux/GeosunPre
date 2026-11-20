@@ -14,15 +14,26 @@ Windows x64，需算力 ≥ 8.0 的 NVIDIA GPU（RTX 30/40/50、RTX A 系列等�
 .\Geosun.exe --scene "D:/数据/场景" --output "D:/成果/场景"
 ```
 
+`--output` 也可以设为场景目录本身，或场景下的新目录。磁盘空间估算会排除本次的成果和工作缓存。
+
+新建预处理任务时，默认使用场景根目录中修改时间最新的 PCC `.pro`。可用 `--project 1110.pro` 手动改选。多份 `.pro` 并列最新时，程序会列出候选，需用 `--project` 指定。
+
+```powershell
+.\Geosun.exe --scene "D:/数据/场景" --output "D:/数据/场景"
+```
+
+此例把 `delivery/`、`train/`、`export/` 和 `logs/` 放在场景根目录。预处理根据选中的项目名读取同名的 CameraPos、导航表及默认 LAS。LAS 存于其他位置或使用了自定义文件名时，追加 `--preprocess-arg --las --preprocess-arg "D:/点云/办公室0918.las"`。续跑沿用已选项目。
+
 `--output` 下生成 `delivery/`（训练数据）、`train/project.licht`、`export/`（含 `splats.ply`、`mesh.ply` 和 `mesh_osgb/`）以及 `logs/`（含总控日志 `geosun.log`、预处理日志 `preprocess.log`、训练日志 `train.log`、导出日志 `export.log` 与训练器运行期崩溃诊断目录 `runtime/logs/`，全程不写入系统用户目录 `%USERPROFILE%`；排障时可直接打包 `logs/` 目录）。导出由包内训练器完成。默认纹理像素尺寸为 0.02 场景单位，可用 `--texel-size` 调整。
 
-- 预处理中途失败：以相同命令重跑即续跑，已完成的交付只做回读检查。
-- 训练中途失败：移走 `train.pending` 后重跑，或用新的 `--output`。
-- `--step preprocess` 只预处理，`--step train` 只对已有交付训练。
-- `--step export` 从已有 `train/project.licht` 补导。失败时保留 `export.pending`，将它移走后可重新补导。
+已有 3DGS 成果时，可以用相同的 `--output` 重跑。全流程会复用通过回读校验的 `delivery/`，等新训练和导出都完成后一起替换 `train/` 和 `export/`。
+
+- `--step preprocess` 只预处理，中断后可用同一命令续跑。已完成的交付会回读校验。
+- `--step train` 用现有交付训练，成功后替换 `train/`。`--step export` 从已有 `train/project.licht` 导出，成功后替换 `export/`。
+- 训练或导出中断会留下 `.pending` 目录。对应阶段重跑时，会先将它改名保留，再生成新成果。
 - `--preprocess-arg` 传给 `geosunpre.exe run`，例如 `--preprocess-arg --ply-voxel --preprocess-arg 0.1`；`--train-arg` 传给训练器，覆盖 `trainer.json` 中的设置，例如 `--train-arg --iter --train-arg 7000`。
 
-输入、配置或程序改变时使用新的 `--output`，保留已有成果。更新任一程序时组装新的整体包，不覆盖旧包。
+需要重新预处理或保留多轮 3DGS 成果时，使用新的 `--output`，例如 `D:/数据/场景/3DGS-1119`。更新任一程序时组装新的整体包。
 
 ## 查版本和自检
 

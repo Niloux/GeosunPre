@@ -215,17 +215,49 @@ Scene Scene::FromJson(const Json& v) {
   }
   return s;
 }
-Scene ReadScene(const fs::path& input, const fs::path& chosen_las, bool enhanced_photos) {
+namespace {
+bool IsProjectName(const fs::path& name) {
+  return _wcsicmp(name.extension().c_str(), L".pro") == 0;
+}
+fs::path SelectProject(const fs::path& input, const fs::path& chosen) {
+  if (!chosen.empty()) {
+    if (chosen != chosen.filename() || !IsProjectName(chosen))
+      throw std::runtime_error("--project must be a .pro filename in the input directory");
+    if (!fs::is_regular_file(input / chosen))
+      throw std::runtime_error("Missing .pro project: " + (input / chosen).u8string());
+    return input / chosen;
+  }
+  fs::file_time_type latest_time{};
+  std::vector<fs::path> latest;
+  for (const auto& row : fs::directory_iterator(input)) {
+    if (!IsProjectName(row.path()) || !row.is_regular_file())
+      continue;
+    const auto modified = row.last_write_time();
+    if (latest.empty() || modified > latest_time) {
+      latest_time = modified;
+      latest.clear();
+    }
+    if (modified == latest_time)
+      latest.push_back(row.path());
+  }
+  if (latest.empty())
+    throw std::runtime_error("Missing .pro project");
+  if (latest.size() > 1) {
+    std::sort(latest.begin(), latest.end());
+    std::string message = "PCC projects share the latest modification time. Use --project to select one.";
+    for (const auto& path : latest)
+      message += "\n  " + path.filename().u8string();
+    throw std::runtime_error(message);
+  }
+  return latest.front();
+}
+}  // namespace
+Scene ReadScene(const fs::path& input, const fs::path& chosen_project, const fs::path& chosen_las,
+                bool enhanced_photos) {
   Scene s;
   s.input = fs::weakly_canonical(input);
-  for (const auto& row : fs::directory_iterator(input))
-    if (row.path().extension() == ".pro") {
-      if (!s.project.empty())
-        throw std::runtime_error("Expected exactly one .pro project");
-      s.project = row.path();
-    }
-  if (s.project.empty())
-    throw std::runtime_error("Missing .pro project");
+  s.project = SelectProject(input, chosen_project);
+  Log("PCC project: " + s.project.u8string());
   const auto pro = ReadJson(s.project);
   std::set<std::string> labels;
   for (const auto& device : pro.at("cameraDevices").at("devices")) {
@@ -264,7 +296,7 @@ Scene ReadScene(const fs::path& input, const fs::path& chosen_las, bool enhanced
   const auto pos = input / fs::u8path(stem + "_CameraPos_C2E.txt");
   std::ifstream stream(pos);
   if (!stream)
-    throw std::runtime_error("Missing camera positions");
+    throw std::runtime_error("Cannot read camera positions: " + pos.u8string());
   struct Position {
     int week;
     double seconds;

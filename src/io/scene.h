@@ -21,7 +21,7 @@ struct Scene {
   Json ToJson() const;
   static Scene FromJson(const Json& value);
 };
-Scene ReadScene(const fs::path& input, const fs::path& las = {}, bool enhanced = false);
+Scene ReadScene(const fs::path& input, const fs::path& project, const fs::path& las, bool enhanced);
 cv::Mat ReadImage(const fs::path& path, int mode);
 void WriteImage(const fs::path& path, const cv::Mat& image, int png_compression = -1);
 struct ResizeCoefficients {
