@@ -2,7 +2,6 @@
 #include "frontend/inference.h"
 #include "geometry/camera.h"
 #include "geometry/model.h"
-#include <functional>
 
 namespace geosun {
 // MoGe-2 runs on square pinhole faces of a fisheye lens: a front face and, for a wide lens, rings
@@ -63,61 +62,26 @@ class MonocularEstimator {
                                      const Eigen::Vector3d& omega = Eigen::Vector3d::Zero(),
                                      int axis = 1, bool rolling = false);
 };
-struct MonocularMaps {
-  cv::Mat distance;  // CV_32F on the grid camera, 0 where no face holds a valid estimate
-  cv::Mat normal;    // CV_32FC3 unit normal, zero where invalid
-};
-// Weighted blend in log distance; log_scale(sample) is added to the log distance of that face
-// sample. A face contributes to a grid pixel only where all four bilinear neighbours of its sample
-// are valid. When omega is nonzero, pixels un-rotate to s = 0 for lookup and normals rotate back
-// into the readout-line camera frame.
-MonocularMaps GatherFaces(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
-                          const std::function<double(const FaceSample&)>& log_scale,
-                          const Eigen::Vector3d* omega = nullptr, int axis = 1);
-// MoGe's depth errors vary within a face (near objects against the room behind them), so every
-// face gets a smooth log-scale field on a Cells x Cells grid of bilinear cells, fitted to LAS ray
-// distances (las: CV_16U millimetres on the grid, 0 where invalid) together with the face
-// overlaps. On a 2-pixel lattice of the grid each covering face contributes one LAS residual where
-// the LAS is trusted (las_normal, the LAS normal encoding, within 15 degrees of the face's MoGe
-// normal) and each pair of covering faces one overlap residual; neighbouring nodes are tied by a
-// first difference. The iteratively reweighted Cauchy least squares in log distance starts from one
-// scale per face. The LAS sets the low frequencies of the depth; MoGe keeps its detail.
-struct FaceFit {
-  static constexpr int Cells = 12;
-  std::vector<double> scales;  // exp of each field's mean, for reports
-  std::vector<std::vector<double>> fields;  // (Cells + 1)^2 log-scale nodes per face, row-major
-  Json faces;  // per face: LAS anchors, inlier fraction, residual median and MAD, field range
-  size_t las_samples = 0;  // lattice LAS depths over valid face samples, trusted or not
-  size_t anchors = 0, inliers = 0;  // trusted LAS residuals and those within 0.05
-  bool accepted = false;  // enough agreeing LAS anchors to give the photo metric depth
-  double LogScale(const FaceSample& sample, int size) const;
-  Json ToJson() const;
-};
-FaceFit FitFaceScales(const MonocularLens& lens, const std::vector<FaceEstimate>& faces,
-                      const cv::Mat& las, const cv::Mat& las_normal,
-                      const Eigen::Vector3d* omega = nullptr, int axis = 1);
-// Supervision maps of one photo in the LAS supervision encoding: uint16 millimetre ray distance
-// and RGB8 normals (B, G, R = z, y, x) from maps on the grid, zero where invalid. allowed (CV_8U,
-// nonzero valid) holds the static mask with its semantic margin removed. Depth drops MoGe's blended
-// depth steps and needs an accepted fit, the 0.05-65.535 m range and agreement with the LAS where
-// the LAS is trusted (as in FitFaceScales); untrusted LAS depth never vetoes. Normals need an
-// incidence of at least min_incidence. Returns per-photo statistics.
-Json EncodeMonocular(const MonocularLens& lens, const MonocularMaps& maps, const cv::Mat& las,
-                     const cv::Mat& las_normal, const cv::Mat& allowed, bool depth,
-                     double min_incidence, cv::Mat& depth_mm, cv::Mat& normal_rgb,
-                     cv::Mat& verified);
-// The 4 x 4 cells of the cross-view check holding any nonzero pixel (CV_8U in, CV_8U cells out).
-cv::Mat ConflictCells(const cv::Mat& pixels);
-// Free-space check between views of the delivered MoGe depth under output/depths. Each photo is
-// paired with the views sharing most tracks (the relation made symmetric). On a 4-pixel lattice a
-// depth point of one view that lies clearly in front of the depth the other view sees along the
-// same ray contradicts one of the two maps, and both cells count the contradicting view. A cell
-// whose depth the trusted LAS confirmed (verified, from ConflictCells, by image index) keeps it;
-// any other loses it when at least two views contradict it. rows (by image index, null if
-// unregistered) get the rewritten file size, depth count and the dropped pixels. Returns the
-// parameters and totals.
-Json FilterViewConflicts(const fs::path& output, const Scene& scene, const Reconstruction& model,
-                         const ShutterMotion* motion, int max_size,
-                         const std::vector<cv::Mat>& verified, std::vector<Json>& rows,
-                         std::vector<cv::Mat>* held_depths = nullptr);
+// Decouples metric LAS depth from MoGe-2 dense normals on the supervision grid:
+// 1. Detects depth/normal edges on each 90-degree MoGe face and dilates them on the grid to
+//    mask LAS edge bleeding and calibration micro-offsets.
+// 2. Gathers rolling-shutter rectified MoGe normals onto the grid (rotating back to readout-line
+//    camera frame when omega is nonzero) and clears severe MoGe normal hallucinations where
+//    confident planar LAS surfels disagree by > 35 degrees off MoGe edges.
+// 3. Runs per-face deterministic RANSAC on inverse depth (q_las ~= s * q_moge + t) over clean
+//    lattice anchors to filter close flying points and far glass/mirror penetrations, checking
+//    multi-face consensus and rescuing solid planar surfaces whose LAS normal agrees with MoGe.
+// 4. Keeps raw millimetre LAS depth for inliers (without warping) and MoGe normals inside allowed
+//    pixels passing min_incidence (zeroing normals only on unrescued glass penetrations or
+//    severe planar normal disagreements).
+Json CleanLasAndEncodeNormals(const MonocularLens& lens,
+                              const std::vector<FaceEstimate>& faces,
+                              const cv::Mat& las,
+                              const cv::Mat& las_normal,
+                              const cv::Mat& allowed,
+                              const Eigen::Vector3d* omega,
+                              int axis,
+                              double min_incidence,
+                              cv::Mat& depth_mm,
+                              cv::Mat& normal_rgb);
 }  // namespace geosun

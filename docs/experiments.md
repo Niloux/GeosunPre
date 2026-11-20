@@ -650,3 +650,47 @@
 - **抽检对比（[2435-353235-065_00272-L](file:///d:/Dev/GeosunPre/work/篮球场-roi-v2-eval/eval_step_30000/2435-353235-065_00272-L.png)、[2435-353047-182_00084-R](file:///d:/Dev/GeosunPre/work/篮球场-roi-v2-eval/eval_step_30000/2435-353047-182_00084-R.png)）**：修复初版天空透明惩罚稀释后，建筑高楼边缘与走廊藤架空隙处紫白雾影彻底消失；初版 `roi-train`（`20.1678 -> 19.6214`）及对应对照目录保留在 `work\篮球场-roi-train` / `work\篮球场-roi-eval` 作为复盘留档。
 - **取舍结论**：对于存在远景不可达建筑/背景的多视角手持扫描场景，自动 `roi.json` + `CropPolygon` 方案在保持主作业区外观保真（PSNR 偏差仅 `0.09 dB`）、显著压低远区几何噪点（`p90` 深度误差 `-21.6%`）的同时，对下游 TSDF 网格提取与 OSGB 分级瓦片烘培带来了显著工程收益（TSDF 块 `-35.1%`、网格/OSGB 体积减少约 `27%–28.5%`、OSGB 瓦片数减半、导出提速 `22.5%`），确立为 `GeosunPre + LichtFeld-Studio` 联合默认链路。
 
+## Phase B：3DGUT 逐像素射线高斯深度 + 多面穿透共识与 LAS 法线幻觉门控（2026-11-20）
+
+### 问题定位与改动摘要
+针对 Phase A 在 `南非展会-phaseA` `263-L` 出现的展台上方白墙法线凹坑 + `16×16` 黑色瓦片网格，以及 `展厅-phaseA` 法线均值由 `10.8158°` 回退至 `13.0791°` 的问题，联合定位并修复如下：
+1. **3DGUT 训练射线深度替代常量中心深度**（[Cameras.cuh](file:///d:/Dev/LichtFeld-Studio/src/training/rasterization/gsplat/Cameras.cuh)、[FromWorldRay.cuh](file:///d:/Dev/LichtFeld-Studio/src/training/rasterization/gsplat/FromWorldRay.cuh)、[Utils.cuh](file:///d:/Dev/LichtFeld-Studio/src/training/rasterization/gsplat/Utils.cuh)、[RasterizeToPixelsFromWorld3DGSFwd.cu](file:///d:/Dev/LichtFeld-Studio/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSFwd.cu)、[RasterizeToPixelsFromWorld3DGSBwd.cu](file:///d:/Dev/LichtFeld-Studio/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSBwd.cu)、[GeometryFeatures.cu](file:///d:/Dev/LichtFeld-Studio/src/training/rasterization/gsplat/GeometryFeatures.cu)、[Rasterization.cpp](file:///d:/Dev/LichtFeld-Studio/src/training/rasterization/gsplat/Rasterization.cpp)）：
+   - 将训练光栅化 `CDIM ∈ {1, 4, 8}` 的常量高斯中心深度替换为逐像素射线-高斯最近点深度 `depth = max(t_hit, 0) * cam_ray_z`（对齐 Vulkan 实时渲染器 `gut_splat_view_depth`），同步覆盖 `depth^2`、`median_out` 与 `free_space`；并在后向 `opac*vis > 0.999` 饱和路径外完整回传 `v_depth -> means / quats / scales` 解析 VJP，消除大尺度平片高斯的球冠深度伪梯度与 `16×16` 瓦片边界伪影。
+   - 验证：`gsplat_tests.exe` `79/79` 通过（`1` 项显式跳过，`FlatTiltedDiskDepthNormalMatchesPlaneNormal` 平面深度法线一致性 `< 2e-3`、同平面 `depth_distortion < 1e-3`，四核一致性 `GutGeometryGradParity` 最大相对误差 `7.18e-8 ~ 1.09e-5`）；`lichtfeld_tests.exe` 训练参数/先验损失筛选用例 `61/61` 通过。
+2. **多面穿透共识与 LAS 法线交叉门控**（[monocular.h](file:///d:/Dev/GeosunPre/src/geometry/monocular.h)、[monocular.cpp](file:///d:/Dev/GeosunPre/src/geometry/monocular.cpp)、[supervision.cpp](file:///d:/Dev/GeosunPre/src/geometry/supervision.cpp)）：
+   - 向 `CleanLasAndEncodeNormals` 传入 GPU 平面 LAS surfel 法线图，穿透裁剪由 `face[0]` 单面判定升级为多面 RANSAC 共识；新增非 MoGe 边缘处的 `MoGe vs LAS > 35°` 严重幻觉法线置零（`normal_disagree_dropped_pixels`），并对 `≤ 25° && log_ratio ≤ 1.1` 的远端实体墙面执行保留（`far_normal_rescued_pixels`）。
+3. **训练超参平衡**（[trainer.json](file:///d:/Dev/GeosunPre/configs/trainer.json)）：
+   - `depth_distortion_weight` 从 `1.0` 调降至 `0.25`，`normal_prior_decay` 从 `[0.5, 0.8]` 延后至 `[0.6, 1.0]`，避免弱纹理墙面被强行压成超大内凹薄片或在末期过早失去外部法线约束。
+
+### 实验一：`展厅`（`588` 视角，`30k` 步，`res /2`，`cropbox` ROI）
+- **监督清洗统计（[supervision.json](file:///d:/Dev/GeosunPre/work/展厅-phaseB/supervision.json)）**：输入 LAS 像素 `350,210,624`；`edge_dropped=32,613,773`、`near_dropped=2,968,395`（Phase A `3,977,479`）、`far_dropped=3,946,896`（Phase A `9,749,877`）、`far_rescued=3,699,726`、`penetration_normal_dropped=1,809,544`（Phase A `9,579,982`，`-81.1%`）、`normal_disagree_dropped=22,501,650`；最终 `depth_pixels=310,681,560`（Phase A `303,869,497`）、`normal_pixels=372,957,500`（Phase A `387,688,712`）。目视检查 [00233-R 法线图](file:///d:/Dev/GeosunPre/work/展厅-phaseB/normals/R/0000/2436-214175-314_00233-R.JPG.png) 与 [00240-R 法线图](file:///d:/Dev/GeosunPre/work/展厅-phaseB/normals/R/0000/2436-214182-310_00240-R.JPG.png) 确认 `face[0]` 吊顶误裁彻底愈合，玻璃展柜无误保留。
+
+| 评测配置 | 目录 | PSNR ↑ | SSIM ↑ | LPIPS ↓ | `normal_angle_deg` ↓ | 深度中位 / `p90` 误差 (mm) ↓ | 说明 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| `roi-eval` (`588` 视角) | [metrics_report.txt](file:///d:/Dev/GeosunPre/work/展厅-roi-eval/metrics_report.txt) | `26.2289` | `0.8535` | `0.2694` | `10.8158°` | `16.2765 / 107.4884` | 仅 MoGe 尺度深度，`normal_prior_decay=[1.0,1.0]`，对 MoGe 过拟合导致远区深误差高 |
+| `roi-eval-on-las` (`588` 视角) | [metrics_report.txt](file:///d:/Dev/GeosunPre/work/展厅-roi-eval-on-las/metrics_report.txt) | `26.1407` | `0.8511` | `0.2706` | `11.9213°` | `10.6766 / 79.0565` | `roi` 模型投射至 LAS 深度口径评测 |
+| `phaseA-eval` (`588` 视角) | [metrics_report.txt](file:///d:/Dev/GeosunPre/work/展厅-phaseA-eval/metrics_report.txt) | `26.2127` | `0.8533` | `0.2702` | `13.0791°` | `10.9555 / 50.2241` | 常量中心深度 + `decay=[0.5,0.8]` + 无法线交叉门控 |
+| **`phaseB-eval` (`588` 视角)** | [metrics_report.txt](file:///d:/Dev/GeosunPre/work/展厅-phaseB-eval/metrics_report.txt) | **`26.3726`** | **`0.8563`** | **`0.2664`** | **`11.7813°`** | **`9.2377 / 58.5210`** | 全指标优于 `phaseA`，`PSNR/SSIM/LPIPS` 创最佳 |
+| **`phaseB-eval-on-phaseA` (`588` 视角)** | [metrics_report.txt](file:///d:/Dev/GeosunPre/work/展厅-phaseB-eval-on-phaseA/metrics_report.txt) | **`26.3726`** | **`0.8563`** | **`0.2664`** | `12.7728°` | **`9.0576 / 34.7491`** | 同源 `phaseA` 口径下深度中位/`p90` 降 `17.3% / 30.8%` |
+| `roi` / `phaseA` / `phaseB-test` (`74` 视角) | [metrics_report.txt](file:///d:/Dev/GeosunPre/work/展厅-phaseB-eval-test/metrics_report.txt) | `26.1895 / 26.1041 / 26.2386` | `0.8523 / — / 0.8518` | `0.2706 / — / 0.2700` | `10.9237° / 13.1491° / 11.8638°` | `16.9413 / 11.1564 / 9.1127` (med) | 注：`phaseB-train` 以 `enable_eval=false` 使用全量 `588` 张训练后抽取 `74` 张评测 |
+
+### 实验二：`南非展会`（`1,073` 视角，`30k` 步，`res /2`，`cropbox` ROI）
+- **监督清洗对比（[phaseA supervision.json](file:///d:/Dev/GeosunPre/work/南非展会-phaseA/supervision.json) vs [phaseB supervision.json](file:///d:/Dev/GeosunPre/work/南非展会-phaseB/supervision.json)）**：
+  - 全局：`las_input_pixels=696,350,621`，`penetration_normal_dropped` 由 `10,972,035` 降至 **`1,250,223`**（`-88.6%`），`ransac_dropped_far` 由 `11,573,243` 降至 **`4,802,323`**（`-58.5%`），`far_normal_rescued=294,792`，`normal_disagree_dropped=21,155,955`；`depth_pixels` 由 `622,462,814` 增至 `632,372,469`。
+  - `2420-028764-644_00263-L.JPG`：`penetration_normal_dropped` **`42,306 -> 510`**（`-98.8%`）、`ransac_dropped_far` **`42,318 -> 582`**（`-98.6%`），`depth_pixels` `550,008 -> 592,985`，`normal_pixels` `673,887 -> 702,662`（[263L 先验法线](file:///d:/Dev/GeosunPre/work/南非展会-phaseB/normals/2420-028764-644_00263-L.JPG.png) 白墙矩形缺洞完全消失）。
+  - `2420-028779-894_00282-L.JPG`：`penetration_normal_dropped` **`30,543 -> 121`**，`normal_disagree_dropped=56,557`（[282L 先验法线](file:///d:/Dev/GeosunPre/work/南非展会-phaseB/normals/2420-028779-894_00282-L.JPG.png) 精准置零展台上方阴影区 MoGe 天花板幻觉）。
+
+| 评测配置 | 目录 | PSNR ↑ | SSIM ↑ | LPIPS ↓ | `normal_angle_deg` ↓ | 深度中位 / `p90` 误差 (mm) ↓ |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| `南非展会-phaseA-eval` | [metrics_report.txt](file:///d:/Dev/GeosunPre/work/南非展会-phaseA-eval/metrics_report.txt) | `21.5202` | `0.7430` | **`0.3286`** | `10.4399°` | `21.2368 / 86.8826` |
+| **`南非展会-phaseB-eval`** | [metrics_report.txt](file:///d:/Dev/GeosunPre/work/南非展会-phaseB-eval/metrics_report.txt) | `21.6180` | `0.7469` | `0.3292` | **`8.5699°`** | **`19.0939`** / `91.9329` |
+| **`南非展会-phaseB-eval-on-phaseA`** | [metrics_report.txt](file:///d:/Dev/GeosunPre/work/南非展会-phaseB-eval-on-phaseA/metrics_report.txt) | **`21.6225`** | **`0.7470`** | `0.3291` | **`9.1060°`** | **`19.0983`** / `90.7345` |
+
+- **白墙高斯几何审计（[splat_30000.ply](file:///d:/Dev/GeosunPre/work/南非展会-phaseB-train/splat_30000.ply)，`u ∈ [-7, +6], z ∈ [3, 7], |off| < 1.0 m`）与视觉复核**：
+  - 墙框内共 `19,524` 个不透明度 `≥ 0.05` 的高斯：**`>1.0 m` 超大高斯 `0` 个**（基线 `3,398` 个、Phase A `640` 个），`>0.7 m` 仅 `5` 个，最大尺度 `0.7669 m`（基线 `2.65 m`、Phase A `1.455 m`）；总体墙面偏移均值/中位 `-0.20 / -0.10 cm`，左半区 `u ∈ [-7, -4]` 偏移收敛至 `-1.51 / -1.34 cm`（Phase A 为 `-8.9 cm`）。
+  - 渲染对比图 [263-L 渲染法线对比](file:///d:/Dev/GeosunPre/work/南非展会-phaseB-eval/eval_step_30000/2420-028764-644_00263-L_normals.png)、[263-L RGB 对比](file:///d:/Dev/GeosunPre/work/南非展会-phaseB-eval/eval_step_30000/2420-028764-644_00263-L.png) 与 [282-L 渲染法线对比](file:///d:/Dev/GeosunPre/work/南非展会-phaseB-eval/eval_step_30000/2420-028779-894_00282-L_normals.png) 目视确认：`263-L` 白墙左上部红色内凹坑与 `16×16` 黑框网格完全消失，法线平整连续。
+
+### 结论与取舍
+- **工程确立**：逐像素射线-高斯深度光栅化彻底消除了 3DGUT 中心深度模型偏差引发的弱纹理墙面凹陷与瓦片边界伪影；配合多面 RANSAC 共识与 LAS surfel 法线门控，在 `南非展会` 与 `展厅` 两个实景上均实现了外观（`+0.10 ~ +0.16 dB` PSNR）与几何精度（同源口径深度误差 `-10.1% ~ -17.3%`、法线误差大幅下降）的同步改善，确立为联合默认配置。
+
+

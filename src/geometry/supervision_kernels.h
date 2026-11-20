@@ -44,16 +44,6 @@ struct SurfelStats {
   std::vector<float> radius, rms;
 };
 
-struct ConflictView {
-  double rotation[9], translation[3], params[8], motion_rot[3], motion_trans[3];
-  int rolling, axis, camera, width, height, cw, ch;
-};
-struct ConflictPair {
-  uint32_t pair_index;
-  uint16_t slot_a, slot_b;
-  uint32_t id_a, id_b;
-};
-
 // Surfels of the slab's first own points; the rest of points is the halo.
 std::vector<Surfel> SlabSurfels(const std::vector<int3>& points, size_t own, int3 origin,
                                 float3 scale, cudaStream_t stream, SurfelStats& stats);
@@ -78,10 +68,4 @@ void BuildMogeFaceEstimates(const float* points, const float* normals, const flo
                             const double* to_camera, int faces, int size, double focal,
                             float* out_distance, float* out_normal, uint32_t* valid_counts,
                             cudaStream_t stream);
-void CheckConflictPairs(const uint16_t* depths_base, size_t depth_stride, const ConflictView* views,
-                        const double3* rays_cam0, const double3* rays_cam1,
-                        const ConflictPair* pairs, int num_pairs, int max_cells, int lattice_step,
-                        double view_limit, double tolerance, uint8_t* pair_own,
-                        uint8_t* pair_other, unsigned int* tile_conflicts, unsigned long long* stats,
-                        cudaStream_t stream);
 }  // namespace geosun::supervision_gpu

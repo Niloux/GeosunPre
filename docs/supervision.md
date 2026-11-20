@@ -1,6 +1,6 @@
 # 深度与法向监督
 
-`run` 的导出阶段及独立 `export` 默认用 MoGe-2 估计注册照片的深度和法向，并用可信 LAS 定尺度。`--supervision-source las` 直接投影 LAS，`--no-las-supervision` 关闭监督。已有调试工作目录可以直接导出到新目录，无需重跑重建：
+`run` 的导出阶段及独立 `export` 默认采用**解耦监督**（`las_cleaned_moge2_normals`）：输出经 MoGe-2 先验反向清洗后的原始毫米级 LAS 深度图（`depth_source = "las_moge_cleaned"`），与不经逐图缩放扭曲、对齐参考姿态或读出线的 MoGe-2 密集法向图（`normal_source = "moge2_faces"`）。`--supervision-source las` 直接投影 LAS 深度与面元法向，`--no-las-supervision` 关闭监督。已有调试工作目录可以直接导出到新目录，无需重跑重建：
 
 ```powershell
 .\run.ps1 export --work "work/场景" --output "D:/成果/场景-supervised"
@@ -14,7 +14,7 @@
 
 几何过滤不识别玻璃材质。可用 `--supervision-mask-dir DIR` 追加仅影响几何的排除掩码：按 `DIR/{L,R}/**.JPG.png` 保存原图尺寸灰度 PNG，仅 255 保留；未提供文件的照片沿用原静态区域。不同排除掩码使用新交付目录。
 
-定制 LFS 以交付目录为数据路径，直接读取 `depths/`、`normals/` 和 `supervision.json`：识别到毫米深度和 OpenCV 相机法向后，自动把深度损失切到米制 `metric`、法向损失切到 `camera-opencv`，并关闭单目深度和法向的自动生成；显式指定的非默认选择保持不变。深度是沿视线距离，只有 GUT 光栅化按鱼眼视线渲染，训练须加 `--gut`，否则 LFS 告警且离轴处深度监督有偏。监督默认关闭，用 `--use-depth-loss`、`--use-normal-loss` 开启，权重由 `--depth-loss-weight`、`--normal-loss-weight` 设置。`configs/trainer.json` 统一使用 `mask_mode = "segment_and_ignore"`：室外保留的 `128` 施加天空不透明度惩罚并忽略 `0`；封闭室内经静态掩码将 `128` 全部改回 `255` 后仅含 `{255, 0}`，在该模式下与 `ignore` 等价，避免室内灯箱或天花被挖空。`supervision.json` 记录每图有效像素、生成参数及文件身份，`check` 会回读监督图。
+定制 LFS 以交付目录为数据路径，直接读取 `depths/`、`normals/` 和 `supervision.json`：识别到毫米深度和 OpenCV 相机法向后，自动把深度损失切到米制 `metric`、法向损失切到 `camera-opencv`，并关闭单目深度和法向的自动生成；当 `depth_source` 为稀疏 LAS（`las_moge_cleaned` 或 `las`）时还会把默认的 `depth_loss_gradient_weight` 从 `1.0` 自动设为 `0.0`；显式指定的非默认选择保持不变。深度是沿视线距离，只有 GUT 光栅化按鱼眼视线渲染，训练须加 `--gut`，否则 LFS 告警且离轴处深度监督有偏。监督默认关闭，用 `--use-depth-loss`、`--use-normal-loss` 开启，权重由 `--depth-loss-weight`、`--normal-loss-weight` 设置，并可通过 `--normal-prior-decay-start` / `--normal-prior-decay-end` 对外部 MoGe 法向/深度先验权重做平滑余弦衰减（保持内部几何自洽项全程开启）。`configs/trainer.json` 统一使用 `mask_mode = "segment_and_ignore"`：室外保留的 `128` 施加天空不透明度惩罚并忽略 `0`；封闭室内经静态掩码将 `128` 全部改回 `255` 后仅含 `{255, 0}`，在该模式下与 `ignore` 等价，避免室内灯箱或天花被挖空。`supervision.json` 记录每图有效像素、生成参数及文件身份，`check` 会回读监督图。
 
 在 LFS 目录中开启监督试训，并与关闭监督的相同设置对照评估：
 
@@ -22,4 +22,4 @@
 .\build-windows-release\LichtFeld-Studio.exe --headless -d "交付目录" -o "训练输出" --gut --mask-mode segment_and_ignore --use-depth-loss --use-normal-loss
 ```
 
-MoGe 导出在 GPU 重采样阶段按帧读出转角 `ω` 将透视子图对齐至参考姿态（拟合后将法向旋回读出线相机系，记录为 `moge2_vitl_faces_readout_line`）；完成后执行跨视角深度一致性检查，每次最多并行处理 8 幅主视图，每个线程最多同时解码两张深度图，对未获可信 LAS 确认且至少 2 个视角冲突的格子同步清零深度与法向。
+MoGe 导出在 GPU 重采样阶段按帧读出转角 `ω` 将透视子图对齐至参考姿态（汇聚融合后将法向旋回读出线相机系，记录为 `moge2_vitl_faces_readout_line`）；导出直接保留经多面联合支撑清洗后的精确 LAS 深度与 MoGe 原生平滑法向，不再执行 `12×12` 尺度场变形或跨视角自由空间冲突删点：在非边缘带内结合高质量 LAS 平面面元法向剔除 `> 35°` 的严重法向幻觉，并对 LAS 法向与 MoGe 一致（`<= 25°`）且深度比不超过 `3×` 的实体平面免于玻璃穿透误删（仅对未获救援且 `r_las - r_fit > 0.25 m` 的玻璃/镜面穿透外点同步清零对应 MoGe 法向）。

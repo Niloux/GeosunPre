@@ -6,7 +6,6 @@
 #include "io/las.h"
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
-#include <Windows.h>
 #include <algorithm>
 #include <cmath>
 #include <deque>
@@ -17,7 +16,7 @@
 
 namespace geosun {
 namespace {
-constexpr const char* MonocularSource = "moge2_faces_las_scaled";
+constexpr const char* MonocularSource = "las_cleaned_moge2_normals";
 using namespace supervision_gpu;
 constexpr size_t DepthBudget = 1024 * 1024 * 1024;
 constexpr size_t PointChunk = 500000;
@@ -108,13 +107,6 @@ RawBounds BatchReachBounds(const LasHeader& header, const Reconstruction& model,
   const double reach = MaxDepth + 2.0 + 1.5 * max_shift;
   return WorldBoxToRawBounds(header, lo - Eigen::Vector3d::Constant(reach),
                              hi + Eigen::Vector3d::Constant(reach));
-}
-uint64_t HoldDepthBudgetBytes() {
-  MEMORYSTATUSEX status{};
-  status.dwLength = sizeof(status);
-  if (GlobalMemoryStatusEx(&status) && status.ullAvailPhys > 0)
-    return std::min<uint64_t>(uint64_t(status.ullAvailPhys) / 4, 8192ULL << 20);
-  return 1536ULL << 20;
 }
 struct Stream {
   cudaStream_t value = nullptr;
@@ -626,6 +618,7 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
     request["crop_windows"] = {(*options.crop)[0].ToJson(), (*options.crop)[1].ToJson()};
   if (monocular) {
     request["source"] = "moge";
+    request["pipeline"] = MonocularSource;
     request["rolling_shutter"] = rolling;
     request["geometry"] = GeometryIdentity(options.geometry_models);
   }
@@ -796,25 +789,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   };
   // Lens plans outlive their camera's loop: the monocular fits run with the pending writes.
   std::array<std::optional<MonocularLens>, 2> lens_plans;
-  // Cells of each photo whose MoGe depth the trusted LAS confirmed, for the cross-view check; each
-  // pending write fills its own image.
-  uint64_t held_depth_bytes = 0;
-  if (monocular) {
-    const std::array<Camera, 2> grids{MapCamera(model.cameras[0], options.max_size),
-                                      MapCamera(model.cameras[1], options.max_size)};
-    for (const auto& img : model.images)
-      if (img.registered) {
-        const auto& g = grids[img.camera];
-        held_depth_bytes += uint64_t(g.width) * uint64_t(g.height) * sizeof(uint16_t);
-      }
-  }
-  const uint64_t hold_depth_budget_bytes = monocular ? HoldDepthBudgetBytes() : 0;
-  const bool hold_depths = monocular && held_depth_bytes <= hold_depth_budget_bytes;
-  std::vector<cv::Mat> verified_cells(model.images.size());
-  std::vector<cv::Mat> held_depths(hold_depths ? model.images.size() : 0);
-  auto* verified_out = &verified_cells;
-  auto* held_out = hold_depths ? &held_depths : nullptr;
-  // Pending writes use the lens plans and verified cells above, which are destroyed before the
+  // Pending writes use the lens plans above, which are destroyed before the
   // queue itself; on an exception, wait for the tasks first (their results are discarded).
   struct DrainWrites {
     std::deque<std::future<Written>>& queue;
@@ -956,41 +931,27 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           Json monocular_row;
           if (plan) {
             const Eigen::Vector3d* omega_ptr = rolling_moge ? &omega : nullptr;
-            const auto fit = FitFaceScales(*plan, estimates, depth, normal, omega_ptr, axis);
-            const auto maps = GatherFaces(
-                *plan, estimates,
-                [&](const FaceSample& sample) { return fit.LogScale(sample, plan->size); },
-                omega_ptr, axis);
-            cv::Mat monocular_depth, monocular_normal, confirmed;
-            monocular_row = EncodeMonocular(*plan, maps, depth, normal, allowed, fit.accepted,
-                                            MinIncidence, monocular_depth, monocular_normal,
-                                            confirmed);
-            (*verified_out)[id] = ConflictCells(confirmed);
-            Json faces = Json::array();
-            for (const auto& estimate : estimates)
-              faces.push_back(estimate.ToJson());
-            monocular_row["fit"] = fit.ToJson();
-            monocular_row["faces"] = faces;
-            depth = monocular_depth;
-            normal = monocular_normal;
+            cv::Mat cleaned_depth, moge_normal;
+            monocular_row = CleanLasAndEncodeNormals(*plan, estimates, depth, normal, allowed,
+                                                     omega_ptr, axis, MinIncidence, cleaned_depth,
+                                                     moge_normal);
+            depth = std::move(cleaned_depth);
+            normal = std::move(moge_normal);
           }
           const auto valid = Counts(depth, normal, !monocular);
-          if (!hold_depths)
-            WriteImage(dp, depth);
+          WriteImage(dp, depth);
           WriteImage(np, normal);
           Json row = {{"image_index", id},
                       {"name", name},
                       {"width", w},
                       {"height", h},
-                      {"depth_size", hold_depths ? uint64_t(0) : fs::file_size(dp)},
+                      {"depth_size", fs::file_size(dp)},
                       {"normal_size", fs::file_size(np)},
                       {"static_pixels", static_pixels},
                       {"depth_pixels", valid.first},
                       {"normal_pixels", valid.second}};
           if (monocular)
-            row["monocular"] = monocular_row;
-          if (hold_depths)
-            (*held_out)[id] = std::move(depth);
+            row["monocular"] = std::move(monocular_row);
           return Written{id, std::move(row)};
         }));
       }
@@ -1004,21 +965,28 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   points.Finish();
   estimator.reset();
   geometry.reset();
-  Json view_conflicts;
+  uint64_t las_input_pixels = 0, moge_edge_dropped_pixels = 0, ransac_dropped_near_pixels = 0,
+           ransac_dropped_far_pixels = 0, far_normal_rescued_pixels = 0,
+           penetration_normal_dropped_pixels = 0, normal_disagree_dropped_pixels = 0;
   if (monocular) {
-    view_conflicts = FilterViewConflicts(output, scene, model, motion, options.max_size,
-                                         verified_cells, rows, held_out);
-    view_conflicts["hold_depths"] = hold_depths;
-    view_conflicts["held_depth_bytes"] = held_depth_bytes;
-    view_conflicts["hold_depth_budget_bytes"] = hold_depth_budget_bytes;
-    depth_pixels = 0;
-    normal_pixels = 0;
     for (const auto& row : rows)
       if (!row.is_null()) {
-        depth_pixels += row.at("depth_pixels").get<uint64_t>();
-        normal_pixels += row.at("normal_pixels").get<uint64_t>();
+        const auto& m = row.at("monocular");
+        las_input_pixels += m.at("las_input_pixels").get<uint64_t>();
+        moge_edge_dropped_pixels += m.at("moge_edge_dropped_pixels").get<uint64_t>();
+        ransac_dropped_near_pixels += m.at("ransac_dropped_near_pixels").get<uint64_t>();
+        ransac_dropped_far_pixels += m.at("ransac_dropped_far_pixels").get<uint64_t>();
+        far_normal_rescued_pixels += m.at("far_normal_rescued_pixels").get<uint64_t>();
+        penetration_normal_dropped_pixels += m.at("penetration_normal_dropped_pixels").get<uint64_t>();
+        normal_disagree_dropped_pixels += m.at("normal_disagree_dropped_pixels").get<uint64_t>();
       }
-    Log("MoGe view conflicts: " + view_conflicts.dump());
+    Log("LAS MoGe cleaning: input=" + std::to_string(las_input_pixels) +
+        ", edge_dropped=" + std::to_string(moge_edge_dropped_pixels) +
+        ", near_dropped=" + std::to_string(ransac_dropped_near_pixels) +
+        ", far_dropped=" + std::to_string(ransac_dropped_far_pixels) +
+        ", far_rescued=" + std::to_string(far_normal_rescued_pixels) +
+        ", penetration_normal_dropped=" + std::to_string(penetration_normal_dropped_pixels) +
+        ", normal_disagree_dropped=" + std::to_string(normal_disagree_dropped_pixels));
   }
   if (!depth_pixels || !normal_pixels)
     throw std::runtime_error("LAS supervision has no reliable depth or normal pixels");
@@ -1030,6 +998,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     throw std::runtime_error("LAS or geometry exclusion masks changed during supervision export");
   Json summary = {{"request", request},
           {"source", "valid original LAS records"},
+          {"depth_source", "las"},
+          {"normal_source", "las"},
           {"projection", motion ? "rolling_shutter_readout_line" : "global_shutter"},
           {"accepted_records", accepted_records},
           {"excluded_records", excluded_records},
@@ -1064,31 +1034,33 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
           {"seconds", Seconds(started)}};
   if (monocular) {
     summary["source"] = MonocularSource;
+    summary["depth_source"] = "las_moge_cleaned";
+    summary["normal_source"] = "moge2_faces";
     summary["anchor_source"] = "valid original LAS records";
     summary["geometry_model"] = request.at("geometry");
     summary["lenses"] = lenses;
     summary["depth_rendering"] =
-        "moge2 faces scaled per face to the LAS depth, blended in log distance";
+        "las_surfel_tangent_disks_cleaned_by_moge_edges_and_per_face_ransac";
     summary["depth_validity"] =
-        "accepted face fit, static mask off the semantic margin, no blended depth step, "
-        "agreement with trusted LAS depth, no free-space conflict with neighbouring views";
+        "isolated_outlier_removal_occlusion_boundary_local_depth_support_moge_edge_mask_and_per_face_ransac";
     summary["normal_estimator"] =
         motion ? "moge2_vitl_faces_readout_line" : "moge2_vitl_faces";
     summary["normal_validity"] =
-        "static mask off the semantic margin, incidence, no free-space conflict with neighbouring "
-        "views";
-    summary["monocular"] = {{"fit", "per-face 12 x 12 bilinear log-scale field, Cauchy IRLS in log "
-                                    "distance, scale 0.03, inliers within 0.05, overlap weight 0.25, "
-                                    "node first difference 0.1 x mean anchors per node, lattice 2 px"},
-                            {"trusted_las", "LAS depth whose surfel normal is within 15 degrees of the "
-                                            "MoGe normal; only it is fitted and vetoes MoGe depth"},
-                            {"accept", "at least 2000 trusted LAS anchors scaled by map area (min 128), "
-                                       "half of them inliers"},
-                            {"depth_step_log", .04},
-                            {"las_agreement", "within max(3%, 0.03 m)"},
-                            {"normals_need_depth", false},
-                            {"view_conflicts", view_conflicts},
-                            {"inference", geometry_profile}};
+        "static mask off semantic margin, incidence, planar LAS normal agreement <= 35 deg, and excluding unrescued LAS glass/mirror penetration";
+    summary["monocular"] = {
+        {"cleaning",
+         "per-face MoGe depth/normal edge mask dilated 2 px, multi-face inverse-depth RANSAC "
+         "with planar LAS normal rescue (<= 25 deg and <= 3x depth) and off-edge MoGe-vs-LAS normal "
+         "disagreement (> 35 deg) gating"},
+        {"las_input_pixels", las_input_pixels},
+        {"moge_edge_dropped_pixels", moge_edge_dropped_pixels},
+        {"ransac_dropped_near_pixels", ransac_dropped_near_pixels},
+        {"ransac_dropped_far_pixels", ransac_dropped_far_pixels},
+        {"far_normal_rescued_pixels", far_normal_rescued_pixels},
+        {"penetration_normal_dropped_pixels", penetration_normal_dropped_pixels},
+        {"normal_disagree_dropped_pixels", normal_disagree_dropped_pixels},
+        {"normals_need_depth", false},
+        {"inference", geometry_profile}};
   }
   return summary;
 }
