@@ -441,16 +441,22 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
       for (const auto& o : p.track) {
         ++observations;
         auto& image = m.images[o.image];
-        const double depth = image.pose.Apply(p.xyz).z();
-        if (depth <= 0)
-          throw std::runtime_error("BA requires positive initial depth");
+        const Eigen::Vector3d p_cam = image.pose.Apply(p.xyz);
+        const double depth = p_cam.z();
+        if (depth <= 1e-6)
+          throw std::runtime_error("BA requires initial depth > 1e-6 (point " + std::to_string(pid) +
+                                   ", image " + std::to_string(o.image) + ")");
         const Eigen::Vector2d pixel = image.pixels[o.feature];
         if (shutter) {
-          problem.AddResidualBlock(
-              new ShutterReprojection(pixel, shutter->velocity[o.image],
-                                      shutter->Fraction(m.cameras[image.camera], pixel)),
-              loss, shutter_images[o.image].data(), p.xyz.data(),
-              shutter_cameras[image.camera].data());
+          const double s = shutter->Fraction(m.cameras[image.camera], pixel);
+          const double exposed_depth = shutter->Apply(o.image, image.camera, s, p_cam).z();
+          if (exposed_depth <= 1e-6)
+            throw std::runtime_error("Shutter BA requires initial exposed depth > 1e-6 (point " +
+                                     std::to_string(pid) + ", image " + std::to_string(o.image) +
+                                     ")");
+          problem.AddResidualBlock(new ShutterReprojection(pixel, shutter->velocity[o.image], s),
+                                   loss, shutter_images[o.image].data(), p.xyz.data(),
+                                   shutter_cameras[image.camera].data());
           if (need_depth_guard)
             problem.AddResidualBlock(new Depth<10>(.05 * depth, 1000 / depth), nullptr,
                                      shutter_images[o.image].data(), p.xyz.data());

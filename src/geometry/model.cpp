@@ -76,7 +76,7 @@ void Reconstruction::Filter(double threshold, double min_angle) {
       const auto xyz = rotations[o.image] * p.xyz + translations[o.image];
       const auto& c = cameras[image.camera];
       const double e = (c.Project(xyz) - image.pixels[o.feature]).norm();
-      if (xyz.z() > 1e-9 && xyz.allFinite() && std::isfinite(e) && e <= threshold) {
+      if (xyz.z() > 1e-4 && xyz.allFinite() && std::isfinite(e) && e <= threshold) {
         track.push_back(o);
         error += e;
         directions.push_back((p.xyz - centers[o.image]).normalized());

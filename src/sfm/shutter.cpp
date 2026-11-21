@@ -29,6 +29,21 @@ Eigen::Vector3d Exposed(const Reconstruction& model, const ShutterMotion& motion
   const double s = motion.Fraction(model.cameras[image.camera], image.pixels[o.feature]);
   return motion.Apply(o.image, image.camera, s, image.pose.Apply(point));
 }
+bool HasPositiveReferenceDepth(const Reconstruction& model, const ModelPoint& point,
+                               double min_depth = 1e-3) {
+  return point.xyz.allFinite() &&
+         std::all_of(point.track.begin(), point.track.end(), [&](const Observation& o) {
+           return model.images[o.image].registered &&
+                  model.images[o.image].pose.Apply(point.xyz).z() > min_depth;
+         });
+}
+bool HasPositiveShutterDepth(const Reconstruction& model, const ShutterMotion& motion,
+                             const ModelPoint& point, double min_depth = 1e-3) {
+  return HasPositiveReferenceDepth(model, point, min_depth) &&
+         std::all_of(point.track.begin(), point.track.end(), [&](const Observation& o) {
+           return Exposed(model, motion, o, point.xyz).z() > min_depth;
+         });
+}
 double ShutterError(const Reconstruction& model, const ShutterMotion& motion, const Observation& o,
                     const Eigen::Vector3d& point) {
   const auto v = Exposed(model, motion, o, point);
@@ -453,13 +468,17 @@ EvaluatedAxis CorrectAlongAxis(const Scene& scene, const Reconstruction& source,
   motion.velocity = inputs.velocity;
   for (size_t c = 0; c < 2; ++c)
     motion.readout[c] = std::clamp(initial_readout[c], -.04, .04);
+  std::set<uint64_t> active_training;
+  for (const uint64_t id : inputs.training)
+    if (HasPositiveShutterDepth(model, motion, model.points[id]))
+      active_training.insert(id);
   Log(std::string("Rolling-shutter readout along ") + (axis ? "rows" : "columns"));
   auto& report = result.report;
   report = {{"readout_axis", axis ? "rows" : "columns"}, {"used", false}};
   // Synchronous L/R reference (middle-line) poses are rigid; this is the only BA given the rig.
   report["optimization"] =
       Optimize(model, scene.cameras, "principal", ba_workers, 150, {}, inputs.training_planes,
-               inputs.navigation, inputs.training, &motion, inputs.frames, {}, false,
+               inputs.navigation, active_training, &motion, inputs.frames, {}, false,
                inputs.imu_omega);
   // Held-out reprojection with every camera fixed: the source projection against the
   // rolling-shutter projection, each with its points refit to the same observations.
@@ -590,17 +609,10 @@ void PolishAcceptedShutter(const Scene& scene, const Reconstruction& source,
   std::set<uint64_t> all_tracks;
   for (uint64_t id = 0; id < model.points.size(); ++id) {
     const auto& point = model.points[id];
-    if (point.track.size() < 2 || !point.xyz.allFinite())
+    if (point.track.size() < 2 || !HasPositiveShutterDepth(model, motion, point))
       continue;
-    const bool positive_depth =
-        std::all_of(point.track.begin(), point.track.end(), [&](const auto& o) {
-          return model.images[o.image].registered &&
-                 model.images[o.image].pose.Apply(point.xyz).z() > 1e-3;
-        });
-    if (positive_depth) {
-      all_tracks.insert(id);
-      model.points[id].error = ShutterPointError(model, motion, model.points[id]);
-    }
+    all_tracks.insert(id);
+    model.points[id].error = ShutterPointError(model, motion, model.points[id]);
   }
   auto& report = accepted_axis.correction.report;
   const auto polish_planes = LasPlaneConstraints(scene, model, workers);
@@ -1420,7 +1432,8 @@ void RescueRigFrames(const Scene& scene, const fs::path& work, const ShutterInpu
                          [&](const Observation& o) {
                            if (!model.images[o.image].registered)
                              return true;
-                           if (Exposed(model, motion, o, pt.xyz).z() <= 1e-3)
+                           if (model.images[o.image].pose.Apply(pt.xyz).z() <= 1e-3 ||
+                               Exposed(model, motion, o, pt.xyz).z() <= 1e-3)
                              return true;
                            if (cand_set.count(o.image) &&
                                ShutterError(model, motion, o, pt.xyz) > max_cand_err)
@@ -1608,7 +1621,7 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   // Whole tracks are held out of the camera solve and refit afterwards with cameras fixed.
   for (uint64_t id = 0; id < source.points.size(); ++id) {
     const auto& point = source.points[id];
-    if (point.track.size() < 2)
+    if (point.track.size() < 2 || !HasPositiveReferenceDepth(source, point))
       continue;
     if (point.track.size() >= 3 && id % 5 == 0)
       inputs.validation.push_back(id);
