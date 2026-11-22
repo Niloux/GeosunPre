@@ -283,6 +283,15 @@ struct ImuShutterRotation {
     return true;
   }
 };
+struct EqualReadoutDuration {
+  template <class T>
+  bool operator()(const T* cam_l, const T* cam_r, T* r) const {
+    const T tl = cam_l[8], tr = cam_r[8];
+    const T scale = ceres::sqrt(tl * tl + T(1e-8)) + ceres::sqrt(tr * tr + T(1e-8));
+    r[0] = (tl * tl - tr * tr) / (scale * T(EqualReadoutSigma));
+    return true;
+  }
+};
 class Progress : public ceres::IterationCallback {
   Clock::time_point last = Clock::now();
 
@@ -608,6 +617,11 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           shutter_cameras[m.images[id].camera].data());
     }
   }
+  if (shutter && !fixed_rig_and_readout && used_cameras.size() == 2 &&
+      m.cameras[0].width == m.cameras[1].width && m.cameras[0].height == m.cameras[1].height)
+    problem.AddResidualBlock(
+        new ceres::AutoDiffCostFunction<EqualReadoutDuration, 1, 9, 9>(new EqualReadoutDuration),
+        nullptr, shutter_cameras[0].data(), shutter_cameras[1].data());
   Pose rig;
   size_t rig_frames = 0;
   ceres::LossFunction* rig_shutter_loss = nullptr;
@@ -625,6 +639,8 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
     }
   }
   if (have_rig) {
+    // Quadratic rig constraints follow ReanchorRigOutliers so weak-texture corridor outliers
+    // cannot drift off the calibrated rig.
     for (const auto& f : frames)
       if (used_images.count(f.left) && used_images.count(f.right)) {
         const double rot_sigma = f.synchronous ? RigRotationSigma : AsyncRigRotationSigma;
@@ -634,7 +650,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
               new ceres::AutoDiffCostFunction<RigLink, 6, 10, 10, 7>(
                   new RigLink{f.delta_rotation.normalized(), f.delta_translation, rot_sigma,
                               pos_sigma}),
-              loss, shutter_images[f.left].data(), shutter_images[f.right].data(),
+              nullptr, shutter_images[f.left].data(), shutter_images[f.right].data(),
               rig.params.data());
           if (f.synchronous && m.images[f.left].camera != m.images[f.right].camera) {
             if (!rig_shutter_loss)
@@ -651,7 +667,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
               new ceres::AutoDiffCostFunction<RigLink, 6, 7, 7, 7>(
                   new RigLink{f.delta_rotation.normalized(), f.delta_translation, rot_sigma,
                               pos_sigma}),
-              loss, m.images[f.left].pose.params.data(), m.images[f.right].pose.params.data(),
+              nullptr, m.images[f.left].pose.params.data(), m.images[f.right].pose.params.data(),
               rig.params.data());
         }
         if (!rig_frames++) {

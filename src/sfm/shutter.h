@@ -9,6 +9,7 @@ struct ShutterCorrection {
   ShutterMotion motion;
   Json report;
   bool accepted = false;
+  bool rig_refined = false;
 };
 // Estimates per-image readout rotation and per-lens readout time jointly with cameras, points and
 // the shared intrinsics, the readout translation following the navigation velocity. Held-out

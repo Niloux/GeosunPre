@@ -335,7 +335,8 @@ std::vector<fs::path> CorrectShutter(const Scene& scene, const fs::path& work,
   report["source_model"] = original.value("selected_model", std::string("aligned"));
   std::vector<fs::path> products{work / "cache/shutter.bin", work / "cache/shutter.json",
                                  work / "cache/shutter_result.json"};
-  const auto& selected = correction.accepted ? correction.candidate : model;
+  const auto& selected =
+      (correction.accepted || correction.rig_refined) ? correction.candidate : model;
   auto result = PostprocessResult(scene, selected, original, "shutter");
   result["shutter"] = report;
   auto saved = report;

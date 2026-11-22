@@ -60,9 +60,10 @@ constexpr double NavigationSigma = .03, NavigationGate = .25;
 // Synchronous L/R exposures share one body pose: R = extrinsic * L. Independent solutions on 室内
 // and 展厅 scatter about the mean extrinsic by 0.03-0.06 degrees and 2 mm (median).
 constexpr double RigRotationSigma = Pi / 180 * .01, RigPositionSigma = .001;
-constexpr double AsyncRigRotationSigma = Pi / 180 * .08, AsyncRigPositionSigma = .003;
+constexpr double AsyncRigRotationSigma = Pi / 180 * .08, AsyncRigPositionSigma = .001;
 constexpr double RigShutterRotationSigma = Pi / 180 * .02;
 constexpr double ImuShutterRotationSigma = Pi / 180 * .15;
+constexpr double EqualReadoutSigma = .0002;
 struct RigFrame {
   uint32_t left = 0, right = 0;
   double dt_seconds = 0;

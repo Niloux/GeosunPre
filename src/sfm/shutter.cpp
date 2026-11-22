@@ -89,11 +89,18 @@ Eigen::Vector2d Rectify(const Camera& camera, const ShutterMotion& motion, uint3
   return camera.Project(motion.Reference(image, lens, s, range * camera.Ray(pixel)));
 }
 double ExposureTime(const Exposure& e) { return e.week * 604800. + e.seconds; }
-// Readout rotation predicted by the readout time and the rotation rate between neighbouring
-// exposures of the same lens. The readout time comes from the translation term, so agreement
-// is a physical check independent of the per-image rotations.
+// Readout rotation predicted by the readout time and the camera rotation rate. With verified IMU
+// attitude the rate is the instantaneous 200 Hz rate at the exposure (+-20 ms), in the same sign
+// convention as the ImuShutterRotation prior; otherwise it is the rotation between neighbouring
+// exposures of the same lens. Exposures 0.8 s apart on a hand-held walk average away most of the
+// rotation during a 20-50 ms readout (小场景: explained 0.02 for a lens whose readout cut the
+// held-out error), so the neighbour rate is only the fallback. The readout time comes mainly from
+// the translation term, so agreement is a physical check on it.
 Json ReadoutConsistency(const Scene& scene, const Reconstruction& model,
-                        const ShutterMotion& motion, bool& consistent) {
+                        const ShutterMotion& motion,
+                        const std::vector<Eigen::Vector3d>& imu_omega, bool& consistent) {
+  if (!imu_omega.empty() && imu_omega.size() != model.images.size())
+    throw std::runtime_error("IMU angular velocity count differs from image count");
   Json lenses = Json::array();
   consistent = true;
   for (uint32_t lens = 0; lens < 2; ++lens) {
@@ -106,20 +113,28 @@ Json ReadoutConsistency(const Scene& scene, const Reconstruction& model,
     });
     double wo = 0, oo = 0, ww = 0;
     std::vector<double> rates, rotations;
-    for (size_t k = 1; k + 1 < ids.size(); ++k) {
-      const uint32_t a = ids[k - 1], i = ids[k], b = ids[k + 1];
-      const double dt = ExposureTime(scene.images[b]) - ExposureTime(scene.images[a]);
-      if (dt <= 0 || dt > 3)
-        continue;
-      const Eigen::AngleAxisd relative(model.images[b].pose.Rotation() *
-                                       model.images[a].pose.Rotation().conjugate());
-      const Eigen::Vector3d omega = relative.angle() * relative.axis() / dt;
+    auto add = [&](uint32_t i, const Eigen::Vector3d& omega) {
       const auto& w = motion.rotation[i];
       wo += w.dot(omega);
       oo += omega.squaredNorm();
       ww += w.squaredNorm();
       rates.push_back(omega.norm() * 180 / Pi);
       rotations.push_back(w.norm() * 180 / Pi);
+    };
+    if (!imu_omega.empty()) {
+      for (const uint32_t i : ids)
+        if (imu_omega[i].allFinite())
+          add(i, model.images[i].pose.Rotation() * imu_omega[i]);
+    } else {
+      for (size_t k = 1; k + 1 < ids.size(); ++k) {
+        const uint32_t a = ids[k - 1], i = ids[k], b = ids[k + 1];
+        const double dt = ExposureTime(scene.images[b]) - ExposureTime(scene.images[a]);
+        if (dt <= 0 || dt > 3)
+          continue;
+        const Eigen::AngleAxisd relative(model.images[b].pose.Rotation() *
+                                         model.images[a].pose.Rotation().conjugate());
+        add(i, relative.angle() * relative.axis() / dt);
+      }
     }
     if (ids.empty())
       continue;
@@ -129,6 +144,7 @@ Json ReadoutConsistency(const Scene& scene, const Reconstruction& model,
     const bool passed = rates.size() >= 20 && explained >= MinimumExplainedRotation;
     consistent = consistent && passed;
     lenses.push_back({{"camera", lens},
+                      {"rate_source", imu_omega.empty() ? "neighbouring exposures" : "imu"},
                       {"images", ids.size()},
                       {"rate_samples", rates.size()},
                       {"readout_s", readout},
@@ -327,6 +343,72 @@ Pose PredictCompanionPose(const Pose& known, const Pose& rig, const RigFrame& f,
   }
   return predicted;
 }
+size_t ReanchorRigOutliers(Reconstruction& model, const ShutterInputs& inputs, int workers) {
+  Pose rig;
+  if (inputs.frames.empty() || !RigExtrinsic(model, inputs.frames, rig))
+    return 0;
+  std::array<Eigen::Vector3d, 2> nav_bias{Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()};
+  std::array<bool, 2> has_bias{false, false};
+  for (uint32_t cam = 0; cam < 2; ++cam) {
+    std::array<std::vector<double>, 3> diffs;
+    for (uint32_t i = 0; i < model.images.size(); ++i)
+      if (model.images[i].registered && model.images[i].camera == cam) {
+        const Eigen::Vector3d d =
+            model.images[i].pose.Rotation() * (model.images[i].pose.Center() - inputs.navigation[i]);
+        for (int k = 0; k < 3; ++k)
+          diffs[k].push_back(d[k]);
+      }
+    if (diffs[0].size() >= 8) {
+      nav_bias[cam] = {Quantile(diffs[0], .5), Quantile(diffs[1], .5), Quantile(diffs[2], .5)};
+      has_bias[cam] = true;
+    }
+  }
+  auto nav_dev = [&](uint32_t id) {
+    const Eigen::Vector3d raw = model.images[id].pose.Center() - inputs.navigation[id];
+    const uint32_t cam = model.images[id].camera;
+    if (!has_bias[cam])
+      return raw.norm();
+    return (raw - model.images[id].pose.Rotation().conjugate() * nav_bias[cam]).norm();
+  };
+  std::set<uint32_t> moved;
+  for (const auto& f : inputs.frames) {
+    if (!model.images[f.left].registered || !model.images[f.right].registered)
+      continue;
+    const Pose pred_r = PredictCompanionPose(model.images[f.left].pose, rig, f, true);
+    const double err_pos = (model.images[f.right].pose.Center() - pred_r.Center()).norm();
+    const double err_rot = model.images[f.right].pose.Rotation().angularDistance(pred_r.Rotation());
+    if (err_pos <= .025 && err_rot <= 1.5 * Pi / 180)
+      continue;
+    const bool move_right = nav_dev(f.right) > nav_dev(f.left);
+    const uint32_t target = move_right ? f.right : f.left;
+    const uint32_t anchor = move_right ? f.left : f.right;
+    Pose snapped = PredictCompanionPose(model.images[anchor].pose, rig, f, move_right);
+    if (err_rot <= 1.5 * Pi / 180)
+      snapped.Set(model.images[target].pose.Rotation(),
+                  -(model.images[target].pose.Rotation() * snapped.Center()));
+    if ((snapped.Center() - inputs.navigation[target]).norm() < NavigationGate) {
+      model.images[target].pose = snapped;
+      moved.insert(target);
+    }
+  }
+  if (moved.empty())
+    return 0;
+  std::vector<uint64_t> touched;
+  for (uint64_t id = 0; id < model.points.size(); ++id) {
+    const auto& p = model.points[id];
+    if (p.track.size() >= 2 &&
+        std::any_of(p.track.begin(), p.track.end(), [&](const Observation& o) {
+          return moved.count(o.image) != 0;
+        }) &&
+        HasPositiveReferenceDepth(model, p))
+      touched.push_back(id);
+  }
+  ParallelFor(touched.size(), workers, 64, [&](size_t k) {
+    auto& p = model.points[touched[k]];
+    RefinePoint(model, p.track, p.xyz);
+  });
+  return moved.size();
+}
 struct EvaluatedAxis {
   ShutterCorrection correction;
   Reconstruction unrectified;
@@ -440,7 +522,8 @@ AxisScreen ScreenAlongAxis(const Scene& scene, const Reconstruction& source,
   const auto opt = Optimize(model, scene.cameras, "fixed", ba_workers, 3, {}, screen_planes,
                             inputs.navigation, screen_tracks, &motion, inputs.frames, {}, false,
                             inputs.imu_omega);
-  const auto consistency = ReadoutConsistency(scene, model, motion, screen.consistent);
+  const auto consistency =
+      ReadoutConsistency(scene, model, motion, inputs.imu_omega, screen.consistent);
   screen.readout = motion.readout;
   for (const auto& lens : consistency)
     screen.explained.push_back(lens.at("explained_rotation").get<double>());
@@ -461,6 +544,9 @@ EvaluatedAxis CorrectAlongAxis(const Scene& scene, const Reconstruction& source,
   EvaluatedAxis evaluated;
   auto& result = evaluated.correction;
   auto model = source;
+  const size_t reanchored = ReanchorRigOutliers(model, inputs, workers);
+  if (reanchored)
+    Log("Re-anchored " + std::to_string(reanchored) + " rig-outlier poses before shutter BA");
   auto& motion = result.motion;
   const size_t n = source.images.size();
   motion.axis = axis;
@@ -537,7 +623,8 @@ EvaluatedAxis CorrectAlongAxis(const Scene& scene, const Reconstruction& source,
   const auto quality = rectified.Quality(scene, limits.median_px, limits.p90_px);
   const auto plane_before = PlaneErrors(source, planes), plane_after = PlaneErrors(rectified, planes);
   bool consistent = false;
-  const auto consistency = ReadoutConsistency(scene, rectified, motion, consistent);
+  const auto consistency =
+      ReadoutConsistency(scene, rectified, motion, inputs.imu_omega, consistent);
   std::vector<double> rotation, translation;
   const bool bounded = MotionStats(source, motion, rotation, translation);
   const auto validation_before = Statistics(held_before.all),
@@ -590,6 +677,82 @@ EvaluatedAxis CorrectAlongAxis(const Scene& scene, const Reconstruction& source,
   report["seconds"] = Seconds(started);
   return evaluated;
 }
+Json StructuralChecks(const Reconstruction& source, const Reconstruction& candidate,
+                      const Json& source_quality, const Json& candidate_quality,
+                      const std::vector<PlaneConstraint>& planes, const Json& plane_before,
+                      const Json& plane_after, const Json* baseline_quality = nullptr) {
+  const auto& source_images = source_quality.at("images");
+  const auto& alt_images =
+      baseline_quality ? baseline_quality->at("images") : source_quality.at("images");
+  const auto& candidate_images = candidate_quality.at("images");
+  bool per_image_stable = true;
+  for (size_t i = 0; i < source.images.size(); ++i) {
+    if (!source.images[i].registered)
+      continue;
+    const auto& a_p90 = source_images[i].at("reprojection_px").at("p90");
+    const auto& b_p90 = alt_images[i].at("reprojection_px").at("p90");
+    const auto& c_p90 = candidate_images[i].at("reprojection_px").at("p90");
+    if (!a_p90.is_number() || !b_p90.is_number() || !c_p90.is_number() ||
+        c_p90.get<double>() > std::max(a_p90.get<double>(), b_p90.get<double>()) * 1.1 + .1) {
+      per_image_stable = false;
+      break;
+    }
+  }
+  const double source_p90 = source_quality.at("reprojection_px").at("p90");
+  const auto& full_p90 = candidate_quality.at("reprojection_px").at("p90");
+  return {{"visual_acceptance", candidate_quality.at("passed")},
+          {"per_image_stability", per_image_stable},
+          {"full_reprojection",
+           full_p90.is_number() && full_p90.get<double>() <= source_p90 * 1.05 + .05},
+          {"surface_fit",
+           planes.empty() ||
+               (plane_after.at("p90").is_number() &&
+                plane_after.at("p90").get<double>() <=
+                    plane_before.at("p90").get<double>() * 1.25 + .01)},
+          {"registered_images_preserved", candidate.Registered() == source.Registered()}};
+}
+void GlobalRigFallback(const Scene& scene, const Reconstruction& source,
+                       const ShutterInputs& inputs, int workers, const AlignmentLimits& limits,
+                       int ba_workers, ShutterCorrection& correction) {
+  const auto started = Clock::now();
+  auto model = source;
+  const size_t reanchored = ReanchorRigOutliers(model, inputs, workers);
+  if (reanchored)
+    Log("Re-anchored " + std::to_string(reanchored) + " rig-outlier poses for global rig fallback");
+  const auto opt = Optimize(model, scene.cameras, "principal", ba_workers, 100, {}, inputs.planes,
+                            inputs.navigation, {}, nullptr, inputs.frames, {}, false,
+                            inputs.imu_omega);
+  const auto quality = model.Quality(scene, limits.median_px, limits.p90_px);
+  const auto plane_before = PlaneErrors(source, inputs.planes);
+  const auto plane_after = PlaneErrors(model, inputs.planes);
+  const Json checks = StructuralChecks(source, model, inputs.source_quality, quality, inputs.planes,
+                                       plane_before, plane_after);
+  const auto failed = FailedChecks(checks);
+  if (!failed.empty()) {
+    correction.report["global_rig_fallback"] = {{"used", false},
+                                                {"reanchored_images", reanchored},
+                                                {"rig_frames", inputs.frames.size()},
+                                                {"surface_constraints", inputs.planes.size()},
+                                                {"checks", checks},
+                                                {"failed_checks", failed},
+                                                {"seconds", Seconds(started)}};
+    return;
+  }
+  Log("Applied global-shutter rig refinement fallback (" + std::to_string(inputs.frames.size()) +
+      " rig frames)");
+  correction.rig_refined = true;
+  correction.candidate = std::move(model);
+  correction.report["plane_before_m"] = plane_before;
+  correction.report["plane_after_m"] = plane_after;
+  correction.report["candidate_quality"] = quality;
+  correction.report["global_rig_fallback"] = {{"used", true},
+                                              {"reanchored_images", reanchored},
+                                              {"rig_frames", inputs.frames.size()},
+                                              {"surface_constraints", inputs.planes.size()},
+                                              {"optimization", opt},
+                                              {"checks", checks},
+                                              {"seconds", Seconds(started)}};
+}
 void PolishAcceptedShutter(const Scene& scene, const Reconstruction& source,
                            const ShutterInputs& inputs, int workers, const AlignmentLimits& limits,
                            int ba_workers, EvaluatedAxis& accepted_axis) {
@@ -627,46 +790,27 @@ void PolishAcceptedShutter(const Scene& scene, const Reconstruction& source,
   const auto plane_after = PlaneErrors(rectified, inputs.planes);
   const auto polish_plane_fit = PlaneErrors(rectified, polish_planes);
   bool consistent = false;
-  const auto consistency = ReadoutConsistency(scene, rectified, motion, consistent);
+  const auto consistency =
+      ReadoutConsistency(scene, rectified, motion, inputs.imu_omega, consistent);
   std::vector<double> rotation, translation;
   const bool bounded = MotionStats(source, motion, rotation, translation);
   const auto& unpolished_quality = report.at("candidate_quality");
-  const auto& source_images = inputs.source_quality.at("images");
-  const auto& unpolished_images = unpolished_quality.at("images");
-  const auto& polished_images = quality.at("images");
-  bool per_image_stable = true;
-  for (size_t i = 0; i < source.images.size(); ++i) {
-    if (!source.images[i].registered)
-      continue;
-    const auto& a_p90 = source_images[i].at("reprojection_px").at("p90");
-    const auto& b_p90 = unpolished_images[i].at("reprojection_px").at("p90");
-    const auto& c_p90 = polished_images[i].at("reprojection_px").at("p90");
-    if (!a_p90.is_number() || !b_p90.is_number() || !c_p90.is_number() ||
-        c_p90.get<double>() > std::max(a_p90.get<double>(), b_p90.get<double>()) * 1.1 + .1) {
-      per_image_stable = false;
-      break;
-    }
-  }
-  const double source_p90 = inputs.source_quality.at("reprojection_px").at("p90");
   const auto& plane_before = report.at("plane_before_m");
-  const Json checks = {
-      {"visual_acceptance", quality.at("passed")},
-      {"per_image_stability", per_image_stable},
-      {"full_reprojection", quality.at("reprojection_px").at("p90").is_number() &&
-                                quality.at("reprojection_px").at("p90").get<double>() <=
-                                    source_p90 * 1.05 + .05},
-      {"surface_fit", inputs.planes.empty() ||
-                          (plane_after.at("p90").is_number() &&
-                           plane_after.at("p90").get<double>() <=
-                               plane_before.at("p90").get<double>() * 1.25 + .01)},
-      {"physical_readout", consistent},
-      {"motion_within_bounds", bounded},
-      {"registered_images_preserved", rectified.Registered() == source.Registered()}};
+  Json checks = StructuralChecks(source, rectified, inputs.source_quality, quality, inputs.planes,
+                                 plane_before, plane_after, &unpolished_quality);
+  checks["physical_readout"] = consistent;
+  checks["motion_within_bounds"] = bounded;
   const auto failed = FailedChecks(checks);
   if (!failed.empty()) {
+    double max_rot = 0;
+    for (uint32_t i = 0; i < model.images.size(); ++i)
+      if (model.images[i].registered)
+        max_rot = std::max(max_rot, motion.rotation[i].cwiseAbs().maxCoeff());
     report["polish"] = {{"used", false},
                         {"tracks", all_tracks.size()},
                         {"surface_constraints", polish_planes.size()},
+                        {"readout_s", motion.readout},
+                        {"max_rotation_rad", max_rot},
                         {"checks", checks},
                         {"failed_checks", failed},
                         {"seconds", Seconds(started)}};
@@ -1544,7 +1688,8 @@ void RescueRigFrames(const Scene& scene, const fs::path& work, const ShutterInpu
   auto rectified = RectifyModel(model, motion, workers, shift);
   const auto quality = rectified.Quality(scene, limits.median_px, limits.p90_px);
   bool consistent = false;
-  const auto consistency = ReadoutConsistency(scene, rectified, motion, consistent);
+  const auto consistency =
+      ReadoutConsistency(scene, rectified, motion, inputs.imu_omega, consistent);
   std::vector<double> rotation, translation;
   const bool bounded = MotionStats(model, motion, rotation, translation);
   if (!quality.at("passed").get<bool>() || !consistent || !bounded) {
@@ -1708,6 +1853,8 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   if (best.correction.accepted) {
     PolishAcceptedShutter(scene, source, inputs, workers, limits, ba_workers, best);
     RescueRigFrames(scene, work, inputs, workers, limits, ba_workers, best);
+  } else if (!inputs.frames.empty()) {
+    GlobalRigFallback(scene, source, inputs, workers, limits, ba_workers, best.correction);
   }
   auto& report = best.correction.report;
   Json boresight_json = Json::array();

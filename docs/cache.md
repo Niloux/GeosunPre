@@ -30,7 +30,7 @@ cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用
 
 默认阶段为 `prepare → masks → features → matches → sfm → align → shutter → cleanup → export`。align 产物为 `cache/aligned.bin` 和 `cache/alignment.json`，后续处理不改写它们。
 
-配置 `rolling_shutter` 默认为 true，在 align 与 cleanup 之间执行 shutter 阶段，写入 `cache/shutter.bin`、`cache/shutter.json` 和中间结果 `cache/shutter_result.json`。shutter.bin 保存所选模型：通过验收时为换算到参考位姿的候选，否则为上一步模型。shutter.json 在报告之外保存 `motion`：`readout_axis`（rows 或 columns）、读出比例约定、相机点公式、两镜头 `readout_s`，以及每幅已注册照片的 `rotation_rad`（参考相机系、整帧读出）和 `velocity_m_s`（参考相机系）；报告另含两轴轻量预筛 `axis_screen` 与 `axis_attempts`（`evaluated: "full" | "screen"`）。配置为 false 时不生成这些缓存，最终报告记录 shutter.enabled=false。
+配置 `rolling_shutter` 默认为 true，在 align 与 cleanup 之间执行 shutter 阶段，写入 `cache/shutter.bin`、`cache/shutter.json` 和中间结果 `cache/shutter_result.json`。shutter.bin 保存所选模型：通过卷帘验收时为换算到参考位姿的候选；卷帘未通过但全局快门 rig 回退（`global_rig_fallback.used=true`）通过验收时为 rig 修正后的全局快门模型（`shutter.used=false`，不交付 `rolling_shutter.json`）；否则为上一步模型。shutter.json 在报告之外保存 `motion`：`readout_axis`（rows 或 columns）、读出比例约定、相机点公式、两镜头 `readout_s`，以及每幅已注册照片的 `rotation_rad`（参考相机系、整帧读出）和 `velocity_m_s`（参考相机系）；报告另含两轴轻量预筛 `axis_screen` 与 `axis_attempts`（`evaluated: "full" | "screen"`）。配置为 false 时不生成这些缓存，最终报告记录 shutter.enabled=false。
 
 cleanup 阶段默认对上一步所选模型独立清理与验收，写入 `cache/cleaned.bin`、`cache/cleanup.json` 和最终 `result.json`。可靠 LAS 平面支撑少于 200 条时不采用清理；清理候选未通过时同样保留清理前模型，cleaned.bin 保存所选结果，cleanup.used=false 及 reason 记录原因。清理只处理稀疏点及轨迹，相机内参和位姿保持不变。cleanup.source_model 记录输入缓存（aligned 或 shutter），quality 与导航误差按最终所选模型计算。
 
