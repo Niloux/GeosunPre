@@ -799,7 +799,8 @@ Json CleanLasAndEncodeNormals(const MonocularLens& lens,
   const double far_rescue_cos = std::cos(Radians(FarRescueNormalAgreeMaxDeg));
   uint64_t las_input = 0, moge_edge_dropped = 0, ransac_dropped_near = 0,
            ransac_dropped_far = 0, far_normal_rescued = 0,
-           penetration_normal_dropped = 0, normal_disagree_dropped = 0;
+           penetration_normal_dropped = 0, normal_disagree_dropped = 0,
+           las_normal_used = 0, moge_normal_fill = 0;
 
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x) {
@@ -813,9 +814,6 @@ Json CleanLasAndEncodeNormals(const MonocularLens& lens,
           -(double(n[0]) * ray[0] + double(n[1]) * ray[1] + double(n[2]) * ray[2]) >= min_incidence) {
         n_moge = Eigen::Vector3d(double(n[0]), double(n[1]), double(n[2])).normalized();
         has_moge_normal = true;
-        normal_rgb.at<cv::Vec3b>(y, x) = cv::Vec3b(uint8_t(127.5f + 127.5f * n[2] + .5f),
-                                                   uint8_t(127.5f + 127.5f * n[1] + .5f),
-                                                   uint8_t(127.5f + 127.5f * n[0] + .5f));
       }
 
       const auto& ln = las_normal.at<cv::Vec3b>(y, x);
@@ -835,75 +833,83 @@ Json CleanLasAndEncodeNormals(const MonocularLens& lens,
       const bool on_moge_edge = moge_edge_band.at<uint8_t>(y, x) != 0;
       const double normal_dot =
           (has_moge_normal && has_las_normal) ? n_moge.dot(n_las) : -2.;
-      if (!on_moge_edge && has_moge_normal && has_las_normal && normal_dot < normal_disagree_cos) {
-        normal_rgb.at<cv::Vec3b>(y, x) = cv::Vec3b(0, 0, 0);
-        ++normal_disagree_dropped;
-      }
+      const bool normal_disagree =
+          !on_moge_edge && has_moge_normal && has_las_normal && normal_dot < normal_disagree_cos;
 
+      bool las_kept = false;
+      bool penetration_dropped = false;
       const uint16_t raw_mm = las.at<uint16_t>(y, x);
-      if (!raw_mm)
-        continue;
-      ++las_input;
-      if (on_moge_edge) {
-        ++moge_edge_dropped;
-        continue;
-      }
-
-      const auto& pf = pixel_faces[size_t(y) * w + x];
-      const double r_las = double(raw_mm) / 1000.;
-      bool has_accepted = false;
-      bool any_inlier = false;
-      bool has_best_fit = false;
-      double best_abs_log = std::numeric_limits<double>::infinity();
-      double best_log_ratio = 0.;
-      double best_r_fit = 0.;
-      double best_tau = 0.;
-      for (uint8_t k = 0; k < pf.count; ++k) {
-        const auto& fit = fits[pf.face[k]];
-        if (!fit.accepted)
-          continue;
-        has_accepted = true;
-        const double q_hat = fit.s / double(pf.distance[k]) + fit.t;
-        if (!(q_hat > 0.))
-          continue;
-        const double r_fit = 1. / q_hat;
-        const double log_ratio = std::log(r_las / r_fit);
-        const double abs_log = std::abs(log_ratio);
-        if (abs_log <= fit.tau) {
-          any_inlier = true;
-          break;
-        }
-        if (abs_log < best_abs_log) {
-          has_best_fit = true;
-          best_abs_log = abs_log;
-          best_log_ratio = log_ratio;
-          best_r_fit = r_fit;
-          best_tau = fit.tau;
-        }
-      }
-
-      if (!has_accepted || any_inlier) {
-        depth_mm.at<uint16_t>(y, x) = raw_mm;
-        continue;
-      }
-      if (!has_best_fit) {
-        ++ransac_dropped_far;
-        continue;
-      }
-      if (best_log_ratio < -best_tau) {
-        ++ransac_dropped_near;
-      } else if (has_las_normal && has_moge_normal && normal_dot >= far_rescue_cos &&
-                 best_log_ratio <= FarRescueMaxLogRatio) {
-        depth_mm.at<uint16_t>(y, x) = raw_mm;
-        ++far_normal_rescued;
-      } else {
-        ++ransac_dropped_far;
-        if (r_las - best_r_fit > PenetrationMinDiffMetres) {
-          auto& code = normal_rgb.at<cv::Vec3b>(y, x);
-          if (code[0] || code[1] || code[2]) {
-            code = cv::Vec3b(0, 0, 0);
-            ++penetration_normal_dropped;
+      if (raw_mm) {
+        ++las_input;
+        if (on_moge_edge) {
+          ++moge_edge_dropped;
+        } else {
+          const auto& pf = pixel_faces[size_t(y) * w + x];
+          const double r_las = double(raw_mm) / 1000.;
+          bool has_accepted = false;
+          bool any_inlier = false;
+          bool has_best_fit = false;
+          double best_abs_log = std::numeric_limits<double>::infinity();
+          double best_log_ratio = 0.;
+          double best_r_fit = 0.;
+          double best_tau = 0.;
+          for (uint8_t k = 0; k < pf.count; ++k) {
+            const auto& fit = fits[pf.face[k]];
+            if (!fit.accepted)
+              continue;
+            has_accepted = true;
+            const double q_hat = fit.s / double(pf.distance[k]) + fit.t;
+            if (!(q_hat > 0.))
+              continue;
+            const double r_fit = 1. / q_hat;
+            const double log_ratio = std::log(r_las / r_fit);
+            const double abs_log = std::abs(log_ratio);
+            if (abs_log <= fit.tau) {
+              any_inlier = true;
+              break;
+            }
+            if (abs_log < best_abs_log) {
+              has_best_fit = true;
+              best_abs_log = abs_log;
+              best_log_ratio = log_ratio;
+              best_r_fit = r_fit;
+              best_tau = fit.tau;
+            }
           }
+
+          if (!has_accepted || any_inlier) {
+            depth_mm.at<uint16_t>(y, x) = raw_mm;
+            las_kept = true;
+          } else if (!has_best_fit) {
+            ++ransac_dropped_far;
+          } else if (best_log_ratio < -best_tau) {
+            ++ransac_dropped_near;
+          } else if (has_las_normal && has_moge_normal && normal_dot >= far_rescue_cos &&
+                     best_log_ratio <= FarRescueMaxLogRatio) {
+            depth_mm.at<uint16_t>(y, x) = raw_mm;
+            las_kept = true;
+            ++far_normal_rescued;
+          } else {
+            ++ransac_dropped_far;
+            if (r_las - best_r_fit > PenetrationMinDiffMetres)
+              penetration_dropped = true;
+          }
+        }
+      }
+
+      if (normal_disagree) {
+        ++normal_disagree_dropped;
+      } else if (las_kept && has_las_normal) {
+        normal_rgb.at<cv::Vec3b>(y, x) = ln;
+        ++las_normal_used;
+      } else if (has_moge_normal) {
+        if (penetration_dropped) {
+          ++penetration_normal_dropped;
+        } else {
+          normal_rgb.at<cv::Vec3b>(y, x) = cv::Vec3b(uint8_t(127.5f + 127.5f * n[2] + .5f),
+                                                     uint8_t(127.5f + 127.5f * n[1] + .5f),
+                                                     uint8_t(127.5f + 127.5f * n[0] + .5f));
+          ++moge_normal_fill;
         }
       }
     }
@@ -915,6 +921,8 @@ Json CleanLasAndEncodeNormals(const MonocularLens& lens,
           {"far_normal_rescued_pixels", far_normal_rescued},
           {"penetration_normal_dropped_pixels", penetration_normal_dropped},
           {"normal_disagree_dropped_pixels", normal_disagree_dropped},
+          {"las_normal_used_pixels", las_normal_used},
+          {"moge_normal_fill_pixels", moge_normal_fill},
           {"ransac_samples", total_samples},
           {"ransac_inliers", total_inliers},
           {"faces", face_rows}};

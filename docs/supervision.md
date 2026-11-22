@@ -1,6 +1,6 @@
 # 深度与法向监督
 
-`run` 的导出阶段及独立 `export` 默认采用**解耦监督**（`las_cleaned_moge2_normals`）：输出经 MoGe-2 先验反向清洗后的原始毫米级 LAS 深度图（`depth_source = "las_moge_cleaned"`），与不经逐图缩放扭曲、对齐参考姿态或读出线的 MoGe-2 密集法向图（`normal_source = "moge2_faces"`）。`--supervision-source las` 直接投影 LAS 深度与面元法向，`--no-las-supervision` 关闭监督。已有调试工作目录可以直接导出到新目录，无需重跑重建：
+`run` 的导出阶段及独立 `export` 默认采用**解耦混合监督**（`las_cleaned_moge2_normals`）：输出经 MoGe-2 先验反向清洗后的原始毫米级 LAS 深度图（`depth_source = "las_moge_cleaned"`），与以高置信度平面 LAS 面元法向为主、MoGe-2 密集法向补全空洞/边缘/非平面细结构的联合法向图（`normal_source = "las_planar_moge2_fill"`）。`--supervision-source las` 直接投影 LAS 深度与面元法向，`--no-las-supervision` 关闭监督。已有调试工作目录可以直接导出到新目录，无需重跑重建：
 
 ```powershell
 .\run.ps1 export --work "work/场景" --output "D:/成果/场景-supervised"
@@ -22,4 +22,4 @@
 .\build-windows-release\LichtFeld-Studio.exe --headless -d "交付目录" -o "训练输出" --gut --mask-mode segment_and_ignore --use-depth-loss --use-normal-loss
 ```
 
-MoGe 导出在 GPU 重采样阶段按帧读出转角 `ω` 将透视子图对齐至参考姿态（汇聚融合后将法向旋回读出线相机系，记录为 `moge2_vitl_faces_readout_line`）；导出直接保留经多面联合支撑清洗后的精确 LAS 深度与 MoGe 原生平滑法向，不再执行 `12×12` 尺度场变形或跨视角自由空间冲突删点：在非边缘带内结合高质量 LAS 平面面元法向剔除 `> 35°` 的严重法向幻觉，并对 LAS 法向与 MoGe 一致（`<= 25°`）且深度比不超过 `3×` 的实体平面免于玻璃穿透误删（仅对未获救援且 `r_las - r_fit > 0.25 m` 的玻璃/镜面穿透外点同步清零对应 MoGe 法向）。
+MoGe 导出在 GPU 重采样阶段按帧读出转角 `ω` 将透视子图对齐至参考姿态（汇聚融合后将法向旋回读出线相机系，记录为 `las_knn_pca_surfel_moge2_vitl_readout_line` / `las_knn_pca_surfel_moge2_vitl`）；导出直接保留经多面联合支撑清洗后的精确 LAS 深度，不再执行 `12×12` 尺度场变形或跨视角自由空间冲突删点：在非边缘带内结合高质量 LAS 平面面元法向剔除 `> 35°` 的严重法向冲突，对 LAS 法向与 MoGe 一致（`<= 25°`）且深度比不超过 `3×` 的实体平面免于玻璃穿透误删，并对 RANSAC 保留的实体表面优先写入多视角绝对一致的平面 LAS 法向，其余空洞、边缘带及非平面细节由 MoGe 原生平滑法向回填（仅对未获救援且 `r_las - r_fit > 0.25 m` 的玻璃/镜面穿透外点同步清零对应 MoGe 法向）。

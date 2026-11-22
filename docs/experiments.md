@@ -753,3 +753,27 @@
 
 - **结论**：双场景手眼自标定稳定收敛（`0.19°–0.65°`），已知旋转二次核验精准清理了误匹配并救回 `8` / `24` 对弱纹理配对，增量注册在 `小场景` 直接救回 `2` 帧 AP3P 失败帧，双场景长轨迹与总有效观测数均稳定提升（`+1.5%–2.6%`），导航位置与重投影一致性保持或微幅改善，且完全不干扰后续 `shutter` 卷帘读出时间求解（`shutter.used=true` 稳定保留）。`展厅` 的 `00214–00216-R` 白墙帧因匹配候选中不足 24 条共视观测仍由 `shutter.rig_rescue` 完整补回。确立保留为主线默认，无需新增 CLI 开关。
 
+## 2026-11-22：高置信平面 LAS 法向优先 + MoGe-2 回填混合法向监督（`las_planar_moge2_fill`）
+
+- **背景与核心改动**：此前解耦监督（`normal_source = "moge2_faces"`）全图采用 MoGe-2 单图法向、仅用 LAS 面元做 `> 35°` 幻觉剔除，在弱纹理墙面和地面上仍受单目预测跨视角 `2°–4°` 漂移影响。改为在 [monocular.h](file:///C:/Users/youwu/Documents/GeosunPre/src/geometry/monocular.h) / [monocular.cpp](file:///C:/Users/youwu/Documents/GeosunPre/src/geometry/monocular.cpp) 与 [supervision.cpp](file:///C:/Users/youwu/Documents/GeosunPre/src/geometry/supervision.cpp) 中保持原有 `las_moge_cleaned` 深度清洗与 `> 35°` 冲突门控不变，在非边缘且通过 RANSAC 清洗的实体表面上优先写入多视角几何一致的平面 LAS 面元法向（`las_normal_used_pixels`），仅在 LAS 缺测、MoGe 边缘带及非平面细节处由 MoGe-2 法向回填（`moge_normal_fill_pixels`）；`supervision.json` 保持 `source = "las_cleaned_moge2_normals"`、`depth_source = "las_moge_cleaned"`，更新 `normal_source = "las_planar_moge2_fill"`，与下游 `LichtFeld-Studio` `las_prior_sidecar.cpp` 完全兼容。
+
+### 实景对比：`小场景`（296 幅）与 `展厅`（588 幅）
+
+两套实景均全流程跑通并经 `run.ps1 check` 校验通过（`passed: true`，`296 / 296` 与 `588 / 588` 注册），输出目录（[小场景-las-norm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/小场景-las-norm-out) 与 [展厅-las-norm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/展厅-las-norm-out)）保留在本地供下游 3DGS 训练对照。
+
+| 指标 | `小场景` 纯 MoGe (`小场景-imu-sfm-out`) | `小场景` LAS 优先 (`小场景-las-norm-out`) | `展厅` 纯 MoGe (`展厅-imu-sfm-out`) | `展厅` LAS 优先 (`展厅-las-norm-out`) |
+| --- | :---: | :---: | :---: | :---: |
+| `normal_source` | `moge2_faces` | `las_planar_moge2_fill` | `moge2_faces` | `las_planar_moge2_fill` |
+| 有效深度像素 `depth_pixels` | `171,255,710` | `171,302,367`（持平 `+0.03%`） | `309,680,050` | `309,724,759`（持平 `+0.01%`） |
+| 有效法向像素 `normal_pixels` | `203,330,932` | `203,939,965`（`+0.30%`） | `371,896,047` | `373,320,888`（`+0.38%`） |
+| LAS 平面法向像素 (`las_normal_used`) | `0` | **`155,329,822`（`76.2%`）** | `0` | **`264,669,380`（`70.9%`）** |
+| MoGe-2 回填像素 (`moge_normal_fill`) | `203,330,932` | `48,610,143`（`23.8%`） | `371,896,047` | `108,651,508`（`29.1%`） |
+| `normal_disagree_dropped` | `5,431,670` | `5,401,664` | `22,524,721` | `22,520,963` |
+| `penetration_normal_dropped` | `447,144` | `441,808` | `1,822,754` | `1,787,728` |
+| 抽样有效区法向变化（`>0.6°` 占比 / 角差 med / p90） | — | `84.0%` / `3.26°` / `9.98°` | — | `70.8%` / `3.86°` / `14.55°` |
+
+- **跨视角几何一致性评测（`小场景`，逐行卷帘重投影 + `<= 2 px` 双向回环去遮挡）**：
+  - **同镜头（相邻 1–2 帧，~455 万像素）**：跨视角深度中位/P90 差 `1.04 / 6.17 mm -> 1.05 / 6.21 mm`（`< 2 cm` 占比保持 `98.4%`）；世界系法线夹角由 `2.69° / 7.77°` 降至 **`0.28° / 1.06°`**（`< 5°` 占比 `77.8% -> 97.1%`），点-面偏移由 `0.33 / 2.04 mm` 收紧至 **`0.29 / 1.80 mm`**。
+  - **跨镜头 L→R（近同时刻，~17.6 万像素）**：深度中位/P90 差 `1.07 / 4.75 mm -> 1.09 / 4.90 mm`（`< 2 cm` `99.3% -> 99.2%`）；世界系法线夹角由 `2.80° / 7.52°` 降至 **`0.27° / 0.74°`**（`< 5°` 占比 `77.6% -> 98.3%`），点-面偏移由 `0.26 / 1.19 mm` 收紧至 **`0.24 / 1.01 mm`**。
+- **结论与待验证**：两场景有效监督法向中约 `71%–76%` 的墙面、地面等高置信度平面像素由多视角绝对一致的毫米级 LAS 面元法向接管，在被替换区域纠偏了原 MoGe-2 单目预测 `3.3°–3.9°`（P90 `10.0°–14.5°`）的视角漂移并将 `小场景` 跨视角法线一致性从 `~2.7°–2.8°` 压低至 `~0.27°–0.28°`；`depth_pixels` 完整保持，有效 `normal_pixels` 略有提升且零新增 GPU 开销。待在下游 `LichtFeld-Studio` 用 [小场景-las-norm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/小场景-las-norm-out) 与 [展厅-las-norm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/展厅-las-norm-out) 启动 3DGS 试训评估 novel view 法线与渲染改善。
+

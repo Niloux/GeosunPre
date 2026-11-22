@@ -66,14 +66,15 @@ class MonocularEstimator {
 // 1. Detects depth/normal edges on each 90-degree MoGe face and dilates them on the grid to
 //    mask LAS edge bleeding and calibration micro-offsets.
 // 2. Gathers rolling-shutter rectified MoGe normals onto the grid (rotating back to readout-line
-//    camera frame when omega is nonzero) and clears severe MoGe normal hallucinations where
-//    confident planar LAS surfels disagree by > 35 degrees off MoGe edges.
+//    camera frame when omega is nonzero) and clears severe disagreements (> 35 degrees) where
+//    confident planar LAS surfels and MoGe normals conflict off MoGe edges.
 // 3. Runs per-face deterministic RANSAC on inverse depth (q_las ~= s * q_moge + t) over clean
 //    lattice anchors to filter close flying points and far glass/mirror penetrations, checking
 //    multi-face consensus and rescuing solid planar surfaces whose LAS normal agrees with MoGe.
-// 4. Keeps raw millimetre LAS depth for inliers (without warping) and MoGe normals inside allowed
-//    pixels passing min_incidence (zeroing normals only on unrescued glass penetrations or
-//    severe planar normal disagreements).
+// 4. Keeps raw millimetre LAS depth for inliers (without warping); prioritizes confident planar
+//    LAS surfel normals on RANSAC-kept off-edge pixels and backfills LAS gaps, edges, and
+//    non-planar regions with MoGe-2 normals (zeroing unrescued glass penetrations and > 35 deg
+//    off-edge conflicts).
 Json CleanLasAndEncodeNormals(const MonocularLens& lens,
                               const std::vector<FaceEstimate>& faces,
                               const cv::Mat& las,

@@ -967,7 +967,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   geometry.reset();
   uint64_t las_input_pixels = 0, moge_edge_dropped_pixels = 0, ransac_dropped_near_pixels = 0,
            ransac_dropped_far_pixels = 0, far_normal_rescued_pixels = 0,
-           penetration_normal_dropped_pixels = 0, normal_disagree_dropped_pixels = 0;
+           penetration_normal_dropped_pixels = 0, normal_disagree_dropped_pixels = 0,
+           las_normal_used_pixels = 0, moge_normal_fill_pixels = 0;
   if (monocular) {
     for (const auto& row : rows)
       if (!row.is_null()) {
@@ -979,6 +980,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         far_normal_rescued_pixels += m.at("far_normal_rescued_pixels").get<uint64_t>();
         penetration_normal_dropped_pixels += m.at("penetration_normal_dropped_pixels").get<uint64_t>();
         normal_disagree_dropped_pixels += m.at("normal_disagree_dropped_pixels").get<uint64_t>();
+        las_normal_used_pixels += m.at("las_normal_used_pixels").get<uint64_t>();
+        moge_normal_fill_pixels += m.at("moge_normal_fill_pixels").get<uint64_t>();
       }
     Log("LAS MoGe cleaning: input=" + std::to_string(las_input_pixels) +
         ", edge_dropped=" + std::to_string(moge_edge_dropped_pixels) +
@@ -986,7 +989,9 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         ", far_dropped=" + std::to_string(ransac_dropped_far_pixels) +
         ", far_rescued=" + std::to_string(far_normal_rescued_pixels) +
         ", penetration_normal_dropped=" + std::to_string(penetration_normal_dropped_pixels) +
-        ", normal_disagree_dropped=" + std::to_string(normal_disagree_dropped_pixels));
+        ", normal_disagree_dropped=" + std::to_string(normal_disagree_dropped_pixels) +
+        ", las_normal_used=" + std::to_string(las_normal_used_pixels) +
+        ", moge_normal_fill=" + std::to_string(moge_normal_fill_pixels));
   }
   if (!depth_pixels || !normal_pixels)
     throw std::runtime_error("LAS supervision has no reliable depth or normal pixels");
@@ -1035,7 +1040,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
   if (monocular) {
     summary["source"] = MonocularSource;
     summary["depth_source"] = "las_moge_cleaned";
-    summary["normal_source"] = "moge2_faces";
+    summary["normal_source"] = "las_planar_moge2_fill";
     summary["anchor_source"] = "valid original LAS records";
     summary["geometry_model"] = request.at("geometry");
     summary["lenses"] = lenses;
@@ -1043,15 +1048,17 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         "las_surfel_tangent_disks_cleaned_by_moge_edges_and_per_face_ransac";
     summary["depth_validity"] =
         "isolated_outlier_removal_occlusion_boundary_local_depth_support_moge_edge_mask_and_per_face_ransac";
-    summary["normal_estimator"] =
-        motion ? "moge2_vitl_faces_readout_line" : "moge2_vitl_faces";
+    summary["normal_estimator"] = motion ? "las_knn_pca_surfel_moge2_vitl_readout_line"
+                                         : "las_knn_pca_surfel_moge2_vitl";
     summary["normal_validity"] =
-        "static mask off semantic margin, incidence, planar LAS normal agreement <= 35 deg, and excluding unrescued LAS glass/mirror penetration";
+        "static mask off semantic margin, incidence, planar LAS surfel priority on RANSAC-kept off-edge "
+        "pixels with MoGe-2 backfill, excluding > 35 deg off-edge conflicts and unrescued LAS "
+        "glass/mirror penetration";
     summary["monocular"] = {
         {"cleaning",
          "per-face MoGe depth/normal edge mask dilated 2 px, multi-face inverse-depth RANSAC "
-         "with planar LAS normal rescue (<= 25 deg and <= 3x depth) and off-edge MoGe-vs-LAS normal "
-         "disagreement (> 35 deg) gating"},
+         "with planar LAS normal rescue (<= 25 deg and <= 3x depth), planar LAS normal priority "
+         "with MoGe-2 backfill, and off-edge MoGe-vs-LAS normal disagreement (> 35 deg) gating"},
         {"las_input_pixels", las_input_pixels},
         {"moge_edge_dropped_pixels", moge_edge_dropped_pixels},
         {"ransac_dropped_near_pixels", ransac_dropped_near_pixels},
@@ -1059,6 +1066,8 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
         {"far_normal_rescued_pixels", far_normal_rescued_pixels},
         {"penetration_normal_dropped_pixels", penetration_normal_dropped_pixels},
         {"normal_disagree_dropped_pixels", normal_disagree_dropped_pixels},
+        {"las_normal_used_pixels", las_normal_used_pixels},
+        {"moge_normal_fill_pixels", moge_normal_fill_pixels},
         {"normals_need_depth", false},
         {"inference", geometry_profile}};
   }
