@@ -341,3 +341,69 @@
    - **单高斯法线/旋转锚定正则**：在优化器直接约束每颗扁平高斯的 `min_vec` 与其局部渲染/先验墙面法线一致（打破多层正负/斜向倾角在 pixel-wise blended normal 下互相蒙混的漏洞，直接封死 `50°~67°` 倾斜瓦片）；
    - **绝对最大尺度软上限**：对平坦弱纹理区的高斯施加 `s_max` 软上限（比如超过 `5~8 cm` 才生效的 hinge penalty），精准卡死 `30 cm × 7 cm` 宽条带而不影响小圆盘导致 `alpha` 微孔；
    - **前 3k 近距弱纹理限密**：在 `< 1.8 m` 且无显著图像/几何边缘区域限制 early MRNF 拆分速率，避免 1F 长出 2F `7~8×` 的冗余自由度。
+
+---
+
+### 6.8 GUT 沿光线一致性正则（`exp5–exp8`）与跨场景落地结论
+
+针对 `6.7.2` 定位的“pixel-wise 混合均值法线与 RGB 对沿光线正负倾斜、互补黑白小圆盘盲区”，在 [LichtFeld-Studio](file:///C:/Users/youwu/Documents/LichtFeld-Studio) 中实现并验证了沿光线方差正则（**方案 A**），经 `小场景` 四组新消融（`exp5–exp8`）收敛与 `展厅`（588 视角）跨场景回归测试，最终将成果固化为新的主线默认配置。
+
+#### 6.8.1 底层实现与方案取舍（LichtFeld-Studio）
+
+最终保留两项**无量纲、与场景物理尺度无关、默认权重为 `0.0`** 的 GUT 正则约束：
+
+1. **沿光线法向方差正则 `normal_variance_weight`**（CLI `--normal-variance-weight`，新增 [normal_variance_loss.hpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/kernels/normal_variance_loss.hpp) / [normal_variance_loss.cu](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/kernels/normal_variance_loss.cu) 并接入 [trainer.cpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/trainer.cpp#L8650-L8693)）：
+   - 不额外开辟渲染通道，直接利用 GUT 已渲染的累积法线 $N = \sum w_i \hat{n}_i$（$|\hat{n}_i|=1$）与像素不透明度 $\alpha = \sum w_i$ 计算沿光线归一化方差 $\operatorname{var}_n = 1 - \|N\|^2 / \alpha^2 = \frac{1}{\alpha}\sum w_i \|\hat{n}_i - N/\alpha\|^2$（对 $\alpha > 0.5$、$pixel\_weight > 0$ 且 $10^{-8} \le \|N\|^2/\alpha^2 < 1$ 的有效像素累加 $L = w \cdot \sum (pixel\_weight \cdot \operatorname{var}_n) / (W \cdot H)$）；
+   - 通过 `grad_normal` 与 `grad_alpha` 反传，随 `normal_start_fraction` 启动并共享 ROI / `SegmentAndIgnore` 掩码像素权重，直接封堵“多层短轴互相歪倾至 `50°~67°` 却在混合平均法线中抵消为零误差”的几何漏洞。
+2. **GUT 沿光线颜色方差正则 `color_variance_weight`**（改动 [RasterizeToPixelsFromWorld3DGSBwd.cu](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSBwd.cu#L755-L790)、[gsplat_rasterizer.cpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/rasterization/gsplat_rasterizer.cpp) 与 [parameters.cpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/core/parameters.cpp)）：
+   - 在 GUT 光栅反向内核中基于去背景后的期望前景颜色 $C = (I_{\text{render}} - T_{\text{final}} \cdot I_{\text{bg}}) / (1 - T_{\text{final}})$ 直接计算 SteadySplats Eq. 7 沿光线 RGB 方差梯度并回传至 `v_rgb_local` 与 `v_alpha`；
+   - 在维持非 GUT FastGS 对掩码互斥校验不变的同时，放行 `gut = true` 下与 `SegmentAndIgnore` / `Ignore` 掩码及 `normal_terms_weight`（掩码 + ROI）协同训练，直接封堵“贴墙多层黑白高光/暗点颗粒在低处视锥互补抵消为灰色、高处视角爆糊斑”的作弊路径。
+3. **废弃并彻底移除实验性世界尺度硬上限 `max_scale_reg` / `max_scale_threshold`**：
+   - `exp5` 初版曾同时启用 `max_scale_reg = 0.002, max_scale_threshold = 0.1`（`m`），虽将全局 `s_max` 最大值封死在 `10.11 cm` 并把 `1F_win1_left` `>15 cm` 宽条清零，却重伤高层玻璃电梯与稀疏大面（`exp5` 全场景 `Mask PSNR` 较 `exp3` 跌 `-0.95 dB`、四楼高窗/电梯视角如 `00122-R`/`00121-R` 暴跌 **`-3.38 / -3.26 dB`**，Aligned 更跌至 `-4.16 dB`），且带物理米制量纲无法跨不同尺度场景复用，已在代码清理阶段从全部源码中完全删除。
+
+#### 6.8.2 `小场景-las-norm-out` 全量消融汇总（`exp0–exp8`，296 视角，30k `--eval-all`）
+
+各组配置差异及 30k 全视角指标与 1F 白墙（`1F_win1_left`）三维审计对照如下（完整产物与对比图存留于 [work/las-norm-ablation/](file:///C:/Users/youwu/Documents/GeosunPre/work/las-norm-ablation)；注：`exp0-baseline` 采用旧版默认 `sh_degree = 0`、`use_exposure_correction = true`）：
+
+| 实验组 | 相对 `exp3` 关键改动 | 耗时 | `#GS` | PSNR ↑ | SSIM ↑ | LPIPS ↓ | Aligned PSNR / SSIM / LPIPS | Bias (raw) | 法线角 (°) ↓ | 深度 med / P90 (mm) | `alpha < 0.98` ↓ | `1F_L`: `od / >15cm / dark / luma_std / ang` |
+|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|
+| `exp0-baseline` | 旧 `trainer.json`（`sh=0`, 双边网格） | `843.8s` | `2,984,778` | `24.2966` | `0.8293` | `0.2415` | `25.4524 / 0.8537 / 0.2374` | `(+0.042,+0.041,+0.047)` | `9.0262` | `6.33 / 34.33` | `0.3147` | `5.38x / — / 10.8% / — / —` |
+| `exp3-reg-sh1` | `dc=0.005, erank=0.008, sh=1, nflat=0.01` | `873.6s` | `2,994,286` | **`24.7914`** | **`0.8343`** | **`0.2399`** | **`26.2151 / 0.8597 / 0.2353`** | `(+0.004,+0.001,+0.005)` | `8.2109` | **`6.15`** / `33.63` | `0.2681` | `6.11x / 477 / 8.8% / 0.2778 / 50.3°` |
+| `exp4-overexp-mask` | `>=252` 掩码 + `nflat=0.04` | `855.8s` | `2,996,245` | `23.6354` | `0.8296` | `0.2443` | `24.7180 / 0.8538 / 0.2398` | `(+0.001,-0.000,+0.004)` | `8.2799` | `6.26` / `32.47` | `0.2807` | `4.74x / 393 / 9.1% / — / 49.9°` |
+| `exp5-gut-ray-consist` | `nflat=0.03, nvar=0.15, cv=0.5@3k, max_s=0.002@0.1m` | `851.7s` | `2,997,379` | `23.8446` | `0.8175` | `0.2547` | `25.0517 / 0.8431 / 0.2500` | `(-0.009,-0.009,-0.008)` | `8.0658` | `7.01 / 38.25` | `0.3024` | `4.66x / 0 / 2.4% / 0.1865 / 15.4°` |
+| `exp6-nvar-only` | `nflat=0.03, nvar=0.15`（纯法向方差） | `858.4s` | `2,993,935` | `24.5679` | `0.8277` | `0.2471` | `25.9365 / 0.8527 / 0.2426` | `(+0.004,+0.004,+0.007)` | **`7.0754`** | `6.26 / 33.31` | **`0.2564`** | `6.82x / 559 / 6.2% / 0.2610 / 19.1°` |
+| **`exp7-nvar-cv-balanced`** | `nflat=0.02, nvar=0.06, cv=0.18@5k` | `877.3s` | `2,994,590` | `24.4838` | `0.8286` | `0.2452` | `25.8417 / 0.8542 / 0.2405` | **`(-0.001,-0.001,+0.001)`** | `7.6668` | `6.17` / **`33.12`** | `0.2653` | `8.52x / 634 / 4.3% / 0.2280 / 29.8°` |
+| `exp8-nvar-cv-polish` | `nflat=0.02, nvar=0.10, cv=0.30@5k` | `870.1s` | `2,994,451` | `24.3410` | `0.8255` | `0.2484` | `25.6741 / 0.8511 / 0.2437` | `(-0.002,-0.003,-0.000)` | `7.6408` | `6.29 / 33.36` | `0.2671` | `9.01x / 653 / 3.2% / 0.2112 / 23.0°` |
+
+核心实验判读与选型理由：
+- **为什么需要两项协同**：`exp6` 证实单加 `normal_variance_weight` 即可将全局渲染法线角误差压至七组最优的 **`7.0754°`**、1F 短轴歪斜从 `50.3°` 降至 `19.1°`、空洞比 `alpha<0.98` 压到 **`0.2564`**，但缺乏颜色一致性约束时 `30k` 墙面仍残留灰色云雾（`dark 6.2%`）；加入延迟至 `5k` 启动（避开 `stop_refine = 4500` 拓扑阶段，保护暗细节不提前抹平）的 `color_variance_weight` 后，`exp7`（`0.06 / 0.18`）与 `exp8`（`0.10 / 0.30`）均消除了 `exp3` 的柔雾灰白糊斑。
+- **`exp7` 为主线最优 Pareto 甜点**：相较 `exp3`，`exp7` 在 1F 墙面将 `dark` 黑点腰斩（`8.8% → 4.3%`）、亮度方差 `luma_std` 降至 `0.2280`、短轴倾角压至 `29.8°`、全局超色域降至 **`0.066%`**、`needle >5 / >10` 保持 **`3.56% / 0.97%`**、`Raw Bias` 完美归零至 `(-0.001, -0.001, +0.001)`、法线误差改善 `-0.54°` 且深度 `P90` 达到 **七组最低 `33.12 mm`**（`Aligned PSNR 25.8417` 仍显著优于旧基线 `25.4524` `+0.39 dB`）；且视觉对比 `exp3/exp5/exp7/exp8` 确认 `exp7` 保持了走廊门框与 4F 玻璃电梯锐度（`exp8` 虽使 1F 更接近 `exp5` 的极净墙面，但全场景 PSNR 再降 `0.143 dB`、部分走廊逆光帧如 `00152-L / 00157-L` 分别跌 `-1.32 / -1.12 dB`）。
+
+#### 6.8.3 跨场景回归验证：`展厅-las-norm-out`（588 视角，1,208 m²，30k）
+
+使用清理移除 `max_scale_reg` 后的最终 Release 编译版 [LichtFeld-Studio.exe](file:///C:/Users/youwu/Documents/LichtFeld-Studio/build-windows-release/LichtFeld-Studio.exe)，在第二套大型室内真实场景 [展厅-las-norm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/展厅-las-norm-out)（588 视角，区域面积 `1,208.0 m²`）完成旧 [trainer.json](file:///C:/Users/youwu/Documents/GeosunPre/work/las-norm-ablation/configs/zhanting-old-baseline.json)（`zhanting-baseline`）与新 [configs/trainer.json](file:///C:/Users/youwu/Documents/GeosunPre/configs/trainer.json)（`zhanting-exp7`）的全量 30k A/B 验证（结果留存于 `work/las-norm-ablation/zhanting-{baseline,exp7}`）：
+
+| 指标 | `zhanting-baseline`（旧配置） | `zhanting-exp7`（新 `trainer.json`） | 变化 |
+|---|---:|---:|---|
+| 训练耗时 / `#GS` | `950.4s` / `2,999,903` | **`899.1s`** / `2,988,447` | **`-5.4%`**（`-51.3s`） |
+| `Mask PSNR / SSIM / LPIPS` | **`26.1824` / `0.8511` / `0.2657`** | `26.1516` / `0.8486` / `0.2717` | PSNR 仅 `-0.031 dB` |
+| `Aligned PSNR / SSIM / LPIPS` | `26.8482` / **`0.8651`** / **`0.2630`** | **`26.8578`** / `0.8632` / `0.2685` | **Aligned PSNR `+0.010 dB`**，最大对齐位移 `5.485 -> 4.145 px` |
+| `Normal angle (deg)` ↓ | `9.9503°` | **`7.6643°`** | **`-2.29°`（`-23.0%`）** |
+| `Depth AbsRel` / 中位误差 (mm) ↓ | `0.0060` / `8.7783` | **`0.0059` / `8.1261`** | **`-0.65 mm`（`-7.4%`）** |
+| `alpha < 0.98` 空洞占比 ↓ | `0.2284` | **`0.1854`** | **`-4.30 pp`（`-18.8%`）** |
+| `depth_prior_err_p90_mm` ↓ | **`52.5313`** | `73.0369` | `+20.51 mm`（**已确诊为良性分布统计差异，见下文**） |
+| 全局超色域 `OOG` / 细针 `>5` / `>10` ↓ | `30.30%` / `21.55%` / `5.51%` | **`0.04%` / `3.02%` / `0.92%`** | **退化高光/超色域清零，细针降 `7×`** |
+| 不透明度中位 / `>0.9` 占比 | `0.381` / `11.5%` | **`0.623` / `29.3%`** | 实面化大幅增强 |
+
+- **`depth_prior_err_p90_mm`（`52.53 → 73.04 mm`）专项排查确认无三维几何退化**：
+  1. **原始 LAS 3D 体素偏差与 3D 浮渣全面更优**：以 `882,665` 原始 LAS 点构建多尺度 3D 体素网格核验，在有效不透明层 `zhanting-exp7` 严格优于基线——`opac > 0.5` 时 `off > 5 cm` 为 **`2.50% vs 2.63%`**（`s_max` 中位 `4.09 vs 5.95 cm`）、`off > 15 cm` 为 **`0.14% vs 0.23%`**（`2,483 vs 2,702` 颗，`s_max` 中位 `9.60 vs 12.40 cm`）；`opac > 0.05` 时 `off > 15 cm` 为 **`6,382 vs 6,790`**（`s_max` 中位 `4.38 vs 10.67 cm`）、`off > 30 cm` 为 **`709 vs 823`**（`s_max` 中位 `9.16 vs 22.93 cm`）；且 `>25 cm`、`opac > 0.1` 的远端浮渣高斯由 `1,475` 颗降至 **`978` 颗（`-33.7%`）**、所占 `0.25 m` 离群空间体素格由 `876` 格降至 **`680` 格（`-22.4%`）**。
+  2. **重尾视角与 `alpha >= 0.5` 评分分母扩增效应**：均匀抽样 `--test-every 50`（12 视角）上 `zhanting-exp7` 的 `p90` 反而低于基线（**`36.3451 vs 36.8963 mm`**、`median 8.6422 vs 9.8853 mm`、`low_alpha 0.1999 vs 0.2582`）；`--test-every 10`（59 视角）上仅差 `+5.78 mm`（`48.0987 vs 42.3153 mm`）。全量 `588` 视角 `p90` 为逐图 `p90` 的算术均值，受个别近桌杂物高遮挡低先验帧（`00021–00024`，`depths/` 覆盖仅 `17.7%–25.2%` 却直视 `6–10 m` 远墙与桌面反光/透明水杯）及透明玻璃展柜/玻璃幕墙/反光专利框、最远 `42.53 m` 透视视角主导；同时 [metrics.cpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/metrics/metrics.cpp#L1506) 仅对 `a >= 0.5`（`kDepthPriorMinAlpha`）像素计入误差，`exp7` 将边缘/弱纹理与玻璃区 `low_alpha (<0.98)` 压低 `-4.30 pp` 后使原本被跳过的小部分重尾困难像素进入 `p90` 统计样本。
+  3. **评测渲染图视觉复核**：抽查 `eval_step_30000` 对比渲染图（`00021-L`、`00121-L`、`00127-R`、`00177-R`、`00221-L`、`00277-R`），墙面、文字展板、展柜、格栅吊顶均清晰干净，无漂浮斑块或几何撕裂。
+
+#### 6.8.4 默认配置落地（`configs/trainer.json`）
+
+已将 [configs/trainer.json](file:///C:/Users/youwu/Documents/GeosunPre/configs/trainer.json) 升级为验证收敛的 `exp7` 配方（保留原 `save_steps: [7000, 30000]` 等数据/输出设定）：
+- 外观与颜色约束：`use_exposure_correction = false`、`use_ppisp = true`、`sh_degree = 1`、`sh_rest_reg = 0.001`、`dc_reg = 0.005`、`gradient_loss_weight = 0.0`；
+- 拓扑与形态正则：`start_refine = 1200`、`stop_refine = 4500`、`opacity_decay = 0.0`、`scale_decay = 0.0`、`scale_reg = 0.005`、`erank_reg = 0.008`；
+- 先验与沿光线一致性：`normal_loss_weight = 0.1`、`normal_prior_depth_weight = 0.05`、`normal_prior_decay_start = 0.95`、`normal_consistency_weight = 0.1`、`normal_flatten_weight = 0.02`、**`normal_variance_weight = 0.06`**、**`color_variance_weight = 0.18`**、**`color_variance_warmup_iters = 5000`**。
+- （可选进阶档）若遇极大面积极端强反光纯白墙场景且可接受约 `~0.14 dB` 局部逆光峰值权衡，可在项目配置中参照 `exp8` 手动上调至 `normal_variance_weight = 0.10`、`color_variance_weight = 0.30`。

@@ -777,3 +777,43 @@
   - **跨镜头 L→R（近同时刻，~17.6 万像素）**：深度中位/P90 差 `1.07 / 4.75 mm -> 1.09 / 4.90 mm`（`< 2 cm` `99.3% -> 99.2%`）；世界系法线夹角由 `2.80° / 7.52°` 降至 **`0.27° / 0.74°`**（`< 5°` 占比 `77.6% -> 98.3%`），点-面偏移由 `0.26 / 1.19 mm` 收紧至 **`0.24 / 1.01 mm`**。
 - **结论与待验证**：两场景有效监督法向中约 `71%–76%` 的墙面、地面等高置信度平面像素由多视角绝对一致的毫米级 LAS 面元法向接管，在被替换区域纠偏了原 MoGe-2 单目预测 `3.3°–3.9°`（P90 `10.0°–14.5°`）的视角漂移并将 `小场景` 跨视角法线一致性从 `~2.7°–2.8°` 压低至 `~0.27°–0.28°`；`depth_pixels` 完整保持，有效 `normal_pixels` 略有提升且零新增 GPU 开销。待在下游 `LichtFeld-Studio` 用 [小场景-las-norm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/小场景-las-norm-out) 与 [展厅-las-norm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/展厅-las-norm-out) 启动 3DGS 试训评估 novel view 法线与渲染改善。
 
+## 2026-11-23：3DGUT 沿光线法向/颜色一致性正则（LichtFeld-Studio）与 `configs/trainer.json` 升级
+
+- **问题与核心改动**：在 [小场景-las-norm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/小场景-las-norm-out) 高处俯视 novel view 下，旧版 `configs/trainer.json`（含局部双边网格 + `sh_degree = 0` + 全局不透明度衰减）及仅改单像素正则的 `exp3/exp4` 仍在 1F 白墙上从 `3k → 30k` 渐进长出灰白糊斑与贴墙倾角瓦片（根因在于 pixel-wise 混合平均法线与 RGB 对沿光线正负倾斜短轴及互补黑白微粒存在抵消盲区，详见专项报告 [novel-view-whitewall-investigation.md](file:///C:/Users/youwu/Documents/GeosunPre/docs/novel-view-whitewall-investigation.md) 第 `6.8` 节）。我们在下游 [LichtFeld-Studio](file:///C:/Users/youwu/Documents/LichtFeld-Studio) 中实现两项**无量纲、与场景尺度无关且默认 `0.0`** 的 GUT 沿光线一致性正则并完成消融升级：
+  1. **沿光线法向方差正则 `normal_variance_weight`**（`--normal-variance-weight`，新增 [normal_variance_loss.hpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/kernels/normal_variance_loss.hpp) / [normal_variance_loss.cu](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/kernels/normal_variance_loss.cu)，经 `grad_normal` / `grad_alpha` 反传并尊重 `normal_start_fraction`、ROI 与 `SegmentAndIgnore` 掩码权重）：直接惩罚每条光线上各高斯单位短轴相对混合平均法线的离散度 $\operatorname{var}_n = 1 - \|N\|^2 / \alpha^2$。
+  2. **GUT 沿光线颜色方差正则 `color_variance_weight`**（[RasterizeToPixelsFromWorld3DGSBwd.cu](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSBwd.cu) / [gsplat_rasterizer.cpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/training/rasterization/gsplat_rasterizer.cpp) / [parameters.cpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/src/core/parameters.cpp)）：在 GUT 光栅反向阶段启用 SteadySplats Eq. 7 沿光线 RGB 方差惩罚，并放行 `gut = true` 下与掩码模式、ROI 权重协同使用。
+  3. **舍弃实验性世界尺度上限 `max_scale_reg` / `max_scale_threshold`**：`exp5` 实测 `0.1 m` 硬帽会重伤 4F 高层玻璃电梯与稀疏大面（全场景 PSNR `-0.95 dB`、部分视角跌 `-3.38 dB`），且带物理米制量纲无法通用，已在清理提交时彻底移除。
+
+### 1. `小场景-las-norm-out` 核心消融对照（296 视角，30k `--eval-all`）
+
+完整 8 组消融产物、逐视角评测与对比渲染保留在 [work/las-norm-ablation/](file:///C:/Users/youwu/Documents/GeosunPre/work/las-norm-ablation)。
+
+| 实验组 | 关键设置（相对旧配置） | 耗时 | `#GS` | Mask PSNR / SSIM / LPIPS | Aligned PSNR / SSIM / LPIPS | Bias (raw) | 法线角 (°) ↓ | 深度 med / P90 (mm) | `alpha < 0.98` ↓ | `1F_L`: `od / >15cm / dark / ang` |
+|---|---|---:|---:|---|---|---:|---:|---:|---:|---|
+| `exp0-baseline` | 旧 `trainer.json`（`sh=0`, 双边网格） | `843.8s` | `2,984,778` | `24.2966 / 0.8293 / 0.2415` | `25.4524 / 0.8537 / 0.2374` | `(+0.042,+0.041,+0.047)` | `9.0262` | `6.33 / 34.33` | `0.3147` | `5.38x / — / 10.8% / —` |
+| `exp3-reg-sh1` | PPISP + `dc=0.005, erank=0.008, sh=1, nflat=0.01, stop_refine=4500` | `873.6s` | `2,994,286` | **`24.7914 / 0.8343 / 0.2399`** | **`26.2151 / 0.8597 / 0.2353`** | `(+0.004,+0.001,+0.005)` | `8.2109` | **`6.15`** / `33.63` | `0.2681` | `6.11x / 477 / 8.8% / 50.3°` |
+| `exp5-gut-ray-consist` | + `nflat=0.03, nvar=0.15, cv=0.5@3k, max_s=0.002@0.1m` | `851.7s` | `2,997,379` | `23.8446 / 0.8175 / 0.2547` | `25.0517 / 0.8431 / 0.2500` | `(-0.009,-0.009,-0.008)` | `8.0658` | `7.01 / 38.25` | `0.3024` | `4.66x / 0 / 2.4% / 15.4°` |
+| `exp6-nvar-only` | + `nflat=0.03, nvar=0.15`（纯法向方差） | `858.4s` | `2,993,935` | `24.5679 / 0.8277 / 0.2471` | `25.9365 / 0.8527 / 0.2426` | `(+0.004,+0.004,+0.007)` | **`7.0754`** | `6.26 / 33.31` | **`0.2564`** | `6.82x / 559 / 6.2% / 19.1°` |
+| **`exp7-nvar-cv-balanced`** | + **`nflat=0.02, nvar=0.06, cv=0.18@5k`** | `877.3s` | `2,994,590` | `24.4838 / 0.8286 / 0.2452` | `25.8417 / 0.8542 / 0.2405` | **`(-0.001,-0.001,+0.001)`** | `7.6668` | `6.17` / **`33.12`** | `0.2653` | `8.52x / 634 / 4.3% / 29.8°` |
+| `exp8-nvar-cv-polish` | + `nflat=0.02, nvar=0.10, cv=0.30@5k` | `870.1s` | `2,994,451` | `24.3410 / 0.8255 / 0.2484` | `25.6741 / 0.8511 / 0.2437` | `(-0.002,-0.003,-0.000)` | `7.6408` | `6.29 / 33.36` | `0.2671` | `9.01x / 653 / 3.2% / 23.0°` |
+
+### 2. 跨场景回归验证：`展厅-las-norm-out`（588 视角，1,208 m²，30k，清理后最终二进制）
+
+使用移除 `max_scale` 后的最终 Release 编译版对 [展厅-las-norm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/展厅-las-norm-out) 进行完整 30k A/B 验证（结果保留于 `work/las-norm-ablation/zhanting-{baseline,exp7}`）：
+
+| 指标 | `zhanting-baseline`（旧配置） | `zhanting-exp7`（新 `trainer.json`） | 变化 |
+|---|---:|---:|---|
+| 耗时 / `#GS` | `950.4s` / `2,999,903` | **`899.1s`** / `2,988,447` | **`-5.4%`** |
+| `Mask PSNR / SSIM / LPIPS` | **`26.1824` / `0.8511` / `0.2657`** | `26.1516` / `0.8486` / `0.2717` | PSNR `-0.031 dB` |
+| `Aligned PSNR / SSIM / LPIPS` | `26.8482` / `0.8651` / `0.2630` | **`26.8578`** / `0.8632` / `0.2685` | **Aligned PSNR `+0.010 dB`**（max 移 `5.49 -> 4.15 px`） |
+| `Normal angle (deg)` / `Depth AbsRel` / 中位 (mm) ↓ | `9.9503°` / `0.0060` / `8.7783` | **`7.6643°` / `0.0059` / `8.1261`** | **法线 `-2.29°` / 深度 `-0.65 mm`** |
+| `alpha < 0.98` 空洞占比 ↓ | `0.2284` | **`0.1854`** | **`-4.30 pp`** |
+| `depth_prior_err_p90_mm` ↓ | **`52.5313`** | `73.0369` | 见下方排查确认 |
+| 全局 `OOG` / 细针 `>5` / `>10` ↓ | `30.30%` / `21.55%` / `5.51%` | **`0.04%` / `3.02%` / `0.92%`** | **退化高光/超色域近清零，细针 `-86%`** |
+
+- **`p90` 统计差异诊断与三维验证**：在 `882,665` 原始 LAS 点多尺度 3D 体素偏差审计中，`zhanting-exp7` 在有效不透明层全面优于基线（`opac > 0.5`: `off > 5 cm` `2.50% vs 2.63%`、`off > 15 cm` `0.14% vs 0.23%`、`2,483 vs 2,702` 颗；`opac > 0.05`: `off > 30 cm` `709 vs 823`、`s_max` 中位 `9.16 vs 22.93 cm`；`>25 cm` 且 `opac > 0.1` 远端浮渣颗粒由 `1,475` 颗降至 **`978` 颗（`-33.7%`）**、离群空间体素格由 `876` 格降至 **`680` 格**）；`--test-every 50`（12 视角）上 `exp7` 的 `p90` 同样优于基线（**`36.35 vs 36.90 mm`**），全量 `588` 视角 `p90` 上升系个别低先验覆盖贴桌近距视角、透明展柜玻璃反光与 `alpha < 0.98` 压低 `-4.30 pp` 后更多边缘难像素越过 `kDepthPriorMinAlpha = 0.5` 进入尾部统计所致，视觉抽查 `eval_step_30000` 图像确认无几何退化。
+
+### 3. 结论、配置升级与未验证边界
+- **结论与主线升级**：选取 `exp7` 作为新 Pareto 甜点更新至 [configs/trainer.json](file:///C:/Users/youwu/Documents/GeosunPre/configs/trainer.json)（PPISP 替代局部双边网格、`sh_degree = 1 / sh_rest_reg = 0.001`、`dc_reg = 0.005`、`erank_reg = 0.008`、`scale_reg = 0.005`、`gradient_loss_weight = 0.0`、`start_refine = 1200 / stop_refine = 4500`、`opacity_decay = 0.0 / scale_decay = 0.0`、`normal_loss_weight = 0.1`、`normal_prior_depth_weight = 0.05`、`normal_prior_decay_start = 0.95`、`normal_consistency_weight = 0.1`、`normal_flatten_weight = 0.02`、`normal_variance_weight = 0.06`、`color_variance_weight = 0.18`、`color_variance_warmup_iters = 5000`，保留原 `save_steps: [7000, 30000]`）；极大面积纯白墙极端场景可酌情手动调高至 `exp8` 挡（`0.10 / 0.30`）。
+- **验证与未验证项**：`LichtFeld-Studio` Release 全量编译（`171/171`）、CLI `--help` 与 200 步联合冒烟测试以及双实景全量 30k 对比均已完成；[test_color_variance.cpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/tests/test_color_variance.cpp) 已同步补充 GUT 掩码放行与 `NormalVarianceParameters` 用例，但 `build-windows-release` 开启 `BUILD_TESTS=OFF`，测试可执行文件尚未单独编跑。
+
