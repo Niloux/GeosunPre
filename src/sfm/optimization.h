@@ -63,7 +63,14 @@ constexpr double RigRotationSigma = Pi / 180 * .01, RigPositionSigma = .001;
 constexpr double AsyncRigRotationSigma = Pi / 180 * .08, AsyncRigPositionSigma = .001;
 constexpr double RigShutterRotationSigma = Pi / 180 * .02;
 constexpr double ImuShutterRotationSigma = Pi / 180 * .15;
+constexpr double ImuRelativeRotationSigma = Pi / 180 * .5;
 constexpr double EqualReadoutSigma = .0002;
+struct RelativeRotationPrior {
+  uint32_t a = 0, b = 0;
+  // Predicted R_b * R_a^T (world-to-camera rotations: R_b ≈ relative * R_a).
+  Eigen::Quaterniond relative = Eigen::Quaterniond::Identity();
+  double sigma = ImuRelativeRotationSigma;
+};
 struct RigFrame {
   uint32_t left = 0, right = 0;
   double dt_seconds = 0;
@@ -85,5 +92,6 @@ Json Optimize(Reconstruction& model, const std::array<Camera, 2>& initial, const
               const std::set<uint64_t>& selected_points = {}, ShutterMotion* shutter = nullptr,
               const std::vector<RigFrame>& frames = {}, const std::set<uint64_t>& fixed_points = {},
               bool fixed_rig_and_readout = false,
-              const std::vector<Eigen::Vector3d>& imu_omega = {});
+              const std::vector<Eigen::Vector3d>& imu_omega = {},
+              const std::vector<RelativeRotationPrior>& relative_rotations = {});
 }  // namespace geosun

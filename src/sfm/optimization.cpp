@@ -292,6 +292,25 @@ struct EqualReadoutDuration {
     return true;
   }
 };
+// Consecutive exposure relative rotation prior: R_b ≈ relative * R_a.
+struct RelativeRotationCost {
+  Eigen::Quaterniond relative;
+  double sigma;
+  template <class T>
+  bool operator()(const T* pose_a, const T* pose_b, T* r) const {
+    const T qa[] = {pose_a[3], pose_a[0], pose_a[1], pose_a[2]},
+            qb[] = {pose_b[3], pose_b[0], pose_b[1], pose_b[2]},
+            qrel[] = {T(relative.w()), T(relative.x()), T(relative.y()), T(relative.z())};
+    T predicted[4], difference[4];
+    ceres::QuaternionProduct(qrel, qa, predicted);
+    const T inv_pred[] = {predicted[0], -predicted[1], -predicted[2], -predicted[3]};
+    ceres::QuaternionProduct(qb, inv_pred, difference);
+    const T sign = difference[0] < T(0) ? T(-2) : T(2);
+    for (int i = 0; i < 3; ++i)
+      r[i] = sign * difference[i + 1] / T(sigma);
+    return true;
+  }
+};
 class Progress : public ceres::IterationCallback {
   Clock::time_point last = Clock::now();
 
@@ -413,7 +432,8 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
               const std::vector<PlaneConstraint>& planes, const std::vector<Eigen::Vector3d>& nav,
               const std::set<uint64_t>& selected_points, ShutterMotion* shutter,
               const std::vector<RigFrame>& frames, const std::set<uint64_t>& fixed_points,
-              bool fixed_rig_and_readout, const std::vector<Eigen::Vector3d>& imu_omega) {
+              bool fixed_rig_and_readout, const std::vector<Eigen::Vector3d>& imu_omega,
+              const std::vector<RelativeRotationPrior>& relative_rotations) {
   const auto started = Clock::now();
   ceres::Problem problem;
   auto ordering = std::make_shared<ceres::ParameterBlockOrdering>();
@@ -622,6 +642,27 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
     problem.AddResidualBlock(
         new ceres::AutoDiffCostFunction<EqualReadoutDuration, 1, 9, 9>(new EqualReadoutDuration),
         nullptr, shutter_cameras[0].data(), shutter_cameras[1].data());
+  size_t relative_rotation_count = 0;
+  if (!shutter && !relative_rotations.empty()) {
+    ceres::LossFunction* rel_rot_loss = nullptr;
+    for (const auto& rr : relative_rotations) {
+      if (!used_images.count(rr.a) || !used_images.count(rr.b) || !(rr.sigma > 0))
+        continue;
+      const bool fixed_a = (!metric && rr.a == m.gauge_image) ||
+                           (!variable_images.empty() && !variable_images.count(rr.a));
+      const bool fixed_b = (!metric && rr.b == m.gauge_image) ||
+                           (!variable_images.empty() && !variable_images.count(rr.b));
+      if (fixed_a && fixed_b)
+        continue;
+      if (!rel_rot_loss)
+        rel_rot_loss = new ceres::HuberLoss(2.);
+      problem.AddResidualBlock(
+          new ceres::AutoDiffCostFunction<RelativeRotationCost, 3, 7, 7>(
+              new RelativeRotationCost{rr.relative.normalized(), rr.sigma}),
+          rel_rot_loss, m.images[rr.a].pose.params.data(), m.images[rr.b].pose.params.data());
+      ++relative_rotation_count;
+    }
+  }
   Pose rig;
   size_t rig_frames = 0;
   ceres::LossFunction* rig_shutter_loss = nullptr;
@@ -755,6 +796,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"variable_images", variable_count},
           {"metric_constraints", metric},
           {"rig_frames", rig_frames},
+          {"relative_rotation_priors", relative_rotation_count},
           {"rolling_shutter", shutter != nullptr},
           {"observations", observations},
           {"solver", ceres::LinearSolverTypeToString(summary.linear_solver_type_used)},

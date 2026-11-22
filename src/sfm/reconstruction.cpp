@@ -195,12 +195,31 @@ Measurement Measure(const Camera& camera, const Eigen::Vector2d& pixel) {
   m.derivative.col(1) /= p[1];
   return m;
 }
-double EpipolarSquared(const Eigen::Matrix3d& e, const Measurement& a, const Measurement& b) {
+double ExposureTime(const Exposure& e) { return e.week * 604800. + e.seconds; }
+double RotationAngleDeg(const Eigen::Matrix3d& R) {
+  return std::acos(std::clamp((R.trace() - 1.) * .5, -1., 1.)) * 180. / Pi;
+}
+Eigen::Matrix3d CrossMatrix(const Eigen::Vector3d& v) {
+  Eigen::Matrix3d m;
+  m << 0, -v.z(), v.y(), v.z(), 0, -v.x(), -v.y(), v.x(), 0;
+  return m;
+}
+Eigen::Matrix3d ExpSO3(const Eigen::Vector3d& w) {
+  const double theta = w.norm();
+  if (theta < 1e-12)
+    return Eigen::Matrix3d::Identity() + CrossMatrix(w);
+  return Eigen::AngleAxisd(theta, w / theta).toRotationMatrix();
+}
+double EpipolarSigned(const Eigen::Matrix3d& e, const Measurement& a, const Measurement& b) {
   const Eigen::Vector3d ea = e * a.ray, eb = e.transpose() * b.ray;
   const double value = b.ray.dot(ea);
   const double gradient =
       (a.derivative.transpose() * eb).squaredNorm() + (b.derivative.transpose() * ea).squaredNorm();
-  return value * value / std::max(gradient, 1e-24);
+  return value / std::sqrt(std::max(gradient, 1e-24));
+}
+double EpipolarSquared(const Eigen::Matrix3d& e, const Measurement& a, const Measurement& b) {
+  const double s = EpipolarSigned(e, a, b);
+  return s * s;
 }
 bool RefitEssential(const std::vector<Measurement>& a, const std::vector<Measurement>& b,
                     const Eigen::Matrix3d& current, Eigen::Matrix3d& candidate) {
@@ -357,10 +376,507 @@ Pair Verify(const Scene& scene, const Reconstruction& model, const MatchSet& mat
     result.inliers.clear();
   return result;
 }
+struct ImuPriorContext {
+  bool available = false;
+  std::vector<Eigen::Quaterniond> body_rotation;
+  std::array<Eigen::Matrix3d, 2> boresight{Eigen::Matrix3d::Identity(), Eigen::Matrix3d::Identity()};
+  std::array<bool, 2> verified{false, false};
+  std::array<double, 2> boresight_median_deg{-1., -1.};
+  std::array<std::string, 2> source{"none", "none"};
+  size_t pairs_checked = 0, pairs_rescued = 0, pairs_overruled = 0, pairs_rejected = 0;
+  size_t pnp_rescued = 0, pnp_overruled = 0, pnp_rejected = 0;
+
+  void Initialize(const Scene& scene) {
+    *this = ImuPriorContext{};
+    auto kinematics = ReadExposureKinematics(scene);
+    if (!kinematics.has_attitude || kinematics.body_rotation.size() != scene.images.size())
+      return;
+    for (const auto& q : kinematics.body_rotation)
+      if (!q.coeffs().allFinite() || q.squaredNorm() <= 1e-12)
+        return;
+    body_rotation = std::move(kinematics.body_rotation);
+    available = true;
+  }
+
+  bool RelativeRotation(const Scene& scene, uint32_t a, uint32_t b,
+                        Eigen::Matrix3d& R_ba) const {
+    if (!available)
+      return false;
+    const uint32_t ca = scene.images[a].camera, cb = scene.images[b].camera;
+    if (!verified[ca] || !verified[cb])
+      return false;
+    const Eigen::Matrix3d R_body_ba =
+        (body_rotation[b].conjugate() * body_rotation[a]).normalized().toRotationMatrix();
+    R_ba = boresight[cb] * R_body_ba * boresight[ca].transpose();
+    return true;
+  }
+
+  void CalibrateHandEye(const Scene& scene, const std::vector<Pair>& pairs) {
+    if (!available)
+      return;
+    struct Obs {
+      Eigen::Matrix3d A, B;
+      Eigen::Matrix<double, 9, 9> rows;
+      double w = 1.0;
+    };
+    for (uint32_t cid = 0; cid < 2; ++cid) {
+      std::vector<Obs> obs;
+      for (const auto& p : pairs) {
+        if (p.inliers.size() < 48 || scene.images[p.a].camera != cid ||
+            scene.images[p.b].camera != cid)
+          continue;
+        const Eigen::Matrix3d B =
+            (body_rotation[p.b].conjugate() * body_rotation[p.a]).normalized().toRotationMatrix();
+        if (RotationAngleDeg(B) < 2.0)
+          continue;
+        const Eigen::Matrix3d A = p.relative.Rotation().toRotationMatrix();
+        Eigen::Matrix<double, 9, 9> rows = Eigen::Matrix<double, 9, 9>::Zero();
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c) {
+            const int row_idx = 3 * r + c;
+            for (int m = 0; m < 3; ++m)
+              rows(row_idx, 3 * m + c) += A(r, m);
+            for (int n = 0; n < 3; ++n)
+              rows(row_idx, 3 * r + n) -= B(n, c);
+          }
+        obs.push_back({A, B, rows, 1.0});
+      }
+      if (obs.size() < 8)
+        continue;
+      Eigen::Matrix3d X = Eigen::Matrix3d::Identity();
+      Eigen::Matrix<double, 9, 1> eigvals = Eigen::Matrix<double, 9, 1>::Zero();
+      size_t inliers = 0;
+      std::vector<double> errors_deg;
+      for (int pass = 0; pass < 3; ++pass) {
+        Eigen::Matrix<double, 9, 9> N = Eigen::Matrix<double, 9, 9>::Zero();
+        double sum_w = 0;
+        for (const auto& item : obs)
+          if (item.w > 0) {
+            N.noalias() += item.w * item.rows.transpose() * item.rows;
+            sum_w += item.w;
+          }
+        if (sum_w <= 0) {
+          inliers = 0;
+          break;
+        }
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 9, 9>> solver(N);
+        if (solver.info() != Eigen::Success) {
+          inliers = 0;
+          break;
+        }
+        eigvals = solver.eigenvalues();
+        const Eigen::Matrix<double, 9, 1> v = solver.eigenvectors().col(0);
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c)
+            X(r, c) = v(3 * r + c);
+        if (X.determinant() < 0)
+          X = -X;
+        const auto svd = X.jacobiSvd(Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d U = svd.matrixU();
+        if ((U * svd.matrixV().transpose()).determinant() < 0)
+          U.col(2) = -U.col(2);
+        X = U * svd.matrixV().transpose();
+        if (!X.allFinite()) {
+          inliers = 0;
+          break;
+        }
+        inliers = 0;
+        errors_deg.clear();
+        errors_deg.reserve(obs.size());
+        for (auto& item : obs) {
+          const double theta =
+              RotationAngleDeg(item.A.transpose() * X * item.B * X.transpose());
+          errors_deg.push_back(theta);
+          if (theta <= 3.0) {
+            item.w = 1.0;
+            ++inliers;
+          } else if (theta <= 10.0) {
+            const double s = 3.0 / theta;
+            item.w = s * s;
+          } else {
+            item.w = 0.0;
+          }
+        }
+      }
+      if (inliers < 8 || errors_deg.size() != obs.size())
+        continue;
+      if (eigvals[1] / std::max(eigvals[0], 1e-12) < 2.0)
+        continue;
+      const double median = Quantile(errors_deg, .5);
+      if (median <= 2.0) {
+        boresight[cid] = X;
+        verified[cid] = true;
+        boresight_median_deg[cid] = median;
+        source[cid] = "hand_eye";
+      }
+    }
+    Log("IMU hand-eye boresight: L=" +
+        (verified[0] ? std::to_string(boresight_median_deg[0]) + " deg" : std::string("unverified")) +
+        ", R=" +
+        (verified[1] ? std::to_string(boresight_median_deg[1]) + " deg" : std::string("unverified")));
+  }
+
+  void RefreshFromNavigationModel(const Reconstruction& model) {
+    if (!available)
+      return;
+    for (uint32_t cid = 0; cid < 2; ++cid) {
+      std::vector<Eigen::Quaterniond> samples;
+      for (uint32_t i = 0; i < model.images.size(); ++i)
+        if (model.images[i].registered && model.images[i].camera == cid)
+          samples.push_back((model.images[i].pose.Rotation() * body_rotation[i]).normalized());
+      if (samples.size() < 8)
+        continue;
+      std::vector<uint8_t> inlier(samples.size(), 1);
+      Eigen::Quaterniond q_mean = Eigen::Quaterniond::Identity();
+      bool ok = true;
+      for (int pass = 0; pass < 3; ++pass) {
+        Eigen::Matrix4d sum = Eigen::Matrix4d::Zero();
+        size_t count = 0;
+        for (size_t k = 0; k < samples.size(); ++k)
+          if (inlier[k]) {
+            sum += samples[k].coeffs() * samples[k].coeffs().transpose();
+            ++count;
+          }
+        if (count < 4) {
+          ok = false;
+          break;
+        }
+        const Eigen::Vector4d eig =
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d>(sum).eigenvectors().col(3);
+        q_mean = Eigen::Quaterniond(eig[3], eig[0], eig[1], eig[2]).normalized();
+        for (size_t k = 0; k < samples.size(); ++k)
+          inlier[k] = samples[k].angularDistance(q_mean) <= 5.0 * Pi / 180.0;
+      }
+      if (!ok)
+        continue;
+      std::vector<double> errors_deg;
+      errors_deg.reserve(samples.size());
+      for (const auto& q : samples)
+        errors_deg.push_back(q.angularDistance(q_mean) * 180.0 / Pi);
+      const double median = Quantile(errors_deg, .5);
+      if (median <= 2.0) {
+        boresight[cid] = q_mean.toRotationMatrix();
+        verified[cid] = true;
+        boresight_median_deg[cid] = median;
+        source[cid] = "navigation";
+      }
+    }
+    Log("IMU navigation boresight: L=" +
+        (verified[0] ? std::to_string(boresight_median_deg[0]) + " deg" : std::string("unverified")) +
+        ", R=" +
+        (verified[1] ? std::to_string(boresight_median_deg[1]) + " deg" : std::string("unverified")));
+  }
+
+  std::vector<RelativeRotationPrior> BuildRelativeRotationPriors(const Scene& scene) const {
+    std::vector<RelativeRotationPrior> priors;
+    if (!available)
+      return priors;
+    for (uint32_t cid = 0; cid < 2; ++cid) {
+      if (!verified[cid])
+        continue;
+      std::vector<uint32_t> ids;
+      for (uint32_t i = 0; i < scene.images.size(); ++i)
+        if (scene.images[i].camera == cid)
+          ids.push_back(i);
+      std::sort(ids.begin(), ids.end(), [&](uint32_t a, uint32_t b) {
+        return ExposureTime(scene.images[a]) < ExposureTime(scene.images[b]);
+      });
+      for (size_t k = 1; k < ids.size(); ++k) {
+        const uint32_t a = ids[k - 1], b = ids[k];
+        const double dt = ExposureTime(scene.images[b]) - ExposureTime(scene.images[a]);
+        if (dt <= 0 || dt > 5.0)
+          continue;
+        Eigen::Matrix3d R_ba;
+        if (RelativeRotation(scene, a, b, R_ba))
+          priors.push_back(
+              {a, b, Eigen::Quaterniond(R_ba).normalized(), ImuRelativeRotationSigma});
+      }
+    }
+    return priors;
+  }
+};
+
+bool RefineNearRotation(const std::vector<Measurement>& ra, const std::vector<Measurement>& rb,
+                        const std::vector<size_t>& inliers, const Eigen::Matrix3d& R_prior,
+                        double sigma_rad, double radius_px, Eigen::Matrix3d& R_inout,
+                        Eigen::Vector3d& t_inout) {
+  if (inliers.size() < 5 || t_inout.norm() < 1e-12)
+    return false;
+  const int n = int(inliers.size());
+  const size_t m = size_t(n) + 3;
+  const double inv_r = 1.0 / std::max(radius_px, 1e-12);
+  const Eigen::AngleAxisd aa0(R_inout * R_prior.transpose());
+  const Eigen::Vector3d d0 = aa0.angle() * aa0.axis();
+  double x[5] = {d0.x(), d0.y(), d0.z(), 0.0, 0.0};
+  Eigen::Vector3d t0 = t_inout.normalized();
+  Eigen::Vector3d tu, tv;
+  auto tangent_basis = [&]() {
+    const Eigen::Vector3d ax =
+        std::abs(t0.x()) < .9 ? Eigen::Vector3d::UnitX() : Eigen::Vector3d::UnitY();
+    tu = ax.cross(t0).normalized();
+    tv = t0.cross(tu);
+  };
+  tangent_basis();
+  auto t_at = [&](const double* q) {
+    return (t0 + q[3] * tu + q[4] * tv).normalized();
+  };
+  auto eval_at = [&](const double* q, std::vector<double>& e) {
+    const Eigen::Matrix3d R = ExpSO3({q[0], q[1], q[2]}) * R_prior;
+    const Eigen::Matrix3d E = CrossMatrix(t_at(q)) * R;
+    e.resize(m);
+    for (int k = 0; k < n; ++k)
+      e[size_t(k)] = inv_r * EpipolarSigned(E, ra[inliers[size_t(k)]], rb[inliers[size_t(k)]]);
+    for (int i = 0; i < 3; ++i)
+      e[size_t(n) + i] = sigma_rad > 0 ? q[i] / sigma_rad : 0.0;
+  };
+  auto robust_cost = [&](const std::vector<double>& e) {
+    double c = 0;
+    for (int k = 0; k < n; ++k)
+      c += std::log1p(e[size_t(k)] * e[size_t(k)]);
+    for (int i = 0; i < 3; ++i)
+      c += e[size_t(n) + i] * e[size_t(n) + i];
+    return c;
+  };
+  std::vector<double> e0, ep, em, w(m, 1.0);
+  std::vector<Eigen::Matrix<double, 5, 1>> J(m);
+  eval_at(x, e0);
+  double c0 = robust_cost(e0);
+  double lambda = 1e-3;
+  for (int it = 0; it < 15; ++it) {
+    for (int k = 0; k < n; ++k)
+      w[size_t(k)] = 1.0 / (1.0 + e0[size_t(k)] * e0[size_t(k)]);
+    for (int p = 0; p < 5; ++p) {
+      const double h = 1e-6;
+      double xp[5], xm[5];
+      std::copy_n(x, 5, xp);
+      std::copy_n(x, 5, xm);
+      xp[p] += h;
+      xm[p] -= h;
+      eval_at(xp, ep);
+      eval_at(xm, em);
+      for (size_t k = 0; k < m; ++k)
+        J[k][p] = (ep[k] - em[k]) / (2.0 * h);
+    }
+    Eigen::Matrix<double, 5, 5> H = Eigen::Matrix<double, 5, 5>::Zero();
+    Eigen::Matrix<double, 5, 1> g = Eigen::Matrix<double, 5, 1>::Zero();
+    for (size_t k = 0; k < m; ++k) {
+      H.noalias() += w[k] * J[k] * J[k].transpose();
+      g.noalias() += w[k] * J[k] * e0[k];
+    }
+    bool accepted = false;
+    for (int tries = 0; tries < 6 && !accepted; ++tries) {
+      Eigen::Matrix<double, 5, 5> A = H;
+      for (int a = 0; a < 5; ++a)
+        A(a, a) += lambda * std::max(H(a, a), 1e-12);
+      const Eigen::LDLT<Eigen::Matrix<double, 5, 5>> ldlt(A);
+      if (ldlt.info() != Eigen::Success) {
+        lambda *= 10.0;
+        continue;
+      }
+      const Eigen::Matrix<double, 5, 1> d = ldlt.solve(-g);
+      if (!d.allFinite()) {
+        lambda *= 10.0;
+        continue;
+      }
+      double xn[5];
+      for (int k = 0; k < 5; ++k)
+        xn[k] = x[k] + d[k];
+      eval_at(xn, ep);
+      const double c1 = robust_cost(ep);
+      if (c1 < c0) {
+        const double drop = (c0 - c1) / std::max(c0, 1e-300);
+        for (int k = 0; k < 3; ++k)
+          x[k] = xn[k];
+        t0 = t_at(xn);
+        x[3] = x[4] = 0.0;
+        tangent_basis();
+        e0.swap(ep);
+        c0 = c1;
+        lambda = std::max(lambda * 0.3, 1e-9);
+        accepted = true;
+        if (drop < 1e-6)
+          it = 15;
+      } else {
+        lambda *= 10.0;
+      }
+    }
+    if (!accepted)
+      break;
+  }
+  const Eigen::Matrix3d R_out = ExpSO3({x[0], x[1], x[2]}) * R_prior;
+  if (!R_out.allFinite() || !t0.allFinite())
+    return false;
+  R_inout = R_out;
+  t_inout = t0;
+  return true;
+}
+
+Pair VerifyKnownRotation(const Scene& scene, const Reconstruction& model, const MatchSet& matches,
+                         const Eigen::Matrix3d& R_prior, const Pose* free_pose) {
+  Pair result{matches.a, matches.b};
+  if (matches.matches.size() < 24)
+    return result;
+  const auto& ca = model.cameras[scene.images[matches.a].camera];
+  const auto& cb = model.cameras[scene.images[matches.b].camera];
+  std::vector<Measurement> ra, rb;
+  std::vector<Eigen::Vector3d> epipolar_normals;
+  ra.reserve(matches.matches.size());
+  rb.reserve(matches.matches.size());
+  epipolar_normals.reserve(matches.matches.size());
+  for (const auto& m : matches.matches) {
+    const auto x = Measure(ca, model.images[matches.a].pixels.at(m.a));
+    const auto y = Measure(cb, model.images[matches.b].pixels.at(m.b));
+    ra.push_back(x);
+    rb.push_back(y);
+    epipolar_normals.push_back(y.ray.cross(R_prior * x.ray));
+  }
+  const double focal = (ca.params[0] + ca.params[1] + cb.params[0] + cb.params[1]) / 4;
+  constexpr double rot_sigma_rad = 1.5 * Pi / 180.0;
+  const double loose_px = std::min(30.0, 3.0 + rot_sigma_rad * focal);
+  const double loose_sq = loose_px * loose_px;
+  Eigen::Vector3d best_t = Eigen::Vector3d::Zero();
+  size_t best_loose = 0;
+  double best_loose_cost = INFINITY;
+  auto score_t = [&](const Eigen::Vector3d& t) {
+    const Eigen::Matrix3d E = CrossMatrix(t) * R_prior;
+    size_t support = 0;
+    double cost = 0;
+    for (size_t i = 0; i < ra.size(); ++i) {
+      const double err = EpipolarSquared(E, ra[i], rb[i]);
+      support += err <= loose_sq;
+      cost += std::min(err, loose_sq);
+    }
+    if (support > best_loose || (support == best_loose && cost < best_loose_cost)) {
+      best_loose = support;
+      best_loose_cost = cost;
+      best_t = t;
+    }
+  };
+  const uint32_t seed = matches.a * 73856093u ^ matches.b * 19349663u ^ 0x517cc1b7u;
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<size_t> choose(0, ra.size() - 1);
+  size_t trials = 256;
+  for (size_t trial = 0; trial < trials; ++trial) {
+    const size_t i = choose(rng);
+    size_t j = 0;
+    do {
+      j = choose(rng);
+    } while (j == i);
+    const Eigen::Vector3d t = epipolar_normals[i].cross(epipolar_normals[j]);
+    const double norm = t.norm();
+    if (norm < 1e-10)
+      continue;
+    score_t(t / norm);
+    if (best_loose >= 24) {
+      const double success = std::pow(double(best_loose) / ra.size(), 2);
+      const double needed = success >= 1 ? 32 : std::ceil(std::log(.001) / std::log1p(-success));
+      trials = std::min(trials, size_t(std::clamp(needed, 32., 256.)));
+    }
+  }
+  if (best_loose < 24)
+    return result;
+  std::vector<size_t> loose_inliers;
+  const Eigen::Matrix3d E_loose = CrossMatrix(best_t) * R_prior;
+  for (size_t i = 0; i < ra.size(); ++i)
+    if (EpipolarSquared(E_loose, ra[i], rb[i]) <= loose_sq)
+      loose_inliers.push_back(i);
+
+  auto eval_strict = [&](const Eigen::Matrix3d& R_cand, const Eigen::Vector3d& t_cand,
+                         size_t& support, double& cost) {
+    const Eigen::Matrix3d E = CrossMatrix(t_cand) * R_cand;
+    support = 0;
+    cost = 0;
+    for (size_t i = 0; i < ra.size(); ++i) {
+      const double err = EpipolarSquared(E, ra[i], rb[i]);
+      support += err <= 9.0;
+      cost += std::min(err, 9.0);
+    }
+  };
+
+  Eigen::Matrix3d R_best = R_prior;
+  Eigen::Vector3d t_best = best_t;
+  bool have_refined =
+      RefineNearRotation(ra, rb, loose_inliers, R_prior, rot_sigma_rad, 3.0, R_best, t_best) &&
+      RotationAngleDeg(R_best * R_prior.transpose()) <= 5.0;
+  size_t best_strict = 0;
+  double best_strict_cost = INFINITY;
+  if (have_refined)
+    eval_strict(R_best, t_best, best_strict, best_strict_cost);
+  if (free_pose &&
+      RotationAngleDeg(free_pose->Rotation().toRotationMatrix() * R_prior.transpose()) <= 10.0) {
+    Eigen::Matrix3d R_alt = free_pose->Rotation().toRotationMatrix();
+    Eigen::Vector3d t_alt = free_pose->Translation();
+    if (t_alt.norm() >= 1e-12) {
+      t_alt.normalize();
+      if (RefineNearRotation(ra, rb, loose_inliers, R_prior, rot_sigma_rad, 3.0, R_alt, t_alt) &&
+          RotationAngleDeg(R_alt * R_prior.transpose()) <= 5.0) {
+        size_t alt_strict = 0;
+        double alt_cost = INFINITY;
+        eval_strict(R_alt, t_alt, alt_strict, alt_cost);
+        if (!have_refined || alt_strict > best_strict ||
+            (alt_strict == best_strict && alt_cost < best_strict_cost)) {
+          have_refined = true;
+          R_best = R_alt;
+          t_best = t_alt;
+          best_strict = alt_strict;
+          best_strict_cost = alt_cost;
+        }
+      }
+    }
+  }
+  if (!have_refined || best_strict < 24)
+    return result;
+
+  const Eigen::Matrix3d E_final = CrossMatrix(t_best) * R_best;
+  std::vector<uint8_t> strict_mask(ra.size(), 0);
+  for (size_t i = 0; i < ra.size(); ++i)
+    strict_mask[i] = EpipolarSquared(E_final, ra[i], rb[i]) <= 9.0 ? 1 : 0;
+
+  const Pose origin;
+  const Eigen::Quaterniond q_best(R_best);
+  std::vector<Match> best_inliers;
+  std::vector<double> best_angles;
+  Pose best_pose;
+  for (double sign : {1.0, -1.0}) {
+    Pose cand;
+    cand.Set(q_best, sign * t_best);
+    std::vector<Match> inliers;
+    std::vector<double> angles;
+    for (size_t i = 0; i < matches.matches.size(); ++i) {
+      if (!strict_mask[i])
+        continue;
+      const auto& m = matches.matches[i];
+      const auto& xa = model.images[matches.a].pixels[m.a];
+      const auto& xb = model.images[matches.b].pixels[m.b];
+      Eigen::Vector3d point;
+      if (Triangulate(origin, cand, ra[i].ray, rb[i].ray, point) &&
+          (ca.Project(point) - xa).norm() <= 6 &&
+          (cb.Project(cand.Apply(point)) - xb).norm() <= 6) {
+        inliers.push_back(m);
+        angles.push_back(
+            std::acos(std::clamp(ra[i].ray.dot(q_best.conjugate() * rb[i].ray), -1., 1.)) *
+            180.0 / Pi);
+      }
+    }
+    if (inliers.size() > best_inliers.size()) {
+      best_pose = cand;
+      best_inliers = std::move(inliers);
+      best_angles = std::move(angles);
+    }
+  }
+  if (best_inliers.size() < 24)
+    return result;
+  result.relative = best_pose;
+  result.inliers = std::move(best_inliers);
+  result.angle = best_angles.empty() ? 0 : Quantile(best_angles, .5);
+  return result;
+}
+
 // Each pair is verified independently with its own fixed seed, so the result does not depend on
 // the thread count.
 std::vector<Pair> VerifyPairs(const Scene& scene, const Reconstruction& model, const fs::path& work,
-                              const std::vector<std::array<uint32_t, 2>>& candidates, int workers) {
+                              const std::vector<std::array<uint32_t, 2>>& candidates, int workers,
+                              ImuPriorContext& imu) {
   std::vector<Pair> pairs(candidates.size());
   if (candidates.empty())
     return pairs;
@@ -387,6 +903,85 @@ std::vector<Pair> VerifyPairs(const Scene& scene, const Reconstruction& model, c
         Log("Geometry " + std::to_string(n) + "/" + std::to_string(candidates.size()));
     }
   });
+  imu.CalibrateHandEye(scene, pairs);
+  if (imu.verified[0] || imu.verified[1]) {
+    std::vector<size_t> check_indices;
+    std::vector<Eigen::Matrix3d> check_priors;
+    std::vector<double> check_angles;
+    for (size_t i = 0; i < pairs.size(); ++i) {
+      Eigen::Matrix3d R_prior;
+      if (!imu.RelativeRotation(scene, candidates[i][0], candidates[i][1], R_prior))
+        continue;
+      if (pairs[i].inliers.empty()) {
+        check_indices.push_back(i);
+        check_priors.push_back(R_prior);
+        check_angles.push_back(0.0);
+      } else {
+        const double angle_err =
+            RotationAngleDeg(pairs[i].relative.Rotation().toRotationMatrix() * R_prior.transpose());
+        if (angle_err > 3.0) {
+          check_indices.push_back(i);
+          check_priors.push_back(R_prior);
+          check_angles.push_back(angle_err);
+        }
+      }
+    }
+    imu.pairs_checked = check_indices.size();
+    if (!check_indices.empty()) {
+      enum class Outcome : uint8_t { Unchanged = 0, Rescued = 1, Overruled = 2, Rejected = 3 };
+      std::vector<Outcome> outcomes(check_indices.size(), Outcome::Unchanged);
+      std::atomic<size_t> next_check{0};
+      const int check_threads = std::min<int>(workers, int(check_indices.size()));
+      ParallelFor(size_t(check_threads), check_threads, 1, [&](size_t) {
+        std::ifstream stream(archive_path, std::ios::binary);
+        if (!stream)
+          throw std::runtime_error("Cannot read match archive: " + archive_path.u8string());
+        for (;;) {
+          const size_t k = next_check.fetch_add(1);
+          if (k >= check_indices.size())
+            break;
+          const size_t idx = check_indices[k];
+          const auto p = candidates[idx];
+          const auto it = index.find({p[0], p[1]});
+          if (it == index.end())
+            throw std::runtime_error("Missing match record in archive: " + std::to_string(p[0]) +
+                                     "_" + std::to_string(p[1]));
+          const auto matches = ReadMatchRecord(stream, it->second, p[0], p[1]);
+          if (pairs[idx].inliers.empty()) {
+            Pair known = VerifyKnownRotation(scene, model, matches, check_priors[k], nullptr);
+            if (!known.inliers.empty()) {
+              pairs[idx] = std::move(known);
+              outcomes[k] = Outcome::Rescued;
+            }
+          } else {
+            Pair known = VerifyKnownRotation(scene, model, matches, check_priors[k],
+                                             &pairs[idx].relative);
+            const double angle_err = check_angles[k];
+            if (!known.inliers.empty() &&
+                (known.inliers.size() * 10 >= pairs[idx].inliers.size() * 7 || angle_err > 6.0)) {
+              pairs[idx] = std::move(known);
+              outcomes[k] = Outcome::Overruled;
+            } else if (known.inliers.empty() && angle_err > 6.0) {
+              pairs[idx].inliers.clear();
+              outcomes[k] = Outcome::Rejected;
+            }
+          }
+        }
+      });
+      for (Outcome o : outcomes) {
+        if (o == Outcome::Rescued)
+          ++imu.pairs_rescued;
+        else if (o == Outcome::Overruled)
+          ++imu.pairs_overruled;
+        else if (o == Outcome::Rejected)
+          ++imu.pairs_rejected;
+      }
+      Log("IMU verification pass: checked " + std::to_string(imu.pairs_checked) + ", rescued " +
+          std::to_string(imu.pairs_rescued) + ", overruled " +
+          std::to_string(imu.pairs_overruled) + ", rejected " +
+          std::to_string(imu.pairs_rejected));
+    }
+  }
   return pairs;
 }
 using FeatureColors = std::vector<std::vector<std::array<uint8_t, 3>>>;
@@ -733,11 +1328,183 @@ size_t Correspondences(const Reconstruction& model, const std::vector<Pair>& pai
   }
   return xyz->size();
 }
+bool PredictImageRotation(const Scene& scene, const Reconstruction& model,
+                          const std::vector<Pair>& pairs, const std::vector<size_t>& neighbors,
+                          uint32_t id, const ImuPriorContext& imu, bool in_nav_frame,
+                          Eigen::Matrix3d& R_pred) {
+  if (!imu.available)
+    return false;
+  size_t best_shared = 0, best_inliers = 0;
+  uint32_t best_nbr = UINT32_MAX;
+  Eigen::Matrix3d best_rel = Eigen::Matrix3d::Identity();
+  for (size_t index : neighbors) {
+    const auto& pair = pairs[index];
+    const bool first = pair.a == id;
+    const uint32_t nbr = first ? pair.b : pair.a;
+    if (!model.images[nbr].registered)
+      continue;
+    Eigen::Matrix3d R_rel;
+    if (!imu.RelativeRotation(scene, nbr, id, R_rel))
+      continue;
+    size_t shared = 0;
+    for (const auto& m : pair.inliers)
+      if (model.images[nbr].points[first ? m.b : m.a] != NoPoint)
+        ++shared;
+    if (shared == 0)
+      continue;
+    if (shared > best_shared || (shared == best_shared && pair.inliers.size() > best_inliers) ||
+        (shared == best_shared && pair.inliers.size() == best_inliers && nbr < best_nbr)) {
+      best_shared = shared;
+      best_inliers = pair.inliers.size();
+      best_nbr = nbr;
+      best_rel = R_rel;
+    }
+  }
+  if (best_nbr != UINT32_MAX) {
+    R_pred = best_rel * model.images[best_nbr].pose.Rotation().toRotationMatrix();
+    return true;
+  }
+  const uint32_t cam_id = scene.images[id].camera;
+  if (in_nav_frame && imu.verified[cam_id] && imu.source[cam_id] == "navigation") {
+    R_pred = imu.boresight[cam_id] * imu.body_rotation[id].conjugate().toRotationMatrix();
+    return true;
+  }
+  return false;
+}
+
+bool SolvePnPKnownRotation(const Camera& cam, const ModelImage& image,
+                           const std::vector<cv::Point3d>& xyz,
+                           const std::vector<uint32_t>& features, const Eigen::Matrix3d& R_pred,
+                           const Eigen::Vector3d* navigation, uint32_t id, Pose& out_pose) {
+  const size_t n = xyz.size();
+  if (n < 24)
+    return false;
+  std::vector<Eigen::Vector3d> pts(n), rays(n), rx(n);
+  for (size_t i = 0; i < n; ++i) {
+    pts[i] = {xyz[i].x, xyz[i].y, xyz[i].z};
+    rays[i] = cam.Ray(image.pixels[features[i]]);
+    rx[i] = R_pred * pts[i];
+  }
+  const Eigen::Quaterniond q_pred(R_pred);
+  Pose best_pose;
+  size_t best_loose = 0;
+  double best_loose_cost = INFINITY;
+  std::mt19937 rng(id * 2654435761u ^ 0x517cc1b7u);
+  std::uniform_int_distribution<size_t> choose(0, n - 1);
+  size_t trials = 512;
+  for (size_t trial = 0; trial < trials; ++trial) {
+    const size_t i = choose(rng);
+    size_t j = 0;
+    do {
+      j = choose(rng);
+    } while (j == i);
+    if (std::abs(rays[i].dot(rays[j])) > 1. - 1e-8)
+      continue;
+    Eigen::Matrix3d N = Eigen::Matrix3d::Zero();
+    Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+    for (size_t k : {i, j}) {
+      const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() - rays[k] * rays[k].transpose();
+      N.noalias() += P;
+      rhs.noalias() -= P * rx[k];
+    }
+    const Eigen::LDLT<Eigen::Matrix3d> ldlt(N);
+    if (ldlt.info() != Eigen::Success || ldlt.vectorD().minCoeff() <= 1e-8)
+      continue;
+    const Eigen::Vector3d t = ldlt.solve(rhs);
+    if (!t.allFinite())
+      continue;
+    if ((rx[i] + t).dot(rays[i]) <= 0 || (rx[j] + t).dot(rays[j]) <= 0)
+      continue;
+    Pose cand;
+    cand.Set(q_pred, t);
+    if (navigation && (cand.Center() - *navigation).norm() > NavigationGate)
+      continue;
+    size_t support = 0;
+    double cost = 0;
+    for (size_t k = 0; k < n; ++k) {
+      const Eigen::Vector3d v = cand.Apply(pts[k]);
+      const double err =
+          v.z() > 0 ? (cam.Project(v) - image.pixels[features[k]]).squaredNorm() : INFINITY;
+      support += err <= 144.;
+      cost += std::min(err, 144.);
+    }
+    if (support > best_loose || (support == best_loose && cost < best_loose_cost)) {
+      best_pose = cand;
+      best_loose = support;
+      best_loose_cost = cost;
+    }
+    if (best_loose >= 24) {
+      const double success = std::pow(double(best_loose) / n, 2);
+      const double needed = success >= 1 ? 32 : std::ceil(std::log(.001) / std::log1p(-success));
+      trials = std::min(trials, size_t(std::clamp(needed, 32., 512.)));
+    }
+  }
+  if (best_loose < 24)
+    return false;
+  auto strict_score = [&](const Pose& pose, size_t& support, double& cost, size_t& cell_count) {
+    if (navigation && (pose.Center() - *navigation).norm() > NavigationGate)
+      return false;
+    if (RotationAngleDeg(pose.Rotation().toRotationMatrix() * R_pred.transpose()) > 5.0)
+      return false;
+    support = 0;
+    cost = 0;
+    std::set<int> cells;
+    for (size_t i = 0; i < n; ++i) {
+      const Eigen::Vector3d v = pose.Apply(pts[i]);
+      const Eigen::Vector2d& px = image.pixels[features[i]];
+      const double err = v.z() > 0 ? (cam.Project(v) - px).squaredNorm() : INFINITY;
+      if (err <= 36.) {
+        ++support;
+        cells.insert(cam.CoverageCell(px));
+      }
+      cost += std::min(err, 36.);
+    }
+    cell_count = cells.size();
+    return true;
+  };
+  Pose cur = best_pose;
+  size_t cur_support = 0, cur_cells = 0;
+  double cur_cost = INFINITY;
+  strict_score(cur, cur_support, cur_cost, cur_cells);
+  for (int round = 0; round < 2; ++round) {
+    const double threshold = round == 0 ? 12.0 : 6.0;
+    std::vector<Eigen::Vector3d> fit_points;
+    std::vector<Eigen::Vector2d> fit_pixels;
+    for (size_t i = 0; i < n; ++i) {
+      const Eigen::Vector3d v = cur.Apply(pts[i]);
+      const Eigen::Vector2d& px = image.pixels[features[i]];
+      if (v.z() > 0 && (cam.Project(v) - px).norm() <= threshold) {
+        fit_points.push_back(pts[i]);
+        fit_pixels.push_back(px);
+      }
+    }
+    if (fit_points.size() < 6)
+      break;
+    Pose cand = cur;
+    RefinePose(cam, cand, fit_points, fit_pixels);
+    size_t cand_support = 0, cand_cells = 0;
+    double cand_cost = INFINITY;
+    if (strict_score(cand, cand_support, cand_cost, cand_cells) &&
+        (cand_support > cur_support || (cand_support == cur_support && cand_cost < cur_cost))) {
+      cur = cand;
+      cur_support = cand_support;
+      cur_cost = cand_cost;
+      cur_cells = cand_cells;
+    } else if (round == 1) {
+      break;
+    }
+  }
+  if (cur_support < MinimumImageObservations || cur_cells < MinimumImageCells)
+    return false;
+  out_pose = cur;
+  return true;
+}
+
 // With the model in the navigation frame, pose hypotheses whose centre is beyond the navigation
 // gate are rejected: repeated texture can otherwise support a pose shifted along the pattern.
-bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
+bool Register(const Scene& scene, Reconstruction& model, const std::vector<Pair>& pairs,
               const std::vector<size_t>& neighbors, uint32_t id,
-              const Eigen::Vector3d* navigation) {
+              const Eigen::Vector3d* navigation, ImuPriorContext& imu, bool in_nav_frame) {
   std::vector<cv::Point3d> xyz;
   std::vector<cv::Point2d> xy;
   std::vector<uint32_t> features;
@@ -810,34 +1577,59 @@ bool Register(Reconstruction& model, const std::vector<Pair>& pairs,
       trials = std::min(trials, size_t(std::clamp(needed, 32., 2000.)));
     }
   }
-  if (maximum < 24)
-    return false;
-  for (int round = 0; round < 2; ++round) {
-    std::vector<Eigen::Vector3d> fit_points;
-    std::vector<Eigen::Vector2d> fit_pixels;
+  bool free_ok = false;
+  if (maximum >= 24) {
+    for (int round = 0; round < 2; ++round) {
+      std::vector<Eigen::Vector3d> fit_points;
+      std::vector<Eigen::Vector2d> fit_pixels;
+      for (size_t i = 0; i < xyz.size(); ++i) {
+        const Eigen::Vector3d point(xyz[i].x, xyz[i].y, xyz[i].z);
+        const auto v = selected.Apply(point);
+        const auto& pixel = image.pixels[features[i]];
+        if (v.z() > 0 && (cam.Project(v) - pixel).norm() <= 6) {
+          fit_points.push_back(point);
+          fit_pixels.push_back(pixel);
+        }
+      }
+      Pose pose = selected;
+      RefinePose(cam, pose, fit_points, fit_pixels);
+      if (!score(pose))
+        break;
+    }
+    std::set<int> cells;
     for (size_t i = 0; i < xyz.size(); ++i) {
-      const Eigen::Vector3d point(xyz[i].x, xyz[i].y, xyz[i].z);
-      const auto v = selected.Apply(point);
+      const auto v = selected.Apply({xyz[i].x, xyz[i].y, xyz[i].z});
       const auto& pixel = image.pixels[features[i]];
-      if (v.z() > 0 && (cam.Project(v) - pixel).norm() <= 6) {
-        fit_points.push_back(point);
-        fit_pixels.push_back(pixel);
+      if (v.z() > 0 && (cam.Project(v) - pixel).norm() <= 6)
+        cells.insert(cam.CoverageCell(pixel));
+    }
+    free_ok = maximum >= MinimumImageObservations && cells.size() >= MinimumImageCells;
+  }
+  Eigen::Matrix3d R_pred;
+  if (PredictImageRotation(scene, model, pairs, neighbors, id, imu, in_nav_frame, R_pred)) {
+    if (!free_ok) {
+      Pose known_pose;
+      if (!SolvePnPKnownRotation(cam, image, xyz, features, R_pred, navigation, id, known_pose))
+        return false;
+      selected = known_pose;
+      ++imu.pnp_rescued;
+    } else {
+      const double angle_err =
+          RotationAngleDeg(selected.Rotation().toRotationMatrix() * R_pred.transpose());
+      if (angle_err > 3.0) {
+        Pose known_pose;
+        if (SolvePnPKnownRotation(cam, image, xyz, features, R_pred, navigation, id, known_pose)) {
+          selected = known_pose;
+          ++imu.pnp_overruled;
+        } else if (angle_err > 8.0) {
+          ++imu.pnp_rejected;
+          return false;
+        }
       }
     }
-    Pose pose = selected;
-    RefinePose(cam, pose, fit_points, fit_pixels);
-    if (!score(pose))
-      break;
-  }
-  std::set<int> cells;
-  for (size_t i = 0; i < xyz.size(); ++i) {
-    const auto v = selected.Apply({xyz[i].x, xyz[i].y, xyz[i].z});
-    const auto& pixel = image.pixels[features[i]];
-    if (v.z() > 0 && (cam.Project(v) - pixel).norm() <= 6)
-      cells.insert(cam.CoverageCell(pixel));
-  }
-  if (maximum < MinimumImageObservations || cells.size() < MinimumImageCells)
+  } else if (!free_ok) {
     return false;
+  }
   image.pose = selected;
   image.registered = true;
   for (size_t i = 0; i < xyz.size(); ++i) {
@@ -975,10 +1767,13 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   for (const auto& pair : catalog.at("pairs"))
     candidates.push_back(pair.get<std::array<uint32_t, 2>>());
   const auto geometry_started = Clock::now();
+  ImuPriorContext imu;
+  imu.Initialize(scene);
   // Pair verification uses the whole CPU.
   const int geometry_workers =
       std::clamp(int(std::thread::hardware_concurrency()), workers, 32);
-  const auto pairs = VerifyPairs(scene, m, work, candidates, geometry_workers);
+  const auto pairs = VerifyPairs(scene, m, work, candidates, geometry_workers, imu);
+  std::vector<RelativeRotationPrior> rel_rot_priors = imu.BuildRelativeRotationPriors(scene);
   const double geometry_seconds = Seconds(geometry_started);
   const auto graph_started = Clock::now();
   Tracks graph(m, pairs);
@@ -1004,7 +1799,8 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   // pose hypothesis in registration lost three R exposures).
   auto ba = [&](const std::string& stage, int iterations, const std::set<uint32_t>& variable = {},
                 const std::set<uint64_t>& selected = {}) {
-    return Optimize(m, scene.cameras, stage, ba_workers, iterations, variable, {}, nav, selected);
+    return Optimize(m, scene.cameras, stage, ba_workers, iterations, variable, {}, nav, selected,
+                    nullptr, {}, {}, false, {}, rel_rot_priors);
   };
   auto unregister = [&](const std::vector<uint32_t>& ids) {
     for (uint32_t id : ids)
@@ -1113,6 +1909,8 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       Log("Unregister " + scene.images[id].name + " (beyond the navigation gate)");
     unregister(outliers);
     nav = positions;
+    imu.RefreshFromNavigationModel(m);
+    rel_rot_priors = imu.BuildRelativeRotationPriors(scene);
     navigation_frame = {{"used", true},
                         {"registered_images", ids.size()},
                         {"scale", fit.scale},
@@ -1135,8 +1933,8 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       if (count < 24)
         break;
       const auto registration_started = Clock::now();
-      const bool success =
-          Register(m, pairs, adjacency[id], id, nav.empty() ? nullptr : &positions[id]);
+      const bool success = Register(scene, m, pairs, adjacency[id], id,
+                                    nav.empty() ? nullptr : &positions[id], imu, !nav.empty());
       registration_seconds += Seconds(registration_started);
       if (!success)
         continue;
@@ -1309,6 +2107,20 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
             {"unassigned_completion", unassigned_completion},
             {"pre_calibration_completion", calibration_completion},
             {"navigation_frame", navigation_frame},
+            {"imu_prior",
+             {{"available", imu.available},
+              {"used", imu.verified[0] || imu.verified[1]},
+              {"verified", imu.verified},
+              {"source", imu.source},
+              {"boresight_median_deg", imu.boresight_median_deg},
+              {"relative_rotation_priors", rel_rot_priors.size()},
+              {"pairs_checked", imu.pairs_checked},
+              {"pairs_rescued", imu.pairs_rescued},
+              {"pairs_overruled", imu.pairs_overruled},
+              {"pairs_rejected", imu.pairs_rejected},
+              {"pnp_rescued", imu.pnp_rescued},
+              {"pnp_overruled", imu.pnp_overruled},
+              {"pnp_rejected", imu.pnp_rejected}}},
             {"calibration_tracks", stable_calibration ? "stable" : "all"},
             {"calibration_selection", calibration_selection},
             {"optimization", optimization}};

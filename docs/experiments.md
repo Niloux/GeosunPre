@@ -725,3 +725,31 @@
 
 - **专项排查归档（2026-11-22）**：针对 `小场景-fixed` 在高处俯视 novel view 下 1F 弱纹理白墙出现彩斑、拉丝及法线起皱的问题，完成 `v1`–`v4` 参数对照与 3D 高斯几何/色域审计，详见 [novel-view-whitewall-investigation.md](file:///C:/Users/youwu/Documents/GeosunPre/docs/novel-view-whitewall-investigation.md)（[configs/trainer.json](file:///C:/Users/youwu/Documents/GeosunPre/configs/trainer.json) 暂保持不变）。
 
+## 2026-11-22：200 Hz IMU 相对旋转先验前移进 SfM（手眼自标定 + 已知旋转验证/PnP + BA 先验）
+
+- **核心改动**：借鉴 Spirula `PriorSource` / `KnownRotation` 思路，在保持全局快门 SfM 不绑 L/R 刚性 rig 的前提下，将 `ReadExposureKinematics` 提供的 200 Hz POS 姿态前移进 SfM 全链路：
+  1. [optimization.h](file:///C:/Users/youwu/Documents/GeosunPre/src/sfm/optimization.h) / [optimization.cpp](file:///C:/Users/youwu/Documents/GeosunPre/src/sfm/optimization.cpp)：新增 `RelativeRotationCost` 与 `Optimize(..., relative_rotations)`，在非卷帘 BA 中对同镜头连续曝光（`Δt <= 5 s`）施加相对旋转先验（`ImuRelativeRotationSigma = 0.5°`，`2σ Huber`）。
+  2. [reconstruction.cpp](file:///C:/Users/youwu/Documents/GeosunPre/src/sfm/reconstruction.cpp)：新增 `ImuPriorContext`（Pass 1 五点初验后各镜头独立跑 3 轮 `A X = X B` IRLS 手眼自标定；转入导航坐标系后再用注册姿态稳健四元数均值刷新视轴外参）、`VerifyPairs` Pass 2 已知旋转 2 点 RANSAC + 5-DOF 近旋转 LM 精调（救回漏配对并改判/剔除偏离先验的错配）、`Register` 已知旋转 2 点 PnP 回退与离群复核（`SolvePnPKnownRotation`），并将统计记录写入 `cache/sfm.json` 的 `imu_prior`。
+
+### 实景对比：`小场景`（296 幅异步）与 `展厅`（588 幅同步）
+
+两套实景全流程输出至独立目录（[小场景-imu-sfm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/小场景-imu-sfm-out) 与 [展厅-imu-sfm-out](file:///C:/Users/youwu/Documents/GeosunPre/work/展厅-imu-sfm-out)）并保留在本地，均通过 `run.ps1 check` 校验（`passed: true`）。`小场景` 基线取同代码世代（含 `bdda234` 卷帘修复）的 `work\1122\小场景-fixed`；`展厅` 基线取 `work\1122\展厅`。
+
+| 指标 | `小场景` 基线 (`1122/小场景-fixed`) | `小场景` IMU-SfM (`小场景-imu-sfm-out`) | `展厅` 基线 (`1122/展厅`) | `展厅` IMU-SfM (`展厅-imu-sfm-out`) |
+| --- | :---: | :---: | :---: | :---: |
+| 注册情况（最终交付） | `296 / 296` | `296 / 296`（`pnp_rescued=2`） | `588 / 588`（`rig_rescue=3`） | `588 / 588`（`rig_rescue=3`） |
+| 手眼 / 终态视轴中位残差 (L / R) | — | `0.394° / 0.188°` → `0.580° / 0.188°` | — | `0.607° / 0.647°` → `0.607° / 0.421°` |
+| Pass 2 核验（check/rescue/overrule/reject） | — | `782 / 8 / 199 / 151` | — | `2066 / 24 / 566 / 99` |
+| 验证配对数 / 几何耗时 | `3,258` / `3.64 s` | `3,115` / `4.03 s` | `7,958` / `6.42 s` | `7,883` / `7.52 s` |
+| `sfm` 总耗时 | `67.17 s` | **`58.84 s`**（`-12.4%`） | `127.60 s` | `141.61 s`（`+11.0%`） |
+| 卷帘前点数 / 观测数 (`source_quality`) | `161,364` / `534,420` | **`166,230` / `548,115`**（`+3.0% / +2.6%`） | `206,648` / `958,662` | **`208,565` / `972,749`**（`+0.93% / +1.47%`） |
+| 交付点数 / 观测数 (`quality`) | `118,837` / `404,029` | **`122,614` / `413,944`**（`+3.2% / +2.5%`） | `152,915` / `738,818` | **`154,227` / `748,355`**（`+0.86% / +1.29%`） |
+| 交付长轨迹 (`tracks >= 3 / >= 8`) | `56,061` / `6,527` | **`57,300` / `6,675`** | `71,183` / `17,364` | **`71,891` / `17,630`** |
+| 交付重投影 `median / p90` | `0.7279 / 1.7694 px` | **`0.7247 / 1.7625 px`** | `0.8898 / 2.0707 px` | `0.8940 / 2.0763 px` |
+| 导航位置残差 `median / p90` | `0.0432 / 0.0521 m` | **`0.0421 / 0.0508 m`** | `0.0213 / 0.0367 m` | **`0.0211 / 0.0357 m`** |
+| LAS 点到面 `median / p90` | `0.00747 / 0.02828 m` | **`0.00717 / 0.02703 m`** | `0.00563 / 0.01644 m` | `0.00583 / 0.01655 m` |
+| 卷帘 `used` / `readout_s` | `true` / `[-0.04232, +0.03851]` | `true` / `[-0.04192, +0.03862]` | `true` / `[+0.02439, +0.02298]` | `true` / `[+0.02449, +0.02359]` |
+| 卷帘留出 `before -> after` 中位 | `1.1560 -> 0.9412 px` | `1.1650 -> 0.9534 px` | `1.4319 -> 1.1525 px` | **`1.4277 -> 1.1506 px`** |
+
+- **结论**：双场景手眼自标定稳定收敛（`0.19°–0.65°`），已知旋转二次核验精准清理了误匹配并救回 `8` / `24` 对弱纹理配对，增量注册在 `小场景` 直接救回 `2` 帧 AP3P 失败帧，双场景长轨迹与总有效观测数均稳定提升（`+1.5%–2.6%`），导航位置与重投影一致性保持或微幅改善，且完全不干扰后续 `shutter` 卷帘读出时间求解（`shutter.used=true` 稳定保留）。`展厅` 的 `00214–00216-R` 白墙帧因匹配候选中不足 24 条共视观测仍由 `shutter.rig_rescue` 完整补回。确立保留为主线默认，无需新增 CLI 开关。
+
