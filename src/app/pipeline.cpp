@@ -390,7 +390,8 @@ std::vector<fs::path> RunStage(const std::string& stage, const Scene& scene, con
     return {work / "scene.json"};
   }
   if (stage == "masks") {
-    WriteJson(work / "cache/masks_profile.json", MakeMasks(scene, work, root));
+    WriteJson(work / "cache/masks_profile.json",
+              MakeMasks(scene, work, root, settings.at("workers")));
     return {work / "cache/masks", work / "cache/masks_profile.json"};
   }
   if (stage == "features") {

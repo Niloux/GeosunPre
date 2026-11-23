@@ -88,3 +88,31 @@
   - `展厅` 实景全流程输出至 `work/展厅-ssi`（耗时 `617.10 s`，`588/588` 注册，MoGe-2 SSI 导出 `98.01 s`）与非破坏性 `export` 至 `work/展厅-ssi-verify` 均通过 `geosunpre check`（`passed: true`，`415,362,326` 有效深度与法向像素，`iterations=29000`、`max_cap=2600000`、`depth_loss_mode="ssi"`）。
   - `geosun_3dgs_train.exe`（5 步）与 `LichtFeld-Studio.exe`（1 步）实跑加载 `work/展厅-ssi-verify` 退出码 `0`：确认 `Depth anchors` 以 `ssi-depth` 拟合 `579/588` 相机（`mean |corr| = 0.985`）、`588` 相机启用卷帘渲染、`roi.json` 生效。
 - **未验证项**：尚未跑完 `展厅-ssi` 或 `小场景` 的完整 29k–30k 步训练与留出评测对比。
+
+## 2026-11-23：借鉴 Spirula 第一顺位轻量优化（`WriterPool` / 特征压缩 / 中间 BA 早停 / LAS 表面命中率保护）
+
+- **核心改动**：
+  1. **`masks` 固定写盘线程池与全图合成异步化**（[frontend.h](../src/frontend/frontend.h)、[frontend.cpp](../src/frontend/frontend.cpp)、[pipeline.cpp](../src/app/pipeline.cpp)）：以有界多线程池 `WriterPool`（1–8 线程，`workers` 控制）替换原 `AsyncWriter`，将全分辨率 `cv::resize` 上采样、镜头有效域合成与 PNG 写盘从主推理循环下沉至后台与 TensorRT 推理完全重叠。
+  2. **SfM 建图前特征压缩**（[reconstruction.cpp](../src/sfm/reconstruction.cpp)）：在 `VerifyPairs` 之后、`Tracks` 构建之前新增 `FeatureCompaction`，剔除未出现在任何已验证匹配（及断点已绑点）中的冗余特征并重映射索引（统计写入 `cache/sfm.json` 的 `compact_features`），写盘 `incremental.bin` 断点与终局 `visual.bin` 前自动还原完整原始索引。
+  3. **增量期中间 BA 松容差早停**（[optimization.h](../src/sfm/optimization.h)、[optimization.cpp](../src/sfm/optimization.cpp)、[reconstruction.cpp](../src/sfm/reconstruction.cpp)）：为 `Optimize` 增加可选 `function_tolerance`；仅在增量增长期临时 BA（每 8 帧局部 `1e-3`、导航转换/32 帧首次标定/周期及停滞全局 `5e-4`）放宽早停阈值，seed 与终局严格 BA（`1e-5` / `1e-6`）及 `shutter` 保持不变。
+  4. **`align` LAS 表面命中率失位图硬保护**（[alignment.cpp](../src/alignment/alignment.cpp)）：借鉴 Spirula `5% + 20 cm` 规则新增 `CheckLasSurfaceHitRate`，在抽样未命中 `< 50%` 时自动对未命中点执行一次流式全量 LAS 复核防误删，统计记入 `cache/alignment.json` 的 `las_surface_check`。
+- **已观测验证**（`.\tools\windows\build.ps1` Ninja Release `/W4` 0 错误 0 新增警告；`小场景` 296 图全流程输出至 `work/小场景-spirula-p1-out`，总耗时 `324.02 s`，`run.ps1 check` `passed: true`）：
+
+| 指标 (`小场景` 296 图) | 基线 (`小场景-imu-sfm-out`) | 本次 (`小场景-spirula-p1-out`) |
+| --- | :---: | :---: |
+| `masks` 总耗时 / 主线程后处理 / 后台写盘 | — | `74.85 s` / `0.09 s` / `31.65 s`（全重叠） |
+| `sfm` 特征压缩 `before -> after` | — | `909,312 -> 712,472`（`78.35%` 保留） |
+| `sfm` 总耗时（中间 BA / 终局 BA） | `58.84 s` | `59.38 s`（44 次中间 `12.23 s` / 5 次终局 `30.49 s`） |
+| 终局 `principal` BA 线性求解 | — | `33` 轮 `22.51 s`（线性 `13.92 s` / `8045` CG 迭代） |
+| `align` `las_surface_check` | — | `296/296` 通过，`min_hit_rate = 91.25%`，`dropped = 0` |
+| 最终注册 / `check` | `296 / 296` | `296 / 296`（`passed: true`） |
+| 交付点数 / 观测数 | `122,614 / 413,944` | `121,670 / 419,989`（观测 `+1.46%`） |
+| 交付长轨迹 (`tracks >= 3 / >= 8`) | `57,300 / 6,675` | **`57,954 / 6,903`**（`+1.1% / +3.4%`） |
+| 交付重投影 `median / p90` | `0.7247 / 1.7625 px` | `0.7349 / 1.7777 px` |
+| 导航位置残差 `median / p90` | `0.0421 / 0.0508 m` | `0.0436 / 0.0513 m` |
+| `align` LAS 点到面 `median / p90` | `7.17 / 27.03 mm` | **`6.57 / 22.64 mm`** |
+| 卷帘 `used` / `readout_s` | `true` / `[-0.04192, +0.03862]` | `true` / `[-0.04202, +0.03824]` |
+| 卷帘留出 `before -> after` 中位 | `1.1650 -> 0.9534 px` | `1.1683 -> 0.9575 px` |
+| `polish` 重关联 LAS 平面 `med / p90` | — | `4.04 / 13.84 mm` |
+
+- **结论与未验证项**：采用为主线。`masks` 写盘与上采样已 100% 与 TRT 推理重叠，SfM 有效轨迹与长轨迹稳步增加、`align` 平面精度略优且卷帘/验收稳定通过；实测同时显示 `小场景` `sfm` 终局严格 BA 的线性求解（`13.92 s` / `8045` CG 迭代）为下一步 CUDA GPU BA 的主要提速空间。尚未在更大图量场景（如 `展厅` 588 图）实测增长期 BA 早停/特征压缩的耗时差异，亦未构造故意失位相机用例单独触发 `las_surface_check` 全量复核与剔除分支。

@@ -3,7 +3,7 @@
 #include <set>
 
 namespace geosun {
-Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& models);
+Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& models, int workers = 4);
 Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& models);
 Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& models,
                  const std::set<uint32_t>& repair = {});

@@ -433,7 +433,8 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
               const std::set<uint64_t>& selected_points, ShutterMotion* shutter,
               const std::vector<RigFrame>& frames, const std::set<uint64_t>& fixed_points,
               bool fixed_rig_and_readout, const std::vector<Eigen::Vector3d>& imu_omega,
-              const std::vector<RelativeRotationPrior>& relative_rotations) {
+              const std::vector<RelativeRotationPrior>& relative_rotations,
+              double function_tolerance) {
   const auto started = Clock::now();
   ceres::Problem problem;
   auto ordering = std::make_shared<ceres::ParameterBlockOrdering>();
@@ -736,7 +737,9 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   options.linear_solver_ordering = has_variable_points ? ordering : nullptr;
   // Below 1e-6 the final refinements only creep: in the shutter BA the last half of the
   // iterations moved camera centres by under 5 um and changed held-out error by 3e-5 px.
-  options.function_tolerance = iterations <= 100 && planes.empty() ? 1e-5 : 1e-6;
+  options.function_tolerance =
+      function_tolerance > 0 ? function_tolerance
+                             : (iterations <= 100 && planes.empty() ? 1e-5 : 1e-6);
   Progress progress;
   options.callbacks.push_back(&progress);
   ceres::Solver::Summary summary;

@@ -153,28 +153,88 @@ class ImageReader {
     return image;
   }
 };
-class AsyncWriter {
-  std::deque<std::future<double>> jobs;
+class WriterPool {
+  std::deque<std::function<void()>> queue_;
+  std::mutex mutex_;
+  std::condition_variable can_push_, can_pop_;
+  bool stop_ = false;
+  std::exception_ptr error_;
+  std::vector<std::thread> workers_;
+  size_t max_queue_ = 8;
+
+  void Run() {
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        can_pop_.wait(lock, [&] { return !queue_.empty() || stop_; });
+        if (queue_.empty() && stop_)
+          return;
+        task = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      can_push_.notify_one();
+      const auto started = Clock::now();
+      try {
+        task();
+        const double elapsed = Seconds(started);
+        std::lock_guard<std::mutex> lock(mutex_);
+        seconds += elapsed;
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!error_)
+          error_ = std::current_exception();
+        stop_ = true;
+        can_push_.notify_all();
+        can_pop_.notify_all();
+        return;
+      }
+    }
+  }
 
  public:
   double seconds = 0;
-  void Pop() {
-    seconds += jobs.front().get();
-    jobs.pop_front();
+
+  explicit WriterPool(int threads = 4, size_t max_queue = 0) {
+    const int n = std::clamp(threads, 1, 8);
+    max_queue_ = max_queue ? max_queue : std::max<size_t>(8, size_t(n) * 2);
+    workers_.reserve(size_t(n));
+    for (int i = 0; i < n; ++i)
+      workers_.emplace_back([this] { Run(); });
   }
-  template <class Function>
-  void Submit(Function write) {
-    if (jobs.size() == 4)
-      Pop();
-    jobs.push_back(std::async(std::launch::async, [write = std::move(write)] {
-      const auto started = Clock::now();
-      write();
-      return Seconds(started);
-    }));
+
+  ~WriterPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    can_push_.notify_all();
+    can_pop_.notify_all();
+    for (auto& w : workers_)
+      if (w.joinable())
+        w.join();
   }
+
+  void Submit(std::function<void()> write) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    can_push_.wait(lock, [&] { return queue_.size() < max_queue_ || error_ != nullptr || stop_; });
+    if (error_)
+      std::rethrow_exception(error_);
+    queue_.push_back(std::move(write));
+    can_pop_.notify_one();
+  }
+
   void Finish() {
-    while (!jobs.empty())
-      Pop();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    can_pop_.notify_all();
+    for (auto& w : workers_)
+      if (w.joinable())
+        w.join();
+    if (error_)
+      std::rethrow_exception(error_);
   }
 };
 std::vector<size_t> Select(const std::vector<std::array<float, 3>>& points, const Camera& camera) {
@@ -435,11 +495,10 @@ int GroundingSize(const Json& manifest) {
 struct GroundingResult {
   cv::Mat transient, sky;
 };
-// Full-size 255 where people and the shadows next to them are, and where the sky is. A person
-// detection mostly covered by an at least as confident robot detection is a humanoid exhibit and
-// stays static.
-GroundingResult GroundingMask(const std::vector<Tensor>& outputs, int width, int height,
-                              GroundingCounts& counts) {
+// Coarse grounding-grid (size x size) 255 where people and the shadows next to them are, and
+// where the sky is. A person detection mostly covered by an at least as confident robot detection
+// is a humanoid exhibit and stays static.
+GroundingResult GroundingMaskCoarse(const std::vector<Tensor>& outputs, GroundingCounts& counts) {
   const int k = int(outputs[0].shape[1]), size = int(outputs[2].shape[3]);
   const float *scores = outputs[0].Floats(), *logits = outputs[2].Floats();
   auto detections = [&](int prompt) {
@@ -526,12 +585,18 @@ GroundingResult GroundingMask(const std::vector<Tensor>& outputs, int width, int
     sky |= mask;
   counts.skies += skies.size();
   counts.sky_images += !skies.empty();
-  GroundingResult result;
-  cv::resize(transient, result.transient, {width, height}, 0, 0, cv::INTER_LINEAR);
-  cv::resize(sky, result.sky, {width, height}, 0, 0, cv::INTER_LINEAR);
-  result.transient = result.transient >= 128;
-  result.sky = result.sky >= 128;
-  return result;
+  return {std::move(transient), std::move(sky)};
+}
+cv::Mat ComposeFullMask(const GroundingResult& coarse, const cv::Mat& domain) {
+  cv::Mat transient, sky;
+  cv::resize(coarse.transient, transient, {domain.cols, domain.rows}, 0, 0, cv::INTER_LINEAR);
+  cv::resize(coarse.sky, sky, {domain.cols, domain.rows}, 0, 0, cv::INTER_LINEAR);
+  transient = transient >= 128;
+  sky = sky >= 128;
+  cv::Mat mask = domain.clone();
+  mask.setTo(128, sky & domain);
+  mask.setTo(0, transient);
+  return mask;
 }
 }  // namespace
 Json CheckModels(const fs::path& root, const fs::path& image) {
@@ -668,7 +733,7 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
   }
   return report;
 }
-Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
+Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root, int workers) {
   const auto started = Clock::now();
   FrontendTiming timing;
   std::vector<Exposure> pending;
@@ -692,7 +757,7 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
   const std::array<cv::Mat, 2> domains{scene.cameras[0].Mask(), scene.cameras[1].Mask()};
   GroundingCounts counts;
   ImageReader reader(pending, work, grounding_size);
-  AsyncWriter writer;
+  WriterPool writer(workers);
   for (const auto& record : pending) {
     auto phase = Clock::now();
     auto image = reader.Next();
@@ -706,14 +771,12 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root) {
         {pixels.Normalize(grounding_size, grounding_size, {.5f, .5f, .5f}, {.5f, .5f, .5f})});
     timing.gpu_pipeline += Seconds(phase);
     phase = Clock::now();
-    const auto& domain = domains[record.camera];
-    const auto found = GroundingMask(outputs, domain.cols, domain.rows, counts);
-    cv::Mat mask = domain.clone();
-    mask.setTo(128, found.sky & domain);
-    mask.setTo(0, found.transient);
+    auto coarse = GroundingMaskCoarse(outputs, counts);
     timing.postprocess += Seconds(phase);
     const auto path = MaskPath(work, record.id);
-    writer.Submit([path, mask = std::move(mask)] {
+    const cv::Mat* domain = &domains[record.camera];
+    writer.Submit([path, coarse = std::move(coarse), domain] {
+      const cv::Mat mask = ComposeFullMask(coarse, *domain);
       const auto temporary = path.parent_path() / (path.stem().u8string() + ".writing.png");
       WriteImage(temporary, mask, 1);
       PublishFile(temporary, path);
@@ -758,7 +821,7 @@ Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
   Models models(root);
   ImagePreprocessor pixels(models.Stream());
   ImageReader reader(pending, work);
-  AsyncWriter writer;
+  WriterPool writer;
   for (const auto& record : pending) {
     const auto& camera = scene.cameras[record.camera];
     const auto size = models.DetectorSize(camera.width, camera.height);

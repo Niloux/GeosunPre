@@ -1022,6 +1022,87 @@ void ColorPoints(Reconstruction& m, const FeatureColors& colors) {
       }
   }
 }
+struct FeatureCompaction {
+  std::vector<std::vector<Eigen::Vector2d>> original_pixels;
+  std::vector<std::vector<uint32_t>> new_to_old;
+  size_t features_before = 0, features_after = 0;
+
+  void Compact(Reconstruction& model, std::vector<Pair>& pairs, FeatureColors& colors) {
+    const size_t n_images = model.images.size();
+    original_pixels.resize(n_images);
+    new_to_old.resize(n_images);
+    std::vector<std::vector<uint8_t>> used(n_images);
+    features_before = 0;
+    for (size_t img = 0; img < n_images; ++img) {
+      const size_t n = model.images[img].pixels.size();
+      features_before += n;
+      used[img].assign(n, 0);
+      for (size_t k = 0; k < model.images[img].points.size() && k < n; ++k)
+        if (model.images[img].points[k] != NoPoint)
+          used[img][k] = 1;
+    }
+    for (const auto& pair : pairs)
+      for (const auto& match : pair.inliers) {
+        used[pair.a][match.a] = 1;
+        used[pair.b][match.b] = 1;
+      }
+    for (const auto& point : model.points)
+      for (const auto& obs : point.track)
+        used[obs.image][obs.feature] = 1;
+
+    std::vector<std::vector<uint32_t>> old_to_new(n_images);
+    features_after = 0;
+    for (size_t img = 0; img < n_images; ++img) {
+      auto& im = model.images[img];
+      const size_t n = im.pixels.size();
+      original_pixels[img] = im.pixels;
+      old_to_new[img].assign(n, UINT32_MAX);
+      std::vector<Eigen::Vector2d> kept_pixels;
+      std::vector<uint64_t> kept_points;
+      std::vector<std::array<uint8_t, 3>> kept_colors;
+      auto& map_new = new_to_old[img];
+      for (size_t k = 0; k < n; ++k) {
+        if (!used[img][k])
+          continue;
+        old_to_new[img][k] = uint32_t(map_new.size());
+        map_new.push_back(uint32_t(k));
+        kept_pixels.push_back(im.pixels[k]);
+        kept_points.push_back(k < im.points.size() ? im.points[k] : NoPoint);
+        kept_colors.push_back(colors[img][k]);
+      }
+      features_after += map_new.size();
+      im.pixels = std::move(kept_pixels);
+      im.points = std::move(kept_points);
+      colors[img] = std::move(kept_colors);
+    }
+
+    for (auto& pair : pairs)
+      for (auto& match : pair.inliers) {
+        match.a = old_to_new[pair.a][match.a];
+        match.b = old_to_new[pair.b][match.b];
+      }
+    for (auto& point : model.points)
+      for (auto& obs : point.track)
+        obs.feature = old_to_new[obs.image][obs.feature];
+  }
+
+  void ExpandInPlace(Reconstruction& model) const {
+    for (size_t img = 0; img < model.images.size(); ++img) {
+      model.images[img].pixels = original_pixels[img];
+      model.images[img].points.assign(original_pixels[img].size(), NoPoint);
+    }
+    for (auto& point : model.points)
+      for (auto& obs : point.track)
+        obs.feature = new_to_old[obs.image][obs.feature];
+    model.RebuildReferences();
+  }
+
+  Reconstruction ExpandedCopy(const Reconstruction& model) const {
+    Reconstruction copy = model;
+    ExpandInPlace(copy);
+    return copy;
+  }
+};
 struct Tracks {
   std::vector<std::vector<Observation>> tracks;
   std::vector<std::vector<uint32_t>> lookup;
@@ -1743,10 +1824,11 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     m.Filter();
     filter_seconds += Seconds(phase);
   };
+  FeatureCompaction compaction;
   auto last_checkpoint = Clock::now();
   auto save_checkpoint = [&] {
     const auto phase = Clock::now();
-    WriteModel(checkpoint, m);
+    WriteModel(checkpoint, compaction.ExpandedCopy(m));
     checkpoint_seconds += Seconds(phase);
     last_checkpoint = Clock::now();
   };
@@ -1760,7 +1842,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     m.cameras = scene.cameras;
     m.images.resize(scene.images.size());
   }
-  const auto colors = LoadFeatures(scene, work, m, resumed);
+  auto colors = LoadFeatures(scene, work, m, resumed);
   const double cache_read_seconds = Seconds(started);
   const auto catalog = ReadJson(work / "cache/pairs.json");
   std::vector<std::array<uint32_t, 2>> candidates;
@@ -1772,10 +1854,13 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   // Pair verification uses the whole CPU.
   const int geometry_workers =
       std::clamp(int(std::thread::hardware_concurrency()), workers, 32);
-  const auto pairs = VerifyPairs(scene, m, work, candidates, geometry_workers, imu);
+  auto pairs = VerifyPairs(scene, m, work, candidates, geometry_workers, imu);
   std::vector<RelativeRotationPrior> rel_rot_priors = imu.BuildRelativeRotationPriors(scene);
   const double geometry_seconds = Seconds(geometry_started);
   const auto graph_started = Clock::now();
+  compaction.Compact(m, pairs, colors);
+  Log("Compacted features: " + std::to_string(compaction.features_before) + " -> " +
+      std::to_string(compaction.features_after));
   Tracks graph(m, pairs);
   std::vector<uint64_t> points(graph.tracks.size(), NoPoint);
   std::vector<std::vector<size_t>> adjacency(m.images.size());
@@ -1798,9 +1883,9 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   // not rigid (on 展厅 a rig-constrained SfM left the L readout time at zero later on, and a rig
   // pose hypothesis in registration lost three R exposures).
   auto ba = [&](const std::string& stage, int iterations, const std::set<uint32_t>& variable = {},
-                const std::set<uint64_t>& selected = {}) {
+                const std::set<uint64_t>& selected = {}, double function_tolerance = 0.) {
     return Optimize(m, scene.cameras, stage, ba_workers, iterations, variable, {}, nav, selected,
-                    nullptr, {}, {}, false, {}, rel_rot_priors);
+                    nullptr, {}, {}, false, {}, rel_rot_priors, function_tolerance);
   };
   auto unregister = [&](const std::vector<uint32_t>& ids) {
     for (uint32_t id : ids)
@@ -1915,7 +2000,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
                         {"registered_images", ids.size()},
                         {"scale", fit.scale},
                         {"unregistered", omitted}};
-    optimization.push_back(ba(calibrated ? "radial" : "fixed", 100));
+    optimization.push_back(ba(calibrated ? "radial" : "fixed", 100, {}, {}, 5e-4));
     filter();
     Log("Navigation frame at " + std::to_string(m.Registered()) + " registered images");
   };
@@ -1966,7 +2051,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         std::sort(neighbors.rbegin(), neighbors.rend());
         for (size_t k = 0; k < std::min<size_t>(8, neighbors.size()); ++k)
           local.insert(neighbors[k].second);
-        optimization.push_back(ba("fixed", 30, local));
+        optimization.push_back(ba("fixed", 30, local, {}, 1e-3));
         filter();
         recent.clear();
       }
@@ -1976,17 +2061,17 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           if (image.registered)
             ++counts[image.camera];
         if (counts[0] >= 8 && counts[1] >= 8) {
-          optimization.push_back(ba("focal", 100));
+          optimization.push_back(ba("focal", 100, {}, {}, 5e-4));
           filter();
           completion.push_back(CompleteTracks(m, graph, points));
-          optimization.push_back(ba("radial", 100));
+          optimization.push_back(ba("radial", 100, {}, {}, 5e-4));
           filter();
           completion.push_back(CompleteTracks(m, graph, points));
           calibrated = true;
           last_global = registered;
         }
       } else if (registered >= std::max(last_global + 40, size_t(last_global * 1.35))) {
-        optimization.push_back(ba(calibrated ? "radial" : "fixed", 100));
+        optimization.push_back(ba(calibrated ? "radial" : "fixed", 100, {}, {}, 5e-4));
         filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = registered;
@@ -1999,7 +2084,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     }
     if (!added) {
       if (m.Registered() > last_global) {
-        optimization.push_back(ba("radial", 150));
+        optimization.push_back(ba("radial", 150, {}, {}, 5e-4));
         filter();
         completion.push_back(CompleteTracks(m, graph, points));
         last_global = m.Registered();
@@ -2088,9 +2173,18 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   const auto unassigned_completion = CompleteUnassignedTracks(m, graph);
   const auto color_started = Clock::now();
   ColorPoints(m, colors);
+  const double color_seconds = Seconds(color_started);
+  compaction.ExpandInPlace(m);
   report = {{"verified_pairs", std::count_if(pairs.begin(), pairs.end(),
                                              [](const auto& p) { return !p.inliers.empty(); })},
             {"tracks", graph.tracks.size()},
+            {"compact_features",
+             {{"features_before", compaction.features_before},
+              {"features_after", compaction.features_after},
+              {"kept_fraction",
+               compaction.features_before
+                   ? double(compaction.features_after) / double(compaction.features_before)
+                   : 1.0}}},
             {"seconds", Seconds(started)},
             {"geometry_seconds", geometry_seconds},
             {"geometry_threads", geometry_workers},
@@ -2102,7 +2196,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
               {"triangulation_seconds", triangulation_seconds},
               {"filter_seconds", filter_seconds},
               {"checkpoint_seconds", checkpoint_seconds},
-              {"color_seconds", Seconds(color_started)}}},
+              {"color_seconds", color_seconds}}},
             {"completion", completion},
             {"unassigned_completion", unassigned_completion},
             {"pre_calibration_completion", calibration_completion},

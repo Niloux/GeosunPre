@@ -93,5 +93,6 @@ Json Optimize(Reconstruction& model, const std::array<Camera, 2>& initial, const
               const std::vector<RigFrame>& frames = {}, const std::set<uint64_t>& fixed_points = {},
               bool fixed_rig_and_readout = false,
               const std::vector<Eigen::Vector3d>& imu_omega = {},
-              const std::vector<RelativeRotationPrior>& relative_rotations = {});
+              const std::vector<RelativeRotationPrior>& relative_rotations = {},
+              double function_tolerance = 0.);
 }  // namespace geosun

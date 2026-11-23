@@ -733,6 +733,211 @@ void JointRefinement(const Scene& scene, Reconstruction& model,
     acceptance = proposed;
   }
 }
+// Guard against localized misplaced images whose own observed 3D points mostly miss the LAS
+// surface (Spirula 5% + 20 cm rule: drop when < 50% of >= 20 in-bounds points land on LAS).
+// Rechecks candidate misses against the full LAS stream before dropping so sample gaps never
+// trigger false positives.
+Json CheckLasSurfaceHitRate(const Scene& scene, Reconstruction& model, const LasHeader& header,
+                            const Eigen::Vector3d& origin, const Surface& surface, double fine) {
+  constexpr size_t kMinEvaluated = 20;
+  constexpr double kRelTol = 0.05;
+  constexpr double kAbsTol = 0.20;
+  constexpr double kBoundsPad = 0.50;
+  const double min_tol = std::max(kAbsTol, 2.0 * fine);
+
+  const size_t n_points = model.points.size();
+  std::vector<uint8_t> in_las_bounds(n_points, 0);
+  std::vector<double> sample_dist(n_points, INFINITY);
+  for (size_t id_idx = 0; id_idx < n_points; ++id_idx) {
+    const uint64_t pid = uint64_t(id_idx);
+    const auto& p = model.points[pid];
+    if (p.track.empty())
+      continue;
+    if ((p.xyz - header.lower).minCoeff() < -kBoundsPad ||
+        (header.upper - p.xyz).minCoeff() < -kBoundsPad)
+      continue;
+    in_las_bounds[pid] = 1;
+    const Eigen::Vector3d local = p.xyz - origin;
+    size_t nearest = 0;
+    double squared = INFINITY;
+    surface.tree->knnSearch(local.data(), 1, &nearest, &squared);
+    sample_dist[pid] = std::sqrt(squared);
+  }
+
+  struct ImageHitEval {
+    uint32_t id = 0;
+    size_t evaluated = 0;
+    size_t hits = 0;
+    std::vector<std::pair<uint64_t, double>> missed;
+  };
+  std::vector<ImageHitEval> candidates;
+  size_t checked_images = 0;
+  double min_hit_rate = 1.0;
+
+  for (uint32_t id = 0; id < model.images.size(); ++id) {
+    const auto& im = model.images[id];
+    if (!im.registered)
+      continue;
+    const Eigen::Vector3d center = im.pose.Center();
+    size_t evaluated = 0;
+    size_t hits = 0;
+    std::vector<std::pair<uint64_t, double>> missed;
+    std::unordered_map<uint64_t, double> seen_tol;
+    for (uint64_t pid : im.points) {
+      if (pid == NoPoint || !in_las_bounds[pid])
+        continue;
+      if (seen_tol.count(pid))
+        continue;
+      const double range = (model.points[pid].xyz - center).norm();
+      const double tol = std::max(kRelTol * range + kAbsTol, min_tol);
+      seen_tol.emplace(pid, tol);
+      ++evaluated;
+      if (sample_dist[pid] <= tol)
+        ++hits;
+      else
+        missed.emplace_back(pid, tol);
+    }
+    if (evaluated < kMinEvaluated)
+      continue;
+    ++checked_images;
+    const double rate = double(hits) / double(evaluated);
+    min_hit_rate = std::min(min_hit_rate, rate);
+    if (hits * 2 < evaluated)
+      candidates.push_back({id, evaluated, hits, std::move(missed)});
+  }
+
+  std::vector<uint32_t> dropped_ids;
+  Json dropped = Json::array();
+  if (!candidates.empty()) {
+    std::unordered_map<uint64_t, uint32_t> point_to_idx;
+    std::vector<uint64_t> unresolved_pids;
+    std::vector<double> max_tol_for_point;
+    double cell_size = min_tol;
+    for (const auto& c : candidates) {
+      for (const auto& [pid, tol] : c.missed) {
+        const double clamped_tol = std::min(tol, 2.0);
+        cell_size = std::max(cell_size, clamped_tol);
+        auto [it, inserted] =
+            point_to_idx.emplace(pid, uint32_t(unresolved_pids.size()));
+        if (inserted) {
+          unresolved_pids.push_back(pid);
+          max_tol_for_point.push_back(clamped_tol);
+        } else {
+          max_tol_for_point[it->second] =
+              std::max(max_tol_for_point[it->second], clamped_tol);
+        }
+      }
+    }
+
+    if (!unresolved_pids.empty()) {
+      constexpr int64_t limit = int64_t(1) << 20;
+      auto cell = [&](const Eigen::Vector3d& xyz, std::array<int64_t, 3>& index) {
+        for (int k = 0; k < 3; ++k) {
+          index[k] = int64_t(std::floor(xyz[k] / cell_size));
+          if (std::abs(index[k]) >= limit - 1)
+            return false;
+        }
+        return true;
+      };
+      auto key = [&](const std::array<int64_t, 3>& index) {
+        return uint64_t(index[0] + limit) << 42 | uint64_t(index[1] + limit) << 21 |
+               uint64_t(index[2] + limit);
+      };
+      std::unordered_map<uint64_t, std::vector<uint32_t>> grid;
+      std::vector<Eigen::Vector3d> local(unresolved_pids.size());
+      for (uint32_t i = 0; i < unresolved_pids.size(); ++i) {
+        local[i] = model.points[unresolved_pids[i]].xyz - origin;
+        std::array<int64_t, 3> centre;
+        if (!cell(local[i], centre))
+          continue;
+        for (int dz = -1; dz <= 1; ++dz)
+          for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx)
+              grid[key({centre[0] + dx, centre[1] + dy, centre[2] + dz})].push_back(i);
+      }
+      std::vector<uint8_t> resolved(unresolved_pids.size(), 0);
+      std::vector<double> best_sq(unresolved_pids.size(), INFINITY);
+      ScanLas(scene.las, header, [&](uint64_t, const std::vector<LasPoint>& records) {
+        for (const auto& record : records) {
+          if (!KeepLasPoint(record))
+            continue;
+          const Eigen::Vector3d xyz = LasCoordinates(header, record) - origin;
+          std::array<int64_t, 3> index;
+          if (!cell(xyz, index))
+            continue;
+          const auto found = grid.find(key(index));
+          if (found == grid.end())
+            continue;
+          for (const uint32_t i : found->second) {
+            if (resolved[i])
+              continue;
+            const double sq = (xyz - local[i]).squaredNorm();
+            if (sq < best_sq[i])
+              best_sq[i] = sq;
+          }
+        }
+        for (uint32_t i = 0; i < unresolved_pids.size(); ++i) {
+          if (!resolved[i] && best_sq[i] <= max_tol_for_point[i] * max_tol_for_point[i]) {
+            sample_dist[unresolved_pids[i]] =
+                std::min(sample_dist[unresolved_pids[i]], std::sqrt(best_sq[i]));
+            resolved[i] = 1;
+          }
+        }
+      });
+      for (uint32_t i = 0; i < unresolved_pids.size(); ++i) {
+        if (std::isfinite(best_sq[i])) {
+          sample_dist[unresolved_pids[i]] =
+              std::min(sample_dist[unresolved_pids[i]], std::sqrt(best_sq[i]));
+        }
+      }
+    }
+
+    min_hit_rate = 1.0;
+    for (const auto& c : candidates) {
+      size_t hits = c.hits;
+      for (const auto& [pid, tol] : c.missed) {
+        if (sample_dist[pid] <= tol)
+          ++hits;
+      }
+      const double rate = double(hits) / double(c.evaluated);
+      min_hit_rate = std::min(min_hit_rate, rate);
+      if (hits * 2 < c.evaluated) {
+        if (c.id == model.gauge_image || c.id == model.scale_image) {
+          throw std::runtime_error("LAS surface check flagged reference image as misplaced: " +
+                                   scene.images[c.id].name);
+        }
+        model.images[c.id].registered = false;
+        dropped_ids.push_back(c.id);
+        Log("Drop misplaced image " + scene.images[c.id].name + " (LAS surface hit rate " +
+            std::to_string(hits) + "/" + std::to_string(c.evaluated) + ")");
+        dropped.push_back({{"image_index", c.id},
+                           {"name", scene.images[c.id].name},
+                           {"evaluated_points", c.evaluated},
+                           {"hits", hits},
+                           {"hit_rate", rate}});
+      }
+    }
+    if (!dropped_ids.empty()) {
+      for (auto& point : model.points) {
+        point.track.erase(
+            std::remove_if(point.track.begin(), point.track.end(),
+                           [&](const auto& o) { return !model.images[o.image].registered; }),
+            point.track.end());
+        if (point.track.size() < 2)
+          point.track.clear();
+      }
+      model.RebuildReferences();
+    }
+  }
+
+  return {{"tolerance_rel", kRelTol},
+          {"tolerance_abs_m", kAbsTol},
+          {"min_evaluated_points", kMinEvaluated},
+          {"checked_images", checked_images},
+          {"min_hit_rate", checked_images ? Json(min_hit_rate) : Json(nullptr)},
+          {"full_las_rechecked", !candidates.empty()},
+          {"dropped_images", dropped}};
+}
 }  // namespace
 Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits,
            int ba_workers) {
@@ -811,9 +1016,16 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
     throw std::runtime_error("LAS alignment rejected: " + acceptance.at("failures").dump());
   transform.translation += origin;
   model.Apply(transform);
-  const auto base_quality = model.Quality(scene, limits.median_px, limits.p90_px);
+  auto base_quality = model.Quality(scene, limits.median_px, limits.p90_px);
   if (!base_quality.at("passed").get<bool>())
     throw std::runtime_error("Aligned visual model failed acceptance");
+  const auto las_surface_check =
+      CheckLasSurfaceHitRate(scene, model, header, origin, *surface, fine);
+  if (!las_surface_check.at("dropped_images").empty()) {
+    base_quality = model.Quality(scene, limits.median_px, limits.p90_px);
+    if (!base_quality.at("passed").get<bool>())
+      throw std::runtime_error("Aligned visual model failed acceptance after LAS surface check");
+  }
   auto reliable = CoherentSurfaces(target, fine, workers);
   const auto residuals = Residuals(aligned, *reliable, limits.p90_m);
   std::vector<PlaneConstraint> constraints;
@@ -821,11 +1033,13 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
   Eigen::Matrix3d directions = Eigen::Matrix3d::Zero();
   std::map<Tile, size_t> regional_counts;
   for (size_t i = 0; i < residuals.size(); ++i)
-    if (residuals[i].supported && reliable->coherent[residuals[i].nearest])
+    if (residuals[i].supported && reliable->coherent[residuals[i].nearest] &&
+        model.points[identities[i]].track.size() >= 3)
       ++regional_counts[regions.tiles[i]];
   for (size_t i = 0; i < residuals.size(); ++i) {
     const auto& r = residuals[i];
-    if (!r.supported || !reliable->coherent[r.nearest])
+    if (!r.supported || !reliable->coherent[r.nearest] ||
+        model.points[identities[i]].track.size() < 3)
       continue;
     const auto& normal = reliable->normals[r.nearest];
     const double sigma = std::max({.01, reliable->noise[r.nearest], header.scale.maxCoeff()});
@@ -867,6 +1081,7 @@ Json Align(const Scene& scene, Reconstruction& model, int workers, const Alignme
       {"regions", regions.report},
       {"similarity_rank", optimization.at("minimum_rank")},
       {"alignment", acceptance},
+      {"las_surface_check", las_surface_check},
       {"joint", joint},
       {"quality", model.Quality(scene, limits.median_px, limits.p90_px)}};
 }
