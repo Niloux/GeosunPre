@@ -38,6 +38,7 @@
         "bilateral_grid_Y": 16,
         "bilateral_grid_lr": 0.0020000000949949026,
         "bounds_percentile": 0.800000011920929,
+        "calibration_correction": false,
         "color_variance_warmup_iters": 5000,
         "color_variance_weight": 0.18,
         "crop_to_cropbox": true,

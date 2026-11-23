@@ -145,3 +145,22 @@
 - **未验证项**：
   - 未在真实 `8 GB` 物理显卡上实跑训练，仅验证了 `--vram-gb 8` 的参数计算路径（`cap_vram = 9.9M`）；
   - 未在几千张图（`2,000–8,000` 张）的超大实景数据集上做端到端训练耗时与显存压测，也未通过 `Geosun.exe` 打包体做端到端调用回归（仅核查 `bundle/main.cpp` 编译链接与路径优先级逻辑）。
+
+
+## 2026-11-23：GUT 训练变慢排查与性能修复（`GeosunPre` + `LichtFeld-Studio`）
+
+- **排查定位（基于 `work/小场景` `3000` 步控制变量对比与 `cuobjdump` 分析）**：
+  1. **上游 `#4147` 默认启用 `calibration_correction`**：`LichtFeld-Studio` 将 `parameters.hpp` 中 `calibration_correction` 默认改为 `true`；`configs/trainer.json` 缺省该字段导致 `iter >= 1000` 后每步执行 2D 网格扭曲拟合与先验随动（`warp`/`follow`/`accumulate`/`update`，在 `小场景` `3000` 步下耗时从 `46.490 s / 64.5 iter/s` 增至 `49.094 s / 61.1 iter/s`），且开启 `--eval-all` 时每张图额外运行 `align_for_scoring` 4 层金字塔配准（`小场景` `296` 视角单次评测由 `0.2708 s/image` 升至 `0.3178 s/image`、`1000` 步含一次评测总耗时由 `93.158 s` 升至 `107.614 s`）。由于 `GeosunPre` 已提供精确逐行卷帘（`rolling_shutter.json`）与 LAS 先验，训练期与评测期无需再启用该扭曲拟合。
+  2. **上游 `#4133` 引起的同一步重复 `fit_depth_prior`**：`GeosunPre` 的先验尺寸（如 `1018×1024` / `1024×1024`）小于 `resize_factor=2` 后的训练图像（`2816×2832` / `2832×2832`），命中 `pipelined_depth_own_size_ == true`，导致 `trainer.cpp` 在 `free_space` 准备与 `depth_loss` 阶段同一步内对 `pipelined_depth_` 调用两次 `fit_depth_prior`。
+  3. **GUT 反向核 `bwd_splat_kernel` 的共享内存与全局读取开销**：`RasterizeToPixelsFromWorld3DGSBwd.cu` 无条件为 `s_cv_target` / `s_cv_buf` 分配 `1,280 B` 共享内存（使 `CDIM=8` 达到 `10,240 / 10,496 B`）并保留内层分支，且存在 `pixel_weight` 时每像素重复读取 `*color_variance.pixel_weight_sum`。
+  4. **预期内配置变化贡献**（保留不变）：`configs/trainer.json` 从 `sh_degree=0` / 关闭 PPISP 升级到 `sh_degree=1` / `use_ppisp=true` 在 `小场景` `3000` 步下分别对应约 `2.0 s` 与 `1.7–2.0 s` 增量（关闭 PPISP `44.819 s`，再关正则与 SH1 `42.850 s`，再关深度/法线损失 `37.235 s`）；`normal_variance_weight` 与 `color_variance_weight` 本身在无共享内存挤占后运行开销可忽略。
+
+- **改动**：
+  - [configs/trainer.json](file:///d:/Dev/GeosunPre/configs/trainer.json)：显式添加 `"calibration_correction": false`。
+  - [trainer.cpp](file:///d:/Dev/LichtFeld-Studio/src/training/trainer.cpp)：在 `!fit` 且分辨率匹配时，`depth_loss` 直接复用前序已适配的 `free_space_depth` 并通过 `sync_to_stream` 同步到 `depth_stream`，消除每步第二次 `fit_depth_prior`。
+  - [RasterizeToPixelsFromWorld3DGSBwd.cu](file:///d:/Dev/LichtFeld-Studio/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSBwd.cu)：为 `rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel` 增加 `kColorVariance` 编译期模板参数（关闭时将 `s_cv_target`/`s_cv_buf` 缩至 1 元素，共享内存降回 `8960 / 9216 B`，`LOCAL:0`），并在开启分支前由 warp `lane 0` 读取 `*color_variance.pixel_weight_sum` 后 `__shfl_sync` 广播。
+
+- **验证与未验证项**：
+  - `LichtFeld-Studio` Release 与 `GeosunPre` Release（`geosunpre.exe` / `geosun.exe`）均编译通过；`geosunpre trainer-config --vram-gb 24` 验证生成配置含 `"calibration_correction": false`。
+  - `work/小场景` 同参数（`max_cap = 2,100,000`、`iterations = 3,000`）基准：`benchA` 修复前默认 `49.094 s (61.1 iter/s)` → 修复后 warmup 期（`warmup=2999`）提速至 `45.170 s (66.4 iter/s)`（`-8.0%`）；全程开启 color variance（`warmup=0`）为 `46.912 s (63.9 iter/s)`；直接使用更新后 `configs/trainer.json`（`start_refine=1200`）`3,000` 步为 `41.330 s (72.6 iter/s)`。
+  - **未验证项**：未重跑完整 `20k–30k` 实景训练及 `LichtFeld-Studio` 单元测试套件（当前 Release 构建 `BUILD_TESTS=OFF`）。
