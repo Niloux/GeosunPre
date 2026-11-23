@@ -17,7 +17,7 @@ find_package(CUDAToolkit REQUIRED)
 set(GEOSUN_SOURCES
   src/app/main.cpp src/app/pipeline.cpp src/app/runtime.cpp
   src/io/scene.cpp src/io/cache.cpp src/io/las.cpp src/io/colmap.cpp src/io/crop.cpp
-  src/io/roi.cpp
+  src/io/roi.cpp src/io/trainer_config.cpp
   src/geometry/camera.cpp src/geometry/model.cpp src/geometry/monocular.cpp
   src/geometry/supervision.cpp src/geometry/supervision_kernels.cu src/geometry/static_masks.cpp
   src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/preprocessing.cu src/frontend/frontend.cpp
@@ -58,8 +58,17 @@ namespace geosun {
 extern const char DefaultSettings[] = R"json(@GEOSUN_DEFAULT_SETTINGS@)json";
 }  // namespace geosun
 ]=] @ONLY)
+set(GEOSUN_TRAINER_DEFAULTS "${CMAKE_SOURCE_DIR}/configs/trainer.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GEOSUN_TRAINER_DEFAULTS}")
+file(READ "${GEOSUN_TRAINER_DEFAULTS}" GEOSUN_DEFAULT_TRAINER_CONFIG)
+file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/generated/default_trainer.cpp" CONTENT [=[
+namespace geosun {
+extern const char DefaultTrainerConfig[] = R"json(@GEOSUN_DEFAULT_TRAINER_CONFIG@)json";
+}  // namespace geosun
+]=] @ONLY)
 add_executable(geosunpre ${GEOSUN_SOURCES} "${GEOSUN_BUILD_INFO}"
-  "${CMAKE_BINARY_DIR}/generated/default_settings.cpp")
+  "${CMAKE_BINARY_DIR}/generated/default_settings.cpp"
+  "${CMAKE_BINARY_DIR}/generated/default_trainer.cpp")
 target_include_directories(geosunpre PRIVATE src ${tensorrt_SOURCE_DIR}/include ${OpenCV_INCLUDE_DIRS})
 target_include_directories(geosunpre SYSTEM PRIVATE ${opencv_BINARY_DIR} ${CMAKE_BINARY_DIR}
   ${opencv_SOURCE_DIR}/modules/core/include ${opencv_SOURCE_DIR}/modules/imgproc/include

@@ -590,7 +590,10 @@ void Pipeline(int argc, wchar_t** argv) {
         }
       }
       StartPending(train_pending, geosun_log);
-      RunTrainer(trainer, {L"--config", config.native(), L"-d", delivery.native(), L"-o",
+      const auto delivery_config = delivery / L"trainer.json";
+      const auto active_config = fs::is_regular_file(delivery_config) ? delivery_config : config;
+      geosun_log.WriteLine("Trainer config: " + active_config.u8string());
+      RunTrainer(trainer, {L"--config", active_config.native(), L"-d", delivery.native(), L"-o",
                            train_pending.native()},
                  train_args, "Training", geosun_log, logs, logs / L"train.log");
       RequireFile(train_pending / train.marker);

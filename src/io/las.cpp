@@ -309,7 +309,9 @@ void VerifyInitializationPly(const fs::path& path, uint64_t points) {
 }
 Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& output, double voxel,
                   const Reconstruction* model, const Reconstruction* visual_model,
-                  const std::function<fs::path(uint32_t)>& static_mask_path, Json* roi_out) {
+                  const std::function<fs::path(uint32_t)>& static_mask_path, Json* roi_out,
+                  const std::function<uint64_t(uint64_t voxel_total, uint64_t roi_in_total)>&
+                      cap_resolver) {
   if (!std::isfinite(voxel) || voxel <= 0 || fs::absolute(las) == fs::absolute(output))
     throw std::runtime_error("Invalid PLY voxel size or output");
   if (fs::exists(output))
@@ -812,7 +814,14 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
     }
   }
   const uint64_t visual_vertices = visual_out.size();
-  const uint64_t las_cap = MaxPlyPoints - visual_vertices;
+  uint64_t effective_max_points = MaxPlyPoints;
+  if (model && cap_resolver) {
+    const uint64_t geom_points = roi ? roi_in_total : voxel_vertices;
+    const uint64_t resolved_cap = cap_resolver(voxel_vertices, geom_points);
+    effective_max_points = std::clamp<uint64_t>(resolved_cap, 100000ULL, MaxPlyPoints);
+  }
+  const uint64_t las_cap =
+      effective_max_points > visual_vertices ? (effective_max_points - visual_vertices) : 0ULL;
   const uint64_t las_vertices =
       (model && voxel_vertices > las_cap) ? las_cap : voxel_vertices;
   const uint64_t total_vertices = las_vertices + visual_vertices;
@@ -938,9 +947,11 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
                   model ? (visual_model
                                ? "registered camera frustums (<=50 m) distance-tiered voxels "
                                  "(1x/2x/4x/8x at 10/20/40/50 m) plus static multi-view visual "
-                                 "anchors beyond LAS cover (>0.25 m, <=250 m), capped at 2500000"
+                                 "anchors beyond LAS cover (>0.25 m, <=250 m), capped at " +
+                                     std::to_string(effective_max_points)
                                : "registered camera frustums (<=50 m), distance-tiered voxels "
-                                 "(1x/2x/4x/8x at 10/20/40/50 m), capped at 2500000")
+                                 "(1x/2x/4x/8x at 10/20/40/50 m), capped at " +
+                                     std::to_string(effective_max_points))
                         : "all non-withheld, non-class-7 LAS records; one centroid per voxel"},
                  {"color", "voxel mean of LAS RGB; auto-detect 8/16-bit range; gray if absent"},
                  {"normals", "zero"},
@@ -954,11 +965,12 @@ Json ExportLasPly(const fs::path& las, const LasHeader& h, const fs::path& outpu
     result["culled_out_of_view"] = culled;
     result["voxel_points_before_cap"] = voxel_vertices;
     result["max_range_m"] = MaxPlyRange;
-    result["max_points"] = MaxPlyPoints;
+    result["max_points"] = effective_max_points;
   }
   if (roi) {
     result["roi_las_points"] = roi_las_written;
     result["outside_roi_las_points"] = outside_roi_las_written;
+    result["roi_voxel_points_before_cap"] = roi_in_total;
   }
   if (visual_model) {
     result["max_visual_supplement_points"] = MaxVisualSupplementPoints;

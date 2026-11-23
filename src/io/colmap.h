@@ -8,6 +8,7 @@ namespace geosun {
 Json ExportBundle(const Scene& scene, const Reconstruction& model, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
                   const SupervisionOptions& supervision = {}, bool crop = true,
-                  bool include_roi = true);
+                  bool include_roi = true, double vram_gb = 0.0,
+                  const fs::path& trainer_template = {});
 Json CheckBundle(const fs::path& output, const std::string& project = {});
 }  // namespace geosun

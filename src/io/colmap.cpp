@@ -3,6 +3,7 @@
 #include "io/crop.h"
 #include "io/las.h"
 #include "io/roi.h"
+#include "io/trainer_config.h"
 #include "geometry/static_masks.h"
 #include "sfm/shutter.h"
 #include <algorithm>
@@ -300,8 +301,10 @@ fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
 }  // namespace
 Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::path& work,
                   const fs::path& output, bool include_ply, double voxel, const Json& report,
-                  const SupervisionOptions& supervision_options, bool crop, bool include_roi) {
+                  const SupervisionOptions& supervision_options, bool crop, bool include_roi,
+                  double vram_gb, const fs::path& trainer_template) {
   const bool generate_roi = include_ply && include_roi;
+  const double resolved_vram_gb = vram_gb > 0.0 ? vram_gb : QueryGpuVramGiB();
   // A rolling-shutter corrected model describes photos at its reference poses; they are delivered
   // original, with the readout motion beside the model.
   const bool rolling = report.contains("shutter") && report.at("shutter").value("used", false);
@@ -363,6 +366,10 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   if (include_ply)
     request["ply_filter"] = {
         {"max_range_m", 50.0}, {"max_points", 2500000}, {"max_visual_supplement_points", 100000}};
+  request["trainer_config"] = {
+      {"vram_gb", resolved_vram_gb},
+      {"template",
+       trainer_template.empty() ? Json("embedded") : FileMetadata(trainer_template)}};
   request["roi"] =
       generate_roi
           ? Json{{"enabled", true}, {"source", "las_camera_seeded_occupancy"}, {"version", 1}}
@@ -467,6 +474,13 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
         job.wait();
     }
   } join_initialization{initialization_job};
+  const size_t registered_count = registered.size();
+  const auto cap_resolver = [registered_count, resolved_vram_gb, trainer_template](
+                                uint64_t /*voxel_total*/, uint64_t geom_points) -> uint64_t {
+    return BuildAdaptiveTrainerConfig(
+               {registered_count, geom_points, resolved_vram_gb, trainer_template})
+        .ply_cap;
+  };
   Json roi_json;
   if (include_ply)
     initialization_job = std::async(std::launch::async, [&] {
@@ -474,7 +488,7 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
           scene.las, ReadSceneLas(scene), pending / "sparse/0/points3D.ply", voxel, &model,
           &visual_model,
           [&](uint32_t id) { return pending / "masks" / fs::u8path(scene.images[id].name + ".png"); },
-          generate_roi ? &roi_json : nullptr);
+          generate_roi ? &roi_json : nullptr, cap_resolver);
     });
   Json supervision = nullptr;
   if (options.enabled) {
@@ -490,6 +504,18 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   const Json initialization = include_ply ? initialization_job.get() : Json(nullptr);
   if (generate_roi)
     WriteJson(pending / "roi.json", roi_json);
+  uint64_t geom_points = 0;
+  if (!initialization.is_null()) {
+    if (initialization.contains("roi_voxel_points_before_cap"))
+      geom_points = initialization.at("roi_voxel_points_before_cap").get<uint64_t>();
+    else if (initialization.contains("voxel_points_before_cap"))
+      geom_points = initialization.at("voxel_points_before_cap").get<uint64_t>();
+    else if (initialization.contains("points"))
+      geom_points = initialization.at("points").get<uint64_t>();
+  }
+  const auto trainer_result = BuildAdaptiveTrainerConfig(
+      {registered_count, geom_points, resolved_vram_gb, trainer_template});
+  WriteJson(pending / "trainer.json", trainer_result.config);
   timed("PLY and supervision");
   const auto registration = model.Registration(scene);
   auto quality = report.at("quality");
@@ -526,6 +552,9 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   if (generate_roi)
     manifest["roi"] = {{"file", "roi.json"},
                        {"size_bytes", fs::file_size(pending / "roi.json")}};
+  manifest["trainer_config"] = {{"file", "trainer.json"},
+                                {"size_bytes", fs::file_size(pending / "trainer.json")},
+                                {"summary", trainer_result.summary}};
   WriteJson(pending / "manifest.json", manifest);
   timed("reports");
   auto checked = CheckBundle(pending);
@@ -606,6 +635,19 @@ Json CheckBundle(const fs::path& output, const std::string& project) {
       throw std::runtime_error("LAS supervision manifest differs");
     CheckLasSupervision(output, model, manifest.at("images"), manifest.at("supervision"));
   }
+  if (manifest.contains("trainer_config")) {
+    const auto& tc = manifest.at("trainer_config");
+    const auto trainer_path = output / fs::u8path(tc.at("file").get<std::string>());
+    if (!fs::is_regular_file(trainer_path) ||
+        fs::file_size(trainer_path) != tc.at("size_bytes").get<uint64_t>())
+      throw std::runtime_error("Trainer config file is missing or size differs");
+    const auto parsed = ReadJson(trainer_path);
+    if (!parsed.is_object() || !parsed.contains("optimization") ||
+        !parsed.at("optimization").is_object() ||
+        parsed.at("optimization").value("iterations", uint64_t(0)) == 0 ||
+        parsed.at("optimization").value("max_cap", uint64_t(0)) == 0)
+      throw std::runtime_error("Trainer config JSON is invalid");
+  }
   const auto saved = ReadJson(output / "quality.json");
   const auto registration = manifest.at("registration");
   if (registration != saved.at("registration") ||
@@ -637,6 +679,8 @@ Json CheckBundle(const fs::path& output, const std::string& project) {
                       {"z_max", checked_roi->z_max},
                       {"cameras_inside", checked_roi->cameras_inside}};
   }
+  if (manifest.contains("trainer_config"))
+    checked["trainer_config"] = manifest.at("trainer_config").at("summary");
   return checked;
 }
 }  // namespace geosun

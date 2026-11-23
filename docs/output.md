@@ -15,6 +15,7 @@ OUTPUT/
   quality.json
   initialization.json
   supervision.json            # 默认生成，--no-las-supervision 省略
+  trainer.json                # 导出时按场景规模与本机显存自适应生成
   # masks 默认为持续人物及表面/室内天空误检改回静态后的掩码，--no-static-masks 时为 SAM3 掩码
   rolling_shutter.json        # 卷帘校正被采用时生成
   result.json                 # 各阶段报告，与工作目录 result.json 相同，不参与 check
@@ -26,7 +27,7 @@ COLMAP 小端二进制，`OPENCV_FISHEYE` 模型编号 5、8 个参数。相机 
 
 points3D.bin 的 error 为最终所选模型在该点全部观测上的平均重投影距离，单位像素；联合优化后重新计算，交付回读时验证。
 
-相机和稀疏点已在局部 LAS 坐标（局部 LAS 即输入坐标，ECEF LAS 为其转换后的导航 ENH 局部坐标，见[输入约定](input.md)），下游不再应用配准变换。`points3D.bin` 是清理并验证后的视觉稀疏点及轨迹（保持纯 LAS 锚定口径）；`points3D.ply` 主体保留已注册相机 50 m 视锥范围内的有效 LAS 点，按到最近相机的距离分档体素均值采样（10 m 内 1×、20 m 内 2×、40 m 内 4×、50 m 内 8× 基准体素；基准体素默认 0.05 m），并从清理前视觉模型补充距已注册图像 0.25–250 m、0.25 m 内无有效 LAS 覆盖的高置信静态多视图视觉点（不少于 3 视图、均值重投影不超过 1.5 px、视差至少 2°、无 0 掩码中心且至少 75% 且不少于 3 个视图的 5×5 邻域全为 255，按至少 0.10 m 网格去重并限制补充最多 10 万点），LAS 随同调整上限使 PLY 总点仍封顶 250 万；当启用 `roi.json` 且体素点超出该上限需要抽稀时，外围最多保留 5%（不超过 12.5 万点）作背景支撑，其余优先分配给 ROI 内部点，`initialization.json` 另记录 `las_points`、`visual_supplement_points`（启用 ROI 时另记录 `roi_las_points` 与 `outside_roi_las_points`）。文件为二进制小端，每点 float32 XYZ、零法向量 XYZ、uint8 RGB，共 27 字节。PLY 与相机同一坐标，`initialization.coordinate_frame` 为 `input_las_xyz` 或 `ecef_to_navigation_enh`。LAS 头部范围（ECEF LAS 为转换后范围）的坐标绝对值须不超过 16777 m，使 float32 舍入不超过 1 mm，否则明确报错。下游需明确选择此 PLY 初始化 3DGS。
+相机和稀疏点已在局部 LAS 坐标（局部 LAS 即输入坐标，ECEF LAS 为其转换后的导航 ENH 局部坐标，见[输入约定](input.md)），下游不再应用配准变换。`points3D.bin` 是清理并验证后的视觉稀疏点及轨迹（保持纯 LAS 锚定口径）；`points3D.ply` 主体保留已注册相机 50 m 视锥范围内的有效 LAS 点，按到最近相机的距离分档体素均值采样（10 m 内 1×、20 m 内 2×、40 m 内 4×、50 m 内 8× 基准体素；基准体素默认 0.05 m），并从清理前视觉模型补充距已注册图像 0.25–250 m、0.25 m 内无有效 LAS 覆盖的高置信静态多视图视觉点（不少于 3 视图、均值重投影不超过 1.5 px、视差至少 2°、无 0 掩码中心且至少 75% 且不少于 3 个视图的 5×5 邻域全为 255，按至少 0.10 m 网格去重并限制补充最多 10 万点），LAS 随同调整上限使 PLY 总点仍封顶 250 万；当启用 `roi.json` 且体素点超出该上限需要抽稀时，外围最多保留 5%（不超过 12.5 万点）作背景支撑，其余优先分配给 ROI 内部点，`initialization.json` 另记录 `las_points`、`visual_supplement_points`（启用 ROI 时另记录 `roi_las_points`、`outside_roi_las_points` 与 `roi_voxel_points_before_cap`），实际封顶记录于 `initialization.max_points`（默认随自适应 `max_cap` 联动为 `min(2500000, round(0.75 * max_cap))`，保证初始点云不顶死训练上限）。文件为二进制小端，每点 float32 XYZ、零法向量 XYZ、uint8 RGB，共 27 字节。PLY 与相机同一坐标，`initialization.coordinate_frame` 为 `input_las_xyz` 或 `ecef_to_navigation_enh`。LAS 头部范围（ECEF LAS 为转换后范围）的坐标绝对值须不超过 16777 m，使 float32 舍入不超过 1 mm，否则明确报错。下游需明确选择此 PLY 初始化 3DGS。
 
 `roi.json` 默认随初始化 PLY 在 `export` 阶段自动生成（`--no-roi` 或 `--no-ply` 时省略）：基于 50 m 视锥内有效 LAS 在 1 m×1 m XY 格网的原始点占据（单格不少于 30 点），结合全部已注册相机轨迹连通光栅，经 2 m 圆形膨胀并从相机种子做 4 邻域连通筛选后提取外轮廓（多块时取外凸包），迭代 `approxPolyDP` 简化为 3–64 顶点的简单非自交 2D 多边形（兜底外切凸包或包围框），保证 100% 已注册相机严格落入内部；Z 范围取多边形内体素 LAS 分布与相机高度的稳健包络（`z_min = min(p001, cam_z_min - 2) - 1`，`z_max = min(max(p999, cam_z_max) + 15, max(p999 + 3, las_max + 1, cam_z_max + 3))`）。文件记录 `version: 1`、`type: "polygon_prism"`、`coordinate_frame`、`z_min`/`z_max`、`vertices_xy`（工作坐标二维顶点）、`bounds_min`/`bounds_max`、`params` 与 `stats`；定制 LFS 加载数据集时自动挂载为训练模型 `CropPolygon`，配合 [trainer.json](../configs/trainer.json) 在训练期降权外围并默认终态 `--crop` 裁切输出。`manifest.json` 的 `request.roi` 与顶层 `roi` 记录该文件身份，`check` 回读校验文件尺寸、多边形几何合法性与 100% 相机包含性。
 
@@ -121,3 +122,12 @@ images         [{image_id, camera_id, name, rotation_rad[3], velocity_m_s[3], tr
      - **初始化日志**：满足 `"gut": true` 且 `"undistort": false` 时记录 `Rolling shutter: <N> cameras render with the {row|column} readout motion from rolling_shutter.json`；若条件不满足则明确告警并按全局快门处理。
      - **评测输出**：每次有效评测统计实际激活卷帘渲染的相机数 `rolling_shutter_cameras`（要求 GUT 启用、相机附带卷帘参数、非 `undistort` 针孔网格、非 `EQUIRECTANGULAR` 且读出轴渲染尺寸 `> 1`，并在 `"undistort": true` 且 `"eval_space": "distorted"` 原生 GUT 评测路径保持透传），同时写入运行日志（`Eval: rolling shutter active for <K> / <N> cameras` 与汇总 `EvalMetrics::to_string()` 中的 `rolling_shutter_cameras: K/N`）及 `metrics_report.txt` 中的 `Rolling shutter cameras: K / N`（`metrics.csv` 与 `per_image_metrics.json` 保持既有结构不变）。
      - **核验准则**：按 `configs/trainer.json` 默认口径（`"gut": true`、`"undistort": false`、`"eval_space": "distorted"`）评测含 `rolling_shutter.json` 的交付包时，须核验 `K == N > 0`；未附带 `rolling_shutter.json`、关闭 `--gut` 或在去畸变空间评测时则应为 `K == 0`。
+
+## 自适应训练配置（`trainer.json`）
+
+`run` 与 `export` 默认在导出阶段基于模板 [trainer.json](../configs/trainer.json)（可用 `--trainer-config JSON` 覆盖模板，内嵌副本随二进制编译）结合当前场景统计与本机 GPU 总显存（可用 `--vram-gb GB` 覆盖）自适应生成 `<output>/trainer.json`，`Geosun.exe` 训练时优先加载该文件，不存在时回退公共模板：
+
+- **训练图像数 `N_train`**：由已注册图像数扣除 `test_every` 留出测试集得到（当 `eval_all: true` 或 `test_every <= 1` 时取全部已注册图像）。
+- **迭代步数与调度同步缩放**：以 `550` 张训练图对应模板 `base_iters`（默认 `30000`）为锚点按幂律 `round_1000(clamp(base_iters * (N_train / 550)^0.6, 20000, 120000))` 推导 `iterations`，并按同一比例同步缩放 `start_refine`、`stop_refine`、`reset_every`、`refine_every`、`morton_reorder_interval`、`sh_degree_interval`、`grow_until_iter`、`color_variance_warmup_iters`、`eval_steps` 与 `save_steps`，同时将 `steps_scaler`、`image_count_scaler`、`image_count_scaler_total` 保持为 `1.0` 避免下游二次缩放。
+- **高斯上限 `max_cap` 与初始化点云封顶**：综合几何表面预算 `cap_geom = 3.0 * geom_points`（优先取 `roi_voxel_points_before_cap`，其次 `voxel_points_before_cap` 或 `points`）、视角支撑上限 `cap_views = 8000 * N_train` 与显存硬上限 `cap_vram = round_100k(clamp((vram_gb - 2.5) * 1800000, 4000000, 24000000))`，取 `max_cap = round_100k(clamp(min(cap_geom, cap_views), 1500000, cap_vram))`（下游通过模板的 `grow_fraction = -1`、`shs_lr = -1` 自动跟随 `max_cap` 联动）；`points3D.ply` 总点数封顶联动为 `min(2500000, max(100000, round(0.75 * max_cap)))`。
+- **存量交付补生成与校验**：对于未包含 `trainer.json` 的已有交付包，可执行 `geosunpre trainer-config --output DIR [--vram-gb GB] [--trainer-config JSON]` 从 `manifest.json` 直接生成；新交付包会在 `manifest.json` 的 `trainer_config`（及 `request.trainer_config`）记录摘要，由 `check` 核验文件尺寸与合法性。

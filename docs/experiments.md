@@ -817,3 +817,37 @@
 - **结论与主线升级**：选取 `exp7` 作为新 Pareto 甜点更新至 [configs/trainer.json](file:///C:/Users/youwu/Documents/GeosunPre/configs/trainer.json)（PPISP 替代局部双边网格、`sh_degree = 1 / sh_rest_reg = 0.001`、`dc_reg = 0.005`、`erank_reg = 0.008`、`scale_reg = 0.005`、`gradient_loss_weight = 0.0`、`start_refine = 1200 / stop_refine = 4500`、`opacity_decay = 0.0 / scale_decay = 0.0`、`normal_loss_weight = 0.1`、`normal_prior_depth_weight = 0.05`、`normal_prior_decay_start = 0.95`、`normal_consistency_weight = 0.1`、`normal_flatten_weight = 0.02`、`normal_variance_weight = 0.06`、`color_variance_weight = 0.18`、`color_variance_warmup_iters = 5000`，保留原 `save_steps: [7000, 30000]`）；极大面积纯白墙极端场景可酌情手动调高至 `exp8` 挡（`0.10 / 0.30`）。
 - **验证与未验证项**：`LichtFeld-Studio` Release 全量编译（`171/171`）、CLI `--help` 与 200 步联合冒烟测试以及双实景全量 30k 对比均已完成；[test_color_variance.cpp](file:///C:/Users/youwu/Documents/LichtFeld-Studio/tests/test_color_variance.cpp) 已同步补充 GUT 掩码放行与 `NormalVarianceParameters` 用例，但 `build-windows-release` 开启 `BUILD_TESTS=OFF`，测试可执行文件尚未单独编跑。
 
+## 2026-11-23：预处理导出阶段自适应生成 `trainer.json`（LFS 零改动）
+
+- **问题与设计**：此前下游固定共用同一份 [configs/trainer.json](file:///d:/Dev/GeosunPre/configs/trainer.json)（`iterations = 30000`、`max_cap = 3000000`），未随图像规模（数百至数千张）、ROI 几何体素复杂度及训练机显存自适应调整。在**完全不修改 `LichtFeld-Studio`** 的前提下，在 `GeosunPre` 侧完成全链路自适应配置生成：
+  1. [CMakeLists.txt](file:///d:/Dev/GeosunPre/CMakeLists.txt) 将 `configs/trainer.json` 内嵌编译为 `DefaultTrainerConfig`；新增 [trainer_config.h](file:///d:/Dev/GeosunPre/src/io/trainer_config.h) / [trainer_config.cpp](file:///d:/Dev/GeosunPre/src/io/trainer_config.cpp)，由 `ExportBundle` 在导出期自动生成 `<output>/trainer.json`（同步写入 `manifest.json` 的 `trainer_config` 摘要并在 `check` 中校验；存量交付包可用 `geosunpre trainer-config --output DIR [--vram-gb GB] [--trainer-config JSON]` 补生成）。
+  2. **迭代步数与调度同步缩放**：按 `N_train`（已注册图像数扣除 `test_every` 留出比例）以 `550` 张为锚点幂律推导 `iterations = round_1000(clamp(base_iters * (N_train / 550)^0.6, 20000, 120000))`，并按同一比例缩放 `start_refine`、`stop_refine`、`reset_every`、`refine_every`、`morton_reorder_interval`、`sh_degree_interval`、`grow_until_iter`、`color_variance_warmup_iters`、`eval_steps` 与 `save_steps`，保持 `steps_scaler = 1.0` 避免重复缩放。
+  3. **高斯上限与初始化点云协同**：取几何需求 `cap_geom = 3.0 * geom_points`（优先取 `roi_voxel_points_before_cap`）与视角支撑 `cap_views = 8000 * N_train` 较小值，受显存硬上限 `cap_vram = round_100k(clamp((vram_gb - 2.5) * 1800000, 4000000, 24000000))`（`8 GB -> 9.9M`、`24 GB -> 24M`）钳位并下限保护 `1.5M`，写出 `max_cap`（LFS 自动按 `grow_fraction = -1` / `shs_lr = -1` 联动）；`ExportLasPly`（[las.cpp](file:///d:/Dev/GeosunPre/src/io/las.cpp)）同步记录 `roi_voxel_points_before_cap` 并将 PLY 封顶联动为 `min(2500000, max(100000, round(0.75 * max_cap)))`。
+  4. [bundle/main.cpp](file:///d:/Dev/GeosunPre/bundle/main.cpp) 调整为训练优先加载 `<delivery>/trainer.json`，不存在时回退包内默认模板；[output.md](file:///d:/Dev/GeosunPre/docs/output.md) 已同步更新契约。
+
+### 三场景实景验证（`RTX 4090`，`23.99 GiB` 显存，`--eval-all`，无重复重跑基线）
+
+- `小场景` 对已有交付目录 [work/小场景](file:///d:/Dev/GeosunPre/work/小场景) 通过 `geosunpre trainer-config` 生成 `trainer.json` 并通过 `check`（另验证 `--vram-gb 8` 时 `cap_vram = 9,900,000`）；`展厅` 与 `篮球场` 通过 `run.ps1 run` 端到端预处理分别导出至 [work/展厅](file:///d:/Dev/GeosunPre/work/展厅)（`709.6 s`，`588/588` 注册）与 [work/篮球场](file:///d:/Dev/GeosunPre/work/篮球场)（`765.7 s`，`536/536` 注册）。三组训练产物均保留在 [work/adaptive-test/](file:///d:/Dev/GeosunPre/work/adaptive-test)。
+
+| 场景 / 方案 | `N_reg` / `N_train` | `geom_points` (`roi_voxel`) | `iterations` / `max_cap` / `ply_cap` | 训练耗时 | 裁切后 `#GS` | 采样显存 (`nvidia-smi`) | `Mask PSNR / SSIM / LPIPS` | `Aligned PSNR` | 法线角 (°) ↓ | 深度 med / p90 (mm) ↓ |
+| --- | :---: | ---: | :---: | ---: | ---: | ---: | --- | ---: | ---: | --- |
+| `小场景` 基线（`exp7` `30k/3M`） | `296` / `296` | `~845k` | `30,000 / 3,000,000 / 2,500,000` | `877.3 s` | `2,994,590` | — | **`24.4838 / 0.8286 / 0.2452`** | **`25.8417`** | **`7.6668°`** | `6.17 / 33.12` |
+| `小场景` 自适应（[report](file:///d:/Dev/GeosunPre/work/adaptive-test/小场景/metrics_report.txt)） | `296` / `259` | `845,322` | `20,000 / 2,100,000 / 1,575,000` | **`492.8 s`**（`-43.8%`） | `2,096,943` | `6,068 MiB`（`11,400` 步采样） | `23.8773 / 0.8122 / 0.2734` | `24.9136` | `7.9020°` | **`5.9110 / 30.0103`** |
+| `展厅` 基线（`zhanting-exp7`） | `588` / `588` | `~882k` | `30,000 / 3,000,000 / 2,500,000` | `899.1 s` | `2,988,447` | — | **`26.1516 / 0.8486 / 0.2717`** | **`26.8578`** | `7.6643°` | **`8.1261`** / `73.0369` |
+| `展厅` 自适应（[report](file:///d:/Dev/GeosunPre/work/adaptive-test/展厅/metrics_report.txt)） | `588` / `514` | `881,016` | `29,000 / 2,600,000 / 1,950,000` | **`863.9 s`**（`-3.9%`） | `2,585,606` | `9,084 MiB`（`17,300` 步采样） | `26.1391 / 0.8474 / 0.2763` | `26.8017` | **`7.6382°`** | `8.3586` / **`64.7211`** |
+| `篮球场` 历史旧版基线（`roi-v2`，注） | `536` / `536` | — | `30,000 / 3,000,000 / 2,500,000` | **`459.1 s`** | `2,919,206` | — | **`20.2007`** / `0.5588 / 0.3563` | — | `13.8834°` | `16.9795 / 810.6697` |
+| `篮球场` 自适应（[report](file:///d:/Dev/GeosunPre/work/adaptive-test/篮球场/metrics_report.txt)） | `536` / `469` | `5,143,902` | `27,000 / 3,800,000 / 2,500,000` | `835.0 s` | `3,758,049` | `8,666 MiB`（`17,600` 步采样） | `19.1562` / **`0.5861 / 0.3393`** | `19.3709` | **`13.5641°`** | **`9.6396 / 113.1315`** |
+
+注：`篮球场` 历史 `roi-v2` 基线跑在旧版配置与监督体系（无 PPISP、`normal_variance`/`color_variance` 及 `las_planar_moge2_fill`），仅作大场景跨代参考；三组自适应评测均开启 `--eval-all`，卷帘相机分别正确激活 `296/296`、`588/588` 与 `536/536`。
+
+### 结论与未验证项
+- **已验证生效**：
+  - 全链路从 `GeosunPre` 预处理导出、PLY 点云封顶联动、`check` 校验到 `LichtFeld-Studio` 直接读取 `trainer.json` 完整闭环，无二次步数缩放与 OOM；
+  - `展厅`（中等规模）自适应将容量收敛至 `2.6M / 29k` 步，耗时降低 `3.9%`、模型体积缩减 `13.5%`，PSNR 仅 `-0.0125 dB` 而法线角与深度 `p90` 均更优；
+  - `篮球场`（高几何密度室外大场景）突破 `3.0M` 固定上限抬升至 `3.8M`，实测采样显存约 `8.5 GiB`；
+  - `小场景`（`296` 张图）揭示出小样本区间（`< 300` 图）将步数压到 `20k` + 容量压到 `2.1M` 时虽提速 `43.8%` 且深度误差更低（`5.91 / 30.01 mm`），但外观细节付出 `-0.61 dB` PSNR 代价；后续如需保小场景细节，可微调下限（如 `I_min -> 24000~25000` 或微升小场景容量下限）。
+- **未验证项**：
+  - 未在真实 `8 GB` 物理显卡上实跑训练，仅验证了 `--vram-gb 8` 的参数计算路径（`cap_vram = 9.9M`）；
+  - 未在几千张图（`2,000–8,000` 张）的超大实景数据集上做端到端训练耗时与显存压测，也未通过 `Geosun.exe` 打包体做端到端调用回归（仅核查 `bundle/main.cpp` 编译链接与路径优先级逻辑）。
+
+

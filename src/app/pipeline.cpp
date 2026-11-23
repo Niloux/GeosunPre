@@ -3,6 +3,7 @@
 #include "io/las.h"
 #include "io/colmap.h"
 #include "io/cache.h"
+#include "io/trainer_config.h"
 #include "frontend/frontend.h"
 #include "frontend/inference.h"
 #include "sfm/reconstruction.h"
@@ -177,6 +178,8 @@ struct Delivery {
   double voxel;
   SupervisionOptions supervision;
   bool crop;
+  double vram_gb;
+  fs::path trainer_config;
 };
 // The options ParseDelivery reads, accepted by every command that writes a delivery.
 std::vector<std::string> WithDeliveryOptions(std::vector<std::string> options) {
@@ -184,14 +187,23 @@ std::vector<std::string> WithDeliveryOptions(std::vector<std::string> options) {
        {"--no-ply", "--no-roi", "--ply-voxel", "--no-las-supervision", "--supervision-max-size",
         "--supervision-boundary", "--supervision-mask-dir", "--supervision-cache-mb",
         "--supervision-source", "--supervision-models", "--no-crop-valid-domain",
-        "--no-static-masks"})
+        "--no-static-masks", "--vram-gb", "--trainer-config"})
     options.push_back(option);
   return options;
 }
 Delivery ParseDelivery(const Arguments& args) {
-  return {args.Get("--no-ply") != "true", args.Get("--no-roi") != "true",
-          args.Number("--ply-voxel", .05), ParseSupervisionOptions(args),
-          args.Get("--no-crop-valid-domain") != "true"};
+  const double vram_gb = args.Get("--vram-gb").empty() ? 0.0 : args.Number("--vram-gb", 0.0);
+  const fs::path trainer_config =
+      args.Get("--trainer-config").empty() ? fs::path() : args.Path("--trainer-config");
+  if (!trainer_config.empty())
+    LoadTrainerTemplate(trainer_config);
+  return {args.Get("--no-ply") != "true",
+          args.Get("--no-roi") != "true",
+          args.Number("--ply-voxel", .05),
+          ParseSupervisionOptions(args),
+          args.Get("--no-crop-valid-domain") != "true",
+          vram_gb,
+          trainer_config};
 }
 // Key of a product: relative to the work directory, or absolute when no relative path exists
 // (another drive). Verify resolves both, since work / absolute is the absolute path.
@@ -255,7 +267,8 @@ Json ExportSelected(const Scene& scene, const fs::path& work, const fs::path& ou
                     const Delivery& delivery) {
   const auto result = ReadJson(work / "result.json");
   return ExportBundle(scene, ReadModel(SelectedModelPath(work, result)), work, output, delivery.ply,
-                      delivery.voxel, result, delivery.supervision, delivery.crop, delivery.roi);
+                      delivery.voxel, result, delivery.supervision, delivery.crop, delivery.roi,
+                      delivery.vram_gb, delivery.trainer_config);
 }
 std::vector<fs::path> ReconstructVisual(const Scene& scene, const fs::path& work,
                                         const fs::path& root, const Json& settings,

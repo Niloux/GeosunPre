@@ -38,6 +38,8 @@ Json ExportLasPly(const fs::path& las, const LasHeader& header, const fs::path& 
                   double voxel = .05, const Reconstruction* model = nullptr,
                   const Reconstruction* visual_model = nullptr,
                   const std::function<fs::path(uint32_t)>& static_mask_path = {},
-                  Json* roi_out = nullptr);
+                  Json* roi_out = nullptr,
+                  const std::function<uint64_t(uint64_t voxel_total, uint64_t roi_in_total)>&
+                      cap_resolver = {});
 void VerifyInitializationPly(const fs::path& path, uint64_t points);
 }  // namespace geosun

@@ -2,6 +2,7 @@
 #include "app/build_info.h"
 #include "io/colmap.h"
 #include "io/las.h"
+#include "io/trainer_config.h"
 #include "frontend/inference.h"
 #include "frontend/frontend.h"
 #include <opencv2/core.hpp>
@@ -36,6 +37,16 @@ const Command Commands[] = {
      RunCommand},
     {"export", "--work WORK --output OUT [--no-ply] [--no-roi] [--ply-voxel METRES] [--no-las-supervision]",
      Export},
+    {"trainer-config", "--output DIR [--vram-gb GB] [--trainer-config JSON]",
+     [](const Arguments& args) {
+       args.Validate({"--output", "--vram-gb", "--trainer-config"});
+       const double vram_gb = args.Get("--vram-gb").empty() ? 0.0 : args.Number("--vram-gb", 0.0);
+       const fs::path template_path =
+           args.Get("--trainer-config").empty() ? fs::path() : args.Path("--trainer-config");
+       std::cout << WriteTrainerConfigForBundle(args.Path("--output"), vram_gb, template_path)
+                        .dump(2)
+                 << '\n';
+     }},
     {"check", "--output DIR [--project FILE.pro]",
      [](const Arguments& args) {
        args.Validate({"--output", "--project"});
@@ -84,6 +95,7 @@ void Help(const Arguments&) {
                "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS]\n"
                "    [--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"
                "    [--no-static-masks] [--no-crop-valid-domain] [--no-roi]\n"
+               "    [--vram-gb GB] [--trainer-config JSON]\n"
                "  See README.md and docs/output.md for defaults and delivery details.\n";
 }
 }  // namespace
