@@ -43,15 +43,10 @@ __device__ void FisheyePixel(double x, double y, double z, const double* p, doub
   u = p[0] * x * scale + p[2];
   v = p[1] * y * scale + p[3];
 }
-__device__ float BlendBand(float nearest) { return .01f + .01f * nearest; }
-// Pass Nearest keeps each pixel's nearest ray distance; pass Accumulate adds every surfel
-// within the band of it to the pixel's blend. A surfel covers the pixels whose rays meet its
-// tangent disk, weighted by 1 - (offset / radius)^2; a point without a footprint covers only
-// its projected pixel.
-template <bool Accumulate>
-__global__ void ProjectSurfels(const Surfel* points, int count, const Projection* cameras,
-                               const float3* rays, float* nearest, Blend* blends, int width,
-                               int height) {
+// Keeps each pixel's nearest ray distance. A surfel covers the pixels whose rays meet its tangent
+// disk; a point without a footprint covers only its projected pixel.
+__global__ void ProjectNearestSurfels(const Surfel* points, int count, const Projection* cameras,
+                                      const float3* rays, float* nearest, int width, int height) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count)
     return;
@@ -113,28 +108,13 @@ __global__ void ProjectSurfels(const Surfel* points, int count, const Projection
     n = make_float3(float(rx * facing), float(ry * facing), float(rz * facing));
   }
   const size_t image = size_t(blockIdx.y) * width * height;
-  auto cover = [&](int pixel, float t, float weight) {
-    if (!Accumulate) {
-      atomicMin(reinterpret_cast<unsigned*>(nearest + image + pixel), __float_as_uint(t));
-      return;
-    }
-    const float front = nearest[image + pixel];
-    if (t > front + BlendBand(front))
-      return;
-    auto& b = blends[image + pixel];
-    atomicAdd(&b.weight, weight);
-    atomicAdd(&b.depth, weight * t);
-    if (point.normal) {
-      atomicAdd(&b.nx, weight * n.x);
-      atomicAdd(&b.ny, weight * n.y);
-      atomicAdd(&b.nz, weight * n.z);
-      atomicAdd(&b.normals, weight);
-    }
+  auto cover = [&](int pixel, float t) {
+    atomicMin(reinterpret_cast<unsigned*>(nearest + image + pixel), __float_as_uint(t));
   };
   const int cu = int(u), cv = int(v);
   const float d = float(distance), radius = point.radius;
   if (!point.normal || radius <= 0) {
-    cover(cv * width + cu, d, 1);
+    cover(cv * width + cu, d);
     return;
   }
   // Fisheye magnification stays below 1.6 within MaxTheta, so the box holds the footprint.
@@ -151,30 +131,13 @@ __global__ void ProjectSurfels(const Surfel* points, int count, const Projection
       const float t = plane / den, ex = t * ray.x - q.x, ey = t * ray.y - q.y,
                   ez = t * ray.z - q.z, e2 = (ex * ex + ey * ey + ez * ez) / (radius * radius);
       if (e2 <= 1 && t >= .05f && t <= float(MaxDepth)) {
-        cover(yy * width + xx, t, fmaxf(.05f, 1 - e2));
+        cover(yy * width + xx, t);
         centre = centre || (xx == cu && yy == cv);
       }
     }
   // The point's own pixel is covered even when the tangent plane meets its ray obliquely.
   if (!centre)
-    cover(cv * width + cu, d, 1);
-}
-// Blended depth everywhere a surfel landed; the blended normal only where normal-bearing
-// surfels carry most of the weight and agree (unit-vector mean length MinNormalAgreement).
-__global__ void Resolve(const Blend* blends, float* depth, unsigned* normals, int size) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= size)
-    return;
-  const auto b = blends[i];
-  depth[i] = 0;
-  normals[i] = 0;
-  if (b.weight <= 0)
-    return;
-  const float d = b.depth / b.weight;
-  depth[i] = d <= float(MaxDepth) ? d : 0;
-  const float length = sqrtf(b.nx * b.nx + b.ny * b.ny + b.nz * b.nz);
-  if (b.normals >= .5f * b.weight && length >= MinNormalAgreement * b.normals)
-    normals[i] = EncodeNormal(b.nx / length, b.ny / length, b.nz / length);
+    cover(cv * width + cu, d);
 }
 // Grid-cell key of a slab-relative position; each index fits 21 bits.
 __device__ unsigned long long CellKey(int x, int y, int z) {
@@ -435,164 +398,6 @@ void Cub(std::unique_ptr<DeviceBuffer>& temporary, Run run) {
     temporary = std::make_unique<DeviceBuffer>(bytes);
   CudaCheck(run(temporary->data, bytes));
 }
-__device__ float At(const float* depth, int x, int y, int w, int h) {
-  if (x < 0 || y < 0 || x >= w || y >= h)
-    return 0;
-  const float d = depth[y * w + x];
-  return d > 0 && d <= MaxDepth ? d : 0;
-}
-__global__ void Cull(const float* raw, float* clean, const uint8_t* mask, int w, int h) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= w * h)
-    return;
-  const int x = i % w, y = i / w;
-  float nearest = float(MaxDepth), d = At(raw, x, y, w, h);
-  for (int dy = -2; dy <= 2; ++dy)
-    for (int dx = -2; dx <= 2; ++dx) {
-      const int xx = x + dx, yy = y + dy;
-      const float v = At(raw, xx, yy, w, h);
-      if (v > 0 && mask[yy * w + xx])
-        nearest = fminf(nearest, v);
-    }
-  clean[i] = mask[i] && d <= nearest * 1.03f + .02f ? d : 0;
-}
-__global__ void Fill(const float* input, float* output, const uint8_t* mask, int w, int h) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= w * h)
-    return;
-  const int x = i % w, y = i / w;
-  float sum = 0, lo = float(MaxDepth), hi = 0;
-  int count = 0;
-  for (int dy = -1; dy <= 1; ++dy)
-    for (int dx = -1; dx <= 1; ++dx) {
-      if (!dx && !dy)
-        continue;
-      const float v = At(input, x + dx, y + dy, w, h);
-      if (v > 0) {
-        ++count;
-        sum += v;
-        lo = fminf(lo, v);
-        hi = fmaxf(hi, v);
-      }
-    }
-  const float d = At(input, x, y, w, h);
-  output[i] = d;
-  if (mask[i] && !d && count >= 6 && hi - lo <= .02f * lo + .01f)
-    output[i] = sum / count;
-}
-// Cull leaves no depth jump inside a 5x5 window, so occlusions are found on the supported
-// projection before culling: a background pixel a clear step behind a supported foreground
-// pixel within two pixels is a step seed, which also forms the background-side margin; its
-// depth is kept for the foreground side. The step exceeds the depth ramp across two pixels
-// of oblique floors, ceilings and side walls, so those surfaces do not seed. Pixels next to
-// the semantic mask limit are marked separately.
-__global__ void Edges(const float* depth, const uint8_t* mask, uint8_t* limits, float* seeds,
-                      int w, int h) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= w * h)
-    return;
-  const int x = i % w, y = i / w;
-  float nearest = float(MaxDepth);
-  bool boundary = !mask[i];
-  for (int dy = -2; dy <= 2; ++dy)
-    for (int dx = -2; dx <= 2; ++dx) {
-      const int xx = x + dx, yy = y + dy;
-      const bool adjacent = abs(dx) <= 1 && abs(dy) <= 1;
-      if (xx < 0 || yy < 0 || xx >= w || yy >= h) {
-        boundary = boundary || adjacent;
-        continue;
-      }
-      boundary = boundary || (adjacent && !mask[yy * w + xx]);
-      const float v = At(depth, xx, yy, w, h);
-      if (v > 0 && mask[yy * w + xx])
-        nearest = fminf(nearest, v);
-    }
-  limits[i] = boundary;
-  const float d = At(depth, x, y, w, h);
-  seeds[i] = mask[i] && d > nearest * 1.1f + .05f ? d : 0;
-}
-// LAS foreground silhouettes spread by about OcclusionSpread beyond the photographed ones
-// (lateral range noise and overlapping scans win the nearest-depth test), so a foreground
-// pixel is dropped within that spread, in pixels at its depth, of a step seed behind it.
-__global__ void Margins(const float* depth, const float* projected, const float* seeds,
-                        const uint8_t* limits, uint8_t* edges, int w, int h, float focal) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= w * h)
-    return;
-  edges[i] = limits[i] || seeds[i] > 0;
-  const int x = i % w, y = i / w;
-  float d = At(depth, x, y, w, h);
-  if (!d)
-    d = At(projected, x, y, w, h);
-  if (edges[i] || !d)
-    return;
-  const int radius = min(MaxOcclusionMargin, int(ceilf(OcclusionSpread * focal / d)));
-  const float behind = d * 1.1f + .05f;
-  for (int yy = max(0, y - radius); yy <= min(h - 1, y + radius); ++yy)
-    for (int xx = max(0, x - radius); xx <= min(w - 1, x + radius); ++xx)
-      if (seeds[yy * w + xx] > behind) {
-        edges[i] = 1;
-        return;
-      }
-}
-__global__ void Dilate(const uint8_t* input, uint8_t* output, int w, int h, int radius,
-                         bool horizontal) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= w * h)
-    return;
-  uint8_t bad = 0;
-  for (int d = -radius; d <= radius; ++d) {
-    const int x = i % w + (horizontal ? d : 0), y = i / w + (horizontal ? 0 : d);
-    if (x >= 0 && y >= 0 && x < w && y < h)
-      bad |= input[y * w + x];
-  }
-  output[i] = bad;
-}
-__device__ bool DepthSupported(const float* depth, int x, int y, int w, int h, double center) {
-  int count = 0;
-  for (int dy = -2; dy <= 2; ++dy)
-    for (int dx = -2; dx <= 2; ++dx) {
-      const float v = At(depth, x + dx, y + dy, w, h);
-      if (v > 0 && fabs(v - center) <= .02 * center + .01 && ++count >= 4)
-        return true;
-    }
-  return false;
-}
-// Projected pixels without local depth support are dropped before culling, so an isolated
-// outlier neither culls the surface around it nor seeds a boundary margin.
-__global__ void Isolate(const float* input, float* output, int w, int h) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= w * h)
-    return;
-  const int x = i % w, y = i / w;
-  const float d = At(input, x, y, w, h);
-  output[i] = d && DepthSupported(input, x, y, w, h, d) ? d : 0;
-}
-// Depth stays valid off the occlusion margins with local support; the blended surfel normal
-// is kept only where the pixel holds its blended depth (not a filled one).
-__global__ void Encode(const float* depth, const float* projected, const unsigned* codes,
-                       const float3* rays, const uint8_t* edges, uint16_t* millimetres,
-                       uchar3* normals, int w, int h) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= w * h)
-    return;
-  millimetres[i] = 0;
-  normals[i] = make_uchar3(0, 0, 0);
-  const int x = i % w, y = i / w;
-  const float d = At(depth, x, y, w, h);
-  const auto ray = rays[i];
-  if (edges[i] || !d || (ray.x == 0 && ray.y == 0 && ray.z == 0) ||
-      !DepthSupported(depth, x, y, w, h, d))
-    return;
-  millimetres[i] = uint16_t(max(1, min(65535, int(d * 1000. + .5))));
-  if (!codes[i] || projected[i] != d)
-    return;
-  const auto n = DecodeNormal(codes[i]);
-  if (-(n.x * ray.x + n.y * ray.y + n.z * ray.z) < MinIncidence)
-    return;
-  normals[i] = make_uchar3(uint8_t(127.5f + 127.5f * n.z + .5f), uint8_t(127.5f + 127.5f * n.y + .5f),
-                           uint8_t(127.5f + 127.5f * n.x + .5f));
-}
 }  // namespace
 
 // Surfels of the slab's first own points; the rest of points is the halo.
@@ -674,16 +479,12 @@ std::vector<Surfel> SlabSurfels(const std::vector<int3>& points, size_t own, int
   return result;
 }
 
-void Project(const Surfel* points, size_t count, size_t images, const Projection* cameras,
-             const float3* rays, float* nearest, Blend* blends, int width, int height,
-             bool accumulate, cudaStream_t stream) {
+void ProjectNearest(const Surfel* points, size_t count, size_t images, const Projection* cameras,
+                    const float3* rays, float* nearest, int width, int height,
+                    cudaStream_t stream) {
   const dim3 grid(unsigned((count + 255) / 256), unsigned(images));
-  if (accumulate)
-    ProjectSurfels<true><<<grid, 256, 0, stream>>>(points, int(count), cameras, rays,
-                                                          nearest, blends, width, height);
-  else
-    ProjectSurfels<false><<<grid, 256, 0, stream>>>(points, int(count), cameras, rays,
-                                                           nearest, blends, width, height);
+  ProjectNearestSurfels<<<grid, 256, 0, stream>>>(points, int(count), cameras, rays, nearest,
+                                                  width, height);
   CudaCheck(cudaGetLastError());
 }
 
@@ -695,28 +496,6 @@ __global__ void ClearEmptyNearest(float* depths, size_t count) {
 
 void ResolveNearest(float* depths, size_t count, cudaStream_t stream) {
   ClearEmptyNearest<<<unsigned((count + 255) / 256), 256, 0, stream>>>(depths, count);
-  CudaCheck(cudaGetLastError());
-}
-
-void EncodeMaps(const Blend* blends, int w, int h, int boundary, float focal,
-                const uint8_t* keep, const float3* rays, float* raw_depth, unsigned* codes,
-                float* filtered, float* scratch, uint8_t* limit, uint8_t* dilated,
-                float* seeds, uint8_t* edge, uint16_t* millimetres, uchar3* normals,
-                cudaStream_t stream) {
-  const int size = w * h, blocks = (size + 255) / 256;
-  Resolve<<<blocks, 256, 0, stream>>>(blends, raw_depth, codes, size);
-  Isolate<<<blocks, 256, 0, stream>>>(raw_depth, scratch, w, h);
-  Cull<<<blocks, 256, 0, stream>>>(scratch, filtered, keep, w, h);
-  Edges<<<blocks, 256, 0, stream>>>(scratch, keep, limit, seeds, w, h);
-  for (int pass = 0; pass < 2; ++pass) {
-    Fill<<<blocks, 256, 0, stream>>>(filtered, scratch, keep, w, h);
-    std::swap(filtered, scratch);
-  }
-  Dilate<<<blocks, 256, 0, stream>>>(limit, dilated, w, h, boundary, true);
-  Dilate<<<blocks, 256, 0, stream>>>(dilated, limit, w, h, boundary, false);
-  Margins<<<blocks, 256, 0, stream>>>(filtered, raw_depth, seeds, limit, edge, w, h, focal);
-  Encode<<<blocks, 256, 0, stream>>>(filtered, raw_depth, codes, rays, edge, millimetres,
-                                     normals, w, h);
   CudaCheck(cudaGetLastError());
 }
 
@@ -832,7 +611,11 @@ __global__ void BuildMogeFaceEstimatesKernel(const float* points, const float* n
   if (idx < int(face_pixels)) {
     const size_t p_idx = size_t(f) * face_pixels + size_t(idx);
     const float pz = points[3 * p_idx + 2];
-    const bool valid_px = face_valid[p_idx] && mask[p_idx] > .5f && isfinite(pz);
+    const double nx0 = normals[3 * p_idx], ny0 = normals[3 * p_idx + 1],
+                 nz0 = normals[3 * p_idx + 2];
+    const double n0_len = sqrt(nx0 * nx0 + ny0 * ny0 + nz0 * nz0);
+    const bool valid_px = face_valid[p_idx] && mask[p_idx] > .5f && isfinite(pz) &&
+                          isfinite(n0_len) && n0_len > 1e-6;
     const double depth = double(pz) + shifts[f];
     if (shift_ok[f] && valid_px && depth > 0.0) {
       const int v = idx / size, u = idx % size;
@@ -840,11 +623,9 @@ __global__ void BuildMogeFaceEstimatesKernel(const float* points, const float* n
       const double ry = (v + 0.5 - size * 0.5) / focal;
       const double ray_norm = sqrt(rx * rx + ry * ry + 1.0);
       const double* tc = to_camera + size_t(f) * 9;
-      const double nx0 = normals[3 * p_idx], ny0 = normals[3 * p_idx + 1],
-                   nz0 = normals[3 * p_idx + 2];
-      double nx = tc[0] * nx0 + tc[1] * ny0 + tc[2] * nz0;
-      double ny = tc[3] * nx0 + tc[4] * ny0 + tc[5] * nz0;
-      double nz = tc[6] * nx0 + tc[7] * ny0 + tc[8] * nz0;
+      double nx = (tc[0] * nx0 + tc[1] * ny0 + tc[2] * nz0) / n0_len;
+      double ny = (tc[3] * nx0 + tc[4] * ny0 + tc[5] * nz0) / n0_len;
+      double nz = (tc[6] * nx0 + tc[7] * ny0 + tc[8] * nz0) / n0_len;
       const double cx = tc[0] * rx + tc[1] * ry + tc[2];
       const double cy = tc[3] * rx + tc[4] * ry + tc[5];
       const double cz = tc[6] * rx + tc[7] * ry + tc[8];

@@ -62,27 +62,21 @@ class MonocularEstimator {
                                      const Eigen::Vector3d& omega = Eigen::Vector3d::Zero(),
                                      int axis = 1, bool rolling = false);
 };
-// Decouples metric LAS depth from MoGe-2 dense normals on the supervision grid:
-// 1. Detects depth/normal edges on each 90-degree MoGe face and dilates them on the grid to
-//    mask LAS edge bleeding and calibration micro-offsets.
-// 2. Gathers rolling-shutter rectified MoGe normals onto the grid (rotating back to readout-line
-//    camera frame when omega is nonzero) and clears severe disagreements (> 35 degrees) where
-//    confident planar LAS surfels and MoGe normals conflict off MoGe edges.
-// 3. Runs per-face deterministic RANSAC on inverse depth (q_las ~= s * q_moge + t) over clean
-//    lattice anchors to filter close flying points and far glass/mirror penetrations, checking
-//    multi-face consensus and rescuing solid planar surfaces whose LAS normal agrees with MoGe.
-// 4. Keeps raw millimetre LAS depth for inliers (without warping); prioritizes confident planar
-//    LAS surfel normals on RANSAC-kept off-edge pixels and backfills LAS gaps, edges, and
-//    non-planar regions with MoGe-2 normals (zeroing unrescued glass penetrations and > 35 deg
-//    off-edge conflicts).
-Json CleanLasAndEncodeNormals(const MonocularLens& lens,
-                              const std::vector<FaceEstimate>& faces,
-                              const cv::Mat& las,
-                              const cv::Mat& las_normal,
-                              const cv::Mat& allowed,
-                              const Eigen::Vector3d* omega,
-                              int axis,
-                              double min_incidence,
-                              cv::Mat& depth_mm,
-                              cv::Mat& normal_rgb);
+struct MogeSsiResult {
+  cv::Mat depth_u16;   // CV_16UC1: 0 invalid; valid ray distances mapped [min_d, max_d] -> [0.02, 1.0]*65535
+  cv::Mat normal_rgb;  // CV_8UC3 (OpenCV BGR -> PNG RGB): round(127.5*(n+1)), (0,0,0) invalid
+  double min_distance = 0.0;
+  double max_distance = 0.0;
+  std::vector<double> face_scales;
+  Json report;
+};
+// Aligns face scales across overlapping 90-degree MoGe-2 faces using median ratios, blends ray
+// distance and camera-facing unit normals onto the supervision grid (rotating fused normals back
+// to each readout-line camera frame when omega is nonzero), masks by allowed, and encodes SSI
+// 16-bit depth + 8-bit OpenCV camera normal maps.
+MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
+                                const std::vector<FaceEstimate>& faces,
+                                const cv::Mat& allowed,
+                                const Eigen::Vector3d* omega,
+                                int axis);
 }  // namespace geosun

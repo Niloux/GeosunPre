@@ -19,17 +19,8 @@ constexpr double OuterRingDegrees = 15;
 constexpr double FeatherBand = .3;
 // Fewest valid samples in MoGe's 64 x 64 shift grid for a face to be used.
 constexpr size_t MinimumShiftSamples = 32;
-// MoGe face edge detection and LAS reverse cleaning parameters.
-constexpr double EdgeDepthLog = .05;
-constexpr double EdgeNormalDeg = 35.;
-constexpr int FitLattice = 2;
-constexpr size_t MinFaceRansacSamples = 64, MinFaceRansacInliers = 32;
-constexpr int RansacIterations = 256;
-constexpr size_t RansacScoreSubset = 4096;
-constexpr double RansacScoreLog = .30, RansacMadScale = 3.5, RansacLogMin = .25,
-                 RansacLogMax = .45, MinRansacInlierFraction = .40,
-                 PenetrationMinDiffMetres = .25, NormalDisagreeMaxDeg = 35.,
-                 FarRescueNormalAgreeMaxDeg = 25., FarRescueMaxLogRatio = 1.1;
+// Fewest overlapping samples needed to align the relative scale of a tilted face.
+constexpr size_t MinimumScaleOverlapSamples = 64;
 
 double Radians(double degrees) { return degrees * Pi / 180; }
 void AddRing(std::vector<Eigen::Matrix3d>& rotations, int ring, double tilt) {
@@ -462,257 +453,68 @@ bool SampleFace(const FaceEstimate& face, const FaceSample& sample, double& dist
   normal.setZero();
   for (int c = 0; c < 4; ++c) {
     const float d = face.distance.at<float>(y + c / 2, x + c % 2);
-    if (!(d > 0))
+    if (!(d > 0.f) || !std::isfinite(d))
       return false;
     const auto& value = face.normal.at<cv::Vec3f>(y + c / 2, x + c % 2);
+    if (!std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2]))
+      return false;
     distance += corner[c] * d;
     normal += corner[c] * Eigen::Vector3d(value[0], value[1], value[2]);
   }
-  return true;
+  return std::isfinite(distance) && distance > 0.0;
 }
-struct PixelFaces {
-  float distance[MonocularLens::MaxSamples]{};
-  uint8_t face[MonocularLens::MaxSamples]{};
-  uint8_t count = 0;
+struct FacePixelSample {
+  uint32_t pixel = 0;
+  float distance = 0.f;
+  float weight = 0.f;
 };
-struct RansacSample {
-  double q_moge;
-  double r_las;
-  double q_las;
-};
-struct FaceRansac {
-  bool accepted = false;
-  double s = 1.;
-  double t = 0.;
-  double mad_log = 0.;
-  double tau = RansacLogMax;
-  size_t samples = 0;
-  size_t inliers = 0;
-};
-FaceRansac FitFaceRansac(const std::vector<RansacSample>& pts, size_t face_index) {
-  FaceRansac fit;
-  const size_t n = pts.size();
-  fit.samples = n;
-  if (n < MinFaceRansacSamples)
-    return fit;
-
-  const size_t stride = std::max<size_t>(1, n / RansacScoreSubset);
-  auto score_model = [&](double s, double t) -> size_t {
-    if (!(s > 0.) || !std::isfinite(s) || !std::isfinite(t))
-      return 0;
-    size_t count = 0;
-    for (size_t i = 0; i < n; i += stride) {
-      const double q_hat = s * pts[i].q_moge + t;
-      if (q_hat > 0. && std::abs(std::log(pts[i].r_las * q_hat)) <= RansacScoreLog)
-        ++count;
-    }
-    return count;
-  };
-
-  std::vector<double> init_ratios;
-  init_ratios.reserve((n + stride - 1) / stride);
-  for (size_t i = 0; i < n; i += stride)
-    init_ratios.push_back(std::log(pts[i].q_las / pts[i].q_moge));
-  double best_s = std::exp(Quantile(init_ratios, .5));
-  double best_t = 0.;
-  size_t best_score = score_model(best_s, best_t);
-
-  uint32_t state = 0x9e3779b9u ^ uint32_t(face_index * 2654435761u) ^ uint32_t(n);
-  if (!state)
-    state = 1u;
-  auto next_rand = [&]() {
-    state ^= state << 13;
-    state ^= state >> 17;
-    state ^= state << 5;
-    return state;
-  };
-  for (int it = 0; it < RansacIterations; ++it) {
-    const size_t i0 = next_rand() % n;
-    const size_t i1 = next_rand() % n;
-    const double dq = pts[i1].q_moge - pts[i0].q_moge;
-    if (std::abs(dq) < 1e-6)
-      continue;
-    const double s = (pts[i1].q_las - pts[i0].q_las) / dq;
-    if (!(s > 0.) || !std::isfinite(s))
-      continue;
-    const double t = pts[i0].q_las - s * pts[i0].q_moge;
-    if (!std::isfinite(t))
-      continue;
-    const size_t score = score_model(s, t);
-    if (score > best_score) {
-      best_score = score;
-      best_s = s;
-      best_t = t;
-    }
-  }
-
-  std::vector<size_t> consensus;
-  consensus.reserve(n);
-  std::vector<double> consensus_ratios;
-  consensus_ratios.reserve(n);
-  double m00 = 0., m01 = 0., m11 = 0., rhs0 = 0., rhs1 = 0.;
-  for (size_t i = 0; i < n; ++i) {
-    const double q_hat = best_s * pts[i].q_moge + best_t;
-    if (q_hat > 0. && std::abs(std::log(pts[i].r_las * q_hat)) <= RansacScoreLog) {
-      consensus.push_back(i);
-      consensus_ratios.push_back(std::log(pts[i].q_las / pts[i].q_moge));
-      const double a = pts[i].r_las * pts[i].q_moge;
-      const double b = pts[i].r_las;
-      m00 += a * a;
-      m01 += a * b;
-      m11 += b * b;
-      rhs0 += a;
-      rhs1 += b;
-    }
-  }
-  if (consensus.size() < MinFaceRansacInliers)
-    return fit;
-
-  double s_final = best_s, t_final = best_t;
-  bool ls_ok = false;
-  const double det = m00 * m11 - m01 * m01;
-  if (det > 1e-12 * (m00 * m11 + 1e-12)) {
-    const double s_ls = (m11 * rhs0 - m01 * rhs1) / det;
-    const double t_ls = (-m01 * rhs0 + m00 * rhs1) / det;
-    if (s_ls > 0. && std::isfinite(s_ls) && std::isfinite(t_ls)) {
-      size_t positive = 0;
-      for (const size_t idx : consensus)
-        if (s_ls * pts[idx].q_moge + t_ls > 0.)
-          ++positive;
-      if (positive >= MinFaceRansacInliers) {
-        s_final = s_ls;
-        t_final = t_ls;
-        ls_ok = true;
-      }
-    }
-  }
-  if (!ls_ok) {
-    s_final = std::exp(Quantile(consensus_ratios, .5));
-    t_final = 0.;
-  }
-
-  std::vector<double> residuals;
-  residuals.reserve(consensus.size());
-  for (const size_t idx : consensus) {
-    const double q_hat = s_final * pts[idx].q_moge + t_final;
-    if (q_hat > 0.)
-      residuals.push_back(std::log(pts[idx].r_las * q_hat));
-  }
-  if (residuals.size() < MinFaceRansacInliers)
-    return fit;
-
-  const double med = Quantile(residuals, .5);
-  std::vector<double> abs_dev(residuals.size());
-  for (size_t i = 0; i < residuals.size(); ++i)
-    abs_dev[i] = std::abs(residuals[i] - med);
-  const double mad_log = 1.4826 * Quantile(abs_dev, .5);
-  const double tau = std::clamp(RansacMadScale * mad_log, RansacLogMin, RansacLogMax);
-
-  size_t inliers = 0;
-  for (const auto& p : pts) {
-    const double q_hat = s_final * p.q_moge + t_final;
-    if (q_hat > 0. && std::abs(std::log(p.r_las * q_hat)) <= tau)
-      ++inliers;
-  }
-
-  fit.s = s_final;
-  fit.t = t_final;
-  fit.mad_log = mad_log;
-  fit.tau = tau;
-  fit.inliers = inliers;
-  fit.accepted =
-      inliers >= MinFaceRansacInliers && double(inliers) / double(n) >= MinRansacInlierFraction;
-  return fit;
-}
 }  // namespace
 
-Json CleanLasAndEncodeNormals(const MonocularLens& lens,
-                              const std::vector<FaceEstimate>& faces,
-                              const cv::Mat& las,
-                              const cv::Mat& las_normal,
-                              const cv::Mat& allowed,
-                              const Eigen::Vector3d* omega,
-                              int axis,
-                              double min_incidence,
-                              cv::Mat& depth_mm,
-                              cv::Mat& normal_rgb) {
-  if (faces.size() != lens.faces.size() || las.type() != CV_16UC1 ||
-      las.cols != lens.grid.width || las.rows != lens.grid.height ||
-      las_normal.type() != CV_8UC3 || las_normal.size() != las.size() ||
-      allowed.type() != CV_8UC1 || allowed.size() != las.size())
-    throw std::runtime_error("LAS depth, normal or static mask differs from the lens plan");
+MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
+                                const std::vector<FaceEstimate>& faces,
+                                const cv::Mat& allowed,
+                                const Eigen::Vector3d* omega,
+                                int axis) {
+  const int w = lens.grid.width, h = lens.grid.height, fsize = lens.size;
+  if (faces.size() != lens.faces.size() || allowed.type() != CV_8UC1 || allowed.cols != w ||
+      allowed.rows != h)
+    throw std::runtime_error("Static mask or face count differs from the lens plan");
 
   const size_t face_count = faces.size();
-  const int fsize = lens.size;
-  const double edge_normal_cos = std::cos(Radians(EdgeNormalDeg));
-  std::vector<cv::Mat> face_edges(face_count);
   for (size_t f = 0; f < face_count; ++f) {
     const auto& face = faces[f];
     if (face.distance.type() != CV_32FC1 || face.normal.type() != CV_32FC3 ||
         face.distance.rows != fsize || face.distance.cols != fsize ||
         face.normal.size() != face.distance.size())
       throw std::runtime_error("Monocular face estimate differs from the lens plan");
-    cv::Mat edge = cv::Mat::zeros(fsize, fsize, CV_8UC1);
-    for (int y = 0; y < fsize; ++y)
-      for (int x = 0; x < fsize; ++x) {
-        const float d = face.distance.at<float>(y, x);
-        if (!(d > 0.f))
-          continue;
-        const auto& n1 = face.normal.at<cv::Vec3f>(y, x);
-        const double n1_norm =
-            std::sqrt(double(n1[0]) * n1[0] + double(n1[1]) * n1[1] + double(n1[2]) * n1[2]);
-        bool is_edge = false;
-        for (int dy = -1; dy <= 1 && !is_edge; ++dy)
-          for (int dx = -1; dx <= 1; ++dx) {
-            if (!dx && !dy)
-              continue;
-            const int xx = x + dx, yy = y + dy;
-            if (xx < 0 || yy < 0 || xx >= fsize || yy >= fsize)
-              continue;
-            const float d2 = face.distance.at<float>(yy, xx);
-            if (!(d2 > 0.f))
-              continue;
-            if (std::abs(std::log(double(d2) / double(d))) > EdgeDepthLog) {
-              is_edge = true;
-              break;
-            }
-            const auto& n2 = face.normal.at<cv::Vec3f>(yy, xx);
-            const double n2_norm =
-                std::sqrt(double(n2[0]) * n2[0] + double(n2[1]) * n2[1] + double(n2[2]) * n2[2]);
-            if (n1_norm > 0. && n2_norm > 0.) {
-              const double dot =
-                  double(n1[0]) * n2[0] + double(n1[1]) * n2[1] + double(n1[2]) * n2[2];
-              if (dot < edge_normal_cos * n1_norm * n2_norm) {
-                is_edge = true;
-                break;
-              }
-            }
-          }
-        if (is_edge)
-          edge.at<uint8_t>(y, x) = 1;
-      }
-    face_edges[f] = std::move(edge);
   }
 
-  const int w = lens.grid.width, h = lens.grid.height;
+  const cv::Mat allowed_contig = allowed.isContinuous() ? allowed : allowed.clone();
+  const uint8_t* allowed_ptr = allowed_contig.ptr<uint8_t>();
+  const size_t pixels = size_t(w) * h;
   const bool rolling = omega && !omega->isZero();
-  cv::Mat gathered_normal = cv::Mat::zeros(h, w, CV_32FC3);
-  cv::Mat grid_edge = cv::Mat::zeros(h, w, CV_8UC1);
-  std::vector<PixelFaces> pixel_faces(size_t(w) * h);
+
+  std::vector<std::vector<FacePixelSample>> face_samples(face_count);
+  for (auto& list : face_samples)
+    list.reserve(pixels / std::max<size_t>(1, face_count / 2));
+
+  std::vector<cv::Vec3f> blended_normals(pixels, cv::Vec3f(0.f, 0.f, 0.f));
+  std::vector<uint8_t> has_normal(pixels, 0);
 
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x) {
       const size_t i = size_t(y) * w + x;
+      const auto& r_cv = lens.rays.at<cv::Vec3f>(y, x);
+      if (r_cv[0] == 0.f && r_cv[1] == 0.f && r_cv[2] == 0.f)
+        continue;
+      const Eigen::Vector3d r_exp(r_cv[0], r_cv[1], r_cv[2]);
+
       std::array<FaceSample, MonocularLens::MaxSamples> samples;
       int count = 0;
       Eigen::Vector3d w_rot = Eigen::Vector3d::Zero();
       if (rolling) {
-        const auto& r_cv = lens.rays.at<cv::Vec3f>(y, x);
-        if (r_cv[0] == 0.f && r_cv[1] == 0.f && r_cv[2] == 0.f)
-          continue;
         const double s = axis ? (y + .5 - .5 * h) / h : (x + .5 - .5 * w) / w;
         w_rot = s * (*omega);
-        const Eigen::Vector3d r_exp(r_cv[0], r_cv[1], r_cv[2]);
         const Eigen::Vector3d r_ref =
             (r_exp - w_rot.cross(r_exp) + w_rot.dot(r_exp) * w_rot).normalized();
         count = lens.SamplesAtRay(r_ref, samples);
@@ -720,211 +522,123 @@ Json CleanLasAndEncodeNormals(const MonocularLens& lens,
         samples = lens.samples[i];
         count = lens.counts[i];
       }
-      double weights = 0.;
-      Eigen::Vector3d normal = Eigen::Vector3d::Zero();
-      bool is_edge = false;
-      auto& pf = pixel_faces[i];
+
+      double w_sum = 0.0;
+      Eigen::Vector3d n_sum = Eigen::Vector3d::Zero();
       for (int k = 0; k < count; ++k) {
         const auto& sample = samples[k];
-        double distance = 0.;
+        double distance = 0.0;
         Eigen::Vector3d n;
-        if (!SampleFace(faces[sample.face], sample, distance, n))
+        if (!SampleFace(faces[sample.face], sample, distance, n) || !(sample.weight > 0.f))
           continue;
-        weights += sample.weight;
-        normal += sample.weight * n;
-        if (pf.count < MonocularLens::MaxSamples) {
-          pf.distance[pf.count] = float(distance);
-          pf.face[pf.count] = sample.face;
-          ++pf.count;
-        }
-        const int fx0 = int(sample.x), fy0 = int(sample.y);
-        const auto& fe = face_edges[sample.face];
-        if (fe.at<uint8_t>(fy0, fx0) || fe.at<uint8_t>(fy0, fx0 + 1) ||
-            fe.at<uint8_t>(fy0 + 1, fx0) || fe.at<uint8_t>(fy0 + 1, fx0 + 1))
-          is_edge = true;
+        face_samples[sample.face].push_back({uint32_t(i), float(distance), sample.weight});
+        w_sum += sample.weight;
+        n_sum += sample.weight * n;
       }
-      if (is_edge)
-        grid_edge.at<uint8_t>(y, x) = 1;
-      if (weights <= 0. || normal.norm() < 1e-6)
+
+      if (!allowed_ptr[i] || !(w_sum > 0.0))
         continue;
-      normal.normalize();
+      const double n_norm = n_sum.norm();
+      if (!(n_norm > 1e-6) || !std::isfinite(n_norm))
+        continue;
+      Eigen::Vector3d normal = n_sum / n_norm;
       if (rolling)
         normal = (normal + w_rot.cross(normal)).normalized();
-      gathered_normal.at<cv::Vec3f>(y, x) =
-          cv::Vec3f(float(normal.x()), float(normal.y()), float(normal.z()));
+      if (normal.dot(r_exp) > 0.0)
+        normal = -normal;
+      blended_normals[i] = cv::Vec3f(float(normal.x()), float(normal.y()), float(normal.z()));
+      has_normal[i] = 1;
     }
 
-  cv::Mat moge_edge_band;
-  cv::dilate(grid_edge, moge_edge_band,
-             cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
-
-  std::vector<std::vector<RansacSample>> face_samples(face_count);
-  for (int y = 0; y < h; y += FitLattice)
-    for (int x = 0; x < w; x += FitLattice) {
-      if (!allowed.at<uint8_t>(y, x) || moge_edge_band.at<uint8_t>(y, x))
-        continue;
-      const uint16_t raw_mm = las.at<uint16_t>(y, x);
-      if (!raw_mm)
-        continue;
-      const double r_las = double(raw_mm) / 1000.;
-      const double q_las = 1. / r_las;
-      const auto& pf = pixel_faces[size_t(y) * w + x];
-      for (uint8_t k = 0; k < pf.count; ++k)
-        if (pf.distance[k] > 1e-9f)
-          face_samples[pf.face[k]].push_back({1. / double(pf.distance[k]), r_las, q_las});
-    }
-
-  std::vector<FaceRansac> fits(face_count);
-  uint64_t total_samples = 0, total_inliers = 0;
-  Json face_rows = Json::array();
+  // Align face scales across overlapping faces using median ratio (matching LFS align_face_scales).
+  std::vector<double> scales(face_count, 1.0);
+  std::vector<double> merged(pixels, 0.0);
+  std::vector<double> merged_weight(pixels, 0.0);
+  std::vector<float> ratios;
   for (size_t f = 0; f < face_count; ++f) {
-    fits[f] = FitFaceRansac(face_samples[f], f);
-    total_samples += fits[f].samples;
-    total_inliers += fits[f].inliers;
-    face_rows.push_back({{"accepted", fits[f].accepted},
-                         {"samples", fits[f].samples},
-                         {"inliers", fits[f].inliers},
-                         {"scale", fits[f].s},
-                         {"shift", fits[f].t},
-                         {"mad_log", fits[f].mad_log},
-                         {"tau", fits[f].tau},
-                         {"metric_scale", faces[f].metric_scale},
-                         {"face_shift", faces[f].shift},
-                         {"valid_pixels", faces[f].valid}});
+    const auto& list = face_samples[f];
+    if (f > 0) {
+      ratios.clear();
+      for (const auto& item : list) {
+        if (allowed_ptr[item.pixel] && merged_weight[item.pixel] > 0.0 && item.distance > 0.f &&
+            std::isfinite(item.distance))
+          ratios.push_back(float(merged[item.pixel] / double(item.distance)));
+      }
+      if (ratios.size() < MinimumScaleOverlapSamples) {
+        ratios.clear();
+        for (const auto& item : list) {
+          if (merged_weight[item.pixel] > 0.0 && item.distance > 0.f &&
+              std::isfinite(item.distance))
+            ratios.push_back(float(merged[item.pixel] / double(item.distance)));
+        }
+      }
+      if (ratios.size() >= MinimumScaleOverlapSamples) {
+        const auto mid = ratios.begin() + ptrdiff_t(ratios.size() / 2);
+        std::nth_element(ratios.begin(), mid, ratios.end());
+        scales[f] = double(*mid);
+      }
+    }
+    for (const auto& item : list) {
+      if (!(item.distance > 0.f) || !std::isfinite(item.distance) || !(item.weight > 0.f))
+        continue;
+      const double total = merged_weight[item.pixel] + double(item.weight);
+      merged[item.pixel] = (merged[item.pixel] * merged_weight[item.pixel] +
+                            scales[f] * double(item.distance) * double(item.weight)) /
+                           total;
+      merged_weight[item.pixel] = total;
+    }
   }
 
-  depth_mm = cv::Mat::zeros(h, w, CV_16UC1);
-  normal_rgb = cv::Mat::zeros(h, w, CV_8UC3);
-  const double normal_disagree_cos = std::cos(Radians(NormalDisagreeMaxDeg));
-  const double far_rescue_cos = std::cos(Radians(FarRescueNormalAgreeMaxDeg));
-  uint64_t las_input = 0, moge_edge_dropped = 0, ransac_dropped_near = 0,
-           ransac_dropped_far = 0, far_normal_rescued = 0,
-           penetration_normal_dropped = 0, normal_disagree_dropped = 0,
-           las_normal_used = 0, moge_normal_fill = 0;
+  double min_d = std::numeric_limits<double>::infinity();
+  double max_d = -std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < pixels; ++i) {
+    if (!allowed_ptr[i] || !(merged_weight[i] > 0.0) || !std::isfinite(merged[i]) ||
+        !(merged[i] > 0.0))
+      continue;
+    min_d = std::min(min_d, merged[i]);
+    max_d = std::max(max_d, merged[i]);
+  }
 
-  for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w; ++x) {
-      if (!allowed.at<uint8_t>(y, x))
-        continue;
-      const auto& n = gathered_normal.at<cv::Vec3f>(y, x);
-      const auto& ray = lens.rays.at<cv::Vec3f>(y, x);
-      bool has_moge_normal = false;
-      Eigen::Vector3d n_moge = Eigen::Vector3d::Zero();
-      if ((n[0] || n[1] || n[2]) &&
-          -(double(n[0]) * ray[0] + double(n[1]) * ray[1] + double(n[2]) * ray[2]) >= min_incidence) {
-        n_moge = Eigen::Vector3d(double(n[0]), double(n[1]), double(n[2])).normalized();
-        has_moge_normal = true;
-      }
+  MogeSsiResult out;
+  out.depth_u16 = cv::Mat::zeros(h, w, CV_16UC1);
+  out.normal_rgb = cv::Mat::zeros(h, w, CV_8UC3);
+  out.face_scales = scales;
 
-      const auto& ln = las_normal.at<cv::Vec3b>(y, x);
-      bool has_las_normal = false;
-      Eigen::Vector3d n_las = Eigen::Vector3d::Zero();
-      if (ln[0] || ln[1] || ln[2]) {
-        n_las = Eigen::Vector3d(double(ln[2]) / 127.5 - 1.,
-                                double(ln[1]) / 127.5 - 1.,
-                                double(ln[0]) / 127.5 - 1.);
-        const double ln_norm = n_las.norm();
-        if (ln_norm > 1e-3) {
-          n_las /= ln_norm;
-          has_las_normal = true;
+  if (std::isfinite(min_d) && std::isfinite(max_d)) {
+    out.min_distance = min_d;
+    out.max_distance = max_d;
+    const double denom = std::max(max_d - min_d, 1e-6);
+    const auto encode_norm = [](double v) -> uint8_t {
+      return uint8_t(std::clamp(std::lround(127.5 * (v + 1.0)), 0L, 255L));
+    };
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        const size_t i = size_t(y) * w + x;
+        if (!allowed_ptr[i] || !(merged_weight[i] > 0.0) || !std::isfinite(merged[i]) ||
+            !(merged[i] > 0.0))
+          continue;
+        const double normalized = 0.02 + 0.98 * ((merged[i] - min_d) / denom);
+        out.depth_u16.at<uint16_t>(y, x) =
+            uint16_t(std::clamp(std::lround(normalized * 65535.0), 1L, 65535L));
+        if (has_normal[i]) {
+          const auto& n = blended_normals[i];
+          out.normal_rgb.at<cv::Vec3b>(y, x) =
+              cv::Vec3b(encode_norm(n[2]), encode_norm(n[1]), encode_norm(n[0]));
         }
       }
+  }
 
-      const bool on_moge_edge = moge_edge_band.at<uint8_t>(y, x) != 0;
-      const double normal_dot =
-          (has_moge_normal && has_las_normal) ? n_moge.dot(n_las) : -2.;
-      const bool normal_disagree =
-          !on_moge_edge && has_moge_normal && has_las_normal && normal_dot < normal_disagree_cos;
-
-      bool las_kept = false;
-      bool penetration_dropped = false;
-      const uint16_t raw_mm = las.at<uint16_t>(y, x);
-      if (raw_mm) {
-        ++las_input;
-        if (on_moge_edge) {
-          ++moge_edge_dropped;
-        } else {
-          const auto& pf = pixel_faces[size_t(y) * w + x];
-          const double r_las = double(raw_mm) / 1000.;
-          bool has_accepted = false;
-          bool any_inlier = false;
-          bool has_best_fit = false;
-          double best_abs_log = std::numeric_limits<double>::infinity();
-          double best_log_ratio = 0.;
-          double best_r_fit = 0.;
-          double best_tau = 0.;
-          for (uint8_t k = 0; k < pf.count; ++k) {
-            const auto& fit = fits[pf.face[k]];
-            if (!fit.accepted)
-              continue;
-            has_accepted = true;
-            const double q_hat = fit.s / double(pf.distance[k]) + fit.t;
-            if (!(q_hat > 0.))
-              continue;
-            const double r_fit = 1. / q_hat;
-            const double log_ratio = std::log(r_las / r_fit);
-            const double abs_log = std::abs(log_ratio);
-            if (abs_log <= fit.tau) {
-              any_inlier = true;
-              break;
-            }
-            if (abs_log < best_abs_log) {
-              has_best_fit = true;
-              best_abs_log = abs_log;
-              best_log_ratio = log_ratio;
-              best_r_fit = r_fit;
-              best_tau = fit.tau;
-            }
-          }
-
-          if (!has_accepted || any_inlier) {
-            depth_mm.at<uint16_t>(y, x) = raw_mm;
-            las_kept = true;
-          } else if (!has_best_fit) {
-            ++ransac_dropped_far;
-          } else if (best_log_ratio < -best_tau) {
-            ++ransac_dropped_near;
-          } else if (has_las_normal && has_moge_normal && normal_dot >= far_rescue_cos &&
-                     best_log_ratio <= FarRescueMaxLogRatio) {
-            depth_mm.at<uint16_t>(y, x) = raw_mm;
-            las_kept = true;
-            ++far_normal_rescued;
-          } else {
-            ++ransac_dropped_far;
-            if (r_las - best_r_fit > PenetrationMinDiffMetres)
-              penetration_dropped = true;
-          }
-        }
-      }
-
-      if (normal_disagree) {
-        ++normal_disagree_dropped;
-      } else if (las_kept && has_las_normal) {
-        normal_rgb.at<cv::Vec3b>(y, x) = ln;
-        ++las_normal_used;
-      } else if (has_moge_normal) {
-        if (penetration_dropped) {
-          ++penetration_normal_dropped;
-        } else {
-          normal_rgb.at<cv::Vec3b>(y, x) = cv::Vec3b(uint8_t(127.5f + 127.5f * n[2] + .5f),
-                                                     uint8_t(127.5f + 127.5f * n[1] + .5f),
-                                                     uint8_t(127.5f + 127.5f * n[0] + .5f));
-          ++moge_normal_fill;
-        }
-      }
-    }
-
-  return {{"las_input_pixels", las_input},
-          {"moge_edge_dropped_pixels", moge_edge_dropped},
-          {"ransac_dropped_near_pixels", ransac_dropped_near},
-          {"ransac_dropped_far_pixels", ransac_dropped_far},
-          {"far_normal_rescued_pixels", far_normal_rescued},
-          {"penetration_normal_dropped_pixels", penetration_normal_dropped},
-          {"normal_disagree_dropped_pixels", normal_disagree_dropped},
-          {"las_normal_used_pixels", las_normal_used},
-          {"moge_normal_fill_pixels", moge_normal_fill},
-          {"ransac_samples", total_samples},
-          {"ransac_inliers", total_inliers},
-          {"faces", face_rows}};
+  Json face_rows = Json::array();
+  for (size_t f = 0; f < face_count; ++f) {
+    face_rows.push_back({{"valid_pixels", faces[f].valid},
+                         {"shift", faces[f].shift},
+                         {"metric_scale", faces[f].metric_scale},
+                         {"aligned_scale", scales[f]}});
+  }
+  out.report = {{"min_distance_m", out.min_distance},
+                {"max_distance_m", out.max_distance},
+                {"face_scales", scales},
+                {"faces", std::move(face_rows)}};
+  return out;
 }
 }  // namespace geosun

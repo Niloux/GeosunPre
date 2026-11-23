@@ -91,10 +91,10 @@ void Help(const Arguments&) {
   }
   std::cout << "  Use --debug to keep the work directory for stage resume or export.\n"
                "  Photo directories with pose-bound JPEGs at the top are read flat, else recursively.\n"
-               "  Delivery options: [--supervision-source moge|las] [--supervision-models MODELS]\n"
-               "    [--supervision-max-size PIXELS] [--supervision-boundary PIXELS]\n"
-               "    [--supervision-mask-dir DIR] [--supervision-cache-mb MIB]\n"
-               "    [--no-static-masks] [--no-crop-valid-domain] [--no-roi]\n"
+               "  Delivery options: [--supervision-models MODELS] [--supervision-max-size PIXELS]\n"
+               "    [--supervision-boundary PIXELS] [--supervision-mask-dir DIR]\n"
+               "    [--supervision-cache-mb MIB] [--no-las-supervision] [--no-static-masks]\n"
+               "    [--no-crop-valid-domain] [--no-ply] [--no-roi] [--ply-voxel METRES]\n"
                "    [--vram-gb GB] [--trainer-config JSON]\n"
                "  See README.md and docs/output.md for defaults and delivery details.\n";
 }

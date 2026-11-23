@@ -75,8 +75,10 @@ AdaptiveTrainerResult BuildAdaptiveTrainerConfig(const AdaptiveTrainerInput& inp
   auto scale_field = [&](const char* key, bool clamp_to_one) {
     if (!opt.contains(key))
       return;
-    const uint64_t value = opt.at(key).get<uint64_t>();
-    uint64_t scaled = scale_step(value);
+    const int64_t raw = opt.at(key).get<int64_t>();
+    if (raw < 0)
+      return;
+    uint64_t scaled = scale_step(static_cast<uint64_t>(raw));
     if (clamp_to_one)
       scaled = std::max<uint64_t>(1ULL, scaled);
     opt[key] = scaled;

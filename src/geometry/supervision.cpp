@@ -16,17 +16,25 @@
 
 namespace geosun {
 namespace {
-constexpr const char* MonocularSource = "las_cleaned_moge2_normals";
+constexpr const char* SupervisionSource = "moge2_ssi";
+constexpr const char* DepthSource = "moge2_ssi";
+constexpr const char* NormalSource = "moge2_normals";
+constexpr const char* DepthFormat = "uint16_png_ssi";
+constexpr const char* DepthType = "ray_distance";
+constexpr const char* NormalFrame = "opencv_camera";
+// SSI encoding maps valid [min_d, max_d] linearly onto [0.02, 1.0] * 65535 -> >= 1311.
+constexpr uint16_t MinValidSsiDepth = 1311;
+
 using namespace supervision_gpu;
 constexpr size_t DepthBudget = 1024 * 1024 * 1024;
 constexpr size_t PointChunk = 500000;
 // Mask decoding, PNG encoding and read-back run beside the GPU with this many images in flight.
 constexpr size_t Lookahead = 6;
-// LAS surfels: K nearest neighbours within the hashed-grid reach set the point spacing and the
 // Device bytes per point of a normal-estimation slab, all buffers at their worst-case size.
 constexpr size_t SlabPointBytes = 192;
 constexpr size_t MaxSlabPoints = 64 * 1000 * 1000;
 constexpr int SlabBins = 1 << 16;
+
 struct RawBounds {
   int3 min, max;
 };
@@ -146,10 +154,8 @@ class LasPointCache {
   // Drain both streams before releasing any buffers, including constructor failure.
   Stream compute_, upload_;
   fs::path coordinates_file_, file_;
-  uint64_t count_ = 0, excluded_ = 0, culled_out_of_reach_ = 0, uploaded_bytes_ = 0,
-           chunks_projected_ = 0, chunks_skipped_ = 0;
-  size_t budget_ = 0, batches_ = 0, slabs_ = 0;
-  double prepare_seconds_ = 0, surfel_seconds_ = 0;
+  uint64_t count_ = 0;
+  size_t slabs_ = 0;
   SurfelStats stats_;
   std::vector<SurfelChunk> chunks_;
 
@@ -167,7 +173,6 @@ class LasPointCache {
   }
   LasPointCache(const fs::path& las, const LasHeader& header, const fs::path& output, int cache_mb,
                 const Reconstruction* model = nullptr) {
-    const auto started = Clock::now();
     fs::create_directories(output);
     // Kept coordinates go to a compact file with a histogram along the longest axis, which
     // splits normal estimation into slabs that fit the device together with their halo.
@@ -210,14 +215,10 @@ class LasPointCache {
       ScanLas(las, header, [&](uint64_t, const std::vector<LasPoint>& chunk) {
         kept.clear();
         for (const auto& point : chunk) {
-          if (!KeepLasPoint(point)) {
-            ++excluded_;
+          if (!KeepLasPoint(point))
             continue;
-          }
-          if (reach_bounds && !Contains(*reach_bounds, point.raw)) {
-            ++culled_out_of_reach_;
+          if (reach_bounds && !Contains(*reach_bounds, point.raw))
             continue;
-          }
           kept.push_back(make_int3(point.raw[0], point.raw[1], point.raw[2]));
           ++histogram[bin(point.raw[axis])];
         }
@@ -235,7 +236,7 @@ class LasPointCache {
       throw std::runtime_error("No valid LAS points within camera reach");
     size_t free, total;
     CudaCheck(cudaMemGetInfo(&free, &total));
-    budget_ = std::min(size_t(cache_mb) * 1024 * 1024, free / 4);
+    const size_t budget = std::min(size_t(cache_mb) * 1024 * 1024, free / 4);
     const size_t capacity = std::min(MaxSlabPoints, free / 2 / SlabPointBytes),
                  own_capacity = capacity * 3 / 4;
     // Each slab is a run of histogram bins; its points own the surfels they produce.
@@ -253,7 +254,7 @@ class LasPointCache {
       if (b == SlabBins - 1)
         slabs.emplace_back(first, SlabBins);
     }
-    if (size_t(count_) * sizeof(Surfel) <= budget_)
+    if (size_t(count_) * sizeof(Surfel) <= budget)
       resident_ = std::make_unique<DeviceBuffer>(size_t(count_) * sizeof(Surfel));
     std::ofstream surfels;
     if (!resident_) {
@@ -262,8 +263,6 @@ class LasPointCache {
       if (!surfels)
         throw std::runtime_error("Cannot create LAS surfel cache");
     }
-    prepare_seconds_ = Seconds(started);
-    const auto surfel_started = Clock::now();
     // Halo points hold every neighbour of an own point together with that neighbour's own
     // neighbours, whose spacing the stray test reads.
     const double halo = (2 * NormalRings + 1) * NormalCell / header.scale[axis];
@@ -338,28 +337,13 @@ class LasPointCache {
     }
     for (auto& slot : transfers_)
       slot = std::make_unique<PointTransfer>(!resident_);
-    surfel_seconds_ = Seconds(surfel_started);
     Log("LAS surfels: " + std::to_string(count_) + " points, " + std::to_string(stats_.normals) +
         " with normals, " + std::to_string(slabs_) + " slabs, " +
         (resident_ ? "GPU cache" : "compact file with double-buffered upload"));
   }
   cudaStream_t StreamHandle() const { return compute_.value; }
-  uint64_t Count() const { return count_; }
-  uint64_t Excluded() const { return excluded_; }
   void ProjectNearest(const Projection* cameras, const float3* rays, float* nearest, int width,
                       int height, size_t images, const RawBounds* batch_bounds = nullptr) {
-    Project(cameras, rays, nearest, nullptr, width, height, images, false, batch_bounds);
-    ++batches_;
-  }
-  void Project(const Projection* cameras, const float3* rays, float* nearest, Blend* blends,
-               int width, int height, size_t images, const RawBounds* batch_bounds = nullptr) {
-    for (const bool accumulate : {false, true})
-      Project(cameras, rays, nearest, blends, width, height, images, accumulate, batch_bounds);
-    ++batches_;
-  }
-  void Project(const Projection* cameras, const float3* rays, float* nearest, Blend* blends,
-               int width, int height, size_t images, bool accumulate,
-               const RawBounds* batch_bounds) {
     std::ifstream packed;
     if (!resident_) {
       packed.open(file_, std::ios::binary);
@@ -369,11 +353,8 @@ class LasPointCache {
     size_t index = 0;
     uint64_t file_offset = 0;
     for (const auto& chunk : chunks_) {
-      if (batch_bounds && !Overlaps(chunk.bounds, *batch_bounds)) {
-        ++chunks_skipped_;
+      if (batch_bounds && !Overlaps(chunk.bounds, *batch_bounds))
         continue;
-      }
-      ++chunks_projected_;
       const Surfel* points;
       PointTransfer* transfer = nullptr;
       if (resident_)
@@ -399,10 +380,9 @@ class LasPointCache {
         CudaCheck(cudaEventRecord(transfer->copied.value, upload_.value));
         CudaCheck(cudaStreamWaitEvent(compute_.value, transfer->copied.value, 0));
         points = static_cast<const Surfel*>(transfer->device.data);
-        uploaded_bytes_ += bytes;
       }
-      supervision_gpu::Project(points, chunk.count, images, cameras, rays, nearest, blends, width,
-                               height, accumulate, compute_.value);
+      supervision_gpu::ProjectNearest(points, chunk.count, images, cameras, rays, nearest, width,
+                                      height, compute_.value);
       if (transfer) {
         CudaCheck(cudaEventRecord(transfer->consumed.value, compute_.value));
         transfer->used = true;
@@ -421,46 +401,6 @@ class LasPointCache {
       fs::remove(file_);
       file_.clear();
     }
-  }
-  Json Surfels() const {
-    auto median = [](std::vector<float> values) {
-      if (values.empty())
-        return 0.;
-      std::nth_element(values.begin(), values.begin() + values.size() / 2, values.end());
-      return double(values[values.size() / 2]);
-    };
-    return {{"estimator", "knn_spacing_trimmed_pca_tangent_plane"},
-            {"neighbours", Neighbours},
-            {"minimum_neighbours", MinNeighbours},
-            {"grid_cell_m", NormalCell},
-            {"search_reach_m", NormalRings * NormalCell},
-            {"minimum_plane_radius_m", NormalRadius},
-            {"inlier_band_m", PlaneBand},
-            {"plane_rms_limit_m", PlaneRms},
-            {"minimum_inlier_fraction", .6},
-            {"footprint", "tangent disk of 2 x min(kth-neighbour distance, neighbour median) / sqrt(k), at most 0.05 m, planar points with k neighbours within the reach only"},
-            {"maximum_spacing_to_neighbour_median_spacing", StraySpacing},
-            {"maximum_splat_pixels", MaxSplat},
-            {"slabs", slabs_},
-            {"points_with_normal", stats_.normals},
-            {"median_footprint_m", median(stats_.radius)},
-            {"median_plane_rms_m", median(stats_.rms)},
-            {"seconds", surfel_seconds_}};
-  }
-  Json Profile() const {
-    return {{"storage", resident_ ? "gpu" : "file"},
-            {"las_scans", 1},
-            {"budget_bytes", budget_},
-            {"surfel_bytes", count_ * sizeof(Surfel)},
-            {"culled_out_of_reach", culled_out_of_reach_},
-            {"chunks_total", chunks_.size()},
-            {"chunks_projected", chunks_projected_},
-            {"chunks_skipped", chunks_skipped_},
-            {"gpu_cache_bytes", resident_ ? resident_->bytes : 0},
-            {"transfer_buffer_bytes", resident_ ? 0 : 2 * PointChunk * sizeof(Surfel)},
-            {"host_to_device_bytes", uploaded_bytes_},
-            {"projection_batches", batches_},
-            {"prepare_seconds", prepare_seconds_}};
   }
 };
 fs::path ExtraMask(const SupervisionOptions& options, const std::string& name) {
@@ -497,8 +437,14 @@ cv::Mat StaticMask(const Scene& scene, const fs::path& masks, uint32_t image, co
   mask /= 255;
   return mask;
 }
-std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal,
-                                     bool normal_needs_depth) {
+cv::Mat AllowedMask(const cv::Mat& static_mask, int boundary) {
+  const cv::Mat invalid = (static_mask == 0);
+  cv::Mat dilated;
+  const cv::Mat kernel = cv::Mat::ones(2 * boundary + 1, 2 * boundary + 1, CV_8UC1);
+  cv::dilate(invalid, dilated, kernel, {-1, -1}, 1, cv::BORDER_CONSTANT, cv::Scalar(0));
+  return dilated == 0;
+}
+std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal) {
   static const auto squares = [] {
     std::array<double, 256> values;
     for (int v = 0; v < 256; ++v)
@@ -512,12 +458,14 @@ std::pair<uint64_t, uint64_t> Counts(const cv::Mat& depth, const cv::Mat& normal
     for (int x = 0; x < depth.cols; ++x, n += 3) {
       const bool has_depth = d[x] != 0;
       const bool has_normal = n[0] || n[1] || n[2];
+      if (has_depth && d[x] < MinValidSsiDepth)
+        throw std::runtime_error("SSI depth pixel outside [0.02, 1.0] * 65535 range");
       if (has_normal) {
-        if (normal_needs_depth && !has_depth)
-          throw std::runtime_error("Normal has no corresponding valid LAS depth");
+        if (!has_depth)
+          throw std::runtime_error("Normal has no corresponding valid SSI depth");
         const double norm = squares[n[0]] + squares[n[1]] + squares[n[2]];
         if (std::abs(norm - 1) > .025)
-          throw std::runtime_error("Nonunit encoded LAS normal");
+          throw std::runtime_error("Nonunit encoded normal");
       }
       depths += has_depth;
       normals += has_normal;
@@ -565,40 +513,31 @@ SupervisionOptions ParseSupervisionOptions(const Arguments& args) {
   if (!options.enabled &&
       (args.values.count("--supervision-max-size") || args.values.count("--supervision-boundary") ||
        args.values.count("--supervision-cache-mb") || !options.mask_dir.empty() ||
-       args.values.count("--supervision-source") || args.values.count("--supervision-models")))
+       args.values.count("--supervision-models")))
     throw std::runtime_error("Supervision options cannot be used with --no-las-supervision");
   if (!options.mask_dir.empty() && !fs::is_directory(options.mask_dir))
     throw std::runtime_error("Geometry exclusion mask directory does not exist");
   if (!options.enabled)
     return options;
-  options.source = args.Get("--supervision-source", "moge");
-  if (options.source != "las" && options.source != "moge")
-    throw std::runtime_error("Supervision source must be las or moge");
-  if (!args.Get("--supervision-models").empty()) {
-    if (options.source != "moge")
-      throw std::runtime_error("--supervision-models requires --supervision-source moge");
+  if (!args.Get("--supervision-models").empty())
     options.geometry_models = args.Path("--supervision-models");
-  }
   return options;
 }
 void ResolveSupervisionModels(SupervisionOptions& options, const fs::path& package) {
-  if (!options.enabled || options.source != "moge")
+  if (!options.enabled)
     return;
   // Without --supervision-models, the model package of the reconstruction.
   if (options.geometry_models.empty())
     options.geometry_models = package;
   if (!ReadJson(options.geometry_models / "manifest.json").at("models").contains("geometry"))
     throw std::runtime_error(
-        "MoGe supervision needs the geometry engine: " + options.geometry_models.u8string() +
-        "; prepare it with run.ps1 prepare-models, pass --supervision-models, or use "
-        "--supervision-source las");
+        "Supervision needs the geometry engine: " + options.geometry_models.u8string() +
+        "; prepare it with run.ps1 prepare-models or pass --supervision-models");
 }
 Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const fs::path& masks_dir,
                         const SupervisionOptions& options, bool rolling) {
   if (!options.enabled)
     return nullptr;
-  if (FileMetadata(scene.las) != scene.sources.at("las"))
-    throw std::runtime_error("LAS changed since reconstruction; choose a new work directory");
   Json masks = Json::object(), static_masks = Json::object();
   for (const auto& image : scene.images) {
     if (!model.images[image.id].registered)
@@ -607,21 +546,18 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
     if (!options.mask_dir.empty() && fs::exists(ExtraMask(options, image.name)))
       masks[image.name] = FileMetadata(ExtraMask(options, image.name));
   }
-  const bool monocular = options.source == "moge";
-  Json request = {{"max_size", options.max_size},
+  Json request = {{"source", SupervisionSource},
+                  {"depth_source", DepthSource},
+                  {"normal_source", NormalSource},
+                  {"max_size", options.max_size},
                   {"boundary_pixels", options.boundary},
-                  {"las_file", FileMetadata(scene.las)},
                   {"exclusion_mask_dir", options.mask_dir.u8string()},
                   {"static_masks", static_masks},
-                  {"exclusion_masks", masks}};
+                  {"exclusion_masks", masks},
+                  {"rolling_shutter", rolling},
+                  {"geometry", GeometryIdentity(options.geometry_models)}};
   if (options.crop)
     request["crop_windows"] = {(*options.crop)[0].ToJson(), (*options.crop)[1].ToJson()};
-  if (monocular) {
-    request["source"] = "moge";
-    request["pipeline"] = MonocularSource;
-    request["rolling_shutter"] = rolling;
-    request["geometry"] = GeometryIdentity(options.geometry_models);
-  }
   return request;
 }
 namespace {
@@ -740,24 +676,15 @@ void ProjectLasDepths(LasSurfelCache& cache, const LasHeader& header, const Reco
   }
   CudaCheck(cudaStreamSynchronize(stream));
 }
-Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
-                          const fs::path& masks_dir, const fs::path& output,
-                          const SupervisionOptions& options, LasSurfelCache& cache,
-                          const ShutterMotion* motion) {
+Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs::path& masks_dir,
+                       const fs::path& output, const SupervisionOptions& options,
+                       const ShutterMotion* motion) {
   const auto started = Clock::now();
-  const auto header = ReadSceneLas(scene);
   const auto request = SupervisionRequest(scene, model, masks_dir, options, motion != nullptr);
   std::vector<Json> rows(model.images.size());
-  const bool monocular = options.source == "moge";
-  std::unique_ptr<Models> geometry;
-  std::unique_ptr<MonocularEstimator> estimator;
-  if (monocular) {
-    geometry = std::make_unique<Models>(options.geometry_models);
-    estimator = std::make_unique<MonocularEstimator>(*geometry);
-  }
+  auto geometry = std::make_unique<Models>(options.geometry_models);
+  auto estimator = std::make_unique<MonocularEstimator>(*geometry);
   Json lenses = Json::array();
-  auto& points = cache.Impl();
-  const auto stream = points.StreamHandle();
   uint64_t depth_pixels = 0, normal_pixels = 0;
   size_t done = 0;
   struct Written {
@@ -765,8 +692,7 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     Json row;
   };
   std::deque<std::future<Written>> writes;
-  // Where the export waits: projecting the LAS batches, MoGe inference and CPU-side result writes.
-  double project_seconds = 0, estimate_seconds = 0, write_wait_seconds = 0, face_load_wait_seconds = 0;
+  double estimate_seconds = 0, write_wait_seconds = 0, load_wait_seconds = 0;
   auto finish = [&] {
     const auto waiting = Clock::now();
     // Leave the queue before get(): a throwing task must not leave an invalid future behind.
@@ -779,18 +705,16 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     rows[written.id] = std::move(written.row);
     ++done;
     if (done % 16 == 0 || done == model.Registered())
-      Log("LAS supervision: " + std::to_string(done) + "/" + std::to_string(model.Registered()) +
+      Log("Supervision: " + std::to_string(done) + "/" + std::to_string(model.Registered()) +
           " images, " + std::to_string(Seconds(started)) + " s");
   };
-  struct LoadedMask {
-    cv::Mat pixels;
-    int count;
-    cv::Mat prefiltered;  // Prefiltered RGB photo for rolling-shutter GPU MoGe resampling
+  struct LoadedInput {
+    cv::Mat allowed;
+    int static_pixels = 0;
+    cv::Mat prefiltered;
   };
-  // Lens plans outlive their camera's loop: the monocular fits run with the pending writes.
+  // Lens plans outlive their camera's loop: the CPU blend/write tasks run concurrently.
   std::array<std::optional<MonocularLens>, 2> lens_plans;
-  // Pending writes use the lens plans above, which are destroyed before the
-  // queue itself; on an exception, wait for the tasks first (their results are discarded).
   struct DrainWrites {
     std::deque<std::future<Written>>& queue;
     ~DrainWrites() {
@@ -807,280 +731,127 @@ Json ExportLasSupervision(const Scene& scene, const Reconstruction& model,
     if (images.empty())
       continue;
     const auto camera = MapCamera(model.cameras[cid], options.max_size);
-    const int w = camera.width, h = camera.height, size = w * h;
+    const int w = camera.width, h = camera.height;
     auto& lens = lens_plans.at(cid);
-    if (monocular) {
-      lens = PlanMonocularLens(model.cameras[cid], camera, estimator->FaceSize(), FaceHalfDegrees);
-      lenses.push_back({{"camera", cid}, {"plan", lens->ToJson()}});
-    }
-    const size_t batch = std::min<size_t>(
-        32, std::max<size_t>(1, DepthBudget / (size * (sizeof(float) + sizeof(Blend)))));
-    std::vector<float3> ray_host(size);
-    const double valid_radius = camera.Radius();
-    for (int y = 0; y < h; ++y)
-      for (int x = 0; x < w; ++x) {
-        const double dx = (x + .5 - camera.params[2]) / camera.params[0],
-                     dy = (y + .5 - camera.params[3]) / camera.params[1];
-        const Eigen::Vector3d ray = dx * dx + dy * dy <= valid_radius * valid_radius
-                                       ? camera.Ray({x + .5, y + .5}) : Eigen::Vector3d::Zero();
-        ray_host[y * w + x] = make_float3(float(ray.x()), float(ray.y()), float(ray.z()));
-      }
-    DeviceBuffer nearest(batch * size * sizeof(float)), blends(batch * size * sizeof(Blend)),
-        cameras(batch * sizeof(Projection)), rays(size * sizeof(float3)),
-        projected(size * sizeof(float)), codes(size * sizeof(unsigned)),
-        clean(size * sizeof(float)), filled(size * sizeof(float)),
-        seeds(size * sizeof(float)), mask(size), limit(size), dilated(size), edge(size),
-        millimetres(size * sizeof(uint16_t)), normals(size * sizeof(uchar3));
-    CudaCheck(
-        cudaMemcpyAsync(rays.data, ray_host.data(), rays.bytes, cudaMemcpyHostToDevice, stream));
-    // Masks for the following images decode while the GPU projects the current batch.
-    std::deque<std::future<LoadedMask>> masks;
+    lens = PlanMonocularLens(model.cameras[cid], camera, estimator->FaceSize(), FaceHalfDegrees);
+    lenses.push_back({{"camera", cid}, {"plan", lens->ToJson()}});
+
+    std::deque<std::future<LoadedInput>> inputs;
     size_t requested = 0;
-    auto load_masks = [&] {
-      for (; masks.size() < Lookahead && requested < images.size(); ++requested)
-        masks.push_back(std::async(std::launch::async, [&, id = images[requested]] {
-          auto pixels = StaticMask(scene, masks_dir, id, camera, options);
-          const int count = cv::countNonZero(pixels);
-          LoadedMask loaded{std::move(pixels), count, {}};
-          if (lens) {
-            auto photo = ReadImage(scene.images[id].source, cv::IMREAD_COLOR);
-            if (options.crop) {
-              const auto& window = (*options.crop)[cid];
-              photo = photo(cv::Rect(window.x, window.y, window.width, window.height)).clone();
-            }
-            cv::cvtColor(photo, photo, cv::COLOR_BGR2RGB);
-            loaded.prefiltered = lens->Prefilter(photo);
+    auto load_inputs = [&] {
+      for (; inputs.size() < Lookahead && requested < images.size(); ++requested)
+        inputs.push_back(std::async(std::launch::async, [&, id = images[requested]] {
+          const auto static_mask = StaticMask(scene, masks_dir, id, camera, options);
+          const int static_count = cv::countNonZero(static_mask);
+          cv::Mat allowed = AllowedMask(static_mask, options.boundary);
+          auto photo = ReadImage(scene.images[id].source, cv::IMREAD_COLOR);
+          if (options.crop) {
+            const auto& window = (*options.crop)[cid];
+            photo = photo(cv::Rect(window.x, window.y, window.width, window.height)).clone();
           }
-          return loaded;
+          cv::cvtColor(photo, photo, cv::COLOR_BGR2RGB);
+          return LoadedInput{std::move(allowed), static_count, lens->Prefilter(photo)};
         }));
     };
-    for (size_t first = 0; first < images.size(); first += batch) {
-      load_masks();
-      const size_t count = std::min(batch, images.size() - first);
-      std::vector<Projection> projection(count);
-      for (size_t j = 0; j < count; ++j)
-        projection[j] = MakeProjection(header, model, motion, images[first + j], cid, camera);
-      CudaCheck(cudaMemcpyAsync(cameras.data, projection.data(), count * sizeof(Projection),
-                                cudaMemcpyHostToDevice, stream));
-      CudaCheck(cudaMemsetAsync(nearest.data, 0x7f, count * size * sizeof(float), stream));
-      CudaCheck(cudaMemsetAsync(blends.data, 0, count * size * sizeof(Blend), stream));
-      const auto batch_bounds =
-          BatchReachBounds(header, model, motion, images, first, count, cid);
-      const auto projecting = Clock::now();
-      points.Project(static_cast<const Projection*>(cameras.data),
-                     static_cast<const float3*>(rays.data), static_cast<float*>(nearest.data),
-                     static_cast<Blend*>(blends.data), w, h, count, &batch_bounds);
-      CudaCheck(cudaStreamSynchronize(stream));
-      project_seconds += Seconds(projecting);
-      for (size_t j = 0; j < count; ++j) {
-        const uint32_t id = images[first + j];
-        const auto loading = Clock::now();
-        const auto static_mask = masks.front().get();
-        face_load_wait_seconds += Seconds(loading);
-        masks.pop_front();
-        load_masks();
-        CudaCheck(cudaMemcpyAsync(mask.data, static_mask.pixels.data, size, cudaMemcpyHostToDevice,
-                                  stream));
-        EncodeMaps(
-            static_cast<const Blend*>(blends.data) + j * size, w, h, options.boundary,
-            float(camera.params[0]), static_cast<const uint8_t*>(mask.data),
-            static_cast<const float3*>(rays.data), static_cast<float*>(projected.data),
-            static_cast<unsigned*>(codes.data), static_cast<float*>(clean.data),
-            static_cast<float*>(filled.data), static_cast<uint8_t*>(limit.data),
-            static_cast<uint8_t*>(dilated.data), static_cast<float*>(seeds.data),
-            static_cast<uint8_t*>(edge.data), static_cast<uint16_t*>(millimetres.data),
-            static_cast<uchar3*>(normals.data), stream);
-        cv::Mat depth(h, w, CV_16UC1), normal(h, w, CV_8UC3);
-        CudaCheck(cudaMemcpyAsync(depth.data, millimetres.data, millimetres.bytes,
-                                  cudaMemcpyDeviceToHost, stream));
-        CudaCheck(cudaMemcpyAsync(normal.data, normals.data, normals.bytes, cudaMemcpyDeviceToHost,
-                                  stream));
-        cv::Mat semantic;
-        if (monocular) {
-          semantic.create(h, w, CV_8UC1);
-          CudaCheck(cudaMemcpyAsync(semantic.data, limit.data, limit.bytes, cudaMemcpyDeviceToHost,
-                                    stream));
-        }
-        CudaCheck(cudaStreamSynchronize(stream));
-        // MoGe faces replace the maps; the LAS depth only scales them and gates their depth. The
-        // GPU estimates the faces here (un-rotated along omega when rolling-shutter is active);
-        // the fit and encoding run with the write on the CPU.
-        std::vector<FaceEstimate> estimates;
-        cv::Mat allowed;
-        const bool rolling_moge = motion != nullptr;
-        const Eigen::Vector3d omega = motion ? motion->rotation[id] : Eigen::Vector3d::Zero();
-        const int axis = motion ? motion->axis : 1;
-        if (monocular) {
-          allowed = static_mask.pixels.clone();
-          allowed.setTo(0, semantic);
-          const auto estimating = Clock::now();
-          estimates =
-              estimator->Estimate(*lens, static_mask.prefiltered, omega, axis, rolling_moge);
-          estimate_seconds += Seconds(estimating);
-        }
-        const MonocularLens* plan = monocular ? &*lens : nullptr;
-        const auto& name = scene.images[id].name;
-        const auto dp = output / "depths" / fs::u8path(name + ".png"),
-                   np = output / "normals" / fs::u8path(name + ".png");
-        fs::create_directories(dp.parent_path());
-        fs::create_directories(np.parent_path());
-        if (writes.size() >= Lookahead)
-          finish();
-        writes.push_back(std::async(std::launch::async, [=, estimates = std::move(estimates),
-                                                         static_pixels = static_mask.count]() mutable {
-          Json monocular_row;
-          if (plan) {
+    load_inputs();
+    for (size_t idx = 0; idx < images.size(); ++idx) {
+      const uint32_t id = images[idx];
+      const auto loading = Clock::now();
+      auto loaded = inputs.front().get();
+      load_wait_seconds += Seconds(loading);
+      inputs.pop_front();
+      load_inputs();
+
+      const bool rolling_moge = motion != nullptr;
+      const Eigen::Vector3d omega = motion ? motion->rotation[id] : Eigen::Vector3d::Zero();
+      const int axis = motion ? motion->axis : 1;
+      const auto estimating = Clock::now();
+      auto estimates = estimator->Estimate(*lens, loaded.prefiltered, omega, axis, rolling_moge);
+      estimate_seconds += Seconds(estimating);
+
+      const MonocularLens* plan = &*lens;
+      const auto& name = scene.images[id].name;
+      const auto dp = output / "depths" / fs::u8path(name + ".png"),
+                 np = output / "normals" / fs::u8path(name + ".png");
+      fs::create_directories(dp.parent_path());
+      fs::create_directories(np.parent_path());
+      if (writes.size() >= Lookahead)
+        finish();
+      writes.push_back(std::async(
+          std::launch::async,
+          [=, allowed = std::move(loaded.allowed), estimates = std::move(estimates),
+           static_pixels = loaded.static_pixels]() mutable {
             const Eigen::Vector3d* omega_ptr = rolling_moge ? &omega : nullptr;
-            cv::Mat cleaned_depth, moge_normal;
-            monocular_row = CleanLasAndEncodeNormals(*plan, estimates, depth, normal, allowed,
-                                                     omega_ptr, axis, MinIncidence, cleaned_depth,
-                                                     moge_normal);
-            depth = std::move(cleaned_depth);
-            normal = std::move(moge_normal);
-          }
-          const auto valid = Counts(depth, normal, !monocular);
-          WriteImage(dp, depth);
-          WriteImage(np, normal);
-          Json row = {{"image_index", id},
-                      {"name", name},
-                      {"width", w},
-                      {"height", h},
-                      {"depth_size", fs::file_size(dp)},
-                      {"normal_size", fs::file_size(np)},
-                      {"static_pixels", static_pixels},
-                      {"depth_pixels", valid.first},
-                      {"normal_pixels", valid.second}};
-          if (monocular)
-            row["monocular"] = std::move(monocular_row);
-          return Written{id, std::move(row)};
-        }));
-      }
+            auto ssi = EncodeMogeSsiMaps(*plan, estimates, allowed, omega_ptr, axis);
+            const auto valid = Counts(ssi.depth_u16, ssi.normal_rgb);
+            WriteImage(dp, ssi.depth_u16);
+            WriteImage(np, ssi.normal_rgb);
+            Json row = {{"image_index", id},
+                        {"name", name},
+                        {"width", w},
+                        {"height", h},
+                        {"depth_size", fs::file_size(dp)},
+                        {"normal_size", fs::file_size(np)},
+                        {"static_pixels", static_pixels},
+                        {"depth_pixels", valid.first},
+                        {"normal_pixels", valid.second},
+                        {"monocular", std::move(ssi.report)}};
+            return Written{id, std::move(row)};
+          }));
     }
   }
   while (!writes.empty())
     finish();
-  const uint64_t accepted_records = points.Count(), excluded_records = points.Excluded();
-  const Json point_cache_profile = points.Profile(), surfel_summary = points.Surfels();
-  const Json geometry_profile = monocular ? geometry->Profile() : Json();
-  points.Finish();
+  const Json geometry_profile = geometry->Profile();
   estimator.reset();
   geometry.reset();
-  uint64_t las_input_pixels = 0, moge_edge_dropped_pixels = 0, ransac_dropped_near_pixels = 0,
-           ransac_dropped_far_pixels = 0, far_normal_rescued_pixels = 0,
-           penetration_normal_dropped_pixels = 0, normal_disagree_dropped_pixels = 0,
-           las_normal_used_pixels = 0, moge_normal_fill_pixels = 0;
-  if (monocular) {
-    for (const auto& row : rows)
-      if (!row.is_null()) {
-        const auto& m = row.at("monocular");
-        las_input_pixels += m.at("las_input_pixels").get<uint64_t>();
-        moge_edge_dropped_pixels += m.at("moge_edge_dropped_pixels").get<uint64_t>();
-        ransac_dropped_near_pixels += m.at("ransac_dropped_near_pixels").get<uint64_t>();
-        ransac_dropped_far_pixels += m.at("ransac_dropped_far_pixels").get<uint64_t>();
-        far_normal_rescued_pixels += m.at("far_normal_rescued_pixels").get<uint64_t>();
-        penetration_normal_dropped_pixels += m.at("penetration_normal_dropped_pixels").get<uint64_t>();
-        normal_disagree_dropped_pixels += m.at("normal_disagree_dropped_pixels").get<uint64_t>();
-        las_normal_used_pixels += m.at("las_normal_used_pixels").get<uint64_t>();
-        moge_normal_fill_pixels += m.at("moge_normal_fill_pixels").get<uint64_t>();
-      }
-    Log("LAS MoGe cleaning: input=" + std::to_string(las_input_pixels) +
-        ", edge_dropped=" + std::to_string(moge_edge_dropped_pixels) +
-        ", near_dropped=" + std::to_string(ransac_dropped_near_pixels) +
-        ", far_dropped=" + std::to_string(ransac_dropped_far_pixels) +
-        ", far_rescued=" + std::to_string(far_normal_rescued_pixels) +
-        ", penetration_normal_dropped=" + std::to_string(penetration_normal_dropped_pixels) +
-        ", normal_disagree_dropped=" + std::to_string(normal_disagree_dropped_pixels) +
-        ", las_normal_used=" + std::to_string(las_normal_used_pixels) +
-        ", moge_normal_fill=" + std::to_string(moge_normal_fill_pixels));
-  }
+
   if (!depth_pixels || !normal_pixels)
-    throw std::runtime_error("LAS supervision has no reliable depth or normal pixels");
+    throw std::runtime_error("MoGe-2 SSI supervision has no valid depth or normal pixels");
   Json images = Json::array();
   for (const auto& row : rows)
     if (!row.is_null())
       images.push_back(row);
   if (request != SupervisionRequest(scene, model, masks_dir, options, motion != nullptr))
-    throw std::runtime_error("LAS or geometry exclusion masks changed during supervision export");
-  Json summary = {{"request", request},
-          {"source", "valid original LAS records"},
-          {"depth_source", "las"},
-          {"normal_source", "las"},
+    throw std::runtime_error("Static or geometry exclusion masks changed during supervision export");
+  return {{"request", request},
+          {"source", SupervisionSource},
+          {"depth_source", DepthSource},
+          {"normal_source", NormalSource},
           {"projection", motion ? "rolling_shutter_readout_line" : "global_shutter"},
-          {"accepted_records", accepted_records},
-          {"excluded_records", excluded_records},
-          {"point_cache", point_cache_profile},
-          {"depth_format", "uint16_png_mm"},
-          {"depth_type", "ray_distance"},
+          {"depth_format", DepthFormat},
+          {"depth_type", DepthType},
+          {"depth_encoding", "linear_[min_d,max_d]_to_[0.02,1.0]*65535"},
           {"invalid_depth", 0},
           {"normal_format", "rgb8_png"},
-          {"normal_frame", "opencv_camera_facing_camera"},
+          {"normal_frame", NormalFrame},
           {"normal_encoding", "round(127.5 * (n + 1))"},
           {"invalid_normal_rgb", {0, 0, 0}},
-          {"depth_validity", "isolated_outlier_removal_occlusion_boundary_and_local_depth_support"},
-          {"depth_support_pixels", 4},
-          {"occlusion_step", "background beyond 1.1 x foreground + 0.05 m within 5x5"},
-          {"occlusion_margin", {{"background_pixels", 2},
-                                {"foreground_spread_m", OcclusionSpread},
-                                {"foreground_pixels", "ceil(spread x fx / depth), at most 24"}}},
+          {"normal_estimator", motion ? "moge2_faces_readout_line" : "moge2_faces"},
           {"semantic_margin_pixels", options.boundary},
-          {"depth_rendering", "las_surfel_tangent_disks_blended_within_0.01_m_plus_1_percent_of_nearest"},
-          {"normal_blend_minimum_agreement", MinNormalAgreement},
-          {"normal_estimator", motion ? "las_knn_pca_surfel_readout_line" : "las_knn_pca_surfel"},
-          {"surfels", surfel_summary},
-          {"minimum_abs_normal_dot_ray", MinIncidence},
+          {"geometry_model", request.at("geometry")},
+          {"lenses", lenses},
           {"depth_pixels", depth_pixels},
           {"normal_pixels", normal_pixels},
           {"images", images},
+          {"inference", geometry_profile},
           {"timing",
-           {{"las_project_seconds", project_seconds},
-            {"moge_estimate_seconds", estimate_seconds},
-            {"photo_and_mask_wait_seconds", face_load_wait_seconds},
+           {{"moge_estimate_seconds", estimate_seconds},
+            {"photo_and_mask_wait_seconds", load_wait_seconds},
             {"result_write_wait_seconds", write_wait_seconds}}},
           {"seconds", Seconds(started)}};
-  if (monocular) {
-    summary["source"] = MonocularSource;
-    summary["depth_source"] = "las_moge_cleaned";
-    summary["normal_source"] = "las_planar_moge2_fill";
-    summary["anchor_source"] = "valid original LAS records";
-    summary["geometry_model"] = request.at("geometry");
-    summary["lenses"] = lenses;
-    summary["depth_rendering"] =
-        "las_surfel_tangent_disks_cleaned_by_moge_edges_and_per_face_ransac";
-    summary["depth_validity"] =
-        "isolated_outlier_removal_occlusion_boundary_local_depth_support_moge_edge_mask_and_per_face_ransac";
-    summary["normal_estimator"] = motion ? "las_knn_pca_surfel_moge2_vitl_readout_line"
-                                         : "las_knn_pca_surfel_moge2_vitl";
-    summary["normal_validity"] =
-        "static mask off semantic margin, incidence, planar LAS surfel priority on RANSAC-kept off-edge "
-        "pixels with MoGe-2 backfill, excluding > 35 deg off-edge conflicts and unrescued LAS "
-        "glass/mirror penetration";
-    summary["monocular"] = {
-        {"cleaning",
-         "per-face MoGe depth/normal edge mask dilated 2 px, multi-face inverse-depth RANSAC "
-         "with planar LAS normal rescue (<= 25 deg and <= 3x depth), planar LAS normal priority "
-         "with MoGe-2 backfill, and off-edge MoGe-vs-LAS normal disagreement (> 35 deg) gating"},
-        {"las_input_pixels", las_input_pixels},
-        {"moge_edge_dropped_pixels", moge_edge_dropped_pixels},
-        {"ransac_dropped_near_pixels", ransac_dropped_near_pixels},
-        {"ransac_dropped_far_pixels", ransac_dropped_far_pixels},
-        {"far_normal_rescued_pixels", far_normal_rescued_pixels},
-        {"penetration_normal_dropped_pixels", penetration_normal_dropped_pixels},
-        {"normal_disagree_dropped_pixels", normal_disagree_dropped_pixels},
-        {"las_normal_used_pixels", las_normal_used_pixels},
-        {"moge_normal_fill_pixels", moge_normal_fill_pixels},
-        {"normals_need_depth", false},
-        {"inference", geometry_profile}};
-  }
-  return summary;
 }
-void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
-                         const Json& photos, const Json& summary) {
-  const bool monocular = summary.value("source", std::string()) == MonocularSource;
-  if (summary.at("depth_type") != "ray_distance" ||
-      summary.at("depth_format") != "uint16_png_mm" || summary.at("normal_format") != "rgb8_png" ||
-      summary.at("normal_frame") != "opencv_camera_facing_camera" ||
+void CheckSupervision(const fs::path& output, const Reconstruction& model, const Json& photos,
+                      const Json& summary) {
+  if (summary.value("source", std::string()) != SupervisionSource ||
+      summary.value("depth_source", std::string()) != DepthSource ||
+      summary.value("normal_source", std::string()) != NormalSource ||
+      summary.value("depth_type", std::string()) != DepthType ||
+      summary.value("depth_format", std::string()) != DepthFormat ||
+      summary.value("normal_format", std::string()) != "rgb8_png" ||
+      summary.value("normal_frame", std::string()) != NormalFrame ||
       summary.at("images").size() != photos.size())
-    throw std::runtime_error("Unexpected LAS supervision contract");
+    throw std::runtime_error("Unexpected MoGe-2 SSI supervision contract");
   uint64_t depth_total = 0, normal_total = 0;
   std::deque<std::future<std::pair<uint64_t, uint64_t>>> checks;
   auto finish = [&] {
@@ -1093,35 +864,37 @@ void CheckLasSupervision(const fs::path& output, const Reconstruction& model,
     const auto& image = photos[i];
     const auto& row = summary.at("images")[i];
     if (row.at("image_index") != image.at("image_index") || row.at("name") != image.at("name"))
-      throw std::runtime_error("LAS supervision image identity differs");
+      throw std::runtime_error("Supervision image identity differs");
     const auto camera = MapCamera(model.cameras[image.at("camera").get<size_t>()],
                                   summary.at("request").at("max_size"));
     const auto rel = fs::u8path(image.at("name").get<std::string>() + ".png");
     const auto dp = output / "depths" / rel, np = output / "normals" / rel;
     if (fs::file_size(dp) != row.at("depth_size").get<uint64_t>() ||
         fs::file_size(np) != row.at("normal_size").get<uint64_t>())
-      throw std::runtime_error("LAS supervision file size differs");
+      throw std::runtime_error("Supervision file size differs");
     if (row.at("width") != camera.width || row.at("height") != camera.height)
-      throw std::runtime_error("LAS supervision map dimensions or pixel types differ");
+      throw std::runtime_error("Supervision map dimensions differ");
     if (checks.size() >= Lookahead)
       finish();
-    checks.push_back(std::async(std::launch::async, [=, depths = row.at("depth_pixels").get<uint64_t>(),
-                                                     normals = row.at("normal_pixels").get<uint64_t>()] {
-      const auto depth = ReadImage(dp, cv::IMREAD_UNCHANGED),
-                 normal = ReadImage(np, cv::IMREAD_UNCHANGED);
-      if (depth.type() != CV_16UC1 || normal.type() != CV_8UC3 || depth.size() != normal.size() ||
-          depth.cols != camera.width || depth.rows != camera.height)
-        throw std::runtime_error("LAS supervision map dimensions or pixel types differ");
-      const auto counts = Counts(depth, normal, !monocular);
-      if (counts.first != depths || counts.second != normals)
-        throw std::runtime_error("LAS supervision valid pixel counts differ");
-      return counts;
-    }));
+    checks.push_back(std::async(
+        std::launch::async, [=, depths = row.at("depth_pixels").get<uint64_t>(),
+                             normals = row.at("normal_pixels").get<uint64_t>()] {
+          const auto depth = ReadImage(dp, cv::IMREAD_UNCHANGED),
+                     normal = ReadImage(np, cv::IMREAD_UNCHANGED);
+          if (depth.type() != CV_16UC1 || normal.type() != CV_8UC3 ||
+              depth.size() != normal.size() || depth.cols != camera.width ||
+              depth.rows != camera.height)
+            throw std::runtime_error("Supervision map dimensions or pixel types differ");
+          const auto counts = Counts(depth, normal);
+          if (counts.first != depths || counts.second != normals)
+            throw std::runtime_error("Supervision valid pixel counts differ");
+          return counts;
+        }));
   }
   while (!checks.empty())
     finish();
   if (!depth_total || !normal_total || depth_total != summary.at("depth_pixels").get<uint64_t>() ||
       normal_total != summary.at("normal_pixels").get<uint64_t>())
-    throw std::runtime_error("LAS supervision totals differ");
+    throw std::runtime_error("Supervision totals differ");
 }
 }  // namespace geosun

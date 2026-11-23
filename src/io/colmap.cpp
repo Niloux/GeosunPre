@@ -265,7 +265,7 @@ Reconstruction ReadColmap(const fs::path& path, Scene& scene, const Json* shutte
 // cached in the work directory beside the masks they come from.
 fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
                           const ShutterMotion* motion, const fs::path& work, const Json& report,
-                          std::unique_ptr<LasSurfelCache>& surfel_cache, int cache_mb) {
+                          int cache_mb) {
   const auto source = work / "cache/masks", target = work / "cache/static_masks";
   Json inputs = Json::object();
   for (const auto& image : scene.images)
@@ -287,12 +287,12 @@ fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
   ArchiveInterrupted(pending);
   fs::create_directories(pending);
   const auto header = ReadSceneLas(scene);
-  surfel_cache =
-      std::make_unique<LasSurfelCache>(scene.las, header, work / "cache", cache_mb, &selected);
+  LasSurfelCache surfel_cache(scene.las, header, work / "cache", cache_mb, &selected);
   const auto result =
-      StaticMasks(scene, selected, motion, header, *surfel_cache,
+      StaticMasks(scene, selected, motion, header, surfel_cache,
                   [&](uint32_t id) { return source / (std::to_string(id) + ".png"); },
                   [&](uint32_t id) { return pending / (std::to_string(id) + ".png"); });
+  surfel_cache.Finish();
   WriteJson(pending / "static_masks.json", {{"request", request}, {"result", result}});
   RemoveAll(target);
   PublishDirectory(pending, target);
@@ -321,13 +321,12 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   // A cropped delivery keeps each lens's valid domain: photos are cut losslessly on the JPEG MCU
   // grid and the readout motion is rescaled to the cropped readout axis.
   auto options = supervision_options;
-  // Static masks need the LAS, like the supervision maps they make consistent with the masks.
-  std::unique_ptr<LasSurfelCache> surfel_cache;
+  // Static masks use the LAS nearest-depth surfel projection; finish the cache before MoGe-2 runs.
   Json static_request = nullptr;
   Json static_summary;
   if (options.enabled && options.static_masks) {
     masks = BuildStaticMasks(scene, selected, rolling ? &motion : nullptr, work, report,
-                             surfel_cache, options.cache_mb);
+                             options.cache_mb);
     static_request = {{"rules", StaticMaskRules()},
                       {"file", FileMetadata(masks / "static_masks.json")}};
     static_summary = ReadJson(masks / "static_masks.json").at("result");
@@ -381,8 +380,6 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     if (!fs::is_regular_file(output / "manifest.json") ||
         ReadJson(output / "manifest.json").at("request") != request)
       throw std::runtime_error("Output exists with different inputs; choose a new output");
-    if (surfel_cache)
-      surfel_cache->Finish();
     return CheckBundle(output);
   }
   // Delivery copies the original files, so they must still be the ones reconstructed.
@@ -492,15 +489,9 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     });
   Json supervision = nullptr;
   if (options.enabled) {
-    if (!surfel_cache)
-      surfel_cache = std::make_unique<LasSurfelCache>(scene.las, ReadSceneLas(scene),
-                                                      work / "cache", options.cache_mb, &model);
-    supervision = ExportLasSupervision(scene, model, masks, pending, options, *surfel_cache,
-                                       rolling ? &motion : nullptr);
-    surfel_cache->Finish();
+    supervision = ExportSupervision(scene, model, masks, pending, options, rolling ? &motion : nullptr);
     WriteJson(pending / "supervision.json", supervision);
-  } else if (surfel_cache)
-    surfel_cache->Finish();
+  }
   const Json initialization = include_ply ? initialization_job.get() : Json(nullptr);
   if (generate_roi)
     WriteJson(pending / "roi.json", roi_json);
@@ -632,8 +623,8 @@ Json CheckBundle(const fs::path& output, const std::string& project) {
   if (manifest.contains("supervision")) {
     if (ReadJson(output / "supervision.json") != manifest.at("supervision") ||
         manifest.at("supervision").at("request") != manifest.at("request").at("supervision"))
-      throw std::runtime_error("LAS supervision manifest differs");
-    CheckLasSupervision(output, model, manifest.at("images"), manifest.at("supervision"));
+      throw std::runtime_error("Supervision manifest differs");
+    CheckSupervision(output, model, manifest.at("images"), manifest.at("supervision"));
   }
   if (manifest.contains("trainer_config")) {
     const auto& tc = manifest.at("trainer_config");
