@@ -1,6 +1,6 @@
 # GeosunPre
 
-原生 C++17/CUDA 双鱼眼与 LAS 输入预处理程序，交付包是定制 LichtFeld Studio（LFS）3DGS 训练的数据目录。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、卷帘快门校正、稀疏点清理、COLMAP/PLY 及深度和法向监督导出（默认由 MoGe-2 生成、LAS 定尺度）。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
+原生 C++17/CUDA 双鱼眼与 LAS 输入预处理程序，交付包是定制 LichtFeld Studio（LFS）3DGS 训练的数据目录。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、卷帘快门校正、稀疏点清理、COLMAP/PLY 及深度和法向监督导出（默认采用 MoGe-2 反向清洗的 LAS 深度与平面 LAS 优先/MoGe-2 回填法向）。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
 
 ## 开始使用
 
@@ -41,7 +41,7 @@ $in = @('--project', 'D:/数据/场景/场景.pro', '--images', 'D:/数据/场�
 
 **调试模式**（`--debug`）：工作目录（默认 `work/<输出目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。
 
-交付包含照片（采用卷帘校正时另附读出运动参数）、掩码、鱼眼 COLMAP 模型、50 m 视锥内分档体素 LAS 初始化 PLY（基准体素默认 5 cm，上限 250 万点），以及深度和法向监督图：默认最长边 1024 px，由 MoGe-2 单路 90° 子图同时估计深度和法向，按法向与之一致的可信 LAS 定尺度；`--supervision-source las` 改为 LAS 投影监督。`--no-ply` 省略 PLY，`--ply-voxel` 调整基准体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着 LAS 监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人），以及有 LAS 表面支撑的天空误检块和封闭室内场景残余天空误检均在掩码里改回静态 `255`（配合 `configs/trainer.json` 统一的 `segment_and_ignore`），`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
+交付包含照片（采用卷帘校正时另附读出运动参数）、掩码、鱼眼 COLMAP 模型、50 m 视锥内分档体素 LAS 初始化 PLY（基准体素默认 5 cm，上限随自适应 `max_cap` 联动且封顶 250 万点）、自动生成的多边形 ROI（`roi.json`）、按场景规模与显存自适应生成的训练配置（`trainer.json`），以及深度和法向监督图：默认最长边 1024 px，采用解耦混合监督（`--supervision-source moge`），输出经 MoGe-2 反向清洗的毫米级 LAS 深度与平面 LAS 优先/MoGe-2 回填法向；`--supervision-source las` 改为纯 LAS 投影监督。`--no-ply` 省略 PLY 与 `roi.json`，`--no-roi` 仅省略 `roi.json`，`--ply-voxel` 调整基准体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着 LAS 监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人），以及有 LAS 表面支撑的天空误检块和封闭室内场景残余天空误检均在掩码里改回静态 `255`（配合 `configs/trainer.json` 统一的 `segment_and_ignore`），`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
 
 监督尺寸、额外几何掩码、显存预算及 LFS 训练示例见[深度与法向监督](docs/supervision.md)。已有调试工作目录可直接导出到新目录，无需重跑重建。
 
@@ -86,7 +86,7 @@ models/
 
 独立部署时，将整个包目录复制到目标 Windows 机器，按包内 README 运行。独立 EXE 默认读取同级 `models/`，详细说明见[部署文档](docs/deployment.md)。
 
-预处理和训练作为整体交付时，训练配置以 `configs/trainer.json` 为准。提交后在同级 LFS 仓库执行 `scripts\package-windows-trainer.cmd`，它默认读取这份配置并记录当前 GeosunPre 提交；再组装整体包：
+预处理和训练作为整体交付时，`configs/trainer.json` 作为默认训练配置模板（预处理导出时按场景规模与本机显存自适应生成 `<output>/trainer.json`，整包优先加载交付目录中的 `trainer.json`）。提交后在同级 LFS 仓库执行 `scripts\package-windows-trainer.cmd`，它默认读取这份配置模板并记录当前 GeosunPre 提交；再组装整体包：
 
 ```powershell
 .\package.ps1 -BundleVersion 1.1.0 -Preprocess packages/GeosunPre-版本-提交-ampere_plus -Trainer ..\LichtFeld-Studio\build-delivery\Geosun-3DGS-Trainer-sm80-时间

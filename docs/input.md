@@ -21,7 +21,7 @@
 
 鱼眼参数为 `fx fy cx cy k1 k2 k3 k4`。初值：`fx=fy=focalLength/pixelSize`，`cx=width/2+principalX/pixelSize`，`cy=height/2+principalY/pixelSize`，`k4=p3`。主点偏移与 G203 参考流程采用相同的图像坐标方向；p3 含义尚未独立核对。
 
-左上像素中心为 `(0.5,0.5)`。`theta=atan2(sqrt(X²+Y²),Z)`，径向多项式为 `theta*(1+k1*theta²+k2*theta⁴+k3*theta⁶+k4*theta⁸)`。有效域为完整视场 160°，多项式须单调。L/R 内参各共享一组，每次曝光有独立位姿；同步数据在卷帘 BA 中另以全局 L→R 外参软约束同帧两参考位姿。
+左上像素中心为 `(0.5,0.5)`。`theta=atan2(sqrt(X²+Y²),Z)`，径向多项式为 `theta*(1+k1*theta²+k2*theta⁴+k3*theta⁶+k4*theta⁸)`。有效域为完整视场 160°，多项式须单调。L/R 内参各共享一组，每次曝光有独立位姿；同步及通过导航姿态自检的异步数据在卷帘 BA 中均以全局 L→R 外参约束成对参考位姿。
 
 两视图及 PnP 的 RANSAC 共识按原始鱼眼像素计算；透视归一化坐标仅供最小求解器产生候选。PnP 使用 AP3P 候选、6 px 内点门限及鱼眼位姿精调，不将中心与边缘观测混用同一透视坐标容差。
 
