@@ -164,3 +164,18 @@
   - `LichtFeld-Studio` Release 与 `GeosunPre` Release（`geosunpre.exe` / `geosun.exe`）均编译通过；`geosunpre trainer-config --vram-gb 24` 验证生成配置含 `"calibration_correction": false`。
   - `work/小场景` 同参数（`max_cap = 2,100,000`、`iterations = 3,000`）基准：`benchA` 修复前默认 `49.094 s (61.1 iter/s)` → 修复后 warmup 期（`warmup=2999`）提速至 `45.170 s (66.4 iter/s)`（`-8.0%`）；全程开启 color variance（`warmup=0`）为 `46.912 s (63.9 iter/s)`；直接使用更新后 `configs/trainer.json`（`start_refine=1200`）`3,000` 步为 `41.330 s (72.6 iter/s)`。
   - **未验证项**：未重跑完整 `20k–30k` 实景训练及 `LichtFeld-Studio` 单元测试套件（当前 Release 构建 `BUILD_TESTS=OFF`）。
+
+## 2026-11-23：恢复 MRNF 后期清理与衰减参数以消除展厅空域漂浮点
+
+- **问题定位**：与 `1.1.4` 相比，`展厅`点云视图中存在大量未被清除的空域漂浮点。排查确认根因为提交 `ecf8fbe` 将 [configs/trainer.json](../configs/trainer.json) 中的 `stop_refine` 提前至 `4500`（`LichtFeld-Studio` MRNF 在 `iter >= stop_refine` 时冻结拓扑并跳过 `refine()` 中的 `soft_delete_rows`）并将 `opacity_decay` / `scale_decay` 归零，导致 `4500` 步之后被 `free_space_loss`、`dc_reg` 及 `color_variance` 压暗/压低不透明度的空域漂浮点无法被 prune。
+- **改动**：调整 [configs/trainer.json](../configs/trainer.json) 细化与外观参数，在不修改 `LichtFeld-Studio` 代码的前提下恢复中后期持续清理与衰减：
+  - `start_refine`: `1200` → `1500`
+  - `stop_refine`: `4500` → `28500`
+  - `opacity_decay`: `0.0` → `0.002`
+  - `scale_decay`: `0.0` → `0.002`
+  - `sh_degree`: `1` → `0`
+  - 其余 `ecf8fbe` / `c5a1f16` 正则与外观升级（`use_ppisp=true`、`normal_variance_weight=0.06`、`color_variance_weight=0.18@5000`、`calibration_correction=false`）保持不变。
+- **验证与未验证项**：
+  - 用户已完成 `小场景` 回归验证，效果与此前相当，确认保留 `normal_variance_weight` 与 `color_variance_weight` 后放宽 `stop_refine` 至 `28500` 未引发白墙退化；
+  - `GeosunPre` Release 重编通过，内嵌默认配置及生成 `trainer.json` 已核验包含上述更新参数；
+  - **未验证项**：尚未用该配置重跑 `展厅` 完整训练并复查点云视图漂浮点清理结果。
