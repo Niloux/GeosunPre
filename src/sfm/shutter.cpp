@@ -371,6 +371,7 @@ size_t ReanchorRigOutliers(Reconstruction& model, const ShutterInputs& inputs, i
     return (raw - model.images[id].pose.Rotation().conjugate() * nav_bias[cam]).norm();
   };
   std::set<uint32_t> moved;
+  double max_shift = 0;
   for (const auto& f : inputs.frames) {
     if (!model.images[f.left].registered || !model.images[f.right].registered)
       continue;
@@ -387,6 +388,7 @@ size_t ReanchorRigOutliers(Reconstruction& model, const ShutterInputs& inputs, i
       snapped.Set(model.images[target].pose.Rotation(),
                   -(model.images[target].pose.Rotation() * snapped.Center()));
     if ((snapped.Center() - inputs.navigation[target]).norm() < NavigationGate) {
+      max_shift = std::max(max_shift, (snapped.Center() - model.images[target].pose.Center()).norm());
       model.images[target].pose = snapped;
       moved.insert(target);
     }
@@ -403,9 +405,21 @@ size_t ReanchorRigOutliers(Reconstruction& model, const ShutterInputs& inputs, i
         HasPositiveReferenceDepth(model, p))
       touched.push_back(id);
   }
+  const double max_point_shift = std::max(5.0, 4.0 * max_shift);
   ParallelFor(touched.size(), workers, 64, [&](size_t k) {
     auto& p = model.points[touched[k]];
-    RefinePoint(model, p.track, p.xyz);
+    Eigen::Vector3d candidate = p.xyz;
+    try {
+      RefinePoint(model, p.track, candidate);
+    } catch (const std::runtime_error&) {
+      return;
+    }
+    if (!candidate.allFinite() || (candidate - p.xyz).norm() > max_point_shift)
+      return;
+    for (const auto& o : p.track)
+      if (model.images[o.image].pose.Apply(candidate).z() <= 1e-3)
+        return;
+    p.xyz = candidate;
   });
   return moved.size();
 }
@@ -508,20 +522,25 @@ std::set<uint64_t> SelectScreenTracks(const Reconstruction& source,
 }
 AxisScreen ScreenAlongAxis(const Scene& scene, const Reconstruction& source,
                            const ShutterInputs& inputs, const std::set<uint64_t>& screen_tracks,
-                           const std::vector<PlaneConstraint>& screen_planes, int axis,
+                           const std::vector<PlaneConstraint>& screen_planes, int axis, int workers,
                            int ba_workers) {
   const auto started = Clock::now();
   AxisScreen screen;
   screen.axis = axis;
-  screen.tracks = screen_tracks.size();
   auto model = source;
+  ReanchorRigOutliers(model, inputs, workers);
   ShutterMotion motion;
   motion.axis = axis;
   motion.rotation.assign(source.images.size(), Eigen::Vector3d::Zero());
   motion.velocity = inputs.velocity;
+  std::set<uint64_t> active_screen_tracks;
+  for (const uint64_t id : screen_tracks)
+    if (HasPositiveShutterDepth(model, motion, model.points[id]))
+      active_screen_tracks.insert(id);
+  screen.tracks = active_screen_tracks.size();
   const auto opt = Optimize(model, scene.cameras, "fixed", ba_workers, 3, {}, screen_planes,
-                            inputs.navigation, screen_tracks, &motion, inputs.frames, {}, false,
-                            inputs.imu_omega);
+                            inputs.navigation, active_screen_tracks, &motion, inputs.frames, {},
+                            false, inputs.imu_omega);
   const auto consistency =
       ReadoutConsistency(scene, model, motion, inputs.imu_omega, screen.consistent);
   screen.readout = motion.readout;
@@ -719,9 +738,21 @@ void GlobalRigFallback(const Scene& scene, const Reconstruction& source,
   const size_t reanchored = ReanchorRigOutliers(model, inputs, workers);
   if (reanchored)
     Log("Re-anchored " + std::to_string(reanchored) + " rig-outlier poses for global rig fallback");
+  std::set<uint64_t> active_points;
+  for (uint64_t id = 0; id < model.points.size(); ++id)
+    if (model.points[id].track.size() >= 2 && HasPositiveReferenceDepth(model, model.points[id]))
+      active_points.insert(id);
   const auto opt = Optimize(model, scene.cameras, "principal", ba_workers, 100, {}, inputs.planes,
-                            inputs.navigation, {}, nullptr, inputs.frames, {}, false,
+                            inputs.navigation, active_points, nullptr, inputs.frames, {}, false,
                             inputs.imu_omega);
+  bool cleared = false;
+  for (auto& p : model.points)
+    if (!p.track.empty() && !HasPositiveReferenceDepth(model, p)) {
+      p.track.clear();
+      cleared = true;
+    }
+  if (cleared)
+    model.RebuildReferences();
   const auto quality = model.Quality(scene, limits.median_px, limits.p90_px);
   const auto plane_before = PlaneErrors(source, inputs.planes);
   const auto plane_after = PlaneErrors(model, inputs.planes);
@@ -1792,8 +1823,8 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
     if (screen_tracks.count(plane.point))
       screen_planes.push_back(plane);
   const std::array<AxisScreen, 2> screens{
-      ScreenAlongAxis(scene, source, inputs, screen_tracks, screen_planes, 1, ba_workers),
-      ScreenAlongAxis(scene, source, inputs, screen_tracks, screen_planes, 0, ba_workers)};
+      ScreenAlongAxis(scene, source, inputs, screen_tracks, screen_planes, 1, workers, ba_workers),
+      ScreenAlongAxis(scene, source, inputs, screen_tracks, screen_planes, 0, workers, ba_workers)};
   for (const auto& s : screens)
     Log(std::string("Shutter axis screen ") + (s.axis ? "rows" : "columns") + ": consistent=" +
         (s.consistent ? "true" : "false") + ", cost_drop=" + std::to_string(s.cost_drop_ratio) +

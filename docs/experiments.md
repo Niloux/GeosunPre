@@ -116,3 +116,27 @@
 | `polish` 重关联 LAS 平面 `med / p90` | — | `4.04 / 13.84 mm` |
 
 - **结论与未验证项**：采用为主线。`masks` 写盘与上采样已 100% 与 TRT 推理重叠，SfM 有效轨迹与长轨迹稳步增加、`align` 平面精度略优且卷帘/验收稳定通过；实测同时显示 `小场景` `sfm` 终局严格 BA 的线性求解（`13.92 s` / `8045` CG 迭代）为下一步 CUDA GPU BA 的主要提速空间。尚未在更大图量场景（如 `展厅` 588 图）实测增长期 BA 早停/特征压缩的耗时差异，亦未构造故意失位相机用例单独触发 `las_surface_check` 全量复核与剔除分支。
+
+## 2026-11-24：修复参考图像离群阻断 SfM 进入导航坐标系及卷帘重锚负深度崩解（`南非展会`）
+
+- **故障现象**：`work/南非展会.work`（1,073 幅异步双鱼眼，`L/R` 交替约 `65 ms`）在 `shutter` 阶段崩溃：`ScreenAlongAxis` 初始代价 `5.72e8`，双轴预筛与完整卷帘 BA（初始代价 `6.14e16`）均未通过，随后 `GlobalRigFallback` 抛出 `BA requires initial depth > 1e-6 (point 7, image 1039)`。
+- **根因链路定位**：
+  1. **主因（[reconstruction.cpp](../src/sfm/reconstruction.cpp) `to_navigation`）**：SfM 种子（`gauge_image = 73` `00078-L`、`scale_image = 77` `00080-L`）位于狭窄走廊起点（`L` 42–92 帧沿直线行进，导航横轴方差 `0.0629 < 0.09`），在进入主展厅时跨重复展位产生约 `3.55 m` 平移错位；主展厅注册图像超过九成后 `RobustSimilarity` 已识别出这 72 帧 `L` 错位簇与 `frame 197 R`（偏离 `14.39 m`），但 `to_navigation()` 因 `gauge_image`/`scale_image` 在离群集合中而永久拒绝转换，导致 `navigation_frame.used = false`，`1,073` 幅图像均未受 `NavigationGate` 与 `Position` 先验约束。`align` 中错位帧占 `6.8%` 未触发 `p90` 与 `las_surface_check`（`min_hit_rate = 0.7296`）拦截。
+  2. **次因（[shutter.cpp](../src/sfm/shutter.cpp)）**：`ScreenAlongAxis` 未先运行 `ReanchorRigOutliers` 即施加无 Huber 二次 `RigLink`；`ReanchorRigOutliers` 将 79 个 rig 离群姿态拉回后产生 3,990 个负深度点，且直接对 `p.xyz` 调用无位移/正深度保护的 `RefinePoint`，将仅在错位簇内观测的点（如点 7）解算至极大距离导致 `PlaneCost` 代价爆炸（`6.14e16`）；`GlobalRigFallback` 也未筛选 `HasPositiveReferenceDepth` 即调用 `Optimize`。
+- **改动**：
+  - [reconstruction.cpp](../src/sfm/reconstruction.cpp)：`unregister` 同步清理 `recent`；`to_navigation` 在 `!outliers.empty()` 时校验剩余内点簇的最小数量（`>= 8`）、展开度与共享三维点支撑（`>= 24`），允许撤销含 `gauge_image`/`scale_image` 在内的离群图像并从内点中重选基线最宽的参考图像对及更新 `gauge_baseline`；外层补充停滞/全注册兜底（`allow_majority` 严格多数内点转换并重注册离群簇）。
+  - [shutter.cpp](../src/sfm/shutter.cpp)：`ReanchorRigOutliers` 在临时向量上执行 `RefinePoint` 并校验有限性、位移上界（`max(5 m, 4 * max_shift)`）及全观测正深度（`z > 1e-3`）；`ScreenAlongAxis` 前置 `ReanchorRigOutliers` 并过滤 `HasPositiveShutterDepth`；`GlobalRigFallback` 仅向 `Optimize` 传入 `HasPositiveReferenceDepth` 轨迹并在优化后清理残余负深度轨迹。
+- **实景验证**（`.\tools\windows\build.ps1` Ninja Release `/W4` 0 错误 0 新增警告；复用前端缓存于 `work/南非展会-navfix.work` 从 `sfm` 从头跑至 `export` 并保留于 `work/南非展会-navfix`）：
+
+| 指标 (`南非展会` 1,073 图) | 修复前 (`work/南非展会.work`) | 修复后 (`work/南非展会-navfix.work` / `南非展会-navfix`) |
+| --- | :---: | :---: |
+| `sfm.navigation_frame.used` / 触发点 | `false` | `true`（`700` 图处撤销 `70` 离群，重选参考 `[445, 6]`） |
+| 最终注册 / `check` | `1073/1073`（含 `73` 帧 `> 0.25 m` 错位）→ `shutter` 崩溃 | **`1073/1073`**，`geosunpre check` **`passed: true`** |
+| `aligned.bin` `\|center - body_pos\|` (med / p90 / max) | max `14.3859 m`（`73` 帧 `> 0.25 m`） | `0.0745 / 0.1005 / 0.1197 m`（**`0` 帧 `> 0.25 m`**） |
+| `align` `las_surface_check` 最低命中 / `joint.used` | `0.7296` / `true` | `0.8787` / `true`（位移 `31.9 / 64.8 mm`） |
+| `shutter.used` / `readout_axis` / `readout_s` | 失败退出（`6.14e16` → depth 异常） | **`true`** / `rows` / `[-0.03888, +0.03822] s` |
+| 卷帘留出重投影 `before -> after` (med / p90) | — | `1.2842 -> 1.0683 px` / `3.1794 -> 2.8027 px` |
+| 卷帘 `explained_rotation` (L / R) / `polish` | — | `0.8481 / 0.9096`（`imu`）/ `true`（`6.69 / 18.04 mm`） |
+| 交付点数 / 观测 / 重投影 `med / p90` | — | `321,218` / `1,698,452` / `0.8960 / 1.9976 px` |
+
+- **结论**：修复确立为主线；未在 `GlobalRigFallback` 真实命中场景复测该分支。

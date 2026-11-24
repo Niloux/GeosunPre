@@ -1887,9 +1887,12 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     return Optimize(m, scene.cameras, stage, ba_workers, iterations, variable, {}, nav, selected,
                     nullptr, {}, {}, false, {}, rel_rot_priors, function_tolerance);
   };
+  std::set<uint32_t> recent;
   auto unregister = [&](const std::vector<uint32_t>& ids) {
-    for (uint32_t id : ids)
+    for (uint32_t id : ids) {
       m.images[id].registered = false;
+      recent.erase(id);
+    }
     for (auto& point : m.points)
       point.track.erase(
           std::remove_if(point.track.begin(), point.track.end(),
@@ -1936,7 +1939,6 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     Log("Seed " + scene.images[seed->a].name + " + " + scene.images[seed->b].name);
   }
   size_t last_global = m.Registered();
-  std::set<uint32_t> recent;
   if (!resumed)
     recent = {m.gauge_image, m.scale_image};
   std::array<size_t, 2> resumed_counts{};
@@ -1949,7 +1951,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   // 0.3 m across their main direction, so the similarity is also fixed about that axis. Exposures
   // beyond the navigation gate are unregistered and may register again under the gate. A model
   // that is already in the navigation frame (a resumed checkpoint) fits to about the identity.
-  auto to_navigation = [&] {
+  auto to_navigation = [&](bool allow_majority = false) -> bool {
     std::vector<uint32_t> ids;
     std::vector<Eigen::Vector3d> centers, targets;
     Eigen::Vector3d mean = Eigen::Vector3d::Zero();
@@ -1961,38 +1963,107 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         mean += positions[id];
       }
     if (ids.size() < 8)
-      return;
+      return false;
     mean /= double(ids.size());
     Eigen::Matrix3d spread = Eigen::Matrix3d::Zero();
     for (const auto& p : targets)
       spread += (p - mean) * (p - mean).transpose();
     if (Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(spread / double(ids.size()))
             .eigenvalues()[1] < .3 * .3)
-      return;
+      return false;
     Similarity fit;
     try {
       fit = RobustSimilarity(centers, targets, NavigationGate);
     } catch (const std::runtime_error&) {
-      return;
+      return false;
     }
-    std::vector<uint32_t> outliers;
+    std::vector<uint32_t> inliers, outliers;
+    std::vector<Eigen::Vector3d> inlier_targets;
+    std::vector<uint8_t> is_inlier(m.images.size(), 0);
     Json omitted = Json::array();
     for (size_t k = 0; k < ids.size(); ++k) {
       const double error = (fit.Apply(centers[k]) - targets[k]).norm();
       if (error > NavigationGate) {
         outliers.push_back(ids[k]);
         omitted.push_back({{"image_index", ids[k]}, {"error_m", error}});
+      } else {
+        inliers.push_back(ids[k]);
+        inlier_targets.push_back(targets[k]);
+        is_inlier[ids[k]] = 1;
       }
     }
-    // A few outliers are wrong registrations; many mean the visual model has not settled yet.
-    if (outliers.size() > ids.size() / 10 ||
-        std::count(outliers.begin(), outliers.end(), m.gauge_image) ||
-        std::count(outliers.begin(), outliers.end(), m.scale_image))
-      return;
+    if (!allow_majority && outliers.size() > ids.size() / 10)
+      return false;
+    if (allow_majority && inliers.size() < std::max<size_t>(8, ids.size() / 2 + 1))
+      return false;
+    if (!outliers.empty()) {
+      if (inliers.size() < 8)
+        return false;
+      Eigen::Vector3d inlier_mean = Eigen::Vector3d::Zero();
+      for (const auto& p : inlier_targets)
+        inlier_mean += p;
+      inlier_mean /= double(inlier_targets.size());
+      Eigen::Matrix3d inlier_spread = Eigen::Matrix3d::Zero();
+      for (const auto& p : inlier_targets)
+        inlier_spread += (p - inlier_mean) * (p - inlier_mean).transpose();
+      if (Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(inlier_spread / double(inlier_targets.size()))
+              .eigenvalues()[1] < .3 * .3)
+        return false;
+      size_t supported_points = 0;
+      for (const auto& point : m.points) {
+        if (point.track.empty())
+          continue;
+        size_t count = 0;
+        for (const auto& o : point.track)
+          if (is_inlier[o.image] && ++count >= 2)
+            break;
+        if (count >= 2 && ++supported_points >= 24)
+          break;
+      }
+      if (supported_points < 24)
+        return false;
+    }
     m.Apply(fit);
     for (uint32_t id : outliers)
       Log("Unregister " + scene.images[id].name + " (beyond the navigation gate)");
     unregister(outliers);
+    Json replaced_refs = nullptr;
+    if (!m.images[m.gauge_image].registered || !m.images[m.scale_image].registered) {
+      std::vector<uint32_t> candidates;
+      for (uint32_t id = 0; id < m.images.size(); ++id)
+        if (m.images[id].registered &&
+            std::any_of(m.images[id].points.begin(), m.images[id].points.end(),
+                        [](uint64_t p) { return p != NoPoint; }))
+          candidates.push_back(id);
+      if (candidates.size() < 2) {
+        candidates.clear();
+        for (uint32_t id = 0; id < m.images.size(); ++id)
+          if (m.images[id].registered)
+            candidates.push_back(id);
+      }
+      if (candidates.size() < 2)
+        throw std::runtime_error("Insufficient registered images for reference pair");
+      auto farthest = [&](uint32_t ref) {
+        uint32_t best_id = candidates[0];
+        double best_dist = -1.;
+        for (uint32_t id : candidates) {
+          const double d = (positions[id] - positions[ref]).norm();
+          if (d > best_dist) {
+            best_dist = d;
+            best_id = id;
+          }
+        }
+        return best_id;
+      };
+      const uint32_t a = farthest(candidates[0]);
+      const uint32_t b = farthest(a);
+      m.gauge_image = a;
+      m.scale_image = b;
+      m.gauge_baseline = (m.images[a].pose.Center() - m.images[b].pose.Center()).norm();
+      Log("Replaced navigation-outlier reference images: " + scene.images[a].name + " + " +
+          scene.images[b].name);
+      replaced_refs = Json::array({a, b});
+    }
     nav = positions;
     imu.RefreshFromNavigationModel(m);
     rel_rot_priors = imu.BuildRelativeRotationPriors(scene);
@@ -2000,12 +2071,18 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
                         {"registered_images", ids.size()},
                         {"scale", fit.scale},
                         {"unregistered", omitted}};
+    if (!replaced_refs.is_null())
+      navigation_frame["replaced_reference_images"] = replaced_refs;
     optimization.push_back(ba(calibrated ? "radial" : "fixed", 100, {}, {}, 5e-4));
     filter();
+    last_global = m.Registered();
     Log("Navigation frame at " + std::to_string(m.Registered()) + " registered images");
+    return true;
   };
   to_navigation();
-  while (m.Registered() < m.images.size()) {
+  for (;;) {
+    bool stalled = false;
+    while (m.Registered() < m.images.size()) {
     const auto selection_started = Clock::now();
     std::vector<std::pair<size_t, uint32_t>> options;
     for (uint32_t id = 0; id < m.images.size(); ++id)
@@ -2090,6 +2167,8 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         last_global = m.Registered();
         continue;
       }
+      if (nav.empty() && to_navigation(true))
+        continue;
       Json missing = Json::array();
       for (uint32_t id = 0; id < m.images.size(); ++id)
         if (!m.images[id].registered)
@@ -2105,8 +2184,13 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       if (!allow_partial)
         throw RegistrationIncomplete(missing.get<std::vector<uint32_t>>());
       Log("Finalize registered subset");
+      stalled = true;
       break;
     }
+    }
+    if (!stalled && nav.empty() && to_navigation(true))
+      continue;
+    break;
   }
   // Growth has already refined focal length and distortion. Calibrate the
   // registered image set once, hold intrinsics while incorporating new tracks,
