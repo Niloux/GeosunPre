@@ -140,3 +140,45 @@
 | 交付点数 / 观测 / 重投影 `med / p90` | — | `321,218` / `1,698,452` / `0.8960 / 1.9976 px` |
 
 - **结论**：修复确立为主线；未在 `GlobalRigFallback` 真实命中场景复测该分支。
+
+## 2026-11-25：Ceres CUDA BA、TensorRT 动态批推理、精确 `SO(3)` 卷帘与 IMU 时差自标定、导航引导种子选对
+
+- **改动概要**：
+  1. **Ceres CUDA 混合精度 `DENSE_SCHUR` BA**（[dependencies.cmake](../dependencies/dependencies.cmake)、[optimization.cpp](../src/sfm/optimization.cpp)、[build.ps1](../tools/windows/build.ps1)）：开启 Ceres 2.2.0 `USE_CUDA=ON`（链接 `cudart`、`cublas`、`cusolver`、`cusparse` 并随 `build.ps1` 复制 6 个运行时 CUDA DLL）；对 `>= 64` 图且含可变三维点的全局 BA，在 Schur 补列数 `<= 12000` 且空闲显存满足 `>= 2 * (12 * schur_cols^2) + 512 MiB` 时启用 `DENSE_SCHUR + CUDA + use_mixed_precision_solves=true`（FP32 Cholesky + FP64 迭代精化），否则回退 `ITERATIVE_SCHUR + SCHUR_JACOBI`。
+  2. **TensorRT 动态批推理**（[networks.py](../tools/models/networks.py)、[prepare.py](../tools/models/prepare.py)、[inference.cpp](../src/frontend/inference.cpp)、[frontend.cpp](../src/frontend/frontend.cpp)、[monocular.cpp](../src/geometry/monocular.cpp)、[supervision_kernels.cu](../src/geometry/supervision_kernels.cu)）：为 LoMa `matcher`（`B=1..8`, `opt=8`）与 MoGe-2 `geometry`（`B=1..8`, `opt=7`）开启动态批维度，构建独立模型包 `models-batched`（保留只读 `models/` 不变）；运行时按引擎 `MaxBatch` 与可用显存（`< 5 GiB` 收敛至 `<= 4`）自动分批。
+  3. **精确 `SO(3)` 卷帘模型与暴露–IMU 时钟偏置自标定**（[model.h](../src/geometry/model.h)、[optimization.cpp](../src/sfm/optimization.cpp)、[shutter.cpp](../src/sfm/shutter.cpp)、[scene.cpp](../src/io/scene.cpp)、[monocular.cpp](../src/geometry/monocular.cpp)、[supervision_kernels.cu](../src/geometry/supervision_kernels.cu) 及下游 `LichtFeld-Studio` [rolling_shutter.cpp](file:///d:/Dev/LichtFeld-Studio/src/training/components/rolling_shutter.cpp)）：将线性一阶卷帘统一升级为精确 `SO(3)` `Exp(s[ω]×)(v - s·τ·u)` 与精确左雅可比 `-s·J·[v]×·J_l(sω)`（经中心有限差分校验 `MAX_ABS_ERR = 1.84e-7`，`MAX_REL_ERR = 1.11e-7 < 1e-6`），单轴旋转边界由 `0.05` 放宽至 `0.10` rad；并在 `shutter` 前对 `[-80, +80] ms` 自标定共享时钟偏置 `time_offset_s`。
+  4. **导航展开度与 IMU 旋转感知的三级种子选对**（[reconstruction.cpp](../src/sfm/reconstruction.cpp)）：按 IMU 旋转一致性（`<= 3.0°`）、强邻域（`inliers >= 48`）数量及位置协方差横向展开度 `transverse_m` 分 Tier 2 / 1 / 0 择优。
+
+### Ceres BA 线性求解器对比（同题复现，`ba_workers = 8`）
+
+Ceres 2.2.0 在 `LAPACK=OFF`、`SUITESPARSE=OFF` 下，所有纯 CPU 替代求解器（`SPARSE_SCHUR`、`DENSE_SCHUR`、`CLUSTER_TRIDIAGONAL`、`CLUSTER_JACOBI`）均慢于 `ITERATIVE_SCHUR + SCHUR_JACOBI`（无 LAPACK 时 Eigen 稠密求解与无 AMD/METIS 重排的 `EIGEN_SPARSE` 在全局内参耦合块上出现严重填充/慢分解）；开启 `USE_CUDA=ON` 后 `DENSE_SCHUR (CUDA Mixed)` 在大规模场景获得显著线性求解加速且终态代价与重投影误差完全一致：
+
+| 求解器配置 | `小场景` A (`principal`, 296 图) 总耗时 / 线性 | `小场景` B (`align`) 线性 | `小场景` C (`shutter+polish`) 线性 | `南非展会` A (`principal`, 1,073 图) 总耗时 / 线性 | `南非展会` C (`shutter+polish`) 总耗时 / 线性 |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| `ITERATIVE_SCHUR + SCHUR_JACOBI`（基线） | `8.87 s` / `4.61 s` | `3.27 s` | `5.97 + 5.49 = 11.46 s` | `39.23 s` / `24.73 s` | `55.07+62.53=117.60 s` / `35.73+40.96=76.69 s` |
+| `DENSE_SCHUR`（CPU Eigen） | `10.42 s` / `5.80 s` | `4.18 s` | `11.71 + 8.66 = 20.37 s` | — | — |
+| `SPARSE_SCHUR`（CPU `EIGEN_SPARSE`） | `11.55 s` / `6.76 s` | `5.78 s` | `17.89 + 12.91 = 30.80 s` | `> 220 s`（第 9 轮中止） | — |
+| `ITERATIVE_SCHUR + CLUSTER_TRIDIAGONAL` | `20.21 s` / `15.68 s` | `9.32 s` | `50.67 s`（仅 `shutter`，后中止） | — | — |
+| `ITERATIVE_SCHUR + CLUSTER_JACOBI` | `29.12 s` / `24.50 s` | — | — | — | — |
+| `DENSE_SCHUR`（CUDA FP64） | **`8.04 s` / `3.72 s`** | `3.51 s` | `6.28 + 4.79 = 11.07 s` | `32.64 s` / `18.33 s` | `48.42+50.27=98.69 s` / `28.19+29.66=57.85 s` |
+| **`DENSE_SCHUR`（CUDA Mixed，采用）** | `9.02 s` / `4.31 s` | **`2.43 s`** | **`5.83 + 4.60 = 10.43 s`** | **`31.60 s` / `16.87 s`**（`-31.8%`） | **`44.41+45.35=89.76 s` / `23.39+23.77=47.16 s`**（`-38.5%`） |
+
+### 三场景全流程实景对比（`models-batched`，交付保留于 `work/*-opt24`）
+
+三套实景均通过 `geosunpre check`（`passed: true`，注册率 100%）：
+
+| 指标 | `小场景` 基线 | `小场景-opt24` | `展厅` 基线 | `展厅-opt24` | `南非展会` 基线 | `南非展会-opt24` |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `matches` 耗时 (`B=1..8`) | `25.98 s` | **`20.41 s`**（`-21.4%`） | `73.60 s` | **`51.01 s`**（`-30.7%`） | `99.78 s` | **`78.38 s`**（`-21.4%`） |
+| 种子选对 / 导航入系点数 | — / `11`（`0` 撤销） | Tier 2 `spread=0.94 m` / `11`（`0` 撤销） | — / `9`（`0` 撤销） | Tier 2 `spread=1.00 m` / `10`（`0` 撤销） | — / `700`（`70` 走廊离群） | **Tier 2 `spread=2.04 m` / `133`（`0` 离群）** |
+| `sfm` 终局 BA 总耗时 / 线性 | `29.08 s` / `13.43 s` | `33.09 s` / `13.90 s` | `86.71 s` / `50.02 s` | **`76.92 s` / `40.27 s`** | `156.43 s` / `86.21 s` | **`140.39 s` / `63.35 s`**（`-26.5%`） |
+| `align joint` BA / 线性 | `12.53 s` / `8.10 s` | **`5.92 s` / `2.45 s`**（`-69.8%`） | `19.68 s` / `14.76 s` | **`17.87 s` / `12.30 s`** | `117.12 s` / `90.05 s` | **`29.28 s` / `14.95 s`**（**`6.0×`**） |
+| IMU 时差 `time_offset_s`（视轴中位） | — | `0.0 ms`（`used=false`，`0.160°`） | — | **`-13.0 ms`**（`0.371° → 0.268°`） | — | **`-5.5 ms`**（`0.232° → 0.209°`） |
+| `shutter` + `polish` BA 线性 | `6.57 + 7.64 = 14.21 s` | **`5.40 + 4.98 = 10.38 s`** | `27.61 + 41.32 = 68.93 s` | **`22.85 + 21.68 = 44.53 s`**（`-35.4%`） | `46.64 + 47.91 = 94.55 s` | **`24.50 + 24.66 = 49.16 s`**（`-48.0%`） |
+| 留出重投影中位 (`before → after px`) | `1.1516 → 0.9376` | `1.1660 → 0.9421` | `1.4188 → 1.1337` | `1.4340 → 1.1528` | `1.2842 → 1.0683` | **`1.2523 → 1.0547`** |
+| LAS 平面误差 `plane_after` / 重关联 (mm) | `4.25/15.38` / `4.18/14.75` | **`3.97/14.79` / `3.92/14.34`** | `5.94/17.49` / `5.90/16.81` | **`5.58/16.98` / `5.53/16.38`** | `6.83/18.41` / `6.69/18.04` | **`6.32/18.51` / `6.18/17.91`** |
+| MoGe-2 `moge_estimate`（`host_s`） | `47.35 s` (`33.29 s`) | `46.68 s` (**`2.34 s`**) | `96.97 s` (`64.51 s`) | `92.41 s` (**`3.35 s`**) | `174.86 s` (`120.09 s`) | `169.17 s` (**`5.16 s`**) |
+| 交付点数 / 重投影 (`med / p90 px`) | `123,021` / `0.7226 / 1.7592` | `122,597` / `0.7327 / 1.7703` | `154,185` / `0.8908 / 2.0720` | `154,243` / `0.8929 / 2.0667` | `321,218` / `0.8960 / 1.9976` | **`334,070` / `0.8741 / 1.9639`** |
+
+- **下游验证**：`LichtFeld-Studio` `RollingShutter*` 单元测试 `8/8` 通过；`LichtFeld-Studio.exe` 加载 `work/展厅-opt24` 运行 5 步无头冒烟训练退出码 `0`（确认 `588` 相机启用行读出卷帘、加载 `588/588` 深度与法向先验及 `roi.json` 52 顶点裁切盒，训练完成）。
+- **结论与未验证项**：采用全部优化为主线；注意 MoGe-2 ViT-L 批推理将主机调度等待由 `33–120 s` 压缩至 `2.3–5.2 s`，但因 RTX 4090 上单脸 ViT-L 本身已达算力饱和，端到端 `moge_estimate` 仅微降 `1%–5%`。尚未运行 `opt24` 交付包的完整 20k–41k 步 3DGS 训练对比指标，亦未在 `< 8 GB` 显存卡或超过 `1,330` 幅卷帘图的显存回退分支上实测。

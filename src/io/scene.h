@@ -3,6 +3,7 @@
 #include "io/las.h"
 
 namespace geosun {
+struct Reconstruction;
 struct Exposure {
   uint32_t id = 0, camera = 0;
   std::string name;
@@ -49,6 +50,10 @@ struct ExposureKinematics {
   bool has_attitude = false;
 };
 // High-precision ENH trajectory velocity (+-20 ms), rigid lever arm (lens minus trajectory),
-// and 200 Hz IMU attitude/angular velocity in the LAS frame at every exposure.
-ExposureKinematics ReadExposureKinematics(const Scene& scene);
+// and 200 Hz IMU attitude/angular velocity in the LAS frame at every exposure (shifted by
+// time_offset_s on the POS clock when calibrated).
+ExposureKinematics ReadExposureKinematics(const Scene& scene, double time_offset_s = 0.);
+// Self-calibrates a shared exposure-to-IMU clock offset (s) by minimizing per-lens boresight
+// attitude scatter across registered images. Returns 0.0 when unavailable or improvement is minor.
+double EstimateImuTimeOffset(const Scene& scene, const Reconstruction& model, Json& report);
 }  // namespace geosun

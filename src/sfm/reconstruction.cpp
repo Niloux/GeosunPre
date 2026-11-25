@@ -1900,6 +1900,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           point.track.end());
     filter();
   };
+  Json seed_report = nullptr;
   if (resumed) {
     for (size_t i = 0; i < graph.tracks.size(); ++i) {
       std::set<uint64_t> existing;
@@ -1910,19 +1911,62 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
         points[i] = *existing.begin();
     }
   } else {
-    const Pair* seed = nullptr;
-    double best = 0;
-    for (const auto& p : pairs)
-      if (p.inliers.size() >= 100 && p.angle >= 1. &&
-          (positions[p.a] - positions[p.b]).norm() > .2) {
-        const double score = p.inliers.size() * std::min(p.angle, 8.);
-        if (score > best) {
-          seed = &p;
-          best = score;
-        }
+    struct SeedCandidate {
+      const Pair* pair = nullptr;
+      int tier = 0;
+      double score = 0.;
+      double baseline_m = 0.;
+      size_t local_neighbors = 0;
+      double local_transverse_m = 0.;
+      double imu_error_deg = -1.;
+    };
+    SeedCandidate best_seed;
+    for (const auto& p : pairs) {
+      const double baseline_m = (positions[p.a] - positions[p.b]).norm();
+      if (p.inliers.size() < 100 || p.angle < 1. || baseline_m <= .2)
+        continue;
+      bool imu_ok = true;
+      double imu_error_deg = -1.;
+      Eigen::Matrix3d R_prior;
+      if (imu.RelativeRotation(scene, p.a, p.b, R_prior)) {
+        imu_error_deg = RotationAngleDeg(p.relative.Rotation().toRotationMatrix() * R_prior.transpose());
+        imu_ok = imu_error_deg <= 3.0;
       }
-    if (!seed)
+      std::set<uint32_t> local_ids{p.a, p.b};
+      for (const uint32_t end_id : {p.a, p.b})
+        for (const size_t pidx : adjacency[end_id]) {
+          const auto& nb = pairs[pidx];
+          if (nb.inliers.size() < 48)
+            continue;
+          local_ids.insert(nb.a == end_id ? nb.b : nb.a);
+        }
+      Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+      for (const uint32_t id : local_ids)
+        mean += positions[id];
+      mean /= double(local_ids.size());
+      Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+      for (const uint32_t id : local_ids) {
+        const Eigen::Vector3d d = positions[id] - mean;
+        cov += d * d.transpose();
+      }
+      cov /= double(local_ids.size());
+      const double lambda2 =
+          Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(cov).eigenvalues()[1];
+      const double transverse_m = std::sqrt(std::max(0., lambda2));
+      int tier = 0;
+      if (imu_ok && local_ids.size() >= 8 && transverse_m >= 0.30)
+        tier = 2;
+      else if (imu_ok && local_ids.size() >= 4)
+        tier = 1;
+      const double spread_weight = std::clamp(transverse_m / 0.5, 0.5, 2.0);
+      const double score = double(p.inliers.size()) * std::min(p.angle, 8.) * spread_weight;
+      if (!best_seed.pair || tier > best_seed.tier ||
+          (tier == best_seed.tier && score > best_seed.score))
+        best_seed = {&p, tier, score, baseline_m, local_ids.size(), transverse_m, imu_error_deg};
+    }
+    if (!best_seed.pair)
       throw std::runtime_error("No nondegenerate reconstruction seed");
+    const Pair* seed = best_seed.pair;
     m.gauge_image = seed->a;
     m.scale_image = seed->b;
     m.gauge_baseline = 1;
@@ -1936,7 +1980,23 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
     triangulation_seconds += Seconds(triangulation_started);
     optimization.push_back(ba("fixed", 100));
     filter();
-    Log("Seed " + scene.images[seed->a].name + " + " + scene.images[seed->b].name);
+    seed_report = {{"image_a", seed->a},
+                   {"image_b", seed->b},
+                   {"name_a", scene.images[seed->a].name},
+                   {"name_b", scene.images[seed->b].name},
+                   {"inliers", seed->inliers.size()},
+                   {"angle_deg", seed->angle},
+                   {"baseline_m", best_seed.baseline_m},
+                   {"local_neighbors", best_seed.local_neighbors},
+                   {"local_transverse_m", best_seed.local_transverse_m},
+                   {"imu_error_deg", best_seed.imu_error_deg},
+                   {"tier", best_seed.tier}};
+    Log("Seed " + scene.images[seed->a].name + " + " + scene.images[seed->b].name +
+        " (tier " + std::to_string(best_seed.tier) + ", neighbors " +
+        std::to_string(best_seed.local_neighbors) + ", spread " +
+        std::to_string(best_seed.local_transverse_m) + " m, baseline " +
+        std::to_string(best_seed.baseline_m) + " m, imu_err " +
+        std::to_string(best_seed.imu_error_deg) + " deg)");
   }
   size_t last_global = m.Registered();
   if (!resumed)
@@ -2284,6 +2344,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
             {"completion", completion},
             {"unassigned_completion", unassigned_completion},
             {"pre_calibration_completion", calibration_completion},
+            {"seed", seed_report},
             {"navigation_frame", navigation_frame},
             {"imu_prior",
              {{"available", imu.available},

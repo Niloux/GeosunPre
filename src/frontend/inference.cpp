@@ -146,6 +146,30 @@ struct Models::Implementation {
   cudaStream_t stream = nullptr;
   std::deque<std::unique_ptr<Measurement>> pending;
   std::map<std::string, InferenceTiming> timings;
+  Engine& EnsureEngine(const std::string& name) {
+    auto found = engines.find(name);
+    if (found != engines.end())
+      return found->second;
+    const auto started = Clock::now();
+    const auto path = root / "engines" / (name + ".engine");
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+      throw std::runtime_error("Missing model engine: " + path.u8string());
+    std::vector<uint8_t> data(fs::file_size(path));
+    if (!file.read(reinterpret_cast<char*>(data.data()), data.size()))
+      throw std::runtime_error("Truncated model engine");
+    Engine e;
+    e.engine.reset(runtime->deserializeCudaEngine(data.data(), data.size()));
+    if (!e.engine)
+      throw std::runtime_error("TensorRT engine incompatible with runtime/GPU: " + name);
+    e.context.reset(e.engine->createExecutionContext());
+    if (!e.context)
+      throw std::runtime_error("Cannot allocate inference context");
+    found = engines.emplace(name, std::move(e)).first;
+    Log("Loaded " + name);
+    timings[name].load_seconds += Seconds(started);
+    return found->second;
+  }
   void Collect(bool wait) {
     while (!pending.empty()) {
       const auto& p = *pending.front();
@@ -245,31 +269,23 @@ Json Models::Profile() {
                     {"gpu_seconds", t.gpu_seconds}};
   return result;
 }
+int Models::MaxBatch(const std::string& name) {
+  auto& e = impl_->EnsureEngine(name);
+  const auto& spec = impl_->manifest.at("models").at(name);
+  const auto key = spec.at("inputs").at(0).get<std::string>();
+  const auto dims = e.engine->getTensorShape(key.c_str());
+  if (dims.nbDims > 0 && dims.d[0] == -1) {
+    const auto max_dims =
+        e.engine->getProfileShape(key.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+    return max_dims.nbDims > 0 && max_dims.d[0] > 0 ? int(max_dims.d[0]) : 1;
+  }
+  return 1;
+}
 std::vector<Tensor> Models::Predict(const std::string& name, const std::vector<Tensor>& inputs,
                                     bool device_output) {
   const auto started = Clock::now();
   impl_->Collect(impl_->pending.size() >= 32);
-  auto found = impl_->engines.find(name);
-  if (found == impl_->engines.end()) {
-    const auto path = impl_->root / "engines" / (name + ".engine");
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
-      throw std::runtime_error("Missing model engine: " + path.u8string());
-    std::vector<uint8_t> data(fs::file_size(path));
-    if (!file.read(reinterpret_cast<char*>(data.data()), data.size()))
-      throw std::runtime_error("Truncated model engine");
-    Engine e;
-    e.engine.reset(impl_->runtime->deserializeCudaEngine(data.data(), data.size()));
-    if (!e.engine)
-      throw std::runtime_error("TensorRT engine incompatible with runtime/GPU: " + name);
-    e.context.reset(e.engine->createExecutionContext());
-    if (!e.context)
-      throw std::runtime_error("Cannot allocate inference context");
-    found = impl_->engines.emplace(name, std::move(e)).first;
-    Log("Loaded " + name);
-    impl_->timings[name].load_seconds += Seconds(started);
-  }
-  auto& e = found->second;
+  auto& e = impl_->EnsureEngine(name);
   const auto& spec = impl_->manifest.at("models").at(name);
   if (inputs.size() != spec.at("inputs").size())
     throw std::runtime_error("Wrong inference input count");

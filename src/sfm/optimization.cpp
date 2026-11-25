@@ -3,6 +3,7 @@
 #include <ceres/rotation.h>
 #include <ceres/product_manifold.h>
 #include <Eigen/Eigenvalues>
+#include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
 
@@ -107,7 +108,9 @@ struct ShutterReprojection : ceres::SizedCostFunction<2, 10, 3, 9> {
       return false;
     const Eigen::Vector3d b =
         rotated + Eigen::Map<const Eigen::Vector3d>(pose + 4) - s * readout * velocity;
-    const Eigen::Vector3d v = b + s * w.cross(b);
+    const Eigen::Vector3d phi = s * w;
+    const Eigen::Matrix3d r_rs = RodriguesMatrix(phi);
+    const Eigen::Vector3d v = r_rs * b;
     if (v.z() <= 1e-6)
       return false;
     Camera camera;
@@ -116,17 +119,13 @@ struct ShutterReprojection : ceres::SizedCostFunction<2, 10, 3, 9> {
     output = camera.Project(v) - pixel;
     if (!jacobians)
       return true;
-    Eigen::Matrix3d a;
-    a << 1, -s * w.z(), s * w.y(), s * w.z(), 1, -s * w.x(), -s * w.y(), s * w.x(), 1;
     const auto j = camera.ProjectionJacobian(v);
-    const Eigen::Matrix<double, 2, 3> ja = j * a;
+    const Eigen::Matrix<double, 2, 3> ja = j * r_rs;
     if (jacobians[0]) {
       Eigen::Map<Eigen::Matrix<double, 2, 10, Eigen::RowMajor>> pose_j(jacobians[0]);
       pose_j.leftCols<4>() = ja * RotationJacobian(rotation, point, rotated, norm);
       pose_j.middleCols<3>(4) = ja;
-      Eigen::Matrix3d cross;
-      cross << 0, -b.z(), b.y(), b.z(), 0, -b.x(), -b.y(), b.x(), 0;
-      pose_j.rightCols<3>() = -s * j * cross;
+      pose_j.rightCols<3>() = -s * j * SkewSymmetric(v) * LeftJacobianSO3(phi);
     }
     if (jacobians[1]) {
       Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[1]);
@@ -542,8 +541,8 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
       }
       if (!(fixed_pose && fixed_rig_and_readout)) {
         for (int i = 7; i < 10; ++i) {
-          problem.SetParameterLowerBound(block, i, -.05);
-          problem.SetParameterUpperBound(block, i, .05);
+          problem.SetParameterLowerBound(block, i, -ShutterRotationBound);
+          problem.SetParameterUpperBound(block, i, ShutterRotationBound);
         }
       }
     } else {
@@ -726,12 +725,31 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   options.num_threads = workers;
   options.max_num_iterations = iterations;
   options.logging_type = ceres::SILENT;
-  const bool iterative = has_variable_points && variable_images.empty() && used_images.size() >= 64;
+  const bool global_large =
+      has_variable_points && variable_images.empty() && used_images.size() >= 64;
+  bool use_cuda_dense = false;
+  if (global_large) {
+    const size_t schur_cols = used_images.size() * (shutter ? 9 : 6) +
+                              used_cameras.size() * (shutter ? 9 : 8) + (rig_frames ? 6 : 0);
+    // Mixed-precision CUDA Cholesky holds ~12 B/entry on GPU (FP64 + FP32 lhs plus workspace).
+    const size_t dense_bytes = size_t(12) * schur_cols * schur_cols;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (schur_cols <= 12000 && cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess &&
+        free_bytes >= 2 * dense_bytes + (size_t(512) << 20))
+      use_cuda_dense = true;
+  }
+  const bool iterative = global_large && !use_cuda_dense;
   options.linear_solver_type = !has_variable_points
                                    ? ceres::DENSE_QR
-                                   : (iterative ? ceres::ITERATIVE_SCHUR : ceres::SPARSE_SCHUR);
-  if (iterative)
+                                   : (use_cuda_dense
+                                          ? ceres::DENSE_SCHUR
+                                          : (iterative ? ceres::ITERATIVE_SCHUR : ceres::SPARSE_SCHUR));
+  if (use_cuda_dense) {
+    options.dense_linear_algebra_library_type = ceres::CUDA;
+    options.use_mixed_precision_solves = true;
+  } else if (iterative) {
     options.preconditioner_type = ceres::SCHUR_JACOBI;
+  }
   options.use_explicit_schur_complement = iterative && used_images.size() <= 4096;
   options.sparse_linear_algebra_library_type = ceres::EIGEN_SPARSE;
   options.linear_solver_ordering = has_variable_points ? ordering : nullptr;
@@ -803,6 +821,8 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"rolling_shutter", shutter != nullptr},
           {"observations", observations},
           {"solver", ceres::LinearSolverTypeToString(summary.linear_solver_type_used)},
+          {"cuda_dense", use_cuda_dense},
+          {"mixed_precision", summary.mixed_precision_solves_used},
           {"explicit_schur", options.use_explicit_schur_complement},
           {"build_seconds", build_seconds},
           {"linear_solver_seconds", summary.linear_solver_time_in_seconds},

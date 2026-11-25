@@ -666,7 +666,34 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
     }
     if (!identities)
       throw std::runtime_error("Model verification: no identity matches");
+    if (models.MaxBatch("matcher") >= 2) {
+      auto stack_buf = [&](const Tensor& src, size_t per_bytes, std::vector<int64_t> shape) {
+        Tensor dst;
+        dst.shape = std::move(shape);
+        dst.type = src.type;
+        dst.device = std::make_shared<DeviceBuffer>(2 * per_bytes);
+        CudaCheck(cudaMemcpyAsync(dst.device->data, src.device->data, per_bytes,
+                                  cudaMemcpyDeviceToDevice, models.Stream()));
+        CudaCheck(cudaMemcpyAsync(static_cast<uint8_t*>(dst.device->data) + per_bytes,
+                                  src.device->data, per_bytes, cudaMemcpyDeviceToDevice,
+                                  models.Stream()));
+        return dst;
+      };
+      const auto bk = stack_buf(k, 3072 * 2 * sizeof(float), {2, 3072, 2});
+      const auto bd = stack_buf(d, 3072 * 256 * sizeof(float), {2, 3072, 256});
+      const auto bm = stack_buf(mask, 3072 * sizeof(float), {2, 3072});
+      const auto bmatched = models.Predict("matcher", {bk, bk, bd, bd, bm, bm});
+      if (bmatched.size() != 2 || bmatched[0].type != 2 ||
+          bmatched[0].shape != std::vector<int64_t>{2, 3072})
+        throw std::runtime_error("Model verification: invalid batched matcher output");
+      check(bmatched[1], {2, 3072});
+      for (int b = 0; b < 2; ++b)
+        for (size_t i = 0; i < 3072; ++i)
+          if (bmatched[0].Index(size_t(b) * 3072 + i) != matched[0].Index(i))
+            throw std::runtime_error("Model verification: batched matcher index mismatch");
+    }
     report["identity_matches"] = identities;
+    report["matcher_max_batch"] = models.MaxBatch("matcher");
     report["inference"]["matcher"] = models.Profile().at("matcher");
   }
   // MoGe-2 monocular geometry, used by supervision export.
@@ -675,7 +702,8 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
     ImagePreprocessor pixels(models.Stream());
     pixels.Upload(rgb);
     const int64_t size = manifest.at("geometry_size");
-    const auto outputs = models.Predict("geometry", {pixels.Normalize(int(size), int(size))});
+    const auto face_in = pixels.Normalize(int(size), int(size));
+    const auto outputs = models.Predict("geometry", {face_in});
     if (outputs.size() != 4)
       throw std::runtime_error("Model verification: invalid geometry outputs");
     check(outputs[0], {1, size, size, 3});
@@ -697,7 +725,29 @@ Json CheckModels(const fs::path& root, const fs::path& image) {
     }
     if (valid * 2 < size_t(size * size) || outputs[3].Floats()[0] <= 0)
       throw std::runtime_error("Model verification: geometry point map is mostly invalid");
+    if (models.MaxBatch("geometry") >= 2) {
+      const size_t face_bytes = size_t(3) * size * size * sizeof(float);
+      Tensor b_in;
+      b_in.shape = {2, 3, size, size};
+      b_in.device = std::make_shared<DeviceBuffer>(2 * face_bytes);
+      CudaCheck(cudaMemcpyAsync(b_in.device->data, face_in.device->data, face_bytes,
+                                cudaMemcpyDeviceToDevice, models.Stream()));
+      CudaCheck(cudaMemcpyAsync(static_cast<uint8_t*>(b_in.device->data) + face_bytes,
+                                face_in.device->data, face_bytes, cudaMemcpyDeviceToDevice,
+                                models.Stream()));
+      const auto bout = models.Predict("geometry", {b_in});
+      if (bout.size() != 4)
+        throw std::runtime_error("Model verification: invalid batched geometry outputs");
+      check(bout[0], {2, size, size, 3});
+      check(bout[1], {2, size, size, 3});
+      check(bout[2], {2, size, size});
+      check(bout[3], {2});
+      if (std::abs(bout[3].Floats()[0] - outputs[3].Floats()[0]) > 1e-2f ||
+          std::abs(bout[3].Floats()[1] - outputs[3].Floats()[0]) > 1e-2f)
+        throw std::runtime_error("Model verification: batched geometry scale mismatch");
+    }
     report["geometry_valid_pixels"] = valid;
+    report["geometry_max_batch"] = models.MaxBatch("geometry");
     report["inference"]["geometry"] = models.Profile().at("geometry");
   }
   // SAM3 grounding of people, shadows, robots and the sky, used by the masks.
@@ -1065,38 +1115,123 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
     Models models(root);
     FeatureCache cache(work);
     ArchiveWriterQueue writer(archive_path);
-    for (size_t index = 0; index < pending.size(); ++index) {
-      const auto [a, b] = pending[index];
-      const auto& fa = cache.Get(a);
-      const auto& fb = cache.Get(b);
-      for (size_t next = index + 1; next < std::min(pending.size(), index + 5); ++next) {
+    int max_batch = models.MaxBatch("matcher");
+    if (max_batch > 4) {
+      size_t free_bytes = 0, total_bytes = 0;
+      CudaCheck(cudaMemGetInfo(&free_bytes, &total_bytes));
+      if (free_bytes < size_t(5) * 1024 * 1024 * 1024)
+        max_batch = 4;
+    }
+    max_batch = std::max(1, max_batch);
+    constexpr int64_t capacity = 3072;
+    constexpr size_t kKpBytes = size_t(capacity) * 2 * sizeof(float);
+    constexpr size_t kDescBytes = size_t(capacity) * 256 * sizeof(float);
+    constexpr size_t kMaskBytes = size_t(capacity) * sizeof(float);
+    std::array<std::shared_ptr<DeviceBuffer>, 6> batch_bufs;
+    if (max_batch > 1) {
+      const size_t b = size_t(max_batch);
+      batch_bufs[0] = std::make_shared<DeviceBuffer>(b * kKpBytes);
+      batch_bufs[1] = std::make_shared<DeviceBuffer>(b * kKpBytes);
+      batch_bufs[2] = std::make_shared<DeviceBuffer>(b * kDescBytes);
+      batch_bufs[3] = std::make_shared<DeviceBuffer>(b * kDescBytes);
+      batch_bufs[4] = std::make_shared<DeviceBuffer>(b * kMaskBytes);
+      batch_bufs[5] = std::make_shared<DeviceBuffer>(b * kMaskBytes);
+    }
+    for (size_t index = 0; index < pending.size();) {
+      const size_t batch = std::min<size_t>(size_t(max_batch), pending.size() - index);
+      for (size_t next = index + batch; next < std::min(pending.size(), index + batch + 8); ++next) {
         cache.Prefetch(pending[next].first);
         cache.Prefetch(pending[next].second);
       }
-      const auto na = int64_t(fa.value.pixels.size()), nb = int64_t(fb.value.pixels.size());
-      constexpr int64_t capacity = 3072;
-      auto phase = Clock::now();
-      const auto output = models.Predict("matcher", {fa.keypoints, fb.keypoints, fa.descriptors,
-                                                     fb.descriptors, fa.mask, fb.mask});
-      timing.gpu_pipeline += Seconds(phase);
-      phase = Clock::now();
-      if (output.size() != 2 || output[0].Count() != size_t(capacity) ||
-          output[1].Count() != size_t(capacity))
-        throw std::runtime_error("Unexpected matcher outputs");
-      MatchSet m{a, b, {}};
-      for (uint32_t k = 0; k < uint32_t(na); ++k) {
-        const auto j = output[0].Index(k);
-        if (j >= 0) {
-          if (j >= nb)
-            throw std::runtime_error("Matcher returned invalid feature index");
-          m.matches.push_back({k, uint32_t(j), output[1].Floats()[k]});
+      if (batch == 1) {
+        const auto [a, b] = pending[index];
+        const auto& fa = cache.Get(a);
+        const auto& fb = cache.Get(b);
+        const auto na = int64_t(fa.value.pixels.size()), nb = int64_t(fb.value.pixels.size());
+        auto phase = Clock::now();
+        const auto output = models.Predict("matcher", {fa.keypoints, fb.keypoints, fa.descriptors,
+                                                       fb.descriptors, fa.mask, fb.mask});
+        timing.gpu_pipeline += Seconds(phase);
+        phase = Clock::now();
+        if (output.size() != 2 || output[0].Count() != size_t(capacity) ||
+            output[1].Count() != size_t(capacity))
+          throw std::runtime_error("Unexpected matcher outputs");
+        MatchSet m{a, b, {}};
+        for (uint32_t k = 0; k < uint32_t(na); ++k) {
+          const auto j = output[0].Index(k);
+          if (j >= 0) {
+            if (j >= nb)
+              throw std::runtime_error("Matcher returned invalid feature index");
+            m.matches.push_back({k, uint32_t(j), output[1].Floats()[k]});
+          }
         }
+        timing.postprocess += Seconds(phase);
+        writer.Submit(std::move(m));
+      } else {
+        std::vector<size_t> na_list(batch), nb_list(batch);
+        const auto stream = models.Stream();
+        auto phase_copy = Clock::now();
+        for (size_t bi = 0; bi < batch; ++bi) {
+          const auto [a, b] = pending[index + bi];
+          const auto& fa = cache.Get(a);
+          const auto& fb = cache.Get(b);
+          na_list[bi] = fa.value.pixels.size();
+          nb_list[bi] = fb.value.pixels.size();
+          auto copy_slot = [&](const std::shared_ptr<DeviceBuffer>& dst,
+                               const std::shared_ptr<DeviceBuffer>& src, size_t bytes) {
+            CudaCheck(cudaMemcpyAsync(static_cast<uint8_t*>(dst->data) + bi * bytes, src->data,
+                                      bytes, cudaMemcpyDeviceToDevice, stream));
+          };
+          copy_slot(batch_bufs[0], fa.keypoints.device, kKpBytes);
+          copy_slot(batch_bufs[1], fb.keypoints.device, kKpBytes);
+          copy_slot(batch_bufs[2], fa.descriptors.device, kDescBytes);
+          copy_slot(batch_bufs[3], fb.descriptors.device, kDescBytes);
+          copy_slot(batch_bufs[4], fa.mask.device, kMaskBytes);
+          copy_slot(batch_bufs[5], fb.mask.device, kMaskBytes);
+        }
+        timing.gpu_pipeline += Seconds(phase_copy);
+        auto make_tensor = [&](int slot, std::vector<int64_t> shape) {
+          Tensor t;
+          t.shape = std::move(shape);
+          t.type = 0;
+          t.device = batch_bufs[slot];
+          return t;
+        };
+        const int64_t bn = int64_t(batch);
+        auto phase = Clock::now();
+        const auto output = models.Predict(
+            "matcher",
+            {make_tensor(0, {bn, capacity, 2}), make_tensor(1, {bn, capacity, 2}),
+             make_tensor(2, {bn, capacity, 256}), make_tensor(3, {bn, capacity, 256}),
+             make_tensor(4, {bn, capacity}), make_tensor(5, {bn, capacity})});
+        timing.gpu_pipeline += Seconds(phase);
+        phase = Clock::now();
+        if (output.size() != 2 || output[0].shape != std::vector<int64_t>{bn, capacity} ||
+            output[1].shape != std::vector<int64_t>{bn, capacity})
+          throw std::runtime_error("Unexpected batched matcher outputs");
+        const float* confs = output[1].Floats();
+        for (size_t bi = 0; bi < batch; ++bi) {
+          const auto [a, b] = pending[index + bi];
+          const size_t na = na_list[bi], nb = nb_list[bi];
+          const size_t base = bi * size_t(capacity);
+          MatchSet m{a, b, {}};
+          for (uint32_t k = 0; k < uint32_t(na); ++k) {
+            const auto j = output[0].Index(base + k);
+            if (j >= 0) {
+              if (j >= int64_t(nb))
+                throw std::runtime_error("Matcher returned invalid feature index");
+              m.matches.push_back({k, uint32_t(j), confs[base + k]});
+            }
+          }
+          writer.Submit(std::move(m));
+        }
+        timing.postprocess += Seconds(phase);
       }
-      timing.postprocess += Seconds(phase);
-      writer.Submit(std::move(m));
-      ++timing.computed;
-      if ((index + 1) % 500 == 0)
-        Log("Matches " + std::to_string(index + 1) + "/" + std::to_string(pending.size()));
+      const size_t prev_bucket = index / 500;
+      index += batch;
+      timing.computed += batch;
+      if (index / 500 > prev_bucket)
+        Log("Matches " + std::to_string(index) + "/" + std::to_string(pending.size()));
     }
     writer.Finish();
     timing.write = writer.seconds;
@@ -1104,6 +1239,7 @@ Json MakeMatches(const Scene& scene, const fs::path& work, const fs::path& root,
     timing.wait = cache.wait_seconds;
     timing.preprocess = cache.upload_seconds;
     report = timing.Report(started, &models);
+    report["matcher_max_batch"] = max_batch;
   } else {
     if (!fs::exists(archive_path))
       MatchArchiveWriter(archive_path).Flush();

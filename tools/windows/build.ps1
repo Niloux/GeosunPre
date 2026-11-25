@@ -40,8 +40,10 @@ try {
     & cmake --build --preset release --target geosunpre geosun --parallel $Jobs
     if ($LASTEXITCODE) { throw 'Native compilation failed.' }
     if (-not $env:CUDA_PATH) { throw 'CUDA_PATH must point to the CUDA Toolkit.' }
-    $runtime = Join-Path $env:CUDA_PATH 'bin\cudart64_12.dll'
-    Copy-Item -LiteralPath $runtime -Destination $bin
+    foreach ($dll in @('cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll',
+                       'cusolver64_11.dll', 'cusparse64_12.dll', 'nvJitLink_120_0.dll')) {
+        Copy-Item -LiteralPath (Join-Path $env:CUDA_PATH "bin\$dll") -Destination $bin
+    }
     $crt = Get-ChildItem -LiteralPath (Join-Path $vs 'VC\Redist\MSVC') -Directory | Where-Object Name -Match '^\d' | Sort-Object Name -Descending | Select-Object -First 1
     Get-ChildItem -LiteralPath (Join-Path $crt.FullName 'x64\Microsoft.VC143.CRT') -Filter '*.dll' | Copy-Item -Destination $bin
     Write-Host "Built: $bin\geosunpre.exe"

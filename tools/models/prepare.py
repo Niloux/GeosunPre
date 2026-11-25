@@ -24,12 +24,16 @@ from networks import (ATTENTION_BLOCK, Detector, Descriptor, Geometry, Grounding
 
 TRT_VERSION = '10.13.3.9'
 MAX_FEATURES = 3072
+MATCHER_OPT_BATCH = 8
+MATCHER_MAX_BATCH = 8
 DETECTOR_PROFILE = {'min': [16, 16], 'opt': [1152, 1536], 'max': [1536, 1536]}
 DETECTOR_CHECK_SIZES = ((1152, 1536), (1536, 1152), (1536, 864), (1000, 1536),
                         (1536, 1536), (16, 1536), (1536, 16))
 # MoGe-2 runs on square pinhole faces: 46x46 ViT tokens, inside the suggested 1200-2500.
 GEOMETRY_SIZE = 644
 GEOMETRY_TOKENS = 2116
+GEOMETRY_OPT_BATCH = 7
+GEOMETRY_MAX_BATCH = 8
 # SAM3 runs on the whole photo stretched to its native square input; prompts are baked in.
 GROUNDING_SIZE = 1008
 GROUNDING_MASK_SIZE = 288
@@ -202,10 +206,10 @@ def expected_shapes():
     return {
         'detector': [[1, 3, -1, -1]],
         'descriptor': [[1, 3, 784, 784], [1, MAX_FEATURES, 2]],
-        'matcher': [[1, MAX_FEATURES, 2], [1, MAX_FEATURES, 2],
-                    [1, MAX_FEATURES, 256], [1, MAX_FEATURES, 256],
-                    [1, MAX_FEATURES], [1, MAX_FEATURES]],
-        'geometry': [[1, 3, GEOMETRY_SIZE, GEOMETRY_SIZE]],
+        'matcher': [[-1, MAX_FEATURES, 2], [-1, MAX_FEATURES, 2],
+                    [-1, MAX_FEATURES, 256], [-1, MAX_FEATURES, 256],
+                    [-1, MAX_FEATURES], [-1, MAX_FEATURES]],
+        'geometry': [[-1, 3, GEOMETRY_SIZE, GEOMETRY_SIZE]],
         'grounding': [[1, 3, GROUNDING_SIZE, GROUNDING_SIZE]],
     }
 
@@ -226,7 +230,7 @@ def check_onnx(path, name, shapes):
         for axis, (dim, size) in enumerate(zip(dims, expected)):
             if size == -1 or (name == 'descriptor' and value.name == 'keypoints' and axis == 1):
                 if not dim.dim_param:
-                    raise RuntimeError(f'ONNX input axis must be dynamic: {path}: {value.name}/{axis}')
+                    raise RuntimeError(f'ONNX input axis must be dynamic (static B=1 ONNX cannot be reused): {path}: {value.name}/{axis}')
             elif dim.dim_value != size:
                 raise RuntimeError(f'ONNX input size differs: {path}: {value.name}')
     onnx.checker.check_model(str(path))
@@ -252,6 +256,8 @@ def export_graph(name, module, inputs, directory, shapes, references):
     dynamic = {'keypoints': {1: 'N'}, 'descriptors': {1: 'N'}} if name == 'descriptor' else None
     if name == 'detector':
         dynamic = {'image': {2: 'H', 3: 'W'}, 'logits': {2: 'H', 3: 'W'}}
+    elif name in ('matcher', 'geometry'):
+        dynamic = {tensor_name: {0: 'B'} for tensor_name in CONTRACTS[name][0] + CONTRACTS[name][1]}
     # SAM3 keeps position tables on the CPU, which PyTorch constant folding cannot mix with CUDA
     # weights; TensorRT folds the constants instead.
     grounding = name == 'grounding'
@@ -419,6 +425,19 @@ def build_engine(path, name, shapes, matcher_precision, geometry_precision, hard
         profile = builder.create_optimization_profile()
         profile.set_shape('keypoints', (1, 32, 2), (1, 1024, 2), (1, MAX_FEATURES, 2))
         config.add_optimization_profile(profile)
+    if name == 'matcher':
+        profile = builder.create_optimization_profile()
+        for label, shape in zip(CONTRACTS['matcher'][0], shapes):
+            tail = tuple(shape[1:])
+            profile.set_shape(label, (1, *tail), (MATCHER_OPT_BATCH, *tail), (MATCHER_MAX_BATCH, *tail))
+        config.add_optimization_profile(profile)
+    if name == 'geometry':
+        profile = builder.create_optimization_profile()
+        profile.set_shape('image',
+                          (1, 3, GEOMETRY_SIZE, GEOMETRY_SIZE),
+                          (GEOMETRY_OPT_BATCH, 3, GEOMETRY_SIZE, GEOMETRY_SIZE),
+                          (GEOMETRY_MAX_BATCH, 3, GEOMETRY_SIZE, GEOMETRY_SIZE))
+        config.add_optimization_profile(profile)
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise RuntimeError(f'TensorRT build failed: {name}')
@@ -453,6 +472,18 @@ class Engine:
             expected = [(1, 3, height, width) for width, height in DETECTOR_PROFILE.values()]
             if profile != expected:
                 raise RuntimeError(f'Detector optimization profile differs: {profile}')
+        if name == 'matcher':
+            profile = [tuple(dims) for dims in self.engine.get_tensor_profile_shape('ka', 0)]
+            expected = [(1, MAX_FEATURES, 2), (MATCHER_OPT_BATCH, MAX_FEATURES, 2), (MATCHER_MAX_BATCH, MAX_FEATURES, 2)]
+            if profile != expected:
+                raise RuntimeError(f'Matcher optimization profile differs: {profile}')
+        if name == 'geometry':
+            profile = [tuple(dims) for dims in self.engine.get_tensor_profile_shape('image', 0)]
+            expected = [(1, 3, GEOMETRY_SIZE, GEOMETRY_SIZE),
+                        (GEOMETRY_OPT_BATCH, 3, GEOMETRY_SIZE, GEOMETRY_SIZE),
+                        (GEOMETRY_MAX_BATCH, 3, GEOMETRY_SIZE, GEOMETRY_SIZE)]
+            if profile != expected:
+                raise RuntimeError(f'Geometry optimization profile differs: {profile}')
 
     def __call__(self, *inputs):
         inputs = [value.contiguous() for value in inputs]
@@ -619,11 +650,27 @@ def verify(root, shapes, images):
         valid = identity[0] >= 0
         if not valid.any() or not torch.equal(identity[0, valid].long(), torch.arange(MAX_FEATURES, device='cuda')[valid]):
             raise RuntimeError('Matcher failed real-image identity matching')
+        # Verify dynamic batching B=2 matches B=1 outputs element-by-element.
+        pair_a = padded(points[0][:, :127], points[1][:, :193], descriptions[0][:, :127], descriptions[1][:, :193])
+        pair_b = padded(points[1], points[0], descriptions[1], descriptions[0])
+        single_a = matcher(*pair_a)
+        single_b = matcher(*pair_b)
+        batched = matcher(*(torch.cat((x, y), dim=0) for x, y in zip(pair_a, pair_b)))
+        if tuple(batched[0].shape) != (2, MAX_FEATURES) or tuple(batched[1].shape) != (2, MAX_FEATURES):
+            raise RuntimeError('Batched matcher output contract differs')
+        for idx, ref in enumerate((single_a, single_b)):
+            if not torch.equal(batched[0][idx], ref[0][0]) or not torch.allclose(batched[1][idx], ref[1][0], atol=1e-4, rtol=1e-3):
+                raise RuntimeError(f'Batched matcher output differs from B=1 at item {idx}')
         del matcher
         geometry = Engine(root, 'geometry', shapes['geometry'])
         size = GEOMETRY_SIZE
+        geo_imgs = []
+        geo_singles = []
         for path in images:
-            points, normal, mask, scale = geometry(image_tensor(path, size, size))
+            img = image_tensor(path, size, size)
+            geo_imgs.append(img)
+            points, normal, mask, scale = geometry(img)
+            geo_singles.append((points, normal, mask, scale))
             if (tuple(points.shape) != (1, size, size, 3) or tuple(normal.shape) != (1, size, size, 3) or
                     tuple(mask.shape) != (1, size, size) or tuple(scale.shape) != (1,)):
                 raise RuntimeError('Geometry output contract differs')
@@ -632,6 +679,21 @@ def verify(root, shapes, images):
                 raise RuntimeError('Geometry output is not a valid point map')
             if ((normal.norm(dim=-1) - 1).abs() > 1e-3).any() or (mask < 0).any() or (mask > 1).any():
                 raise RuntimeError('Geometry normals or mask are out of range')
+        for batch_n, indices in ((2, [0, 1]), (GEOMETRY_OPT_BATCH, [0, 1, 0, 1, 0, 1, 0])):
+            batch_in = torch.cat([geo_imgs[i] for i in indices], dim=0)
+            b_outs = geometry(batch_in)
+            if (tuple(b_outs[0].shape) != (batch_n, size, size, 3) or
+                    tuple(b_outs[1].shape) != (batch_n, size, size, 3) or
+                    tuple(b_outs[2].shape) != (batch_n, size, size) or
+                    tuple(b_outs[3].shape) != (batch_n,)):
+                raise RuntimeError(f'Batched geometry output shape differs for B={batch_n}')
+            for b_i, src_i in enumerate(indices):
+                ref = geo_singles[src_i]
+                if (not torch.allclose(b_outs[0][b_i], ref[0][0], atol=2e-3, rtol=1e-3) or
+                        not torch.allclose(b_outs[1][b_i], ref[1][0], atol=5e-3, rtol=1e-3) or
+                        not torch.allclose(b_outs[2][b_i], ref[2][0], atol=5e-3, rtol=1e-3) or
+                        not torch.allclose(b_outs[3][b_i], ref[3][0], atol=5e-3, rtol=1e-3)):
+                    raise RuntimeError(f'Batched geometry B={batch_n} differs from B=1 at item {b_i}')
         del geometry
         grounding = Engine(root, 'grounding', shapes['grounding'])
         prompts, k, size = len(GROUNDING_PROMPTS), GROUNDING_TOP_K, GROUNDING_MASK_SIZE
@@ -674,6 +736,8 @@ def verify_package(root, settings, shapes, images):
         raise RuntimeError('Existing matcher calculation/scoring precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
     if manifest.get('geometry_precision') != settings['geometry_precision']:
         raise RuntimeError('Existing geometry precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
+    if manifest.get('matcher_max_batch') != MATCHER_MAX_BATCH or manifest.get('geometry_max_batch') != GEOMETRY_MAX_BATCH:
+        raise RuntimeError('Existing model batch limits differ. Choose a new -Models directory.')
     if sorted(manifest['models']) != sorted(names):
         raise RuntimeError('Existing model package holds different models. Choose a new -Models directory.')
     for name in names:
@@ -786,6 +850,8 @@ def main():
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': 'fp32' if args.matcher_precision == 'fp16' else args.matcher_precision,
                 'geometry_precision': args.geometry_precision,
+                'matcher_max_batch': MATCHER_MAX_BATCH,
+                'geometry_max_batch': GEOMETRY_MAX_BATCH,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest(),
                 'grounding': GROUNDING_SHA256, 'grounding_prompts': GROUNDING_PROMPTS}
     names = PACKAGE_MODELS
@@ -898,6 +964,8 @@ def main():
                 'detector_profile': DETECTOR_PROFILE, 'descriptor_size': [784, 784],
                 'max_features': MAX_FEATURES, 'descriptor_dimension': 256,
                 'geometry_size': GEOMETRY_SIZE, 'geometry_tokens': GEOMETRY_TOKENS,
+                'matcher_max_batch': MATCHER_MAX_BATCH,
+                'geometry_max_batch': GEOMETRY_MAX_BATCH,
                 'geometry_source': {'moge_commit': MOGE_COMMIT, 'model': 'Ruicheng/moge-2-vitl-normal',
                                     'revision': GEOMETRY_REVISION},
                 'models': {name: {'inputs': CONTRACTS[name][0], 'outputs': CONTRACTS[name][1],

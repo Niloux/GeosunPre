@@ -3,6 +3,29 @@
 
 namespace geosun {
 constexpr uint64_t NoPoint = UINT64_MAX;
+constexpr double ShutterRotationBound = 0.10;
+inline Eigen::Matrix3d SkewSymmetric(const Eigen::Vector3d& w) {
+  Eigen::Matrix3d k;
+  k << 0, -w.z(), w.y(), w.z(), 0, -w.x(), -w.y(), w.x(), 0;
+  return k;
+}
+inline Eigen::Matrix3d RodriguesMatrix(const Eigen::Vector3d& w) {
+  const double theta = w.norm();
+  const double t2 = theta * theta;
+  const double a = theta < 1e-4 ? 1. - t2 / 6. + t2 * t2 / 120. : std::sin(theta) / theta;
+  const double b = theta < 1e-4 ? .5 - t2 / 24. + t2 * t2 / 720. : (1. - std::cos(theta)) / t2;
+  const Eigen::Matrix3d k = SkewSymmetric(w);
+  return Eigen::Matrix3d::Identity() + a * k + b * (k * k);
+}
+inline Eigen::Matrix3d LeftJacobianSO3(const Eigen::Vector3d& w) {
+  const double theta = w.norm();
+  const double t2 = theta * theta;
+  const double b = theta < 1e-4 ? .5 - t2 / 24. + t2 * t2 / 720. : (1. - std::cos(theta)) / t2;
+  const double c =
+      theta < 1e-4 ? (1. / 6.) - t2 / 120. + t2 * t2 / 5040. : (theta - std::sin(theta)) / (t2 * theta);
+  const Eigen::Matrix3d k = SkewSymmetric(w);
+  return Eigen::Matrix3d::Identity() + b * k + c * (k * k);
+}
 struct Observation {
   uint32_t image, feature;
 };
@@ -22,8 +45,8 @@ struct ModelPoint {
 // Rolling-shutter motion of every image. The sensor reads out along one image axis, rows (y) or
 // columns (x); a pixel at coordinate c on that axis was exposed at the readout fraction
 // s = (c - size / 2) / size from the reference (middle-line) pose. Its camera point is
-// (I + s [rotation]x) (v - s readout velocity), where v is the reference camera point, rotation the
-// camera-frame rotation over one full readout and velocity the camera-frame velocity in m/s.
+// Exp(s [rotation]x) (v - s readout velocity), where v is the reference camera point, rotation the
+// camera-frame rotation vector over one full readout and velocity the camera-frame velocity in m/s.
 // The readout time is shared by each lens; its sign carries the line order.
 struct ShutterMotion {
   std::vector<Eigen::Vector3d> rotation, velocity;
@@ -36,15 +59,12 @@ struct ShutterMotion {
   // Camera point of reference camera point v for an observation at readout fraction s.
   Eigen::Vector3d Apply(uint32_t image, uint32_t camera, double s, const Eigen::Vector3d& v) const {
     const Eigen::Vector3d b = v - s * readout[camera] * velocity[image];
-    return b + s * rotation[image].cross(b);
+    return RodriguesMatrix(s * rotation[image]) * b;
   }
   // Inverse of Apply for the same readout fraction.
   Eigen::Vector3d Reference(uint32_t image, uint32_t camera, double s,
                             const Eigen::Vector3d& moved) const {
-    Eigen::Matrix3d a = Eigen::Matrix3d::Identity();
-    const Eigen::Vector3d w = s * rotation[image];
-    a << 1, -w.z(), w.y(), w.z(), 1, -w.x(), -w.y(), w.x(), 1;
-    return a.inverse() * moved + s * readout[camera] * velocity[image];
+    return RodriguesMatrix(-s * rotation[image]) * moved + s * readout[camera] * velocity[image];
   }
 };
 // Pixel window of a lens's photos; see ValidDomainCrop.

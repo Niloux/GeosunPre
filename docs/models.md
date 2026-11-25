@@ -16,7 +16,7 @@
 
 ## 模型接口
 
-manifest.json：tensorrt=`10.13.3.9`、gpu、hardware_compatibility、matcher_precision、matcher_score_precision、geometry_precision、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、geometry_size=644、geometry_tokens=2116、geometry_source（MoGe 提交、模型名与 revision）、models、grounding_size=1008、grounding_mask_size=288、grounding_prompts=`["person","shadow","robot","sky"]`、grounding_top_k=20、grounding_source（模型名、sam3_commit 与检查点 SHA256）。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`。matcher_score_precision 记录最终评分精度，默认 FP16 主干搭配 FP32 评分。hardware_compatibility 为 `none` 或 `ampere_plus`；gpu 始终记录构建 GPU。
+manifest.json：tensorrt=`10.13.3.9`、gpu、hardware_compatibility、matcher_precision、matcher_score_precision、geometry_precision、matcher_max_batch（默认 `8`）、geometry_max_batch（默认 `8`）、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、geometry_size=644、geometry_tokens=2116、geometry_source（MoGe 提交、模型名与 revision）、models、grounding_size=1008、grounding_mask_size=288、grounding_prompts=`["person","shadow","robot","sky"]`、grounding_top_k=20、grounding_source（模型名、sam3_commit 与检查点 SHA256）。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`，matcher 与 geometry 第一维为动态批大小 `-1`（matcher profile `min=1, opt=8, max=8`，geometry profile `min=1, opt=7, max=8`）。matcher_score_precision 记录最终评分精度，默认 FP16 主干搭配 FP32 评分。hardware_compatibility 为 `none` 或 `ampere_plus`；gpu 始终记录构建 GPU。
 
 detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max=[1536,1536]`。opt 只用于 TensorRT 编译优化，不限制原图尺寸。
 
@@ -24,8 +24,8 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 | --- | --- | --- |
 | detector | image float32 `[1,3,H,W]` RGB/255 | logits float32 `[1,1,H,W]` |
 | descriptor | image float32 `[1,3,784,784]`；keypoints `[1,N,2]` | descriptors float32 `[1,N,256]` |
-| matcher | ka/kb float32 `[1,3072,2]`；da/db `[1,3072,256]`；mask_a/mask_b float32 `[1,3072]` | matches int32 `[1,3072]`；confidence float32 `[1,3072]` |
-| geometry | image float32 `[1,3,644,644]` RGB/255 | points float32 `[1,644,644,3]`；normal `[1,644,644,3]`；mask `[1,644,644]`；metric_scale `[1]` |
+| matcher | ka/kb float32 `[B,3072,2]`；da/db `[B,3072,256]`；mask_a/mask_b float32 `[B,3072]` | matches int32 `[B,3072]`；confidence float32 `[B,3072]` |
+| geometry | image float32 `[B,3,644,644]` RGB/255 | points float32 `[B,644,644,3]`；normal `[B,644,644,3]`；mask `[B,644,644]`；metric_scale `[B]` |
 | grounding | image float32 `[1,3,1008,1008]`，整幅照片拉伸缩放，RGB/127.5−1 | scores float32 `[4,20]`；boxes `[4,20,4]`；masks `[4,20,288,288]`；semantic `[4,1,288,288]` |
 
 grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的文本特征在导出时算好并固化进图，不含文本编码器；改提示须重新导出并使用新模型目录。每个提示输出按联合分数（查询分数乘存在分数）降序的前 20 个查询：分数、归一化 cxcywh 框、实例掩码 logits 及该提示的语义 logits。ViT 的复数旋转位置编码导出为等价的实数 cos/sin 形式，导出前在随机输入上与原实现比对。TensorRT 构建工作区为 12 GiB；FP16 下注意力打分会超出半精度范围（PyTorch FP16 的注意力在 FP32 中累加，因此不受影响），故每个 Softmax 及其输入链直到打分矩阵乘保留 FP32，其余可用 FP16。
@@ -36,7 +36,7 @@ grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的
 
 检测输出稠密 logits，原生 CUDA 执行 3×3 NMS，选最多 12288 个候选，用温度 0.5 的局部 softmax 修正子像素。有效域和语义筛选后，用 8×8 网格配额和置信度选最多 3072 个。归一化关键点 `(2x/W-1,2y/H-1)`。
 
-描述采样为双线性 grid_sample、align_corners=false，描述数量动态。匹配保留互为最大值且置信度>0.1 的对应，未匹配为 -1。实际数量 32–3072、Na/Nb 可不同；张量补零到 3072，有效前缀掩码为 1，其余为 0。自注意力、交叉注意力及双 softmax 均屏蔽补齐项，补齐项不改变有效特征的数学归一化。仅保存实际前缀结果。名称及类型须与表格一致。
+描述采样为双线性 grid_sample、align_corners=false，描述数量动态。匹配保留互为最大值且置信度>0.1 的对应，未匹配为 -1。实际数量 32–3072、Na/Nb 可不同；张量补零到 3072，有效前缀掩码为 1，其余为 0。自注意力、交叉注意力及双 softmax 均屏蔽补齐项，补齐项不改变有效特征的数学归一化。仅保存实际前缀结果。matcher 与 geometry 在运行时通过引擎 profile 查询最大支持批大小 `MaxBatch`（当可用显存低于 5 GiB 时收敛至不超过 4，静态旧包退回 1）；构建与 `check-models` 均包含 `B = 2`（geometry 另含 `B = 7`）动态批一致性与形状校验。名称及类型须与表格一致。
 
 固定权重来源：
 

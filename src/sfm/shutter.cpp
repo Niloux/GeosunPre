@@ -13,14 +13,11 @@
 namespace geosun {
 namespace {
 constexpr double MaximumRange = 65.535;
-constexpr double RotationBound = .05, ReadoutBound = .05;
+constexpr double RotationBound = ShutterRotationBound, ReadoutBound = .05;
 constexpr size_t MinimumImageHoldout = 16;
 constexpr double MinimumExplainedRotation = .1;
 Eigen::Matrix3d Readout(const ShutterMotion& motion, uint32_t image, double s) {
-  const Eigen::Vector3d w = s * motion.rotation[image];
-  Eigen::Matrix3d a;
-  a << 1, -w.z(), w.y(), w.z(), 1, -w.x(), -w.y(), w.x(), 1;
-  return a;
+  return RodriguesMatrix(s * motion.rotation[image]);
 }
 // Camera point of an observation under the rolling-shutter model.
 Eigen::Vector3d Exposed(const Reconstruction& model, const ShutterMotion& motion,
@@ -177,7 +174,7 @@ Json MotionToJson(const ShutterMotion& motion, const Reconstruction& model) {
     }
   return {{"readout_axis", motion.axis ? "rows" : "columns"},
           {"readout_fraction", "(c - size / 2) / size along the readout axis"},
-          {"camera_point", "(I + s [rotation]x) (v - s readout velocity)"},
+          {"camera_point", "Exp(s [rotation]x) (v - s readout velocity)"},
           {"frames", "rotation and velocity in the reference camera frame"},
           {"readout_s", motion.readout},
           {"images", images}};
@@ -1778,9 +1775,15 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   inputs.source_quality = source.Quality(scene, limits.median_px, limits.p90_px);
   if (!inputs.source_quality.at("passed").get<bool>())
     throw std::runtime_error("Rolling-shutter source reconstruction failed visual acceptance");
-  inputs.kinematics = ReadExposureKinematics(scene);
+  Json time_offset_report;
+  const double time_offset_s = EstimateImuTimeOffset(scene, source, time_offset_report);
+  inputs.kinematics = ReadExposureKinematics(scene, time_offset_s);
   inputs.imu_boresight_median_deg =
       VerifyImuAttitude(source, inputs.kinematics, inputs.imu_attitude_verified);
+  if (time_offset_report.value("used", false))
+    Log("IMU clock offset: " + std::to_string(time_offset_s * 1000.0) + " ms (boresight median " +
+        std::to_string(time_offset_report.at("before_median_deg").get<double>()) + " -> " +
+        std::to_string(time_offset_report.at("after_median_deg").get<double>()) + " deg)");
   if (inputs.imu_attitude_verified)
     inputs.imu_omega = inputs.kinematics.omega_world;
   inputs.velocity.assign(source.images.size(), Eigen::Vector3d::Zero());
@@ -1897,7 +1900,8 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
   report["rig_mode"] = inputs.rig_mode;
   report["imu_attitude"] = {{"available", inputs.kinematics.has_attitude},
                             {"verified", inputs.imu_attitude_verified},
-                            {"boresight_median_deg", boresight_json}};
+                            {"boresight_median_deg", boresight_json},
+                            {"time_offset", time_offset_report}};
   report["holdout_rule"] = "whole tracks of at least three views with IDs divisible by five";
   report["training_tracks"] = inputs.training.size();
   report["validation_tracks"] = inputs.validation.size();
@@ -1969,13 +1973,13 @@ Json DeliveryShutterJson(const Scene& scene, const Reconstruction& model,
                         {"velocity_m_s", {v.x(), v.y(), v.z()}},
                         {"translation_m", {moved.x(), moved.y(), moved.z()}}});
     }
-  return {{"model", "linear rolling shutter about the reference pose"},
+  return {{"model", "SO(3) rolling shutter about the reference pose"},
           {"readout_axis", motion.axis ? "rows" : "columns"},
           {"readout_fraction",
            "s = (c - N / 2) / N, c the pixel coordinate along the readout axis with the top-left "
            "pixel centre at (0.5, 0.5), N the image width or height along that axis"},
           {"camera_point",
-           "p(s) = (I + s [rotation_rad]x) (R X + t - s translation_m), translation_m = readout_s "
+           "p(s) = Exp(s [rotation_rad]x) (R X + t - s translation_m), translation_m = readout_s "
            "velocity_m_s"},
           {"reference_pose", "COLMAP images.bin world-to-camera R, t, the pose at s = 0"},
           {"frames", "rotation_rad, velocity_m_s and translation_m in the OpenCV reference camera; "

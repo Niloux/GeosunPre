@@ -241,12 +241,13 @@ MonocularLens PlanMonocularLens(const Camera& source, const Camera& grid, int si
 struct MonocularEstimator::Workspace {
   cudaStream_t stream = nullptr;
   int faces = 0;
+  int max_batch = 1;
   size_t prefiltered_capacity = 0;
   const MonocularLens* cached_lens = nullptr;
-  std::unique_ptr<DeviceBuffer> d_prefiltered, d_source_params, d_all_face_inputs, d_points,
+  std::unique_ptr<DeviceBuffer> d_prefiltered, d_source_params, d_points,
       d_normals, d_masks, d_face_valid, d_metric_scales, d_shift_samples, d_shifts, d_shift_ok,
       d_to_camera, d_out_distance, d_out_normal, d_valid_counts;
-  std::shared_ptr<DeviceBuffer> d_face_input;
+  std::shared_ptr<DeviceBuffer> d_all_face_inputs, d_face_input;
   std::unique_ptr<HostBuffer> h_prefiltered, h_shift_samples, h_metric_scales, h_shifts, h_shift_ok,
       h_to_camera, h_out_distance, h_out_normal, h_valid_counts;
   explicit Workspace(cudaStream_t s) : stream(s) {}
@@ -261,13 +262,13 @@ struct MonocularEstimator::Workspace {
     h_prefiltered = std::make_unique<HostBuffer>(bytes);
     prefiltered_capacity = bytes;
   }
-  void Reserve(int count, int size) {
-    if (count <= faces)
+  void Reserve(int count, int size, int batch_cap) {
+    if (count <= faces && batch_cap <= max_batch)
       return;
     const size_t face_pixels = size_t(size) * size, total_pixels = size_t(count) * face_pixels;
     d_source_params = std::make_unique<DeviceBuffer>(8 * sizeof(double));
-    d_all_face_inputs = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
-    d_face_input = std::make_shared<DeviceBuffer>(face_pixels * 3 * sizeof(float));
+    d_all_face_inputs = std::make_shared<DeviceBuffer>(total_pixels * 3 * sizeof(float));
+    d_face_input = std::make_shared<DeviceBuffer>(size_t(batch_cap) * face_pixels * 3 * sizeof(float));
     d_points = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
     d_normals = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
     d_masks = std::make_unique<DeviceBuffer>(total_pixels * sizeof(float));
@@ -289,6 +290,7 @@ struct MonocularEstimator::Workspace {
     h_out_normal = std::make_unique<HostBuffer>(total_pixels * 3 * sizeof(float));
     h_valid_counts = std::make_unique<HostBuffer>(size_t(count) * sizeof(uint32_t));
     faces = count;
+    max_batch = batch_cap;
     cached_lens = nullptr;
   }
 };
@@ -317,7 +319,15 @@ std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens
     return {};
   const size_t face_pixels = size_t(size) * size;
   const auto stream = models_.Stream();
-  workspace_->Reserve(faces, size);
+  int max_batch = models_.MaxBatch("geometry");
+  if (max_batch > 4) {
+    size_t free_bytes = 0, total_bytes = 0;
+    CudaCheck(cudaMemGetInfo(&free_bytes, &total_bytes));
+    if (free_bytes < size_t(5) * 1024 * 1024 * 1024)
+      max_batch = 4;
+  }
+  max_batch = std::max(1, std::min(max_batch, faces));
+  workspace_->Reserve(faces, size, max_batch);
   const cv::Mat contiguous = prefiltered.isContinuous() ? prefiltered : prefiltered.clone();
   const size_t pref_bytes = contiguous.total() * 3;
   workspace_->ReservePrefiltered(pref_bytes);
@@ -348,41 +358,48 @@ std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens
       use_rolling ? 1 : 0, axis, faces, size, lens.focal,
       static_cast<float*>(workspace_->d_all_face_inputs->data),
       static_cast<uint8_t*>(workspace_->d_face_valid->data), stream);
-  const std::vector<int64_t> map{1, size, size, 3};
-  for (int f = 0; f < faces; ++f) {
-    CudaCheck(cudaMemcpyAsync(workspace_->d_face_input->data,
-                              static_cast<const float*>(workspace_->d_all_face_inputs->data) +
-                                  size_t(f) * 3 * face_pixels,
-                              3 * face_pixels * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+  for (int start = 0; start < faces; start += max_batch) {
+    const int batch = std::min(max_batch, faces - start);
+    const std::vector<int64_t> map{batch, size, size, 3};
     Tensor input;
-    input.shape = {1, 3, size, size};
-    input.device = workspace_->d_face_input;
+    input.shape = {batch, 3, size, size};
+    if (start == 0 && batch == faces) {
+      input.device = workspace_->d_all_face_inputs;
+    } else {
+      CudaCheck(cudaMemcpyAsync(workspace_->d_face_input->data,
+                                static_cast<const float*>(workspace_->d_all_face_inputs->data) +
+                                    size_t(start) * 3 * face_pixels,
+                                size_t(batch) * 3 * face_pixels * sizeof(float),
+                                cudaMemcpyDeviceToDevice, stream));
+      input.device = workspace_->d_face_input;
+    }
     const auto outputs = models_.Predict("geometry", {input}, true);
     if (outputs.size() != 4 || outputs[0].shape != map || outputs[1].shape != map ||
-        outputs[2].shape != std::vector<int64_t>{1, size, size} ||
-        outputs[3].shape != std::vector<int64_t>{1} || !outputs[0].device ||
+        outputs[2].shape != std::vector<int64_t>{batch, size, size} ||
+        outputs[3].shape != std::vector<int64_t>{batch} || !outputs[0].device ||
         !outputs[1].device || !outputs[2].device || !outputs[3].device)
       throw std::runtime_error("Geometry engine output contract differs");
     CudaCheck(cudaMemcpyAsync(
-        static_cast<float*>(workspace_->d_points->data) + size_t(f) * face_pixels * 3,
-        outputs[0].device->data, face_pixels * 3 * sizeof(float), cudaMemcpyDeviceToDevice,
-        stream));
+        static_cast<float*>(workspace_->d_points->data) + size_t(start) * face_pixels * 3,
+        outputs[0].device->data, size_t(batch) * face_pixels * 3 * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
     CudaCheck(cudaMemcpyAsync(
-        static_cast<float*>(workspace_->d_normals->data) + size_t(f) * face_pixels * 3,
-        outputs[1].device->data, face_pixels * 3 * sizeof(float), cudaMemcpyDeviceToDevice,
-        stream));
+        static_cast<float*>(workspace_->d_normals->data) + size_t(start) * face_pixels * 3,
+        outputs[1].device->data, size_t(batch) * face_pixels * 3 * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
     CudaCheck(cudaMemcpyAsync(
-        static_cast<float*>(workspace_->d_masks->data) + size_t(f) * face_pixels,
-        outputs[2].device->data, face_pixels * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-    CudaCheck(cudaMemcpyAsync(static_cast<float*>(workspace_->d_metric_scales->data) + f,
-                              outputs[3].device->data, sizeof(float), cudaMemcpyDeviceToDevice,
-                              stream));
-    supervision_gpu::SampleMogeShiftGrid(
-        static_cast<const float*>(workspace_->d_points->data) + size_t(f) * face_pixels * 3,
-        static_cast<const float*>(workspace_->d_masks->data) + size_t(f) * face_pixels,
-        static_cast<const uint8_t*>(workspace_->d_face_valid->data) + size_t(f) * face_pixels,
-        size, static_cast<float4*>(workspace_->d_shift_samples->data) + size_t(f) * 4096, stream);
+        static_cast<float*>(workspace_->d_masks->data) + size_t(start) * face_pixels,
+        outputs[2].device->data, size_t(batch) * face_pixels * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
+    CudaCheck(cudaMemcpyAsync(static_cast<float*>(workspace_->d_metric_scales->data) + start,
+                              outputs[3].device->data, size_t(batch) * sizeof(float),
+                              cudaMemcpyDeviceToDevice, stream));
   }
+  supervision_gpu::SampleMogeShiftGrid(
+      static_cast<const float*>(workspace_->d_points->data),
+      static_cast<const float*>(workspace_->d_masks->data),
+      static_cast<const uint8_t*>(workspace_->d_face_valid->data), faces, size,
+      static_cast<float4*>(workspace_->d_shift_samples->data), stream);
   CudaCheck(cudaMemcpyAsync(workspace_->h_shift_samples->data, workspace_->d_shift_samples->data,
                             size_t(faces) * 4096 * sizeof(float4), cudaMemcpyDeviceToHost, stream));
   CudaCheck(cudaMemcpyAsync(workspace_->h_metric_scales->data, workspace_->d_metric_scales->data,
@@ -515,8 +532,7 @@ MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
       if (rolling) {
         const double s = axis ? (y + .5 - .5 * h) / h : (x + .5 - .5 * w) / w;
         w_rot = s * (*omega);
-        const Eigen::Vector3d r_ref =
-            (r_exp - w_rot.cross(r_exp) + w_rot.dot(r_exp) * w_rot).normalized();
+        const Eigen::Vector3d r_ref = (RodriguesMatrix(-w_rot) * r_exp).normalized();
         count = lens.SamplesAtRay(r_ref, samples);
       } else {
         samples = lens.samples[i];
@@ -543,7 +559,7 @@ MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
         continue;
       Eigen::Vector3d normal = n_sum / n_norm;
       if (rolling)
-        normal = (normal + w_rot.cross(normal)).normalized();
+        normal = (RodriguesMatrix(w_rot) * normal).normalized();
       if (normal.dot(r_exp) > 0.0)
         normal = -normal;
       blended_normals[i] = cv::Vec3f(float(normal.x()), float(normal.y()), float(normal.z()));

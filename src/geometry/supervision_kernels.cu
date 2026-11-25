@@ -43,6 +43,22 @@ __device__ void FisheyePixel(double x, double y, double z, const double* p, doub
   u = p[0] * x * scale + p[2];
   v = p[1] * y * scale + p[3];
 }
+__device__ void RodriguesRotate(double wx, double wy, double wz, double x, double y, double z,
+                                double& ox, double& oy, double& oz) {
+  const double t2 = wx * wx + wy * wy + wz * wz;
+  const double theta = sqrt(t2);
+  const double a = theta < 1e-4 ? 1.0 - t2 / 6.0 + t2 * t2 / 120.0 : sin(theta) / theta;
+  const double b = theta < 1e-4 ? 0.5 - t2 / 24.0 + t2 * t2 / 720.0 : (1.0 - cos(theta)) / t2;
+  const double kx = wy * z - wz * y;
+  const double ky = wz * x - wx * z;
+  const double kz = wx * y - wy * x;
+  const double kkx = wy * kz - wz * ky;
+  const double kky = wz * kx - wx * kz;
+  const double kkz = wx * ky - wy * kx;
+  ox = x + a * kx + b * kkx;
+  oy = y + a * ky + b * kky;
+  oz = z + a * kz + b * kkz;
+}
 // Keeps each pixel's nearest ray distance. A surfel covers the pixels whose rays meet its tangent
 // disk; a point without a footprint covers only its projected pixel.
 __global__ void ProjectNearestSurfels(const Surfel* points, int count, const Projection* cameras,
@@ -77,9 +93,7 @@ __global__ void ProjectNearestSurfels(const Surfel* points, int count, const Pro
       wx = s * c.motion[0];
       wy = s * c.motion[1];
       wz = s * c.motion[2];
-      px = bx + wy * bz - wz * by;
-      py = by + wz * bx - wx * bz;
-      pz = bz + wx * by - wy * bx;
+      RodriguesRotate(wx, wy, wz, bx, by, bz, px, py, pz);
       if (pz <= 0)
         return;
     }
@@ -101,8 +115,9 @@ __global__ void ProjectNearestSurfels(const Surfel* points, int count, const Pro
     double nx = c.rotation[0] * world.x + c.rotation[1] * world.y + c.rotation[2] * world.z,
            ny = c.rotation[3] * world.x + c.rotation[4] * world.y + c.rotation[5] * world.z,
            nz = c.rotation[6] * world.x + c.rotation[7] * world.y + c.rotation[8] * world.z;
-    const double rx = nx + wy * nz - wz * ny, ry = ny + wz * nx - wx * nz,
-                 rz = nz + wx * ny - wy * nx;
+    double rx = nx, ry = ny, rz = nz;
+    if (c.rolling)
+      RodriguesRotate(wx, wy, wz, nx, ny, nz, rx, ry, rz);
     const double length = sqrt(rx * rx + ry * ry + rz * rz),
                  facing = rx * px + ry * py + rz * pz > 0 ? -1 / length : 1 / length;
     n = make_float3(float(rx * facing), float(ry * facing), float(rz * facing));
@@ -533,9 +548,7 @@ __global__ void SampleMogeFacesKernel(const uint8_t* prefiltered, int pre_w, int
       double s = ((axis ? v_src : u_src) - 0.5 * axis_size) / axis_size;
       s = fmax(-0.5, fmin(0.5, s));
       const double wx = s * omega.x, wy = s * omega.y, wz = s * omega.z;
-      px = rx + wy * rz - wz * ry;
-      py = ry + wz * rx - wx * rz;
-      pz = rz + wx * ry - wy * rx;
+      RodriguesRotate(wx, wy, wz, rx, ry, rz, px, py, pz);
     }
   }
   bool valid = pz > 0.0;
@@ -586,14 +599,16 @@ __global__ void SampleMogeShiftGridKernel(const float* points, const float* mask
   const int k = blockIdx.x * blockDim.x + threadIdx.x;
   if (k >= 64 * 64)
     return;
+  const int f = blockIdx.y;
   const int i = k / 64, j = k % 64;
   const int row = i * size / 64, column = j * size / 64;
-  const size_t idx = size_t(row) * size + column;
+  const size_t face_pixels = size_t(size) * size;
+  const size_t idx = size_t(f) * face_pixels + size_t(row) * size + column;
   const float pz = points[3 * idx + 2];
-  if (face_valid[idx] && mask[idx] > .5f && isfinite(pz))
-    samples[k] = make_float4(points[3 * idx], points[3 * idx + 1], pz, 1.f);
-  else
-    samples[k] = make_float4(0.f, 0.f, 0.f, 0.f);
+  samples[size_t(f) * 4096 + k] =
+      (face_valid[idx] && mask[idx] > .5f && isfinite(pz))
+          ? make_float4(points[3 * idx], points[3 * idx + 1], pz, 1.f)
+          : make_float4(0.f, 0.f, 0.f, 0.f);
 }
 
 __global__ void BuildMogeFaceEstimatesKernel(const float* points, const float* normals,
@@ -673,9 +688,11 @@ void SampleMogeFaces(const uint8_t* prefiltered, int pre_w, int pre_h, const dou
 }
 
 void SampleMogeShiftGrid(const float* points, const float* mask, const uint8_t* face_valid,
-                         int size, float4* samples, cudaStream_t stream) {
-  SampleMogeShiftGridKernel<<<(64 * 64 + 255) / 256, 256, 0, stream>>>(points, mask, face_valid,
-                                                                        size, samples);
+                         int faces, int size, float4* samples, cudaStream_t stream) {
+  if (faces <= 0)
+    return;
+  const dim3 grid(unsigned((64 * 64 + 255) / 256), unsigned(faces));
+  SampleMogeShiftGridKernel<<<grid, 256, 0, stream>>>(points, mask, face_valid, size, samples);
   CudaCheck(cudaGetLastError());
 }
 

@@ -60,31 +60,34 @@ class Matcher(nn.Module):
         return F.softmax(similarity, dim=3) @ v
 
     def encoding(self, keypoints):
+        batch = keypoints.shape[0]
         projected = self.model.posenc.Wr(keypoints)
-        cosine = torch.stack((projected.cos(), projected.cos()), dim=3).reshape(1, -1, 64)
-        sine = torch.stack((projected.sin(), projected.sin()), dim=3).reshape(1, -1, 64)
+        cosine = torch.stack((projected.cos(), projected.cos()), dim=3).reshape(batch, -1, 64)
+        sine = torch.stack((projected.sin(), projected.sin()), dim=3).reshape(batch, -1, 64)
         return cosine[:, None], sine[:, None]
 
     def self_attention(self, block, x, encoding, mask):
-        qkv = block.Wqkv(x).reshape(1, -1, block.num_heads, block.head_dim, 3).transpose(1, 2)
+        batch = x.shape[0]
+        qkv = block.Wqkv(x).reshape(batch, -1, block.num_heads, block.head_dim, 3).transpose(1, 2)
         def rotary(tensor):
             # Explicit pairs avoid the legacy ONNX exporter's negative-axis unflatten.
             rotated = torch.stack((-tensor[:, :, :, 1::2], tensor[:, :, :, ::2]), dim=4)
-            rotated = rotated.reshape(1, block.num_heads, -1, block.head_dim)
+            rotated = rotated.reshape(batch, block.num_heads, -1, block.head_dim)
             return tensor * encoding[0] + rotated * encoding[1]
         q = rotary(qkv.select(4, 0))
         k = rotary(qkv.select(4, 1))
         context = self.attention(q, k, qkv.select(4, 2), mask)
-        message = block.out_proj(context.transpose(1, 2).reshape(1, -1, block.embed_dim))
+        message = block.out_proj(context.transpose(1, 2).reshape(batch, -1, block.embed_dim))
         return x + block.ffn(torch.cat((x, message), 2))
 
     def cross_attention(self, block, a, b, ma, mb):
+        batch = a.shape[0]
         qka, qkb = block.to_qk(a), block.to_qk(b)
         va, vb = block.to_v(a), block.to_v(b)
-        qka, qkb, va, vb = [t.reshape(1, -1, block.heads, t.shape[-1] // block.heads).transpose(1, 2)
+        qka, qkb, va, vb = [t.reshape(batch, -1, block.heads, t.shape[-1] // block.heads).transpose(1, 2)
                              for t in (qka, qkb, va, vb)]
-        xa = block.to_out(self.attention(qka, qkb, vb, mb).transpose(1, 2).reshape(1, -1, block.to_out.in_features))
-        xb = block.to_out(self.attention(qkb, qka, va, ma).transpose(1, 2).reshape(1, -1, block.to_out.in_features))
+        xa = block.to_out(self.attention(qka, qkb, vb, mb).transpose(1, 2).reshape(batch, -1, block.to_out.in_features))
+        xb = block.to_out(self.attention(qkb, qka, va, ma).transpose(1, 2).reshape(batch, -1, block.to_out.in_features))
         return (a + block.ffn(torch.cat((a, xa), 2)),
                 b + block.ffn(torch.cat((b, xb), 2)))
 

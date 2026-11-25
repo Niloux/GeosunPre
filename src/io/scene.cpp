@@ -1,4 +1,5 @@
 #include "io/scene.h"
+#include "geometry/model.h"
 #include <opencv2/imgcodecs.hpp>
 #include <fstream>
 #include <cstring>
@@ -558,7 +559,7 @@ std::vector<Eigen::Vector3d> NavigationVelocities(const Scene& scene) {
   }
   return velocities;
 }
-ExposureKinematics ReadExposureKinematics(const Scene& scene) {
+ExposureKinematics ReadExposureKinematics(const Scene& scene, double time_offset_s) {
   constexpr double half_window = .02;
   const auto navigation = ReadNavigation(scene);
   const auto& rows = navigation.rows;
@@ -576,18 +577,20 @@ ExposureKinematics ReadExposureKinematics(const Scene& scene) {
     result.omega_world.reserve(scene.images.size());
   }
   for (const auto& image : scene.images) {
-    const double low = std::max(rows.front().time, image.pose_seconds - half_window),
-                 high = std::min(rows.back().time, image.pose_seconds + half_window);
+    const double t_pos = image.pose_seconds;
+    const double t_eff = std::clamp(t_pos + time_offset_s, rows.front().time, rows.back().time);
+    const double low = std::max(rows.front().time, t_eff - half_window),
+                 high = std::min(rows.back().time, t_eff + half_window);
     if (high - low < half_window)
       throw std::runtime_error("Navigation trajectory does not bracket exposure: " + image.name);
-    const Eigen::Vector3d body = at(image.pose_seconds);
+    const Eigen::Vector3d body_at_pos = at(t_pos);
     result.velocity.push_back((at(high) - at(low)) / (high - low));
     const Eigen::Vector3d lens =
         navigation.conversion.Apply(image.navigation_raw - navigation.center);
-    result.lever_arm.push_back(lens - body);
-    result.body_position.push_back(body);
+    result.lever_arm.push_back(lens - body_at_pos);
+    result.body_position.push_back(at(t_eff));
     if (result.has_attitude) {
-      result.body_rotation.push_back(InterpolateAttitude(rows, image.pose_seconds));
+      result.body_rotation.push_back(InterpolateAttitude(rows, t_eff));
       const Eigen::Quaterniond q_lo = InterpolateAttitude(rows, low);
       const Eigen::Quaterniond q_hi = InterpolateAttitude(rows, high);
       Eigen::Quaterniond q_rel = (q_lo * q_hi.conjugate()).normalized();
@@ -598,5 +601,144 @@ ExposureKinematics ReadExposureKinematics(const Scene& scene) {
     }
   }
   return result;
+}
+double EstimateImuTimeOffset(const Scene& scene, const Reconstruction& model, Json& report) {
+  constexpr double MaxSearchOffset = 0.08, BoundaryMargin = 0.002, HalfWindow = 0.02;
+  const auto navigation = ReadNavigation(scene);
+  const auto& rows = navigation.rows;
+  const bool has_attitude =
+      std::all_of(rows.begin(), rows.end(), [](const NavigationRow& r) { return r.has_attitude; });
+  if (!has_attitude) {
+    report = {{"used", false}, {"offset_s", 0.0}, {"reason", "no_attitude"}};
+    return 0.0;
+  }
+  double min_t = INFINITY, max_t = -INFINITY;
+  size_t reg_count = 0;
+  for (uint32_t i = 0; i < model.images.size(); ++i)
+    if (model.images[i].registered) {
+      min_t = std::min(min_t, scene.images[i].pose_seconds);
+      max_t = std::max(max_t, scene.images[i].pose_seconds);
+      ++reg_count;
+    }
+  if (reg_count < 8) {
+    report = {{"used", false}, {"offset_s", 0.0}, {"reason", "too_few_registered_images"}};
+    return 0.0;
+  }
+  const double min_dt = std::max(-MaxSearchOffset, rows.front().time + HalfWindow - min_t);
+  const double max_dt = std::min(MaxSearchOffset, rows.back().time - HalfWindow - max_t);
+  if (min_dt > 0.0 || max_dt < 0.0 || max_dt - min_dt < 0.01) {
+    report = {{"used", false}, {"offset_s", 0.0}, {"reason", "insufficient_trajectory_margin"}};
+    return 0.0;
+  }
+  struct EvalResult {
+    bool ok = false;
+    double combined_median = INFINITY;
+    std::array<double, 2> per_lens{-1.0, -1.0};
+  };
+  auto evaluate = [&](double dt) -> EvalResult {
+    EvalResult res;
+    std::vector<double> all_errors;
+    size_t verified_lenses = 0;
+    for (uint32_t cid = 0; cid < 2; ++cid) {
+      std::vector<Eigen::Quaterniond> samples;
+      for (uint32_t i = 0; i < model.images.size(); ++i)
+        if (model.images[i].registered && model.images[i].camera == cid) {
+          const double t = std::clamp(scene.images[i].pose_seconds + dt, rows.front().time, rows.back().time);
+          samples.push_back((model.images[i].pose.Rotation() * InterpolateAttitude(rows, t)).normalized());
+        }
+      if (samples.size() < 8)
+        continue;
+      std::vector<uint8_t> inlier(samples.size(), 1);
+      Eigen::Quaterniond q_mean = Eigen::Quaterniond::Identity();
+      bool ok = true;
+      for (int pass = 0; pass < 3; ++pass) {
+        Eigen::Matrix4d sum = Eigen::Matrix4d::Zero();
+        size_t count = 0;
+        for (size_t k = 0; k < samples.size(); ++k)
+          if (inlier[k]) {
+            sum += samples[k].coeffs() * samples[k].coeffs().transpose();
+            ++count;
+          }
+        if (count < 4) {
+          ok = false;
+          break;
+        }
+        const Eigen::Vector4d eig =
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d>(sum).eigenvectors().col(3);
+        q_mean = Eigen::Quaterniond(eig[3], eig[0], eig[1], eig[2]).normalized();
+        for (size_t k = 0; k < samples.size(); ++k)
+          inlier[k] = samples[k].angularDistance(q_mean) <= 5.0 * Pi / 180.0;
+      }
+      if (!ok)
+        return {};
+      std::vector<double> errors_deg;
+      errors_deg.reserve(samples.size());
+      for (const auto& q : samples) {
+        const double err = q.angularDistance(q_mean) * 180.0 / Pi;
+        errors_deg.push_back(err);
+        all_errors.push_back(err);
+      }
+      res.per_lens[cid] = Quantile(errors_deg, .5);
+      if (res.per_lens[cid] > 2.0)
+        return res;
+      ++verified_lenses;
+    }
+    if (!verified_lenses || all_errors.empty())
+      return res;
+    res.ok = true;
+    res.combined_median = Quantile(all_errors, .5);
+    return res;
+  };
+  const EvalResult base = evaluate(0.0);
+  if (!base.ok) {
+    report = {{"used", false},
+              {"offset_s", 0.0},
+              {"per_lens_before_deg", base.per_lens},
+              {"reason", "attitude_unverified_at_zero"}};
+    return 0.0;
+  }
+  double coarse_dt = 0.0;
+  EvalResult coarse_best = base;
+  for (double dt = min_dt; dt <= max_dt + 1e-9; dt += 0.002) {
+    const EvalResult r = evaluate(dt);
+    if (r.ok && r.combined_median < coarse_best.combined_median) {
+      coarse_best = r;
+      coarse_dt = dt;
+    }
+  }
+  double best_dt = coarse_dt;
+  EvalResult best_res = coarse_best;
+  const double fine_lo = std::max(min_dt, coarse_dt - 0.003);
+  const double fine_hi = std::min(max_dt, coarse_dt + 0.003);
+  for (double dt = fine_lo; dt <= fine_hi + 1e-9; dt += 0.0005) {
+    const EvalResult r = evaluate(dt);
+    if (r.ok && r.combined_median < best_res.combined_median) {
+      best_res = r;
+      best_dt = dt;
+    }
+  }
+  const bool interior = best_dt > min_dt + BoundaryMargin && best_dt < max_dt - BoundaryMargin;
+  const double abs_gain = base.combined_median - best_res.combined_median;
+  const double rel_gain = abs_gain / std::max(base.combined_median, 1e-9);
+  const bool improved = abs_gain >= 0.015 && (rel_gain >= 0.05 || abs_gain >= 0.03);
+  bool lens_ok = true;
+  for (int cid = 0; cid < 2; ++cid)
+    if (base.per_lens[cid] >= 0.0 &&
+        (best_res.per_lens[cid] < 0.0 || best_res.per_lens[cid] > base.per_lens[cid] + 0.01))
+      lens_ok = false;
+  const bool used = best_res.ok && interior && improved && lens_ok;
+  const double accepted_dt = used ? best_dt : 0.0;
+  report = {{"used", used},
+            {"offset_s", accepted_dt},
+            {"offset_ms", accepted_dt * 1000.0},
+            {"candidate_offset_ms", best_dt * 1000.0},
+            {"before_median_deg", base.combined_median},
+            {"after_median_deg", used ? best_res.combined_median : base.combined_median},
+            {"candidate_median_deg", best_res.combined_median},
+            {"per_lens_before_deg", base.per_lens},
+            {"per_lens_after_deg", used ? best_res.per_lens : base.per_lens},
+            {"per_lens_candidate_deg", best_res.per_lens},
+            {"search_bounds_ms", {min_dt * 1000.0, max_dt * 1000.0}}};
+  return accepted_dt;
 }
 }  // namespace geosun
