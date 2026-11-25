@@ -114,8 +114,9 @@ struct PreparedImage {
 class ImageReader {
   const std::vector<Exposure>& images;
   const fs::path work;
-  // Square side of the whole-photo grounding input for the masks; 0 reads the masks instead.
+  // Square side of the grounding input for the masks; 0 reads the masks instead.
   const int grounding;
+  const std::array<cv::Rect, 2> grounding_rois;
   size_t next = 0;
   std::deque<std::future<PreparedImage>> ready;
   // Four photos in flight keep the GPU fed with a few full-size photos in memory.
@@ -131,7 +132,9 @@ class ImageReader {
         started = Clock::now();
         cv::cvtColor(image.rgb, image.rgb, cv::COLOR_BGR2RGB);
         if (grounding) {
-          cv::resize(image.rgb, image.grounding, {grounding, grounding}, 0, 0, cv::INTER_AREA);
+          const cv::Rect& roi = grounding_rois[record.camera];
+          const cv::Mat source = roi.empty() ? image.rgb : image.rgb(roi);
+          cv::resize(source, image.grounding, {grounding, grounding}, 0, 0, cv::INTER_AREA);
           image.rgb.release();
         } else
           image.mask = ReadImage(MaskPath(work, record.id), cv::IMREAD_GRAYSCALE);
@@ -142,8 +145,12 @@ class ImageReader {
   }
 
  public:
-  ImageReader(const std::vector<Exposure>& records, fs::path path, int grounding_size = 0)
-      : images(records), work(std::move(path)), grounding(grounding_size) {
+  ImageReader(const std::vector<Exposure>& records, fs::path path, int grounding_size = 0,
+              std::array<cv::Rect, 2> rois = {})
+      : images(records),
+        work(std::move(path)),
+        grounding(grounding_size),
+        grounding_rois(rois) {
     Fill();
   }
   PreparedImage Next() {
@@ -468,8 +475,18 @@ class ArchiveWriterQueue {
     }
   }
 };
-// SAM3 grounding of the whole photo, prompts person, shadow, robot and sky.
+// SAM3 grounding of the centered fisheye square ROI, prompts person, shadow, robot and sky.
 constexpr float kGroundingScore = .5f;
+constexpr float kRimPersonScore = .25f;
+constexpr float kShadowScore = .25f;
+constexpr int kRimBandCells = 10;
+constexpr int kAccessoryCloseRadius = 16;
+constexpr int kAccessoryBridgeDilateRadius = 5;
+constexpr double kAccessoryMaxDomainShare = .08;
+constexpr double kAccessoryMaxPersonRatio = .50;
+constexpr double kPocketMaxDomainShare = .03;
+constexpr double kPocketMinPeopleBorderShare = .35;
+constexpr int kTransientMarginRadius = 2;
 // A shadow is transient only within this many mask cells (about 8% of the photo side) of a
 // person: static furniture and exhibit shadows are seen in every view and stay static.
 constexpr int kShadowReach = 24;
@@ -480,8 +497,8 @@ constexpr double kShadowMaxFullShare = .08;
 constexpr double kShadowSmallShare = .03;
 constexpr double kShadowMaxPersonAreaRatio = 3.;
 struct GroundingCounts {
-  size_t persons = 0, robots = 0, shadows = 0, clipped_shadows = 0, distant_shadows = 0,
-         skies = 0, sky_images = 0;
+  size_t persons = 0, rim_persons = 0, robots = 0, accessory_bridges = 0, filled_pockets = 0,
+         shadows = 0, clipped_shadows = 0, distant_shadows = 0, skies = 0, sky_images = 0;
 };
 int GroundingSize(const Json& manifest) {
   if (manifest.at("grounding_prompts") != Json{"person", "shadow", "robot", "sky"} ||
@@ -492,38 +509,124 @@ int GroundingSize(const Json& manifest) {
         "run.ps1 prepare-models");
   return manifest.at("grounding_size");
 }
+// Square ROI centered on the principal point that keeps full circular fisheye context while
+// stripping 4:3 pillarbox borders so SAM3 runs at 1:1 aspect ratio without horizontal squashing.
+cv::Rect GroundingRoi(const Camera& camera, const cv::Mat& domain) {
+  const cv::Rect box = cv::boundingRect(domain);
+  if (box.empty())
+    return {0, 0, camera.width, camera.height};
+  const int need = std::max(box.width, box.height);
+  const int side = std::min(std::max(std::min(camera.width, camera.height), need),
+                            std::max(camera.width, camera.height));
+  const int rw = std::min(camera.width, side);
+  const int rh = std::min(camera.height, side);
+  int x0 = std::clamp(int(std::lround(camera.params[2] - 0.5 * rw)), 0, camera.width - rw);
+  int y0 = std::clamp(int(std::lround(camera.params[3] - 0.5 * rh)), 0, camera.height - rh);
+  const int x_lo = std::max(0, box.x + box.width - rw), x_hi = std::min(box.x, camera.width - rw);
+  if (x_lo <= x_hi)
+    x0 = std::clamp(x0, x_lo, x_hi);
+  const int y_lo = std::max(0, box.y + box.height - rh), y_hi = std::min(box.y, camera.height - rh);
+  if (y_lo <= y_hi)
+    y0 = std::clamp(y0, y_lo, y_hi);
+  return {x0, y0, rw, rh};
+}
 struct GroundingResult {
   cv::Mat transient, sky;
 };
-// Coarse grounding-grid (size x size) 255 where people and the shadows next to them are, and
-// where the sky is. A person detection mostly covered by an at least as confident robot detection
-// is a humanoid exhibit and stays static.
-GroundingResult GroundingMaskCoarse(const std::vector<Tensor>& outputs, GroundingCounts& counts) {
+// Coarse grounding-grid (size x size) 255 where people, their bridged wrist/hand accessories, and
+// the shadows next to them are, and where the sky is. A person detection mostly covered by an at
+// least as confident robot detection is a humanoid exhibit and stays static.
+GroundingResult GroundingMaskCoarse(const std::vector<Tensor>& outputs,
+                                    const cv::Mat& roi_domain_coarse, const cv::Mat& rim_zone,
+                                    GroundingCounts& counts) {
   const int k = int(outputs[0].shape[1]), size = int(outputs[2].shape[3]);
+  if (roi_domain_coarse.cols != size || roi_domain_coarse.rows != size ||
+      rim_zone.cols != size || rim_zone.rows != size)
+    throw std::runtime_error("Grounding domain grid differs from mask output size");
   const float *scores = outputs[0].Floats(), *logits = outputs[2].Floats();
-  auto detections = [&](int prompt) {
+  auto detections = [&](int prompt, float threshold) {
     std::vector<std::pair<float, cv::Mat>> found;
     // Scores arrive sorted in descending order.
-    for (int q = 0; q < k && scores[prompt * k + q] >= kGroundingScore; ++q) {
+    for (int q = 0; q < k && scores[prompt * k + q] >= threshold; ++q) {
       const cv::Mat logit(size, size, CV_32FC1,
                           const_cast<float*>(logits + (size_t(prompt) * k + q) * size * size));
       found.emplace_back(scores[prompt * k + q], logit > 0);
     }
     return found;
   };
-  const auto persons = detections(0), shadows = detections(1), robots = detections(2),
-             skies = detections(3);
+  const auto persons = detections(0, kRimPersonScore), shadows = detections(1, kShadowScore),
+             robots = detections(2, kRimPersonScore), skies = detections(3, kGroundingScore);
   cv::Mat people = cv::Mat::zeros(size, size, CV_8UC1);
   for (const auto& [score, mask] : persons) {
     const int area = cv::countNonZero(mask);
+    if (!area)
+      continue;
     bool robot = false;
     for (const auto& [robot_score, robot_mask] : robots)
       robot = robot || (robot_score >= score && 2 * cv::countNonZero(mask & robot_mask) >= area);
     if (robot) {
       ++counts.robots;
-    } else {
-      ++counts.persons;
-      people |= mask;
+      continue;
+    }
+    if (score < kGroundingScore) {
+      if (!cv::countNonZero(mask & rim_zone))
+        continue;
+      ++counts.rim_persons;
+    }
+    ++counts.persons;
+    people |= mask;
+  }
+  const int people_area = cv::countNonZero(people);
+  if (people_area > 0) {
+    const int dom_area = std::max(1, cv::countNonZero(roi_domain_coarse));
+    const cv::Mat close_kernel = cv::getStructuringElement(
+        cv::MORPH_ELLIPSE, {2 * kAccessoryCloseRadius + 1, 2 * kAccessoryCloseRadius + 1});
+    cv::Mat closed;
+    cv::morphologyEx(people, closed, cv::MORPH_CLOSE, close_kernel);
+    const cv::Mat bridge = closed & ~people;
+    if (cv::countNonZero(bridge) > 0) {
+      cv::Mat bridge_labels, bridge_stats, bridge_centroids;
+      const int bridge_count = cv::connectedComponentsWithStats(
+          bridge, bridge_labels, bridge_stats, bridge_centroids, 8);
+      const int max_bridge_area =
+          std::min(int(std::lround(kAccessoryMaxDomainShare * dom_area)),
+                   int(std::lround(kAccessoryMaxPersonRatio * people_area)));
+      cv::Mat compact_bridge = cv::Mat::zeros(size, size, CV_8UC1);
+      for (int label = 1; label < bridge_count; ++label) {
+        if (bridge_stats.at<int>(label, cv::CC_STAT_AREA) <= max_bridge_area) {
+          compact_bridge.setTo(255, bridge_labels == label);
+          ++counts.accessory_bridges;
+        }
+      }
+      if (cv::countNonZero(compact_bridge) > 0) {
+        const cv::Mat bridge_dilate = cv::getStructuringElement(
+            cv::MORPH_ELLIPSE,
+            {2 * kAccessoryBridgeDilateRadius + 1, 2 * kAccessoryBridgeDilateRadius + 1});
+        cv::Mat expanded;
+        cv::dilate(compact_bridge, expanded, bridge_dilate);
+        people |= expanded;
+      }
+    }
+    const cv::Mat free_zone = (people == 0) & (roi_domain_coarse > 0);
+    cv::Mat free_labels, free_stats, free_centroids;
+    const int free_count =
+        cv::connectedComponentsWithStats(free_zone, free_labels, free_stats, free_centroids, 8);
+    const int max_pocket_area = int(std::lround(kPocketMaxDomainShare * dom_area));
+    const cv::Mat k3 = cv::Mat::ones(3, 3, CV_8UC1);
+    for (int label = 1; label < free_count; ++label) {
+      if (free_stats.at<int>(label, cv::CC_STAT_AREA) > max_pocket_area)
+        continue;
+      const cv::Mat comp = (free_labels == label);
+      cv::Mat dilated;
+      cv::dilate(comp, dilated, k3);
+      const cv::Mat border = dilated & ~comp;
+      const int border_total = cv::countNonZero(border);
+      const int border_people = cv::countNonZero(border & people);
+      if (border_total > 0 &&
+          double(border_people) >= kPocketMinPeopleBorderShare * double(border_total)) {
+        people |= comp;
+        ++counts.filled_pockets;
+      }
     }
   }
   cv::Mat transient = people.clone();
@@ -576,8 +679,10 @@ GroundingResult GroundingMaskCoarse(const std::vector<Tensor>& outputs, Groundin
       }
     }
   }
-  // One cell of margin covers the coarse mask boundary and the soft shadow edge.
-  cv::dilate(transient, transient, cv::Mat::ones(3, 3, CV_8UC1));
+  // Two cells of margin cover the coarse mask boundary, dark fringes, and soft shadow edges.
+  const cv::Mat margin_kernel = cv::getStructuringElement(
+      cv::MORPH_ELLIPSE, {2 * kTransientMarginRadius + 1, 2 * kTransientMarginRadius + 1});
+  cv::dilate(transient, transient, margin_kernel);
   // Sky is the union of its detections without margin: indoors a bright ceiling panel or a
   // printed sky occasionally qualifies and is accepted.
   cv::Mat sky = cv::Mat::zeros(size, size, CV_8UC1);
@@ -587,15 +692,16 @@ GroundingResult GroundingMaskCoarse(const std::vector<Tensor>& outputs, Groundin
   counts.sky_images += !skies.empty();
   return {std::move(transient), std::move(sky)};
 }
-cv::Mat ComposeFullMask(const GroundingResult& coarse, const cv::Mat& domain) {
+cv::Mat ComposeFullMask(const GroundingResult& coarse, const cv::Mat& domain, const cv::Rect& roi) {
   cv::Mat transient, sky;
-  cv::resize(coarse.transient, transient, {domain.cols, domain.rows}, 0, 0, cv::INTER_LINEAR);
-  cv::resize(coarse.sky, sky, {domain.cols, domain.rows}, 0, 0, cv::INTER_LINEAR);
+  cv::resize(coarse.transient, transient, {roi.width, roi.height}, 0, 0, cv::INTER_LINEAR);
+  cv::resize(coarse.sky, sky, {roi.width, roi.height}, 0, 0, cv::INTER_LINEAR);
   transient = transient >= 128;
   sky = sky >= 128;
   cv::Mat mask = domain.clone();
-  mask.setTo(128, sky & domain);
-  mask.setTo(0, transient);
+  cv::Mat sub = mask(roi);
+  sub.setTo(128, sky & sub);
+  sub.setTo(0, transient);
   return mask;
 }
 }  // namespace
@@ -804,9 +910,24 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root, i
   ImagePreprocessor pixels(models.Stream());
   // SAM3 decides the sky, people and the shadows next to them; the rest of the domain is static.
   const int grounding_size = GroundingSize(models.Manifest());
+  const int mask_size = models.Manifest().at("grounding_mask_size");
   const std::array<cv::Mat, 2> domains{scene.cameras[0].Mask(), scene.cameras[1].Mask()};
+  const std::array<cv::Rect, 2> rois{GroundingRoi(scene.cameras[0], domains[0]),
+                                     GroundingRoi(scene.cameras[1], domains[1])};
+  const cv::Mat rim_kernel =
+      cv::getStructuringElement(cv::MORPH_ELLIPSE, {2 * kRimBandCells + 1, 2 * kRimBandCells + 1});
+  std::array<cv::Mat, 2> roi_domains_coarse, rim_zones;
+  for (int c = 0; c < 2; ++c) {
+    cv::Mat resized;
+    cv::resize(domains[c](rois[c]), resized, {mask_size, mask_size}, 0, 0, cv::INTER_AREA);
+    roi_domains_coarse[c] = resized >= 128;
+    cv::Mat inner;
+    cv::erode(roi_domains_coarse[c], inner, rim_kernel, {-1, -1}, 1, cv::BORDER_CONSTANT,
+              cv::Scalar(0));
+    rim_zones[c] = (roi_domains_coarse[c] == 0) | ((roi_domains_coarse[c] > 0) & (inner == 0));
+  }
   GroundingCounts counts;
-  ImageReader reader(pending, work, grounding_size);
+  ImageReader reader(pending, work, grounding_size, rois);
   WriterPool writer(workers);
   for (const auto& record : pending) {
     auto phase = Clock::now();
@@ -821,12 +942,14 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root, i
         {pixels.Normalize(grounding_size, grounding_size, {.5f, .5f, .5f}, {.5f, .5f, .5f})});
     timing.gpu_pipeline += Seconds(phase);
     phase = Clock::now();
-    auto coarse = GroundingMaskCoarse(outputs, counts);
+    auto coarse = GroundingMaskCoarse(outputs, roi_domains_coarse[record.camera],
+                                      rim_zones[record.camera], counts);
     timing.postprocess += Seconds(phase);
     const auto path = MaskPath(work, record.id);
     const cv::Mat* domain = &domains[record.camera];
-    writer.Submit([path, coarse = std::move(coarse), domain] {
-      const cv::Mat mask = ComposeFullMask(coarse, *domain);
+    const cv::Rect roi = rois[record.camera];
+    writer.Submit([path, coarse = std::move(coarse), domain, roi] {
+      const cv::Mat mask = ComposeFullMask(coarse, *domain, roi);
       const auto temporary = path.parent_path() / (path.stem().u8string() + ".writing.png");
       WriteImage(temporary, mask, 1);
       PublishFile(temporary, path);
@@ -838,13 +961,22 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root, i
   writer.Finish();
   timing.write = writer.seconds;
   auto report = timing.Report(started, &models);
+  Json roi_json = Json::array();
+  for (const auto& roi : rois)
+    roi_json.push_back({roi.x, roi.y, roi.width, roi.height});
   report["grounding"] = {{"score_threshold", kGroundingScore},
+                         {"rim_person_score_threshold", kRimPersonScore},
+                         {"shadow_score_threshold", kShadowScore},
                          {"shadow_reach_cells", kShadowReach},
                          {"shadow_max_full_share", kShadowMaxFullShare},
                          {"shadow_small_share", kShadowSmallShare},
                          {"shadow_max_person_area_ratio", kShadowMaxPersonAreaRatio},
+                         {"rois", roi_json},
                          {"persons", counts.persons},
+                         {"rim_persons", counts.rim_persons},
                          {"persons_kept_as_robots", counts.robots},
+                         {"accessory_bridges", counts.accessory_bridges},
+                         {"filled_pockets", counts.filled_pockets},
                          {"shadows", counts.shadows},
                          {"shadows_clipped", counts.clipped_shadows},
                          {"shadows_far_from_persons", counts.distant_shadows},

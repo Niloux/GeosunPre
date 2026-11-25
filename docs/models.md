@@ -26,7 +26,7 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 | descriptor | image float32 `[1,3,784,784]`；keypoints `[1,N,2]` | descriptors float32 `[1,N,256]` |
 | matcher | ka/kb float32 `[B,3072,2]`；da/db `[B,3072,256]`；mask_a/mask_b float32 `[B,3072]` | matches int32 `[B,3072]`；confidence float32 `[B,3072]` |
 | geometry | image float32 `[B,3,644,644]` RGB/255 | points float32 `[B,644,644,3]`；normal `[B,644,644,3]`；mask `[B,644,644]`；metric_scale `[B]` |
-| grounding | image float32 `[1,3,1008,1008]`，整幅照片拉伸缩放，RGB/127.5−1 | scores float32 `[4,20]`；boxes `[4,20,4]`；masks `[4,20,288,288]`；semantic `[4,1,288,288]` |
+| grounding | image float32 `[1,3,1008,1008]`，主点居中方形鱼眼 ROI 缩放，RGB/127.5−1 | scores float32 `[4,20]`；boxes `[4,20,4]`；masks `[4,20,288,288]`；semantic `[4,1,288,288]` |
 
 grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的文本特征在导出时算好并固化进图，不含文本编码器；改提示须重新导出并使用新模型目录。每个提示输出按联合分数（查询分数乘存在分数）降序的前 20 个查询：分数、归一化 cxcywh 框、实例掩码 logits 及该提示的语义 logits。ViT 的复数旋转位置编码导出为等价的实数 cos/sin 形式，导出前在随机输入上与原实现比对。TensorRT 构建工作区为 12 GiB；FP16 下注意力打分会超出半精度范围（PyTorch FP16 的注意力在 FP32 中累加，因此不受影响），故每个 Softmax 及其输入链直到打分矩阵乘保留 FP32，其余可用 FP16。
 
