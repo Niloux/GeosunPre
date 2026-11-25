@@ -1,5 +1,6 @@
 #include "geometry/static_masks.h"
 #include "geometry/supervision.h"
+#include <Eigen/Cholesky>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -36,6 +37,30 @@ constexpr int SkyEdgeGuidedRadius4k = 12;
 constexpr double SkyEdgeAlphaThreshold = .35;
 constexpr int SkyCanopyPoreMaxArea4k = 2500;
 constexpr double SkyCanopyFoliageBorderShare = .65;
+// Multi-view photometric transient detection (moving shadows and specular glare).
+constexpr int PhotoGridSize = 256;
+constexpr int PhotoNeighbors = 20;
+constexpr double PhotoMaxNeighborDistM = 10.0;
+constexpr double PhotoMinTimeGapS = 1.5;
+constexpr double PhotoMinDepthM = 0.35, PhotoMaxDepthM = 12.0, PhotoMaxDepthGrad = 0.35;
+constexpr int PhotoMinGainSamples = 150, PhotoMinSeen = 6, PhotoGrowMinSeen = 4;
+constexpr double PhotoMinPairGain = 0.50, PhotoMaxPairGain = 2.00;
+constexpr double PhotoMinRefPerceptual = 0.12;
+constexpr int PhotoMinCompArea = 25;
+constexpr double PhotoMaxImageMaskShare = 0.20;
+constexpr double PhotoDarkShare = 0.70, PhotoDarkRatio = 0.78, PhotoDarkDiff = 0.06;
+constexpr double PhotoDarkMaxGrad = 0.20;
+constexpr double PhotoDarkGrowShare = 0.65, PhotoDarkGrowRatio = 0.84, PhotoDarkGrowDiff = 0.04;
+constexpr double PhotoDarkGrowMaxGrad = 0.25;
+constexpr int PhotoDarkGrowRadius = 4, PhotoDarkDilateRadius = 1;
+constexpr double PhotoBrightShare = 0.70, PhotoBrightRatio = 1.30, PhotoBrightDiff = 0.10;
+constexpr double PhotoBrightMaxGrad = 0.25;
+constexpr double PhotoBrightGrowShare = 0.65, PhotoBrightGrowRatio = 1.20, PhotoBrightGrowDiff = 0.07;
+constexpr double PhotoBrightGrowMaxGrad = 0.30;
+constexpr int PhotoBrightGrowRadius = 3, PhotoBrightDilateRadius = 1;
+constexpr int PhotoPersonShadowReach = 24, PhotoPersonMinSeen = 5, PhotoPersonMinCompArea = 12;
+constexpr double PhotoPersonDarkShare = 0.70, PhotoPersonDarkRatio = 0.88, PhotoPersonDarkDiff = 0.04;
+constexpr double PhotoPersonDarkMaxGrad = 0.15;
 
 struct Candidate {
   uint32_t image = 0;
@@ -57,6 +82,27 @@ struct SkyImage {
   int open_sky_grid_pixels = 0;
   std::vector<SkyComponent> components;
 };
+struct PhotoCamGrid {
+  Camera grid_cam;
+  int width = 0, height = 0;
+  double scale_x = 1.0, scale_y = 1.0;
+  std::vector<Eigen::Vector3d> rays;
+  std::vector<float> rho;
+  cv::Mat domain;
+};
+struct PhotoView {
+  cv::Mat lum_lin;
+  cv::Mat lum_srgb;
+  cv::Mat grad_srgb;
+  cv::Mat p_lin, p_min3, p_max3;
+  cv::Mat depth;
+  cv::Mat depth_smooth;
+  cv::Mat static_mask;
+  cv::Mat raw_sky_small;
+  cv::Mat person_small;
+  cv::Mat transient_mask;
+  bool capped = false;
+};
 struct Context {
   const Scene& scene;
   const Reconstruction& model;
@@ -71,12 +117,208 @@ struct Context {
   std::vector<std::vector<Candidate>> candidates;
   std::array<int, 2> full_domain_grid_pixels{0, 0};
   std::vector<SkyImage> skies;
+  std::array<PhotoCamGrid, 2> photo_grids;
+  std::vector<PhotoView> photo_views;
+  std::array<std::array<double, 3>, 2> vig_coeffs{};
+  double photo_seconds = 0.0;
   bool keep_sky = true;
 };
 struct Labelled {
   cv::Mat mask, transient_map, labels, stats, centroids;
   int count = 0;
 };
+void CleanAndDownsampleLasDepth(const cv::Mat& depth_1024, int gw, int gh, cv::Mat& depth_out,
+                                cv::Mat& smooth_out) {
+  const int h1024 = depth_1024.rows, w1024 = depth_1024.cols;
+  cv::Mat las_inf(h1024, w1024, CV_32FC1, cv::Scalar(1e9f));
+  for (int y = 0; y < h1024; ++y) {
+    const float* src = depth_1024.ptr<float>(y);
+    float* dst = las_inf.ptr<float>(y);
+    for (int x = 0; x < w1024; ++x) {
+      const float d = src[x];
+      if (std::isfinite(d) && d >= 0.20f && d <= 60.0f)
+        dst[x] = d;
+    }
+  }
+  cv::Mat las_min;
+  cv::erode(las_inf, las_min, cv::getStructuringElement(cv::MORPH_RECT, {5, 5}));
+  cv::Mat clean(h1024, w1024, CV_32FC1, cv::Scalar(0.f));
+  for (int y = 0; y < h1024; ++y) {
+    const float* src = las_inf.ptr<float>(y);
+    const float* mmin = las_min.ptr<float>(y);
+    float* dst = clean.ptr<float>(y);
+    for (int x = 0; x < w1024; ++x) {
+      const float d = src[x];
+      if (d < 1e8f && d <= mmin[x] * 1.08f + 0.08f)
+        dst[x] = d;
+    }
+  }
+
+  cv::Mat pooled(gh, gw, CV_32FC1, cv::Scalar(0.f));
+  cv::Mat bimodal = cv::Mat::zeros(gh, gw, CV_8UC1);
+  std::vector<float> block_vals;
+  for (int gy = 0; gy < gh; ++gy) {
+    const int y0 = (gy * h1024) / gh;
+    const int y1 = std::max(y0 + 1, ((gy + 1) * h1024) / gh);
+    float* dst = pooled.ptr<float>(gy);
+    uint8_t* bm = bimodal.ptr<uint8_t>(gy);
+    for (int gx = 0; gx < gw; ++gx) {
+      const int x0 = (gx * w1024) / gw;
+      const int x1 = std::max(x0 + 1, ((gx + 1) * w1024) / gw);
+      block_vals.clear();
+      float d_min = 1e9f, d_max = 0.f;
+      for (int sy = y0; sy < y1; ++sy) {
+        const float* row = clean.ptr<float>(sy);
+        for (int sx = x0; sx < x1; ++sx) {
+          const float v = row[sx];
+          if (v > 0.f) {
+            block_vals.push_back(v);
+            d_min = std::min(d_min, v);
+            d_max = std::max(d_max, v);
+          }
+        }
+      }
+      if (block_vals.empty())
+        continue;
+      if (d_max - d_min > std::max(0.30f, 0.15f * d_min))
+        bm[gx] = 1;
+      const float thresh = d_min * 1.06f + 0.06f;
+      double sum = 0.0;
+      int cnt = 0;
+      for (float v : block_vals) {
+        if (v <= thresh) {
+          sum += v;
+          ++cnt;
+        }
+      }
+      if (cnt > 0)
+        dst[gx] = float(sum / double(cnt));
+    }
+  }
+
+  // Conservative 1-pixel hole fill where >= 5 neighbors agree smoothly.
+  depth_out = pooled.clone();
+  float nbrs[8];
+  for (int y = 1; y < gh - 1; ++y) {
+    const float* r_prev = pooled.ptr<float>(y - 1);
+    const float* r_cur = pooled.ptr<float>(y);
+    const float* r_next = pooled.ptr<float>(y + 1);
+    float* dst = depth_out.ptr<float>(y);
+    for (int x = 1; x < gw - 1; ++x) {
+      if (r_cur[x] > 0.f)
+        continue;
+      int cnt = 0;
+      float d_min = 1e9f, d_max = 0.f;
+      const float vals[8] = {r_prev[x - 1], r_prev[x], r_prev[x + 1], r_cur[x - 1],
+                             r_cur[x + 1],  r_next[x - 1], r_next[x], r_next[x + 1]};
+      for (float v : vals) {
+        if (v > 0.f) {
+          nbrs[cnt++] = v;
+          d_min = std::min(d_min, v);
+          d_max = std::max(d_max, v);
+        }
+      }
+      if (cnt >= 5 && d_max - d_min <= std::max(0.10f, 0.06f * d_min)) {
+        std::nth_element(nbrs, nbrs + cnt / 2, nbrs + cnt);
+        dst[x] = nbrs[cnt / 2];
+      }
+    }
+  }
+
+  cv::Mat gx_mat, gy_mat;
+  cv::Sobel(depth_out, gx_mat, CV_32F, 1, 0, 3);
+  cv::Sobel(depth_out, gy_mat, CV_32F, 0, 1, 3);
+  smooth_out = cv::Mat::zeros(gh, gw, CV_8UC1);
+  for (int y = 1; y < gh - 1; ++y) {
+    const float* r_prev = depth_out.ptr<float>(y - 1);
+    const float* r_cur = depth_out.ptr<float>(y);
+    const float* r_next = depth_out.ptr<float>(y + 1);
+    const uint8_t* bm = bimodal.ptr<uint8_t>(y);
+    const float* gxp = gx_mat.ptr<float>(y);
+    const float* gyp = gy_mat.ptr<float>(y);
+    uint8_t* sp = smooth_out.ptr<uint8_t>(y);
+    for (int x = 1; x < gw - 1; ++x) {
+      if (bm[x])
+        continue;
+      const float d = r_cur[x];
+      if (d < float(PhotoMinDepthM) || d > float(PhotoMaxDepthM))
+        continue;
+      bool all_valid = true;
+      float d_min = d, d_max = d;
+      const float* rows[3] = {r_prev, r_cur, r_next};
+      for (int ry = 0; ry < 3 && all_valid; ++ry) {
+        for (int dx = -1; dx <= 1; ++dx) {
+          const float v = rows[ry][x + dx];
+          if (v <= 0.f) {
+            all_valid = false;
+            break;
+          }
+          d_min = std::min(d_min, v);
+          d_max = std::max(d_max, v);
+        }
+      }
+      if (!all_valid)
+        continue;
+      if (d_max - d_min > std::max(0.15f, 0.10f * d))
+        continue;
+      if (std::hypot(gxp[x], gyp[x]) / std::max(d, 0.2f) < float(PhotoMaxDepthGrad))
+        sp[x] = 255;
+    }
+  }
+}
+void BuildPhotoView(Context& context, uint32_t id, const cv::Mat& full_mask,
+                    const cv::Mat& depth_1024) {
+  const uint32_t cid = context.model.images[id].camera;
+  const auto& grid = context.photo_grids[cid];
+  PhotoView view;
+  CleanAndDownsampleLasDepth(depth_1024, grid.width, grid.height, view.depth, view.depth_smooth);
+
+  cv::Mat bgr = ReadImage(context.scene.images[id].source, cv::IMREAD_REDUCED_COLOR_8);
+  if (bgr.empty() || bgr.channels() != 3 || bgr.cols < grid.width || bgr.rows < grid.height)
+    bgr = ReadImage(context.scene.images[id].source, cv::IMREAD_COLOR);
+  if (bgr.empty() || bgr.channels() != 3)
+    throw std::runtime_error("Invalid photo channels for photometric mask: " +
+                             context.scene.images[id].name);
+
+  cv::Mat small_bgr, rgb_f;
+  cv::resize(bgr, small_bgr, {grid.width, grid.height}, 0, 0, cv::INTER_AREA);
+  small_bgr.convertTo(rgb_f, CV_32FC3, 1.0 / 255.0);
+  cv::GaussianBlur(rgb_f, rgb_f, {3, 3}, 0.7);
+
+  view.lum_srgb.create(grid.height, grid.width, CV_32FC1);
+  view.lum_lin.create(grid.height, grid.width, CV_32FC1);
+  for (int y = 0; y < grid.height; ++y) {
+    const cv::Vec3f* sp = rgb_f.ptr<cv::Vec3f>(y);
+    float* ps = view.lum_srgb.ptr<float>(y);
+    float* pl = view.lum_lin.ptr<float>(y);
+    for (int x = 0; x < grid.width; ++x) {
+      const float b = std::clamp(sp[x][0], 0.f, 1.f);
+      const float g = std::clamp(sp[x][1], 0.f, 1.f);
+      const float r = std::clamp(sp[x][2], 0.f, 1.f);
+      ps[x] = 0.114f * b + 0.587f * g + 0.299f * r;
+      pl[x] = 0.0722f * std::pow(b, 2.2f) + 0.7152f * std::pow(g, 2.2f) +
+              0.2126f * std::pow(r, 2.2f);
+    }
+  }
+  cv::Mat gx, gy;
+  cv::Sobel(view.lum_srgb, gx, CV_32F, 1, 0, 3);
+  cv::Sobel(view.lum_srgb, gy, CV_32F, 0, 1, 3);
+  cv::magnitude(gx, gy, view.grad_srgb);
+
+  const cv::Mat& full_domain = context.full_domains[cid];
+  cv::Mat static_resized, sky_resized, person_resized;
+  cv::resize((full_mask == 255) & full_domain, static_resized, {grid.width, grid.height}, 0, 0,
+             cv::INTER_AREA);
+  view.static_mask = (static_resized >= 252) & grid.domain;
+  cv::resize((full_mask == 128) & full_domain, sky_resized, {grid.width, grid.height}, 0, 0,
+             cv::INTER_AREA);
+  view.raw_sky_small = (sky_resized >= 128) & grid.domain;
+  cv::resize((full_mask == 0) & context.domains[cid], person_resized, {grid.width, grid.height}, 0,
+             0, cv::INTER_AREA);
+  view.person_small = (person_resized > 0) & grid.domain;
+
+  context.photo_views[id] = std::move(view);
+}
 // Transient components of an image's mask, on the given grid.
 Labelled Label(const Context& context, uint32_t id, cv::Size grid) {
   const auto& name = context.scene.images[id].name;
@@ -96,6 +338,7 @@ void Collect(Context& context, uint32_t id, const cv::Mat& depth) {
   const auto& model = context.model;
   const auto& camera = model.cameras[model.images[id].camera];
   auto labelled = Label(context, id, depth.size());
+  BuildPhotoView(context, id, labelled.mask, depth);
   const double scale_x = double(camera.width) / depth.cols, scale_y = double(camera.height) / depth.rows;
   const cv::Mat& domain = context.domains[model.images[id].camera];
   cv::Mat transient;
@@ -245,6 +488,8 @@ struct ApplyCounts {
   uint64_t sky_cleared = 0;
   uint64_t sky_edge_to_sky = 0;
   uint64_t sky_edge_to_static = 0;
+  uint64_t photo_dark = 0;
+  uint64_t photo_bright = 0;
 };
 // Smooth local per-channel mean and variance over seed_mask != 0 using 4x block accumulation
 // (exact squared-sum accumulation before smoothing avoids downsampling variance bias), blending
@@ -643,6 +888,533 @@ void RefineOutdoorSkyBoundary(const Context& context, uint32_t id, cv::Mat& mask
   counts.sky_edge_to_sky += uint64_t(cv::countNonZero(new_pore_sky));
   mask_roi.setTo(128, new_pore_sky);
 }
+bool ProjectWorldToPhoto(const Context& context, uint32_t j, const Eigen::Vector3d& world,
+                         double& out_u, double& out_v, double& out_dist, float& out_rho) {
+  const uint32_t cid_j = context.model.images[j].camera;
+  const auto& full_cam = context.model.cameras[cid_j];
+  const auto& grid_j = context.photo_grids[cid_j];
+  const Eigen::Vector3d v = context.rotations[j] * world + context.translations[j];
+  Eigen::Vector3d p = v;
+  Eigen::Vector2d px;
+  if (context.motion) {
+    double s = 0.0;
+    for (int it = 0; it < 2; ++it) {
+      p = context.motion->Apply(j, cid_j, s, v);
+      if (p.norm() <= 0.25)
+        return false;
+      px = full_cam.Project(p);
+      s = context.motion->Fraction(full_cam, px);
+    }
+    p = context.motion->Apply(j, cid_j, s, v);
+  }
+  const double dist = p.norm();
+  if (dist <= 0.25)
+    return false;
+  const double theta = std::acos(std::clamp(p.z() / dist, -1.0, 1.0));
+  if (theta >= 79.0 * Pi / 180.0)
+    return false;
+  px = full_cam.Project(p);
+  out_u = px.x() * grid_j.scale_x - 0.5;
+  out_v = px.y() * grid_j.scale_y - 0.5;
+  if (out_u < 1.5 || out_u >= double(grid_j.width) - 2.5 || out_v < 1.5 ||
+      out_v >= double(grid_j.height) - 2.5)
+    return false;
+  out_dist = dist;
+  out_rho = float(theta / (80.0 * Pi / 180.0));
+  return true;
+}
+inline float SampleBilinear(const cv::Mat& img, double u, double v) {
+  const int x0 = int(std::floor(u)), y0 = int(std::floor(v));
+  const float fx = float(u - x0), fy = float(v - y0);
+  const float* r0 = img.ptr<float>(y0);
+  const float* r1 = img.ptr<float>(y0 + 1);
+  return (1.f - fy) * ((1.f - fx) * r0[x0] + fx * r0[x0 + 1]) +
+         fy * ((1.f - fx) * r1[x0] + fx * r1[x0 + 1]);
+}
+void FitVignetting(Context& context, const std::vector<uint32_t>& written) {
+  struct VigSample {
+    double dr2, dr4, dr6, dl;
+  };
+  for (uint32_t cid = 0; cid < 2; ++cid) {
+    std::vector<uint32_t> cam_imgs;
+    for (const uint32_t id : written)
+      if (context.model.images[id].camera == cid)
+        cam_imgs.push_back(id);
+    if (cam_imgs.size() < 4)
+      continue;
+    const auto& grid = context.photo_grids[cid];
+    std::vector<VigSample> samples;
+    const size_t stride = std::max<size_t>(1, cam_imgs.size() / 80);
+    for (size_t idx = 0; idx < cam_imgs.size(); idx += stride) {
+      const uint32_t i = cam_imgs[idx];
+      std::vector<std::pair<double, uint32_t>> near;
+      for (const uint32_t j : cam_imgs) {
+        if (j == i)
+          continue;
+        const double d = (context.centers[j] - context.centers[i]).norm();
+        if (d > 0.5 && d < 6.0)
+          near.emplace_back(d, j);
+      }
+      std::sort(near.begin(), near.end());
+      if (near.size() > 4)
+        near.resize(4);
+      if (near.empty())
+        continue;
+
+      const auto& view_i = context.photo_views[i];
+      const auto& cam = context.model.cameras[cid];
+      struct SrcPx {
+        Eigen::Vector3d world;
+        float lum, rho;
+      };
+      std::vector<SrcPx> src_pts;
+      for (int y = 0; y < grid.height; ++y) {
+        const uint8_t* m = view_i.static_mask.ptr<uint8_t>(y);
+        const uint8_t* sm = view_i.depth_smooth.ptr<uint8_t>(y);
+        const float* srgb = view_i.lum_srgb.ptr<float>(y);
+        const float* grad = view_i.grad_srgb.ptr<float>(y);
+        const float* lum = view_i.lum_lin.ptr<float>(y);
+        const float* dep = view_i.depth.ptr<float>(y);
+        for (int x = 0; x < grid.width; ++x) {
+          if (!m[x] || !sm[x] || srgb[x] <= 0.12f || srgb[x] >= 0.88f || grad[x] >= 0.12f ||
+              lum[x] <= 1e-4f)
+            continue;
+          const size_t gidx = size_t(y) * size_t(grid.width) + size_t(x);
+          const Eigen::Vector3d moved = grid.rays[gidx] * double(dep[x]);
+          const Eigen::Vector3d cam_pt =
+              context.motion
+                  ? context.motion->Reference(
+                        i, cid,
+                        context.motion->Fraction(
+                            cam, {(x + 0.5) / grid.scale_x, (y + 0.5) / grid.scale_y}),
+                        moved)
+                  : moved;
+          const Eigen::Vector3d world =
+              context.rotations[i].transpose() * (cam_pt - context.translations[i]);
+          src_pts.push_back({world, lum[x], grid.rho[gidx]});
+        }
+      }
+      if (src_pts.size() < 300)
+        continue;
+
+      std::vector<VigSample> pair_samples;
+      for (const auto& [dist_c, j] : near) {
+        (void)dist_c;
+        const auto& view_j = context.photo_views[j];
+        pair_samples.clear();
+        for (const auto& sp : src_pts) {
+          double u = 0.0, v = 0.0, d_proj = 0.0;
+          float rho_j = 0.f;
+          if (!ProjectWorldToPhoto(context, j, sp.world, u, v, d_proj, rho_j))
+            continue;
+          const int ui = int(std::lround(u)), vi = int(std::lround(v));
+          if (!view_j.static_mask.at<uint8_t>(vi, ui))
+            continue;
+          const float d_j = view_j.depth.at<float>(vi, ui);
+          if (d_j <= 0.4f || std::abs(d_proj - double(d_j)) > std::max(0.06, 0.04 * d_proj))
+            continue;
+          const float s_j = SampleBilinear(view_j.lum_srgb, u, v);
+          if (s_j <= 0.12f || s_j >= 0.88f)
+            continue;
+          const float l_j = SampleBilinear(view_j.lum_lin, u, v);
+          if (l_j <= 1e-4f)
+            continue;
+          const double r2i = double(sp.rho) * double(sp.rho);
+          const double r2j = double(rho_j) * double(rho_j);
+          pair_samples.push_back(
+              {r2i - r2j, r2i * r2i - r2j * r2j, r2i * r2i * r2i - r2j * r2j * r2j,
+               std::log(double(sp.lum)) - std::log(double(l_j))});
+        }
+        if (pair_samples.size() < 300)
+          continue;
+        const size_t step = std::max<size_t>(1, pair_samples.size() / 200);
+        double m2 = 0.0, m4 = 0.0, m6 = 0.0, ml = 0.0;
+        size_t cnt = 0;
+        for (size_t k = 0; k < pair_samples.size(); k += step) {
+          m2 += pair_samples[k].dr2;
+          m4 += pair_samples[k].dr4;
+          m6 += pair_samples[k].dr6;
+          ml += pair_samples[k].dl;
+          ++cnt;
+        }
+        m2 /= double(cnt);
+        m4 /= double(cnt);
+        m6 /= double(cnt);
+        ml /= double(cnt);
+        for (size_t k = 0; k < pair_samples.size(); k += step) {
+          samples.push_back({pair_samples[k].dr2 - m2, pair_samples[k].dr4 - m4,
+                             pair_samples[k].dr6 - m6, pair_samples[k].dl - ml});
+        }
+      }
+    }
+    if (samples.size() < 2000)
+      continue;
+    Eigen::Vector3d c = Eigen::Vector3d::Zero();
+    std::vector<double> w(samples.size(), 1.0);
+    for (int iter = 0; iter < 5; ++iter) {
+      Eigen::Matrix3d ata = Eigen::Matrix3d::Zero();
+      Eigen::Vector3d atb = Eigen::Vector3d::Zero();
+      for (size_t k = 0; k < samples.size(); ++k) {
+        const Eigen::Vector3d a(samples[k].dr2, samples[k].dr4, samples[k].dr6);
+        const double wk = w[k];
+        ata.noalias() += wk * (a * a.transpose());
+        atb.noalias() += wk * samples[k].dl * a;
+      }
+      ata.diagonal().array() += 1e-9;
+      c = ata.ldlt().solve(atb);
+      for (size_t k = 0; k < samples.size(); ++k) {
+        const double res = std::abs(c[0] * samples[k].dr2 + c[1] * samples[k].dr4 +
+                                    c[2] * samples[k].dr6 - samples[k].dl);
+        w[k] = res < 0.15 ? 1.0 : 0.15 / std::max(res, 1e-6);
+      }
+    }
+    if (c.allFinite())
+      context.vig_coeffs[cid] = {c[0], c[1], c[2]};
+  }
+
+  const cv::Mat k3 = cv::Mat::ones(3, 3, CV_8UC1);
+  for (const uint32_t id : written) {
+    const uint32_t cid = context.model.images[id].camera;
+    const auto& grid = context.photo_grids[cid];
+    const auto& vc = context.vig_coeffs[cid];
+    auto& view = context.photo_views[id];
+    view.p_lin.create(grid.height, grid.width, CV_32FC1);
+    constexpr float inv_gamma = 1.f / 2.2f;
+    for (int y = 0; y < grid.height; ++y) {
+      float* lp = view.lum_lin.ptr<float>(y);
+      float* pp = view.p_lin.ptr<float>(y);
+      for (int x = 0; x < grid.width; ++x) {
+        const double r2 = double(grid.rho[size_t(y) * size_t(grid.width) + size_t(x)]);
+        const double rr = r2 * r2;
+        const float vig = float(std::clamp(
+            std::exp(vc[0] * rr + vc[1] * rr * rr + vc[2] * rr * rr * rr), 0.35, 1.35));
+        lp[x] /= vig;
+        pp[x] = std::pow(std::max(lp[x], 0.f), inv_gamma);
+      }
+    }
+    cv::erode(view.p_lin, view.p_min3, k3);
+    cv::dilate(view.p_lin, view.p_max3, k3);
+  }
+}
+cv::Mat FilterComponents(const cv::Mat& raw, int min_area) {
+  cv::Mat labels, stats, centroids;
+  const int count = cv::connectedComponentsWithStats(raw, labels, stats, centroids, 8);
+  cv::Mat out = cv::Mat::zeros(raw.size(), CV_8UC1);
+  for (int k = 1; k < count; ++k) {
+    if (stats.at<int>(k, cv::CC_STAT_AREA) >= min_area)
+      out.setTo(255, labels == k);
+  }
+  return out;
+}
+cv::Mat GrowHysteresisMask(const cv::Mat& seed, const cv::Mat& soft_raw, int grow_radius,
+                           int dilate_radius) {
+  if (cv::countNonZero(seed) == 0)
+    return {};
+  cv::Mat reach;
+  cv::dilate(seed, reach,
+             cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                       {2 * grow_radius + 1, 2 * grow_radius + 1}));
+  const cv::Mat allowed = (soft_raw > 0) & (reach > 0);
+  cv::Mat grown = seed.clone();
+  std::vector<cv::Point> queue;
+  cv::findNonZero(seed, queue);
+  const int h = seed.rows, w = seed.cols;
+  for (size_t head = 0; head < queue.size(); ++head) {
+    const cv::Point pt = queue[head];
+    for (int dy = -1; dy <= 1; ++dy) {
+      const int ny = pt.y + dy;
+      if (ny < 0 || ny >= h)
+        continue;
+      const uint8_t* ap = allowed.ptr<uint8_t>(ny);
+      uint8_t* gp = grown.ptr<uint8_t>(ny);
+      for (int dx = -1; dx <= 1; ++dx) {
+        if (!dx && !dy)
+          continue;
+        const int nx = pt.x + dx;
+        if (nx >= 0 && nx < w && ap[nx] && !gp[nx]) {
+          gp[nx] = 255;
+          queue.emplace_back(nx, ny);
+        }
+      }
+    }
+  }
+  if (dilate_radius > 0) {
+    cv::Mat out;
+    cv::dilate(grown, out,
+               cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                         {2 * dilate_radius + 1, 2 * dilate_radius + 1}));
+    return out;
+  }
+  return grown;
+}
+void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& written,
+                                 int workers) {
+  const auto started = Clock::now();
+  if (written.size() < size_t(PhotoMinSeen + 1))
+    return;
+  struct OpenCvThreadsGuard {
+    int previous = cv::getNumThreads();
+    explicit OpenCvThreadsGuard(int threads) { cv::setNumThreads(threads); }
+    ~OpenCvThreadsGuard() { cv::setNumThreads(previous); }
+  } opencv_threads_guard(1);
+
+  for (const uint32_t id : written) {
+    auto& view = context.photo_views[id];
+    if (!context.keep_sky && !view.raw_sky_small.empty())
+      view.static_mask |= view.raw_sky_small;
+    view.raw_sky_small.release();
+  }
+  FitVignetting(context, written);
+
+  const cv::Mat k3 = cv::Mat::ones(3, 3, CV_8UC1);
+  const cv::Mat person_reach_kernel = cv::getStructuringElement(
+      cv::MORPH_ELLIPSE, {2 * PhotoPersonShadowReach + 1, 2 * PhotoPersonShadowReach + 1});
+
+  ParallelFor(written.size(), workers, 1, [&](size_t idx) {
+    const uint32_t i = written[idx];
+    const uint32_t cid_i = context.model.images[i].camera;
+    const auto& cam_i = context.model.cameras[cid_i];
+    const auto& grid_i = context.photo_grids[cid_i];
+    const auto& view_i = context.photo_views[i];
+    const Eigen::Vector3d fwd_i = context.rotations[i].row(2).transpose();
+
+    std::vector<std::pair<double, uint32_t>> cand;
+    for (const uint32_t j : written) {
+      if (j == i)
+        continue;
+      const double dist = (context.centers[j] - context.centers[i]).norm();
+      if (dist >= PhotoMaxNeighborDistM)
+        continue;
+      const Eigen::Vector3d fwd_j = context.rotations[j].row(2).transpose();
+      if (fwd_i.dot(fwd_j) <= -0.35)
+        continue;
+      cand.emplace_back(dist, j);
+    }
+    std::sort(cand.begin(), cand.end());
+    std::vector<uint32_t> nbrs;
+    nbrs.reserve(size_t(PhotoNeighbors));
+    std::vector<uint8_t> used(cand.size(), 0);
+    for (size_t k = 0; k < cand.size() && nbrs.size() < size_t(PhotoNeighbors); ++k) {
+      const uint32_t j = cand[k].second;
+      if (context.model.images[j].camera != cid_i ||
+          std::abs(context.seconds[j] - context.seconds[i]) >= PhotoMinTimeGapS) {
+        nbrs.push_back(j);
+        used[k] = 1;
+      }
+    }
+    for (size_t k = 0; k < cand.size() && nbrs.size() < size_t(PhotoNeighbors); ++k) {
+      if (!used[k])
+        nbrs.push_back(cand[k].second);
+    }
+    if (nbrs.size() < size_t(PhotoMinSeen))
+      return;
+
+    cv::Mat p_min3_i, p_max3_i;
+    cv::erode(view_i.p_lin, p_min3_i, k3);
+    cv::dilate(view_i.p_lin, p_max3_i, k3);
+
+    bool enable_person_near = false;
+    for (const auto& c : context.candidates[i]) {
+      if (c.reason != "static") {
+        enable_person_near = true;
+        break;
+      }
+    }
+    cv::Mat person_near;
+    if (enable_person_near && !view_i.person_small.empty() &&
+        cv::countNonZero(view_i.person_small) > 0) {
+      cv::dilate(view_i.person_small, person_near, person_reach_kernel);
+    }
+
+    struct ValidPx {
+      int x, y;
+      float p_i, p_min3_i, p_max3_i, lum_i, srgb_i, grad_i;
+      uint8_t near_person;
+      Eigen::Vector3d world;
+    };
+    std::vector<ValidPx> valid;
+    valid.reserve(size_t(grid_i.width) * size_t(grid_i.height) / 2);
+    for (int y = 0; y < grid_i.height; ++y) {
+      const uint8_t* mp = view_i.static_mask.ptr<uint8_t>(y);
+      const uint8_t* sp = view_i.depth_smooth.ptr<uint8_t>(y);
+      const uint8_t* np = person_near.empty() ? nullptr : person_near.ptr<uint8_t>(y);
+      const float* pp = view_i.p_lin.ptr<float>(y);
+      const float* pminp = p_min3_i.ptr<float>(y);
+      const float* pmaxp = p_max3_i.ptr<float>(y);
+      const float* lp = view_i.lum_lin.ptr<float>(y);
+      const float* sr = view_i.lum_srgb.ptr<float>(y);
+      const float* gr = view_i.grad_srgb.ptr<float>(y);
+      const float* dp = view_i.depth.ptr<float>(y);
+      for (int x = 0; x < grid_i.width; ++x) {
+        if (!mp[x] || !sp[x])
+          continue;
+        const size_t gidx = size_t(y) * size_t(grid_i.width) + size_t(x);
+        const Eigen::Vector3d moved = grid_i.rays[gidx] * double(dp[x]);
+        const Eigen::Vector3d cam_pt =
+            context.motion
+                ? context.motion->Reference(
+                      i, cid_i,
+                      context.motion->Fraction(
+                          cam_i, {(x + 0.5) / grid_i.scale_x, (y + 0.5) / grid_i.scale_y}),
+                      moved)
+                : moved;
+        const Eigen::Vector3d world =
+            context.rotations[i].transpose() * (cam_pt - context.translations[i]);
+        valid.push_back({x, y, pp[x], pminp[x], pmaxp[x], lp[x], sr[x], gr[x],
+                         uint8_t(np && np[x] ? 1 : 0), world});
+      }
+    }
+    if (valid.empty())
+      return;
+
+    std::vector<uint16_t> seen(valid.size(), 0), dark_global(valid.size(), 0),
+        dark_person(valid.size(), 0), dark_soft(valid.size(), 0), bright_global(valid.size(), 0),
+        bright_soft(valid.size(), 0);
+    struct Hit {
+      size_t k;
+      float p_lo, p_hi;
+    };
+    std::vector<Hit> hits;
+    std::vector<float> ratios;
+    hits.reserve(valid.size());
+    ratios.reserve(valid.size());
+
+    for (const uint32_t j : nbrs) {
+      const auto& view_j = context.photo_views[j];
+      hits.clear();
+      ratios.clear();
+      for (size_t k = 0; k < valid.size(); ++k) {
+        const auto& px = valid[k];
+        double u = 0.0, v = 0.0, d_proj = 0.0;
+        float rho_j = 0.f;
+        if (!ProjectWorldToPhoto(context, j, px.world, u, v, d_proj, rho_j))
+          continue;
+        const int ui = int(std::lround(u)), vi = int(std::lround(v));
+        if (!view_j.static_mask.at<uint8_t>(vi, ui))
+          continue;
+        const float d_j = view_j.depth.at<float>(vi, ui);
+        if (d_j <= 0.30f || std::abs(d_proj - double(d_j)) > std::max(0.08, 0.05 * d_proj))
+          continue;
+        const float l_samp = SampleBilinear(view_j.lum_lin, u, v);
+        const float s_samp = SampleBilinear(view_j.lum_srgb, u, v);
+        const float p_lo = SampleBilinear(view_j.p_min3, u, v);
+        const float p_hi = SampleBilinear(view_j.p_max3, u, v);
+        hits.push_back({k, p_lo, p_hi});
+        if (px.srgb_i > 0.10f && px.srgb_i < 0.90f && s_samp > 0.10f && s_samp < 0.90f)
+          ratios.push_back(px.lum_i / std::max(l_samp, 1e-5f));
+      }
+      if (ratios.size() < size_t(PhotoMinGainSamples))
+        continue;
+      const size_t mid = ratios.size() / 2;
+      std::nth_element(ratios.begin(), ratios.begin() + mid, ratios.end());
+      const float gain = ratios[mid];
+      if (gain < float(PhotoMinPairGain) || gain > float(PhotoMaxPairGain))
+        continue;
+      const float gain_p = std::pow(gain, 1.f / 2.2f);
+      for (const auto& h : hits) {
+        const size_t k = h.k;
+        ++seen[k];
+        const auto& px = valid[k];
+        const float p_lo = h.p_lo * gain_p;
+        const float p_hi = h.p_hi * gain_p;
+        if (p_lo > float(PhotoMinRefPerceptual)) {
+          if (px.grad_i < float(PhotoDarkMaxGrad) && px.p_max3_i < p_lo * float(PhotoDarkRatio) &&
+              px.p_max3_i < p_lo - float(PhotoDarkDiff))
+            ++dark_global[k];
+          if (px.near_person && px.grad_i < float(PhotoPersonDarkMaxGrad) &&
+              px.p_i < p_lo * float(PhotoPersonDarkRatio) &&
+              px.p_i < p_lo - float(PhotoPersonDarkDiff))
+            ++dark_person[k];
+          if (px.grad_i < float(PhotoDarkGrowMaxGrad) &&
+              px.p_i < p_lo * float(PhotoDarkGrowRatio) && px.p_i < p_lo - float(PhotoDarkGrowDiff))
+            ++dark_soft[k];
+        }
+        if (p_hi > float(PhotoMinRefPerceptual)) {
+          if (px.grad_i < float(PhotoBrightMaxGrad) &&
+              px.p_min3_i > p_hi * float(PhotoBrightRatio) &&
+              px.p_min3_i > p_hi + float(PhotoBrightDiff))
+            ++bright_global[k];
+          if (px.grad_i < float(PhotoBrightGrowMaxGrad) &&
+              px.p_i > p_hi * float(PhotoBrightGrowRatio) &&
+              px.p_i > p_hi + float(PhotoBrightGrowDiff))
+            ++bright_soft[k];
+        }
+      }
+    }
+
+    cv::Mat dark_global_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+    cv::Mat dark_person_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+    cv::Mat dark_soft_map = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+    cv::Mat bright_seed_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+    cv::Mat bright_soft_map = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+    for (size_t k = 0; k < valid.size(); ++k) {
+      const uint16_t s = seen[k];
+      if (s < uint16_t(PhotoGrowMinSeen))
+        continue;
+      const int x = valid[k].x, y = valid[k].y;
+      if (double(dark_soft[k]) >= PhotoDarkGrowShare * double(s))
+        dark_soft_map.at<uint8_t>(y, x) = 255;
+      if (double(bright_soft[k]) >= PhotoBrightGrowShare * double(s))
+        bright_soft_map.at<uint8_t>(y, x) = 255;
+      if (s >= uint16_t(PhotoPersonMinSeen) &&
+          double(dark_person[k]) >= PhotoPersonDarkShare * double(s))
+        dark_person_raw.at<uint8_t>(y, x) = 255;
+      if (s < uint16_t(PhotoMinSeen))
+        continue;
+      if (double(dark_global[k]) >= PhotoDarkShare * double(s))
+        dark_global_raw.at<uint8_t>(y, x) = 255;
+      if (double(bright_global[k]) >= PhotoBrightShare * double(s))
+        bright_seed_raw.at<uint8_t>(y, x) = 255;
+    }
+
+    const cv::Mat dark_seed =
+        FilterComponents(dark_global_raw, PhotoMinCompArea) |
+        FilterComponents(dark_person_raw, PhotoPersonMinCompArea);
+    const cv::Mat dark_mask =
+        GrowHysteresisMask(dark_seed, dark_soft_map, PhotoDarkGrowRadius, PhotoDarkDilateRadius);
+    const cv::Mat bright_mask = GrowHysteresisMask(
+        FilterComponents(bright_seed_raw, PhotoMinCompArea), bright_soft_map, PhotoBrightGrowRadius,
+        PhotoBrightDilateRadius);
+    if (dark_mask.empty() && bright_mask.empty())
+      return;
+
+    cv::Mat combined = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+    if (!dark_mask.empty())
+      combined.setTo(1, dark_mask > 0);
+    if (!bright_mask.empty()) {
+      for (int y = 0; y < grid_i.height; ++y) {
+        const uint8_t* bp = bright_mask.ptr<uint8_t>(y);
+        uint8_t* cp = combined.ptr<uint8_t>(y);
+        for (int x = 0; x < grid_i.width; ++x)
+          if (bp[x])
+            cp[x] |= 2;
+      }
+    }
+    const int static_count = cv::countNonZero(view_i.static_mask);
+    const int masked_count = cv::countNonZero((combined > 0) & view_i.static_mask);
+    if (static_count > 0 &&
+        double(masked_count) > PhotoMaxImageMaskShare * double(static_count)) {
+      context.photo_views[i].capped = true;
+      return;
+    }
+    context.photo_views[i].transient_mask = std::move(combined);
+  });
+
+  for (const uint32_t id : written) {
+    auto& view = context.photo_views[id];
+    view.lum_lin.release();
+    view.lum_srgb.release();
+    view.grad_srgb.release();
+    view.p_lin.release();
+    view.p_min3.release();
+    view.p_max3.release();
+    view.depth.release();
+    view.depth_smooth.release();
+    view.static_mask.release();
+    view.person_small.release();
+  }
+  context.photo_seconds = Seconds(started);
+}
 // Pass 3, per image: static candidates become static in the mask, unless a candidate that stays
 // masked is next to them; false-positive sky components and indoor skies become static too.
 ApplyCounts Apply(Context& context, uint32_t id, cv::Size grid) {
@@ -707,6 +1479,29 @@ ApplyCounts Apply(Context& context, uint32_t id, cv::Size grid) {
   }
   if (context.keep_sky && cv::countNonZero(labelled.mask == 128) > 0)
     RefineOutdoorSkyBoundary(context, id, labelled.mask, counts);
+  const cv::Mat& photo_transient = context.photo_views[id].transient_mask;
+  if (!photo_transient.empty()) {
+    const uint32_t cam_idx = model.images[id].camera;
+    const cv::Mat& full_dom = context.full_domains[cam_idx];
+    const cv::Mat dark_small = (photo_transient & 1) != 0;
+    const cv::Mat bright_small = (photo_transient & 2) != 0;
+    cv::Mat dark_change = cv::Mat::zeros(camera.height, camera.width, CV_8UC1);
+    cv::Mat bright_change = cv::Mat::zeros(camera.height, camera.width, CV_8UC1);
+    if (cv::countNonZero(dark_small) > 0) {
+      cv::Mat dark_up;
+      cv::resize(dark_small, dark_up, {camera.width, camera.height}, 0, 0, cv::INTER_LINEAR);
+      dark_change = (dark_up >= 128) & (labelled.mask == 255) & full_dom;
+      counts.photo_dark = uint64_t(cv::countNonZero(dark_change));
+      labelled.mask.setTo(0, dark_change);
+    }
+    if (cv::countNonZero(bright_small) > 0) {
+      cv::Mat bright_up;
+      cv::resize(bright_small, bright_up, {camera.width, camera.height}, 0, 0, cv::INTER_LINEAR);
+      bright_change = (bright_up >= 128) & (labelled.mask == 255) & full_dom;
+      counts.photo_bright = uint64_t(cv::countNonZero(bright_change));
+      labelled.mask.setTo(0, bright_change);
+    }
+  }
   const auto path = context.destination(id);
   fs::create_directories(path.parent_path());
   WriteImage(path, labelled.mask, 1);
@@ -727,7 +1522,49 @@ Json StaticMaskRules() {
           {"sky_edge_guided_filter_radius_4k", SkyEdgeGuidedRadius4k},
           {"sky_edge_alpha_threshold", SkyEdgeAlphaThreshold},
           {"sky_canopy_pore_max_area_4k", SkyCanopyPoreMaxArea4k},
-          {"sky_canopy_foliage_border_share", SkyCanopyFoliageBorderShare}};
+          {"sky_canopy_foliage_border_share", SkyCanopyFoliageBorderShare},
+          {"photo_grid_size", PhotoGridSize},
+          {"photo_neighbors", PhotoNeighbors},
+          {"photo_max_neighbor_dist_m", PhotoMaxNeighborDistM},
+          {"photo_min_time_gap_s", PhotoMinTimeGapS},
+          {"photo_min_depth_m", PhotoMinDepthM},
+          {"photo_max_depth_m", PhotoMaxDepthM},
+          {"photo_max_depth_grad", PhotoMaxDepthGrad},
+          {"photo_min_gain_samples", PhotoMinGainSamples},
+          {"photo_min_seen", PhotoMinSeen},
+          {"photo_grow_min_seen", PhotoGrowMinSeen},
+          {"photo_min_pair_gain", PhotoMinPairGain},
+          {"photo_max_pair_gain", PhotoMaxPairGain},
+          {"photo_min_ref_perceptual", PhotoMinRefPerceptual},
+          {"photo_min_comp_area", PhotoMinCompArea},
+          {"photo_max_image_mask_share", PhotoMaxImageMaskShare},
+          {"photo_dark_share", PhotoDarkShare},
+          {"photo_dark_ratio", PhotoDarkRatio},
+          {"photo_dark_diff", PhotoDarkDiff},
+          {"photo_dark_max_grad", PhotoDarkMaxGrad},
+          {"photo_dark_grow_share", PhotoDarkGrowShare},
+          {"photo_dark_grow_ratio", PhotoDarkGrowRatio},
+          {"photo_dark_grow_diff", PhotoDarkGrowDiff},
+          {"photo_dark_grow_max_grad", PhotoDarkGrowMaxGrad},
+          {"photo_dark_grow_radius", PhotoDarkGrowRadius},
+          {"photo_dark_dilate_radius", PhotoDarkDilateRadius},
+          {"photo_bright_share", PhotoBrightShare},
+          {"photo_bright_ratio", PhotoBrightRatio},
+          {"photo_bright_diff", PhotoBrightDiff},
+          {"photo_bright_max_grad", PhotoBrightMaxGrad},
+          {"photo_bright_grow_share", PhotoBrightGrowShare},
+          {"photo_bright_grow_ratio", PhotoBrightGrowRatio},
+          {"photo_bright_grow_diff", PhotoBrightGrowDiff},
+          {"photo_bright_grow_max_grad", PhotoBrightGrowMaxGrad},
+          {"photo_bright_grow_radius", PhotoBrightGrowRadius},
+          {"photo_bright_dilate_radius", PhotoBrightDilateRadius},
+          {"photo_person_shadow_reach", PhotoPersonShadowReach},
+          {"photo_person_min_seen", PhotoPersonMinSeen},
+          {"photo_person_min_comp_area", PhotoPersonMinCompArea},
+          {"photo_person_dark_share", PhotoPersonDarkShare},
+          {"photo_person_dark_ratio", PhotoPersonDarkRatio},
+          {"photo_person_dark_diff", PhotoPersonDarkDiff},
+          {"photo_person_dark_max_grad", PhotoPersonDarkMaxGrad}};
 }
 Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterMotion* motion,
                  const LasHeader& header, LasSurfelCache& cache,
@@ -739,6 +1576,7 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
   context.las_interior.resize(model.images.size());
   context.candidates.resize(model.images.size());
   context.skies.resize(model.images.size());
+  context.photo_views.resize(model.images.size());
   for (int c = 0; c < 2; ++c) {
     cv::Mat domain = model.cameras[c].Mask();
     context.full_domains[c] = domain.clone();
@@ -748,6 +1586,29 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
     context.full_domain_grid_pixels[c] = cv::countNonZero(grid_domain);
     cv::erode(domain, domain, cv::getStructuringElement(cv::MORPH_ELLIPSE, {31, 31}));
     context.domains[c] = domain;
+
+    auto& pg = context.photo_grids[c];
+    pg.grid_cam = MapCamera(model.cameras[c], PhotoGridSize);
+    pg.width = pg.grid_cam.width;
+    pg.height = pg.grid_cam.height;
+    pg.scale_x = double(pg.width) / double(model.cameras[c].width);
+    pg.scale_y = double(pg.height) / double(model.cameras[c].height);
+    pg.domain = pg.grid_cam.Mask();
+    pg.rays.resize(size_t(pg.width) * size_t(pg.height));
+    pg.rho.resize(size_t(pg.width) * size_t(pg.height), 0.f);
+    for (int y = 0; y < pg.height; ++y) {
+      const uint8_t* dp = pg.domain.ptr<uint8_t>(y);
+      for (int x = 0; x < pg.width; ++x) {
+        if (!dp[x])
+          continue;
+        const size_t gidx = size_t(y) * size_t(pg.width) + size_t(x);
+        const Eigen::Vector3d ray = model.cameras[c].Ray(
+            {(x + 0.5) / pg.scale_x, (y + 0.5) / pg.scale_y});
+        pg.rays[gidx] = ray;
+        const double theta = std::acos(std::clamp(ray.z(), -1.0, 1.0));
+        pg.rho[gidx] = float(theta / (80.0 * Pi / 180.0));
+      }
+    }
   }
   for (const auto& image : model.images) {
     context.rotations.push_back(image.pose.Rotation().toRotationMatrix());
@@ -791,7 +1652,7 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
   ParallelFor(work.size(), workers, 4, [&](size_t i) {
     Judge(context, context.candidates[work[i].first][work[i].second]);
   });
-  // Scene-level sky decision before Pass 3.
+  // Scene-level sky decision before Pass 2.5 and Pass 3.
   std::vector<uint32_t> written;
   for (uint32_t i = 0; i < model.images.size(); ++i)
     if (model.images[i].registered)
@@ -812,6 +1673,8 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
   context.keep_sky =
       open_sky_images >= min_open_images &&
       double(open_sky_images) >= SkySceneMinImageShare * double(written.size());
+  // Pass 2.5: multi-view photometric outlier detection (moving shadows and specular glare).
+  DetectPhotometricTransients(context, written, workers);
   // Pass 3: the new masks, on the same grid as pass 1.
   const auto map_camera = [&](uint32_t id) { return MapCamera(model.cameras[model.images[id].camera], MapSize); };
   std::vector<ApplyCounts> applied(model.images.size());
@@ -829,7 +1692,9 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
   Json rows = Json::array();
   std::map<std::string, size_t> reasons;
   uint64_t pixels = 0, sky_pixels = 0, sky_edge_to_sky = 0, sky_edge_to_static = 0;
+  uint64_t photo_dark_pixels = 0, photo_bright_pixels = 0;
   size_t changed = 0, sky_changed = 0, sky_edge_refined = 0;
+  size_t photo_dark_images = 0, photo_bright_images = 0, photo_capped_images = 0;
   for (const auto id : written) {
     pixels += applied[id].person_unmasked;
     changed += applied[id].person_unmasked > 0;
@@ -838,6 +1703,11 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
     sky_edge_to_sky += applied[id].sky_edge_to_sky;
     sky_edge_to_static += applied[id].sky_edge_to_static;
     sky_edge_refined += (applied[id].sky_edge_to_sky > 0 || applied[id].sky_edge_to_static > 0);
+    photo_dark_pixels += applied[id].photo_dark;
+    photo_dark_images += applied[id].photo_dark > 0;
+    photo_bright_pixels += applied[id].photo_bright;
+    photo_bright_images += applied[id].photo_bright > 0;
+    photo_capped_images += context.photo_views[id].capped ? 1 : 0;
     for (const auto& c : context.candidates[id]) {
       ++reasons[c.reason];
       Json row = {{"image_index", id},
@@ -863,7 +1733,11 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
       std::to_string(sky_pixels) + " sky pixels (" + std::to_string(sky_changed) +
       " images), edge refined " + std::to_string(sky_edge_refined) + " images (+" +
       std::to_string(sky_edge_to_sky) + " sky, +" + std::to_string(sky_edge_to_static) +
-      " static)");
+      " static), photometric masked dark " + std::to_string(photo_dark_pixels) + " px (" +
+      std::to_string(photo_dark_images) + " images) & bright " +
+      std::to_string(photo_bright_pixels) + " px (" + std::to_string(photo_bright_images) +
+      " images, capped " + std::to_string(photo_capped_images) + ") in " +
+      std::to_string(context.photo_seconds) + " s");
   return {{"images", written.size()},
           {"images_changed", changed},
           {"components", rows.size()},
@@ -879,6 +1753,16 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
             {"edge_refined_images", sky_edge_refined},
             {"edge_to_sky_pixels", sky_edge_to_sky},
             {"edge_to_static_pixels", sky_edge_to_static}}},
+          {"photometric",
+           {{"vignetting_coeffs",
+             {{context.vig_coeffs[0][0], context.vig_coeffs[0][1], context.vig_coeffs[0][2]},
+              {context.vig_coeffs[1][0], context.vig_coeffs[1][1], context.vig_coeffs[1][2]}}},
+            {"dark_images", photo_dark_images},
+            {"dark_pixels", photo_dark_pixels},
+            {"bright_images", photo_bright_images},
+            {"bright_pixels", photo_bright_pixels},
+            {"capped_images", photo_capped_images},
+            {"seconds", context.photo_seconds}}},
           {"rules", StaticMaskRules()},
           {"seconds", Seconds(started)},
           {"component_rows", rows}};
