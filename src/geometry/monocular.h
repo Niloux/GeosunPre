@@ -70,13 +70,15 @@ struct MogeSsiResult {
   std::vector<double> face_scales;
   Json report;
 };
-// Aligns face scales across overlapping 90-degree MoGe-2 faces using median ratios, blends ray
-// distance and camera-facing unit normals onto the supervision grid (rotating fused normals back
-// to each readout-line camera frame when omega is nonzero), masks by allowed, and encodes SSI
-// 16-bit depth + 8-bit OpenCV camera normal maps.
+// Aligns each MoGe-2 face to cleaned LAS metric ray distances (falling back to overlap median
+// ratios where LAS support is sparse), applies an edge-preserving 3D bilateral grid log-residual
+// refinement anchored to LAS, blends ray distance and camera-facing unit normals onto the
+// supervision grid (rotating fused normals back to each readout-line camera frame when omega is
+// nonzero), masks by allowed, and encodes SSI 16-bit depth + 8-bit OpenCV camera normal maps.
 MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
                                 const std::vector<FaceEstimate>& faces,
                                 const cv::Mat& allowed,
                                 const Eigen::Vector3d* omega,
-                                int axis);
+                                int axis,
+                                const cv::Mat* las_depth = nullptr);
 }  // namespace geosun

@@ -207,3 +207,24 @@ Ceres 2.2.0 在 `LAPACK=OFF`、`SUITESPARSE=OFF` 下，所有纯 CPU 替代求�
 | 卷帘 `used` / 留出中位 (`px`) | `true` / `1.1528` | `true` / `1.1525` |
 
 - **结论与未验证项**：目视抽检 `00235-L`、`00236-L`、`00294-L`、`00313-L`、`00264-L`、`00036-L` 腕表/腿鞋/人影均已完整覆盖，且 `00051-L`/`00081-L` 人形展品及展台保持静态未误杀。尚未用 `work/展厅-maskfix` 跑完下游 3DGS 全程训练以直接对比训练后的红框与路面视觉效果（另：路面大片分层主因为 MoGe-2 SSI 深度先验在展厅地板系统性偏深 `+10~+36 cm`，待下一步单独验证）。
+
+## 2026-11-25：LAS 分面尺度对齐与三维双边网格残差细化消除 MoGe-2 SSI 地面分层
+
+- **根因诊断（基于 `展厅-maskfix`、`points3D.bin` 与下游 `LichtFeld-Studio` `fitDepthAnchors`）**：下游 `fitDepthAnchors` 仅对每帧监督深度做一次全局仿射拟合 `a * d + b`，而 MoGe-2 90° 透视子图仅凭重叠中位比值拼接时存在显著跨面尺度漂移（`face_scales` `p1–p99 = 0.49–1.68`）与近距离地板偏深（例如 `00264-L` 在非地面 SfM 观测拟合下地面有符号中位误差 `+41.0 cm`，`411` 幅含地面视角 `P90` 达 `33.24 cm`、`p10..p90` 跨越 `[-22.34, +22.76] cm`），导致多视角监督把同一块抛光地面在三维空间拉出多层高斯片；此外极少数贴近有效域边缘的极近伪影（`00264-R` `min_d = 0.14 m`）也会压缩 16 位 SSI 动态范围。
+- **改动**（保持下游 `moge2_ssi` / `uint16_png_ssi` 契约与 `LichtFeld-Studio` 零改动）：
+  - [monocular.h](../src/geometry/monocular.h)、[monocular.cpp](../src/geometry/monocular.cpp)：`EncodeMogeSsiMaps` 新增可选 `las_depth` 输入，先用 5×5 局部最小抑遮挡窗口（`d <= las_min * 1.08 + 0.08`、`[0.20, 60.0] m`）清洗 LAS 投影深度；对每个高权重静态样本不少于 `256` 点的子图先求稳健尺度并在景深跨度充足且严格降差时叠加 8 轮 Cauchy IRLS 仿射对齐，再融合并由重叠中位比值补齐无 LAS 支撑子图；随后在 `[log d, x, y]` 三维双边网格（`sigma_s = max(16, max(w,h)/32)`、`sigma_r = 0.25`、阈值 `0.45` 过滤玻璃穿透）上做 2 遍保边平滑残差校准，最后按 `[0.1%, 99.9%]` 分位（下界 `0.05 m`）编码为 `[1311, 65535]` 16 位 SSI PNG。
+  - [supervision.h](../src/geometry/supervision.h)、[supervision.cpp](../src/geometry/supervision.cpp)、[colmap.cpp](../src/io/colmap.cpp)：`ExportSupervision` 在加载 TensorRT 几何引擎前投影最终交付视角的 LAS 深度至 `.las_scratch/las_depths.u16` 后立即释放 LAS GPU 缓存；完整 `run` 下 `BuildStaticMasks` 将新鲜构建的 `LasSurfelCache` 移交给 `ExportSupervision` 复用，仅解析一次 LAS；`SupervisionRequest` 与 `supervision.json` 新增 `depth_alignment = "las_face_bilateral_v1"` 与 `las_file` 请求身份。
+  - [supervision.md](supervision.md)、[cache.md](cache.md)、[output.md](output.md)：同步更新监督导出流程与请求字段说明。
+- **实景验证**（`.\tools\windows\build.ps1` Ninja Release `/W4` 0 错误 0 新增警告；非破坏性独立 `export` 至保留目录 `work/展厅-depthfix` 与 `work/小场景-depthfix` 并均通过 `geosunpre check`，确认 `.las_scratch` 无残留）：
+
+| 指标 | `展厅-maskfix`（纯 MoGe-2） | `展厅-depthfix`（LAS 对齐） | `小场景-opt24`（纯 MoGe-2） | `小场景-depthfix`（LAS 对齐） |
+| --- | :---: | :---: | :---: | :---: |
+| `geosunpre check` / 图数 | `passed: true` / `588` | **`passed: true` / `588`** | `passed: true` / `296` | **`passed: true` / `296`** |
+| `PLY and supervision`（含 LAS 投影） | — | `126.70 s`（LAS `23.53 s`） | — | `63.35 s`（LAS `9.12 s`） |
+| LAS 对齐子图 / 双边细化生效 | `0` / `0` | **`4116/4116`** / **`588/588`** | `0` / `0` | **`2072/2072`** / **`296/296`** |
+| 对齐后相对清洁 LAS 逐像素绝对误差 `med / p90` | — | **`1.92 / 3.52 cm`** | — | **`1.28 / 4.75 cm`** |
+| 非地面 SfM 仿射拟合后地面误差 `\|signed_med\| p50 / p90`（`411` 图） | `10.78 / 33.24 cm` | **`1.31 / 6.43 cm`** | — | — |
+| 全图 SfM 仿射拟合后绝对误差 `p50 / p90` / 纯米制 `p50` | `00264-L` 地面 `+41.0 cm` | 地面纯米制 `-0.2 cm` | `6.20 / 17.28 cm` | **`1.95 / 5.49 cm`**（`1.92 cm`） |
+| 局部对数深度梯度相关性 `p5 / p50` | — | `0.9147 / 0.9764` | — | **`0.9750 / 0.9918`** |
+
+- **结论与未验证项**：两个室内及室外混合场景的地面/三维尺度跨视角一致性均大幅改善且完整保持边缘细节，下游 LFS 接口无需任何修改即可直接受益；`00264-L` / `00236-L` / `00292-L` 可视化核验显示地板/墙面分面尺度错位消除且建筑轮廓锐利。**未验证项**：1）尚未以 `work/展厅-depthfix` 在下游 `LichtFeld-Studio` 跑完 29,000 步 3DGS 训练以实测成图地面分层消除情况；2）本次通过独立 `export`（命中已有 `static_masks` 缓存）验证，完整从头 `run` 中由 `BuildStaticMasks` 直接移交复用 `LasSurfelCache` 的路径已通过编译与静态检查，尚未在重跑全流程时实测耗时。

@@ -18,6 +18,7 @@ namespace geosun {
 namespace {
 constexpr const char* SupervisionSource = "moge2_ssi";
 constexpr const char* DepthSource = "moge2_ssi";
+constexpr const char* DepthAlignment = "las_face_bilateral_v1";
 constexpr const char* NormalSource = "moge2_normals";
 constexpr const char* DepthFormat = "uint16_png_ssi";
 constexpr const char* DepthType = "ray_distance";
@@ -548,10 +549,12 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
   }
   Json request = {{"source", SupervisionSource},
                   {"depth_source", DepthSource},
+                  {"depth_alignment", DepthAlignment},
                   {"normal_source", NormalSource},
                   {"max_size", options.max_size},
                   {"boundary_pixels", options.boundary},
                   {"exclusion_mask_dir", options.mask_dir.u8string()},
+                  {"las_file", FileMetadata(scene.las)},
                   {"static_masks", static_masks},
                   {"exclusion_masks", masks},
                   {"rolling_shutter", rolling},
@@ -678,9 +681,81 @@ void ProjectLasDepths(LasSurfelCache& cache, const LasHeader& header, const Reco
 }
 Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs::path& masks_dir,
                        const fs::path& output, const SupervisionOptions& options,
-                       const ShutterMotion* motion) {
+                       const ShutterMotion* motion, LasSurfelCache* surfel_cache) {
   const auto started = Clock::now();
   const auto request = SupervisionRequest(scene, model, masks_dir, options, motion != nullptr);
+
+  struct LasScratchGuard {
+    fs::path dir;
+    void Cleanup() {
+      if (dir.empty())
+        return;
+      std::error_code ec;
+      fs::remove_all(dir, ec);
+      dir.clear();
+    }
+    ~LasScratchGuard() { Cleanup(); }
+  };
+  const fs::path scratch_dir = output / ".las_scratch";
+  fs::create_directories(scratch_dir);
+  LasScratchGuard scratch_guard{scratch_dir};
+
+  struct LasDepthRecord {
+    uint64_t offset = 0;
+    int width = 0, height = 0;
+    bool valid = false;
+  };
+  std::vector<LasDepthRecord> las_records(model.images.size());
+  const fs::path las_depths_path = scratch_dir / "las_depths.u16";
+  double las_project_seconds = 0.0;
+  {
+    const auto las_started = Clock::now();
+    const auto header = ReadSceneLas(scene);
+    std::unique_ptr<LasSurfelCache> owned_cache;
+    LasSurfelCache* active_cache = surfel_cache;
+    if (!active_cache) {
+      owned_cache = std::make_unique<LasSurfelCache>(scene.las, header, scratch_dir,
+                                                     options.cache_mb, &model);
+      active_cache = owned_cache.get();
+    }
+    std::ofstream out(las_depths_path, std::ios::binary);
+    if (!out)
+      throw std::runtime_error("Cannot create temporary LAS depth cache");
+    uint64_t offset = 0;
+    std::vector<uint16_t> buffer;
+    ProjectLasDepths(*active_cache, header, model, motion, options.max_size,
+                     [&](uint32_t id, cv::Mat&& depth) {
+                       if (depth.type() != CV_32FC1)
+                         throw std::runtime_error("Unexpected projected LAS depth map format");
+                       const int mw = depth.cols, mh = depth.rows;
+                       const size_t n = size_t(mw) * size_t(mh);
+                       buffer.resize(n);
+                       const cv::Mat contig = depth.isContinuous() ? depth : depth.clone();
+                       const float* src = contig.ptr<float>();
+                       for (size_t i = 0; i < n; ++i) {
+                         const float d = src[i];
+                         buffer[i] = d > 0.f && std::isfinite(d)
+                                         ? uint16_t(std::clamp(std::lround(double(d) * 1000.0),
+                                                               1L, 65535L))
+                                         : uint16_t(0);
+                       }
+                       out.write(reinterpret_cast<const char*>(buffer.data()),
+                                 std::streamsize(n * sizeof(uint16_t)));
+                       if (!out)
+                         throw std::runtime_error("Cannot write temporary LAS depth cache");
+                       las_records[id] = {offset, mw, mh, true};
+                       offset += uint64_t(n * sizeof(uint16_t));
+                     });
+    out.close();
+    if (!out)
+      throw std::runtime_error("Incomplete temporary LAS depth cache write");
+    las_project_seconds = Seconds(las_started);
+    // Release LAS GPU buffers and temporary files before TensorRT loads the geometry engine.
+    active_cache->Finish();
+    owned_cache.reset();
+    Log("Supervision LAS depths projected in " + std::to_string(las_project_seconds) + " s");
+  }
+
   std::vector<Json> rows(model.images.size());
   auto geometry = std::make_unique<Models>(options.geometry_models);
   auto estimator = std::make_unique<MonocularEstimator>(*geometry);
@@ -712,6 +787,7 @@ Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs
     cv::Mat allowed;
     int static_pixels = 0;
     cv::Mat prefiltered;
+    cv::Mat las_depth;
   };
   // Lens plans outlive their camera's loop: the CPU blend/write tasks run concurrently.
   std::array<std::optional<MonocularLens>, 2> lens_plans;
@@ -737,6 +813,14 @@ Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs
     lenses.push_back({{"camera", cid}, {"plan", lens->ToJson()}});
 
     std::deque<std::future<LoadedInput>> inputs;
+    struct DrainInputs {
+      std::deque<std::future<LoadedInput>>& queue;
+      ~DrainInputs() {
+        for (auto& item : queue)
+          if (item.valid())
+            item.wait();
+      }
+    } drain_inputs{inputs};
     size_t requested = 0;
     auto load_inputs = [&] {
       for (; inputs.size() < Lookahead && requested < images.size(); ++requested)
@@ -750,7 +834,28 @@ Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs
             photo = photo(cv::Rect(window.x, window.y, window.width, window.height)).clone();
           }
           cv::cvtColor(photo, photo, cv::COLOR_BGR2RGB);
-          return LoadedInput{std::move(allowed), static_count, lens->Prefilter(photo)};
+          cv::Mat las_depth;
+          const auto& rec = las_records[id];
+          if (rec.valid) {
+            if (rec.width != w || rec.height != h)
+              throw std::runtime_error(
+                  "Projected LAS depth dimensions differ from supervision grid");
+            std::ifstream in(las_depths_path, std::ios::binary);
+            if (!in)
+              throw std::runtime_error("Cannot read temporary LAS depth cache");
+            in.seekg(std::streamoff(rec.offset), std::ios::beg);
+            const size_t n = size_t(rec.width) * size_t(rec.height);
+            std::vector<uint16_t> raw(n);
+            if (!in.read(reinterpret_cast<char*>(raw.data()),
+                         std::streamsize(n * sizeof(uint16_t))))
+              throw std::runtime_error("Truncated temporary LAS depth cache");
+            las_depth = cv::Mat(rec.height, rec.width, CV_32FC1);
+            float* dst = las_depth.ptr<float>();
+            for (size_t k = 0; k < n; ++k)
+              dst[k] = raw[k] ? float(raw[k]) * 0.001f : 0.f;
+          }
+          return LoadedInput{std::move(allowed), static_count, lens->Prefilter(photo),
+                             std::move(las_depth)};
         }));
     };
     load_inputs();
@@ -780,9 +885,10 @@ Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs
       writes.push_back(std::async(
           std::launch::async,
           [=, allowed = std::move(loaded.allowed), estimates = std::move(estimates),
-           static_pixels = loaded.static_pixels]() mutable {
+           las_depth = std::move(loaded.las_depth), static_pixels = loaded.static_pixels]() mutable {
             const Eigen::Vector3d* omega_ptr = rolling_moge ? &omega : nullptr;
-            auto ssi = EncodeMogeSsiMaps(*plan, estimates, allowed, omega_ptr, axis);
+            const cv::Mat* las_ptr = las_depth.empty() ? nullptr : &las_depth;
+            auto ssi = EncodeMogeSsiMaps(*plan, estimates, allowed, omega_ptr, axis, las_ptr);
             const auto valid = Counts(ssi.depth_u16, ssi.normal_rgb);
             WriteImage(dp, ssi.depth_u16);
             WriteImage(np, ssi.normal_rgb);
@@ -802,6 +908,7 @@ Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs
   }
   while (!writes.empty())
     finish();
+  scratch_guard.Cleanup();
   const Json geometry_profile = geometry->Profile();
   estimator.reset();
   geometry.reset();
@@ -817,6 +924,7 @@ Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs
   return {{"request", request},
           {"source", SupervisionSource},
           {"depth_source", DepthSource},
+          {"depth_alignment", DepthAlignment},
           {"normal_source", NormalSource},
           {"projection", motion ? "rolling_shutter_readout_line" : "global_shutter"},
           {"depth_format", DepthFormat},
@@ -836,7 +944,8 @@ Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs
           {"images", images},
           {"inference", geometry_profile},
           {"timing",
-           {{"moge_estimate_seconds", estimate_seconds},
+           {{"las_project_seconds", las_project_seconds},
+            {"moge_estimate_seconds", estimate_seconds},
             {"photo_and_mask_wait_seconds", load_wait_seconds},
             {"result_write_wait_seconds", write_wait_seconds}}},
           {"seconds", Seconds(started)}};

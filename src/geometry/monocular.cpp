@@ -485,13 +485,324 @@ struct FacePixelSample {
   float distance = 0.f;
   float weight = 0.f;
 };
+constexpr size_t MinimumFaceLasSamples = 256;
+constexpr float MinimumFaceFitWeight = 0.1f;
+constexpr size_t MinimumBilateralLasSamples = 256;
+constexpr double BilateralLogGate = 0.45;
+constexpr double BilateralCauchyScale = 0.18;
+constexpr double BilateralSigmaR = 0.25;
+constexpr double BilateralDamping = 2.0;
+constexpr double BilateralMaxLogShift = 0.45;
+
+cv::Mat CleanLasDepth(const cv::Mat& las_depth, const cv::Mat& allowed) {
+  if (las_depth.empty())
+    return {};
+  if (las_depth.type() != CV_32FC1 || las_depth.size() != allowed.size())
+    throw std::runtime_error("LAS depth map differs from the supervision grid");
+  const int h = las_depth.rows, w = las_depth.cols;
+  cv::Mat las_inf(h, w, CV_32FC1, cv::Scalar(1e9f));
+  for (int y = 0; y < h; ++y) {
+    const float* src = las_depth.ptr<float>(y);
+    const uint8_t* allow = allowed.ptr<uint8_t>(y);
+    float* dst = las_inf.ptr<float>(y);
+    for (int x = 0; x < w; ++x) {
+      const float d = src[x];
+      if (allow[x] && std::isfinite(d) && d >= 0.20f && d <= 60.0f)
+        dst[x] = d;
+    }
+  }
+  cv::Mat las_min;
+  cv::erode(las_inf, las_min, cv::getStructuringElement(cv::MORPH_RECT, {5, 5}));
+  cv::Mat las_clean = cv::Mat::zeros(h, w, CV_32FC1);
+  for (int y = 0; y < h; ++y) {
+    const float* src = las_inf.ptr<float>(y);
+    const float* mmin = las_min.ptr<float>(y);
+    float* dst = las_clean.ptr<float>(y);
+    for (int x = 0; x < w; ++x) {
+      const float d = src[x];
+      if (d < 1e8f && d <= mmin[x] * 1.08f + 0.08f)
+        dst[x] = d;
+    }
+  }
+  return las_clean;
+}
+
+struct LasPair {
+  double d_face = 0.0;
+  double d_las = 0.0;
+};
+
+void FitFaceToLas(const std::vector<FacePixelSample>& list, const uint8_t* allowed_ptr,
+                  const float* las_clean_ptr, double& out_a, double& out_b, bool& out_aligned) {
+  out_a = 1.0;
+  out_b = 0.0;
+  out_aligned = false;
+  if (!las_clean_ptr)
+    return;
+
+  std::vector<LasPair> pairs;
+  pairs.reserve(list.size() / 4);
+  for (const auto& item : list) {
+    if (!allowed_ptr[item.pixel] || item.weight < MinimumFaceFitWeight ||
+        !(item.distance > 0.05f) || !std::isfinite(item.distance))
+      continue;
+    const float d_las = las_clean_ptr[item.pixel];
+    if (d_las > 0.f)
+      pairs.push_back({double(item.distance), double(d_las)});
+  }
+  if (pairs.size() < MinimumFaceLasSamples)
+    return;
+
+  std::vector<double> buf(pairs.size());
+  for (size_t k = 0; k < pairs.size(); ++k)
+    buf[k] = pairs[k].d_las / pairs[k].d_face;
+  const double a_init = Quantile(buf, 0.5);
+  if (!std::isfinite(a_init) || a_init <= 0.05 || a_init >= 20.0)
+    return;
+
+  std::vector<LasPair> inliers;
+  inliers.reserve(pairs.size());
+  for (const auto& p : pairs) {
+    const double r = p.d_las / p.d_face;
+    if (r >= 0.35 * a_init && r <= 2.8 * a_init)
+      inliers.push_back(p);
+  }
+  if (inliers.size() < MinimumFaceLasSamples)
+    return;
+
+  std::vector<double> ratios(inliers.size());
+  for (size_t k = 0; k < inliers.size(); ++k)
+    ratios[k] = inliers[k].d_las / inliers[k].d_face;
+  const double a_scale = Quantile(ratios, 0.5);
+  if (!std::isfinite(a_scale) || a_scale <= 0.05 || a_scale >= 20.0)
+    return;
+
+  std::vector<double> errs(inliers.size()), las_vals(inliers.size()), df_vals(inliers.size());
+  for (size_t k = 0; k < inliers.size(); ++k) {
+    errs[k] = std::abs(a_scale * inliers[k].d_face - inliers[k].d_las) / inliers[k].d_las;
+    las_vals[k] = inliers[k].d_las;
+    df_vals[k] = inliers[k].d_face;
+  }
+  const double rel_scale = Quantile(errs, 0.5);
+  out_a = a_scale;
+  out_b = 0.0;
+  out_aligned = true;
+
+  const double las_p10 = Quantile(las_vals, 0.10);
+  const double las_p50 = Quantile(las_vals, 0.50);
+  const double las_p90 = Quantile(las_vals, 0.90);
+  const double df_p01 = Quantile(df_vals, 0.01);
+  if (!(las_p90 / std::max(las_p10, 0.1) >= 1.25 && las_p90 - las_p10 >= 0.40))
+    return;
+
+  double a = a_scale, b = 0.0;
+  std::vector<double> abs_err(inliers.size());
+  for (int iter = 0; iter < 8; ++iter) {
+    for (size_t k = 0; k < inliers.size(); ++k)
+      abs_err[k] = std::abs(a * inliers[k].d_face + b - inliers[k].d_las);
+    const double scale = std::max(0.08, 2.0 * Quantile(abs_err, 0.5));
+    double sxx = 0.0, sx1 = 0.0, s11 = 0.0, sxy = 0.0, sy = 0.0;
+    for (size_t k = 0; k < inliers.size(); ++k) {
+      const double u = abs_err[k] / scale;
+      const double w = 1.0 / (1.0 + u * u);
+      const double x = inliers[k].d_face, y = inliers[k].d_las;
+      sxx += w * x * x;
+      sx1 += w * x;
+      s11 += w;
+      sxy += w * x * y;
+      sy += w * y;
+    }
+    const double det = sxx * s11 - sx1 * sx1;
+    if (!(det > 1e-12))
+      return;
+    a = (sxy * s11 - sy * sx1) / det;
+    b = (sxx * sy - sx1 * sxy) / det;
+  }
+
+  for (size_t k = 0; k < inliers.size(); ++k)
+    errs[k] = std::abs(a * inliers[k].d_face + b - inliers[k].d_las) / inliers[k].d_las;
+  const double rel_affine = Quantile(errs, 0.5);
+  if (std::isfinite(a) && std::isfinite(b) && a > 0.25 * a_scale && a < 2.5 * a_scale &&
+      std::abs(b) <= std::min(1.5, 0.5 * las_p50) && (a * df_p01 + b) > 0.05 &&
+      rel_affine < 0.98 * rel_scale) {
+    out_a = a;
+    out_b = b;
+  }
+}
+
+void BlurGrid3D(std::vector<double>& grid, int gy, int gx, int gz, int passes) {
+  std::vector<double> tmp(grid.size());
+  const size_t stride_y = size_t(gx) * size_t(gz);
+  const size_t stride_x = size_t(gz);
+  for (int pass = 0; pass < passes; ++pass) {
+    for (int y = 0; y < gy; ++y) {
+      const int y0 = std::max(0, y - 1), y2 = std::min(gy - 1, y + 1);
+      for (int x = 0; x < gx; ++x)
+        for (int z = 0; z < gz; ++z) {
+          const size_t off = size_t(x) * stride_x + size_t(z);
+          tmp[size_t(y) * stride_y + off] = 0.25 * grid[size_t(y0) * stride_y + off] +
+                                            0.50 * grid[size_t(y) * stride_y + off] +
+                                            0.25 * grid[size_t(y2) * stride_y + off];
+        }
+    }
+    for (int y = 0; y < gy; ++y)
+      for (int x = 0; x < gx; ++x) {
+        const int x0 = std::max(0, x - 1), x2 = std::min(gx - 1, x + 1);
+        const size_t row = size_t(y) * stride_y;
+        for (int z = 0; z < gz; ++z)
+          grid[row + size_t(x) * stride_x + size_t(z)] =
+              0.25 * tmp[row + size_t(x0) * stride_x + size_t(z)] +
+              0.50 * tmp[row + size_t(x) * stride_x + size_t(z)] +
+              0.25 * tmp[row + size_t(x2) * stride_x + size_t(z)];
+      }
+    for (int y = 0; y < gy; ++y)
+      for (int x = 0; x < gx; ++x) {
+        const size_t base = size_t(y) * stride_y + size_t(x) * stride_x;
+        for (int z = 0; z < gz; ++z) {
+          const int z0 = std::max(0, z - 1), z2 = std::min(gz - 1, z + 1);
+          tmp[base + size_t(z)] = 0.25 * grid[base + size_t(z0)] +
+                                  0.50 * grid[base + size_t(z)] +
+                                  0.25 * grid[base + size_t(z2)];
+        }
+      }
+    grid.swap(tmp);
+  }
+}
+
+struct BilateralStats {
+  size_t las_valid_pixels = 0;
+  size_t las_inlier_pixels = 0;
+  bool bilateral_applied = false;
+  double las_median_abs_err_m = 0.0;
+};
+
+BilateralStats ApplyBilateralLasRefinement(int w, int h, const uint8_t* allowed_ptr,
+                                           const float* las_clean_ptr,
+                                           const std::vector<double>& merged_weight,
+                                           std::vector<double>& merged) {
+  BilateralStats stats;
+  if (!las_clean_ptr)
+    return stats;
+
+  const size_t pixels = size_t(w) * size_t(h);
+  std::vector<double> valid_log_d;
+  std::vector<size_t> las_pixels;
+  valid_log_d.reserve(pixels);
+  for (size_t i = 0; i < pixels; ++i) {
+    if (!allowed_ptr[i] || !(merged_weight[i] > 0.0) || !std::isfinite(merged[i]) ||
+        !(merged[i] > 0.05))
+      continue;
+    valid_log_d.push_back(std::log(merged[i]));
+    if (las_clean_ptr[i] > 0.f)
+      las_pixels.push_back(i);
+  }
+  stats.las_valid_pixels = las_pixels.size();
+  if (las_pixels.size() < MinimumBilateralLasSamples || valid_log_d.size() < MinimumBilateralLasSamples)
+    return stats;
+
+  const double ld_min = Quantile(valid_log_d, 0.005);
+  const double ld_max = std::max(ld_min + 0.25, Quantile(valid_log_d, 0.995));
+  const double sigma_s = std::max(16.0, double(std::max(w, h)) / 32.0);
+  const int gy = int(std::ceil(double(h) / sigma_s)) + 2;
+  const int gx = int(std::ceil(double(w) / sigma_s)) + 2;
+  const int gz = std::clamp(int(std::ceil((ld_max - ld_min) / BilateralSigmaR)) + 3, 4, 48);
+  const double sigma_r = (ld_max - ld_min) / double(std::max(1, gz - 3));
+  const size_t stride_y = size_t(gx) * size_t(gz);
+  const size_t stride_x = size_t(gz);
+
+  std::vector<double> grid_num(size_t(gy) * stride_y, 0.0);
+  std::vector<double> grid_den(size_t(gy) * stride_y, 0.0);
+  std::vector<size_t> inlier_pixels;
+  inlier_pixels.reserve(las_pixels.size());
+
+  for (const size_t i : las_pixels) {
+    const double d_base = merged[i];
+    const double r = std::log(double(las_clean_ptr[i]) / d_base);
+    if (std::abs(r) > BilateralLogGate)
+      continue;
+    inlier_pixels.push_back(i);
+    const double u = r / BilateralCauchyScale;
+    const double w_pix = 1.0 / (1.0 + u * u);
+    const int y = int(i / size_t(w)), x = int(i % size_t(w));
+    const double fy = std::clamp(double(y) / sigma_s, 0.0, double(gy) - 1.001);
+    const double fx = std::clamp(double(x) / sigma_s, 0.0, double(gx) - 1.001);
+    const double fz = std::clamp((std::log(d_base) - ld_min) / sigma_r, 0.0, double(gz) - 1.001);
+    const int iy = int(fy), ix = int(fx), iz = int(fz);
+    const double dy = fy - iy, dx = fx - ix, dz = fz - iz;
+    const double wy[2] = {1.0 - dy, dy};
+    const double wx[2] = {1.0 - dx, dx};
+    const double wz[2] = {1.0 - dz, dz};
+    for (int oy = 0; oy < 2; ++oy)
+      for (int ox = 0; ox < 2; ++ox) {
+        const size_t base = size_t(iy + oy) * stride_y + size_t(ix + ox) * stride_x + size_t(iz);
+        const double wxy = w_pix * wy[oy] * wx[ox];
+        for (int oz = 0; oz < 2; ++oz) {
+          const double ww = wxy * wz[oz];
+          grid_num[base + size_t(oz)] += ww * r;
+          grid_den[base + size_t(oz)] += ww;
+        }
+      }
+  }
+  stats.las_inlier_pixels = inlier_pixels.size();
+
+  if (inlier_pixels.size() >= MinimumBilateralLasSamples) {
+    BlurGrid3D(grid_num, gy, gx, gz, 2);
+    BlurGrid3D(grid_den, gy, gx, gz, 2);
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        const size_t i = size_t(y) * size_t(w) + size_t(x);
+        if (!allowed_ptr[i] || !(merged_weight[i] > 0.0) || !std::isfinite(merged[i]) ||
+            !(merged[i] > 0.05))
+          continue;
+        const double fy = std::clamp(double(y) / sigma_s, 0.0, double(gy) - 1.001);
+        const double fx = std::clamp(double(x) / sigma_s, 0.0, double(gx) - 1.001);
+        const double fz =
+            std::clamp((std::log(merged[i]) - ld_min) / sigma_r, 0.0, double(gz) - 1.001);
+        const int iy = int(fy), ix = int(fx), iz = int(fz);
+        const double dy = fy - iy, dx = fx - ix, dz = fz - iz;
+        const double wy[2] = {1.0 - dy, dy};
+        const double wx[2] = {1.0 - dx, dx};
+        const double wz[2] = {1.0 - dz, dz};
+        double s_num = 0.0, s_den = 0.0;
+        for (int oy = 0; oy < 2; ++oy)
+          for (int ox = 0; ox < 2; ++ox) {
+            const size_t base =
+                size_t(iy + oy) * stride_y + size_t(ix + ox) * stride_x + size_t(iz);
+            const double wxy = wy[oy] * wx[ox];
+            for (int oz = 0; oz < 2; ++oz) {
+              const double ww = wxy * wz[oz];
+              s_num += ww * grid_num[base + size_t(oz)];
+              s_den += ww * grid_den[base + size_t(oz)];
+            }
+          }
+        const double s =
+            s_den > 1e-6
+                ? std::clamp(s_num / (s_den + BilateralDamping), -BilateralMaxLogShift,
+                             BilateralMaxLogShift)
+                : 0.0;
+        merged[i] *= std::exp(s);
+      }
+    stats.bilateral_applied = true;
+  }
+
+  if (!inlier_pixels.empty()) {
+    std::vector<double> abs_errs(inlier_pixels.size());
+    for (size_t k = 0; k < inlier_pixels.size(); ++k) {
+      const size_t i = inlier_pixels[k];
+      abs_errs[k] = std::abs(merged[i] - double(las_clean_ptr[i]));
+    }
+    stats.las_median_abs_err_m = Quantile(abs_errs, 0.5);
+  }
+  return stats;
+}
 }  // namespace
 
 MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
                                 const std::vector<FaceEstimate>& faces,
                                 const cv::Mat& allowed,
                                 const Eigen::Vector3d* omega,
-                                int axis) {
+                                int axis,
+                                const cv::Mat* las_depth) {
   const int w = lens.grid.width, h = lens.grid.height, fsize = lens.size;
   if (faces.size() != lens.faces.size() || allowed.type() != CV_8UC1 || allowed.cols != w ||
       allowed.rows != h)
@@ -508,6 +819,9 @@ MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
 
   const cv::Mat allowed_contig = allowed.isContinuous() ? allowed : allowed.clone();
   const uint8_t* allowed_ptr = allowed_contig.ptr<uint8_t>();
+  const cv::Mat las_clean =
+      las_depth && !las_depth->empty() ? CleanLasDepth(*las_depth, allowed_contig) : cv::Mat();
+  const float* las_clean_ptr = las_clean.empty() ? nullptr : las_clean.ptr<float>();
   const size_t pixels = size_t(w) * h;
   const bool rolling = omega && !omega->isZero();
 
@@ -566,61 +880,88 @@ MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
       has_normal[i] = 1;
     }
 
-  // Align face scales across overlapping faces using median ratio (matching LFS align_face_scales).
-  std::vector<double> scales(face_count, 1.0);
-  std::vector<double> merged(pixels, 0.0);
-  std::vector<double> merged_weight(pixels, 0.0);
-  std::vector<float> ratios;
+  // Align each face to cleaned LAS metric ray distance when supported, then merge remaining faces
+  // via overlapping median scale ratios against already merged faces.
+  std::vector<double> face_a(face_count, 1.0);
+  std::vector<double> face_b(face_count, 0.0);
+  std::vector<uint8_t> face_las_aligned(face_count, 0);
+  size_t las_aligned_faces = 0;
   for (size_t f = 0; f < face_count; ++f) {
-    const auto& list = face_samples[f];
-    if (f > 0) {
-      ratios.clear();
-      for (const auto& item : list) {
-        if (allowed_ptr[item.pixel] && merged_weight[item.pixel] > 0.0 && item.distance > 0.f &&
-            std::isfinite(item.distance))
-          ratios.push_back(float(merged[item.pixel] / double(item.distance)));
-      }
-      if (ratios.size() < MinimumScaleOverlapSamples) {
-        ratios.clear();
-        for (const auto& item : list) {
-          if (merged_weight[item.pixel] > 0.0 && item.distance > 0.f &&
-              std::isfinite(item.distance))
-            ratios.push_back(float(merged[item.pixel] / double(item.distance)));
-        }
-      }
-      if (ratios.size() >= MinimumScaleOverlapSamples) {
-        const auto mid = ratios.begin() + ptrdiff_t(ratios.size() / 2);
-        std::nth_element(ratios.begin(), mid, ratios.end());
-        scales[f] = double(*mid);
-      }
-    }
-    for (const auto& item : list) {
-      if (!(item.distance > 0.f) || !std::isfinite(item.distance) || !(item.weight > 0.f))
-        continue;
-      const double total = merged_weight[item.pixel] + double(item.weight);
-      merged[item.pixel] = (merged[item.pixel] * merged_weight[item.pixel] +
-                            scales[f] * double(item.distance) * double(item.weight)) /
-                           total;
-      merged_weight[item.pixel] = total;
+    bool aligned = false;
+    FitFaceToLas(face_samples[f], allowed_ptr, las_clean_ptr, face_a[f], face_b[f], aligned);
+    if (aligned) {
+      face_las_aligned[f] = 1;
+      ++las_aligned_faces;
     }
   }
 
-  double min_d = std::numeric_limits<double>::infinity();
-  double max_d = -std::numeric_limits<double>::infinity();
+  std::vector<double> merged(pixels, 0.0);
+  std::vector<double> merged_weight(pixels, 0.0);
+  auto merge_face = [&](size_t f, bool use_shift) {
+    const double a = face_a[f], b = face_b[f];
+    for (const auto& item : face_samples[f]) {
+      if (!(item.distance > 0.f) || !std::isfinite(item.distance) || !(item.weight > 0.f))
+        continue;
+      const double d = use_shift ? std::max(0.05, a * double(item.distance) + b)
+                                 : a * double(item.distance);
+      const double total = merged_weight[item.pixel] + double(item.weight);
+      merged[item.pixel] =
+          (merged[item.pixel] * merged_weight[item.pixel] + d * double(item.weight)) / total;
+      merged_weight[item.pixel] = total;
+    }
+  };
+
+  for (size_t f = 0; f < face_count; ++f)
+    if (face_las_aligned[f])
+      merge_face(f, true);
+
+  std::vector<float> ratios;
+  for (size_t f = 0; f < face_count; ++f) {
+    if (face_las_aligned[f])
+      continue;
+    const auto& list = face_samples[f];
+    ratios.clear();
+    for (const auto& item : list) {
+      if (allowed_ptr[item.pixel] && merged_weight[item.pixel] > 0.0 && item.distance > 0.f &&
+          std::isfinite(item.distance))
+        ratios.push_back(float(merged[item.pixel] / double(item.distance)));
+    }
+    if (ratios.size() < MinimumScaleOverlapSamples) {
+      ratios.clear();
+      for (const auto& item : list) {
+        if (merged_weight[item.pixel] > 0.0 && item.distance > 0.f &&
+            std::isfinite(item.distance))
+          ratios.push_back(float(merged[item.pixel] / double(item.distance)));
+      }
+    }
+    if (ratios.size() >= MinimumScaleOverlapSamples) {
+      const auto mid = ratios.begin() + ptrdiff_t(ratios.size() / 2);
+      std::nth_element(ratios.begin(), mid, ratios.end());
+      face_a[f] = double(*mid);
+    }
+    merge_face(f, false);
+  }
+
+  const BilateralStats bilateral =
+      ApplyBilateralLasRefinement(w, h, allowed_ptr, las_clean_ptr, merged_weight, merged);
+
+  std::vector<double> valid_depths;
+  valid_depths.reserve(pixels);
   for (size_t i = 0; i < pixels; ++i) {
     if (!allowed_ptr[i] || !(merged_weight[i] > 0.0) || !std::isfinite(merged[i]) ||
         !(merged[i] > 0.0))
       continue;
-    min_d = std::min(min_d, merged[i]);
-    max_d = std::max(max_d, merged[i]);
+    valid_depths.push_back(merged[i]);
   }
 
   MogeSsiResult out;
   out.depth_u16 = cv::Mat::zeros(h, w, CV_16UC1);
   out.normal_rgb = cv::Mat::zeros(h, w, CV_8UC3);
-  out.face_scales = scales;
+  out.face_scales = face_a;
 
-  if (std::isfinite(min_d) && std::isfinite(max_d)) {
+  if (!valid_depths.empty()) {
+    const double min_d = std::max(0.05, Quantile(valid_depths, 0.001));
+    const double max_d = std::max(min_d + 1e-3, Quantile(valid_depths, 0.999));
     out.min_distance = min_d;
     out.max_distance = max_d;
     const double denom = std::max(max_d - min_d, 1e-6);
@@ -633,9 +974,10 @@ MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
         if (!allowed_ptr[i] || !(merged_weight[i] > 0.0) || !std::isfinite(merged[i]) ||
             !(merged[i] > 0.0))
           continue;
-        const double normalized = 0.02 + 0.98 * ((merged[i] - min_d) / denom);
+        const double clamped = std::clamp(merged[i], min_d, max_d);
+        const double normalized = 0.02 + 0.98 * ((clamped - min_d) / denom);
         out.depth_u16.at<uint16_t>(y, x) =
-            uint16_t(std::clamp(std::lround(normalized * 65535.0), 1L, 65535L));
+            uint16_t(std::clamp(std::lround(normalized * 65535.0), 1311L, 65535L));
         if (has_normal[i]) {
           const auto& n = blended_normals[i];
           out.normal_rgb.at<cv::Vec3b>(y, x) =
@@ -649,12 +991,20 @@ MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
     face_rows.push_back({{"valid_pixels", faces[f].valid},
                          {"shift", faces[f].shift},
                          {"metric_scale", faces[f].metric_scale},
-                         {"aligned_scale", scales[f]}});
+                         {"aligned_scale", face_a[f]},
+                         {"aligned_shift", face_b[f]},
+                         {"las_aligned", face_las_aligned[f] != 0}});
   }
   out.report = {{"min_distance_m", out.min_distance},
                 {"max_distance_m", out.max_distance},
-                {"face_scales", scales},
-                {"faces", std::move(face_rows)}};
+                {"face_scales", face_a},
+                {"faces", std::move(face_rows)},
+                {"las_alignment",
+                 {{"las_valid_pixels", bilateral.las_valid_pixels},
+                  {"las_inlier_pixels", bilateral.las_inlier_pixels},
+                  {"las_aligned_faces", las_aligned_faces},
+                  {"bilateral_applied", bilateral.bilateral_applied},
+                  {"las_median_abs_err_m", bilateral.las_median_abs_err_m}}}};
   return out;
 }
 }  // namespace geosun

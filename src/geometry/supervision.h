@@ -46,7 +46,8 @@ Json SupervisionRequest(const Scene& scene, const Reconstruction& model, const f
 // rectified along omega and fused normals are rotated back to each pixel's readout-line camera.
 Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs::path& masks,
                        const fs::path& output, const SupervisionOptions& options,
-                       const ShutterMotion* motion = nullptr);
+                       const ShutterMotion* motion = nullptr,
+                       LasSurfelCache* surfel_cache = nullptr);
 // Projects the LAS into every registered image and hands over its single-pass nearest tangent-disk
 // ray-distance map (float32, metres, 0 where no LAS record landed) on the MapCamera(max_size) grid,
 // with no mask, hole filling or occlusion handling.

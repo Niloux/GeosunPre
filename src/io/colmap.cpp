@@ -262,10 +262,11 @@ Reconstruction ReadColmap(const fs::path& path, Scene& scene, const Json* shutte
   return m;
 }
 // Masks with the people that are persistent in the scene made static again (see StaticMasks),
-// cached in the work directory beside the masks they come from.
+// cached in the work directory beside the masks they come from. When keep_cache is non-null and
+// a fresh cache had to be built, transfers ownership to keep_cache for supervision projection.
 fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
                           const ShutterMotion* motion, const fs::path& work, const Json& report,
-                          int cache_mb) {
+                          int cache_mb, std::unique_ptr<LasSurfelCache>* keep_cache = nullptr) {
   const auto source = work / "cache/masks", target = work / "cache/static_masks";
   Json inputs = Json::object();
   for (const auto& image : scene.images)
@@ -287,12 +288,16 @@ fs::path BuildStaticMasks(const Scene& scene, const Reconstruction& selected,
   ArchiveInterrupted(pending);
   fs::create_directories(pending);
   const auto header = ReadSceneLas(scene);
-  LasSurfelCache surfel_cache(scene.las, header, work / "cache", cache_mb, &selected);
+  auto surfel_cache =
+      std::make_unique<LasSurfelCache>(scene.las, header, work / "cache", cache_mb, &selected);
   const auto result =
-      StaticMasks(scene, selected, motion, header, surfel_cache,
+      StaticMasks(scene, selected, motion, header, *surfel_cache,
                   [&](uint32_t id) { return source / (std::to_string(id) + ".png"); },
                   [&](uint32_t id) { return pending / (std::to_string(id) + ".png"); });
-  surfel_cache.Finish();
+  if (keep_cache)
+    *keep_cache = std::move(surfel_cache);
+  else
+    surfel_cache->Finish();
   WriteJson(pending / "static_masks.json", {{"request", request}, {"result", result}});
   RemoveAll(target);
   PublishDirectory(pending, target);
@@ -321,12 +326,14 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   // A cropped delivery keeps each lens's valid domain: photos are cut losslessly on the JPEG MCU
   // grid and the readout motion is rescaled to the cropped readout axis.
   auto options = supervision_options;
-  // Static masks use the LAS nearest-depth surfel projection; finish the cache before MoGe-2 runs.
+  std::unique_ptr<LasSurfelCache> surfel_cache;
+  // Static masks use the LAS nearest-depth surfel projection; keep the cache to also project
+  // supervision LAS depths before MoGe-2 loads on the GPU.
   Json static_request = nullptr;
   Json static_summary;
   if (options.enabled && options.static_masks) {
     masks = BuildStaticMasks(scene, selected, rolling ? &motion : nullptr, work, report,
-                             options.cache_mb);
+                             options.cache_mb, &surfel_cache);
     static_request = {{"rules", StaticMaskRules()},
                       {"file", FileMetadata(masks / "static_masks.json")}};
     static_summary = ReadJson(masks / "static_masks.json").at("result");
@@ -386,7 +393,7 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   for (const auto& e : scene.images)
     if (selected.images[e.id].registered && FileMetadata(e.source) != e.source_file)
       throw std::runtime_error("Source image changed since reconstruction: " + e.name);
-  if (include_ply && FileMetadata(scene.las) != scene.sources.at("las"))
+  if ((include_ply || options.enabled) && FileMetadata(scene.las) != scene.sources.at("las"))
     throw std::runtime_error("LAS changed since reconstruction; choose a new work directory");
   auto pending = output;
   pending += ".pending";
@@ -489,9 +496,12 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     });
   Json supervision = nullptr;
   if (options.enabled) {
-    supervision = ExportSupervision(scene, model, masks, pending, options, rolling ? &motion : nullptr);
+    supervision = ExportSupervision(scene, model, masks, pending, options, rolling ? &motion : nullptr,
+                                    surfel_cache.get());
+    surfel_cache.reset();
     WriteJson(pending / "supervision.json", supervision);
   }
+  surfel_cache.reset();
   const Json initialization = include_ply ? initialization_job.get() : Json(nullptr);
   if (generate_roi)
     WriteJson(pending / "roi.json", roi_json);
