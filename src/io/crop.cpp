@@ -566,8 +566,9 @@ void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
   rd_max = std::max(rd_max, 1e-6);
   constexpr int kVigLutSize = 4096;
   constexpr double kMaxThetaRad = 80.0 * Pi / 180.0;
-  std::vector<float> inv_vig_lut(kVigLutSize + 1, 1.0f);
-  const auto& vc = correction.vig_coeffs;
+  std::array<std::vector<float>, 3> inv_vig_lut;
+  for (int ch = 0; ch < 3; ++ch)
+    inv_vig_lut[size_t(ch)].assign(kVigLutSize + 1, 1.0f);
   for (int i = 0; i <= kVigLutSize; ++i) {
     const double rd = rd_max * (double(i) / double(kVigLutSize));
     double theta = rd;
@@ -593,9 +594,12 @@ void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
     }
     const double rho = std::clamp(theta / kMaxThetaRad, 0.0, 1.0);
     const double r2 = rho * rho;
-    const double vig =
-        std::clamp(std::exp(vc[0] * r2 + vc[1] * r2 * r2 + vc[2] * r2 * r2 * r2), 0.35, 1.35);
-    inv_vig_lut[size_t(i)] = float(1.0 / vig);
+    for (int ch = 0; ch < 3; ++ch) {
+      const auto& vc = correction.vig_coeffs_rgb[size_t(ch)];
+      const double vig =
+          std::clamp(std::exp2(vc[0] * r2 + vc[1] * r2 * r2 + vc[2] * r2 * r2 * r2), 0.40, 1.05);
+      inv_vig_lut[size_t(ch)][size_t(i)] = float(1.0 / vig);
+    }
   }
 
   const auto bytes = ReadBytes(source);
@@ -651,6 +655,8 @@ void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
   const float g_g = float(exp_gain * correction.wb_gains[1]);
   const float g_b = float(exp_gain * correction.wb_gains[2]);
   const double rd_scale = double(kVigLutSize) / rd_max;
+  constexpr float kHighlightKnee = 0.92f;
+  constexpr float kHighlightHeadroom = 1.0f - kHighlightKnee;
   for (int y = 0; y < out_h; ++y) {
     const uint8_t* src_row = decoded_rgb.data() + (size_t(wy + y) * size_t(src_w) + size_t(wx)) * 3;
     uint8_t* dst_row = out_rgb.data() + size_t(y) * size_t(out_w) * 3;
@@ -662,13 +668,24 @@ void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
       const double fidx = std::min(rd * rd_scale, double(kVigLutSize));
       const int idx0 = std::min(int(fidx), kVigLutSize - 1);
       const float frac = float(fidx - double(idx0));
-      const float inv_vig =
-          inv_vig_lut[size_t(idx0)] * (1.0f - frac) + inv_vig_lut[size_t(idx0 + 1)] * frac;
+      const float iv_r = inv_vig_lut[0][size_t(idx0)] * (1.0f - frac) +
+                         inv_vig_lut[0][size_t(idx0 + 1)] * frac;
+      const float iv_g = inv_vig_lut[1][size_t(idx0)] * (1.0f - frac) +
+                         inv_vig_lut[1][size_t(idx0 + 1)] * frac;
+      const float iv_b = inv_vig_lut[2][size_t(idx0)] * (1.0f - frac) +
+                         inv_vig_lut[2][size_t(idx0 + 1)] * frac;
 
       const size_t px_off = size_t(x) * 3;
-      const float lr = std::clamp(kSrgbToLin[src_row[px_off + 0]] * g_r * inv_vig, 0.0f, 1.0f);
-      const float lg = std::clamp(kSrgbToLin[src_row[px_off + 1]] * g_g * inv_vig, 0.0f, 1.0f);
-      const float lb = std::clamp(kSrgbToLin[src_row[px_off + 2]] * g_b * inv_vig, 0.0f, 1.0f);
+      auto soft_knee = [&](float v) -> float {
+        if (v <= kHighlightKnee)
+          return v;
+        const float over = v - kHighlightKnee;
+        return std::min(1.0f,
+                        kHighlightKnee + kHighlightHeadroom * (over / (over + kHighlightHeadroom)));
+      };
+      const float lr = soft_knee(std::max(0.0f, kSrgbToLin[src_row[px_off + 0]] * g_r * iv_r));
+      const float lg = soft_knee(std::max(0.0f, kSrgbToLin[src_row[px_off + 1]] * g_g * iv_g));
+      const float lb = soft_knee(std::max(0.0f, kSrgbToLin[src_row[px_off + 2]] * g_b * iv_b));
       dst_row[px_off + 0] = kLinToSrgb[size_t(lr * float(kLinLutSize) + 0.5f)];
       dst_row[px_off + 1] = kLinToSrgb[size_t(lg * float(kLinLutSize) + 0.5f)];
       dst_row[px_off + 2] = kLinToSrgb[size_t(lb * float(kLinLutSize) + 0.5f)];

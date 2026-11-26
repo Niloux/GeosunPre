@@ -340,7 +340,8 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   bool photometric_calibrated = false;
   bool wb_calibrated = false;
   double exposure_ref_ev = 0.0;
-  std::array<std::array<double, 3>, 2> vig_coeffs{};
+  std::string homog_mode = "safe_bounded";
+  std::array<std::array<std::array<double, 3>, 3>, 2> vig_coeffs_rgb{};
   std::unordered_map<uint32_t, CalibratedPhoto> calibrated_photos;
   if (options.enabled && options.static_masks) {
     masks = BuildStaticMasks(scene, selected, rolling ? &motion : nullptr, work, report,
@@ -357,10 +358,13 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
       exposure_ref_ev = pm.at("exposure").value("reference_ev", 0.0);
       if (pm.contains("white_balance"))
         wb_calibrated = pm.at("white_balance").value("calibrated", false);
-      if (pm.contains("vignetting_coeffs") && pm.at("vignetting_coeffs").size() == 2) {
+      if (pm.contains("homogenization"))
+        homog_mode = pm.at("homogenization").value("mode", std::string("safe_bounded"));
+      if (pm.contains("vignetting_coeffs_rgb") && pm.at("vignetting_coeffs_rgb").size() == 2) {
         for (size_t c = 0; c < 2; ++c)
-          for (size_t k = 0; k < 3; ++k)
-            vig_coeffs[c][k] = pm.at("vignetting_coeffs")[c][k].get<double>();
+          for (size_t ch = 0; ch < 3; ++ch)
+            for (size_t k = 0; k < 3; ++k)
+              vig_coeffs_rgb[c][ch][k] = pm.at("vignetting_coeffs_rgb")[c][ch][k].get<double>();
       }
       for (const auto& item : static_summary.at("exposure_ev")) {
         CalibratedPhoto cp;
@@ -409,8 +413,12 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
                        {"windows", {(*windows)[0].ToJson(), (*windows)[1].ToJson()}}};
   if (photometric_calibrated)
     request["photometric_normalization"] = {{"enabled", true},
+                                            {"version", 2},
+                                            {"mode", homog_mode},
                                             {"jpeg_quality", 97},
                                             {"vignetting_corrected", true},
+                                            {"vignetting_rgb", true},
+                                            {"soft_highlight_knee", 0.92},
                                             {"white_balance_corrected", wb_calibrated},
                                             {"reference_ev", exposure_ref_ev}};
   if (include_ply)
@@ -496,7 +504,7 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
       const auto& cp = cal_it->second;
       PhotometricCorrection corr;
       corr.source_camera = selected.cameras[e.camera];
-      corr.vig_coeffs = vig_coeffs[e.camera];
+      corr.vig_coeffs_rgb = vig_coeffs_rgb[e.camera];
       corr.wb_gains = cp.wb_gains;
       corr.pixel_ev_shift = cp.pixel_ev_shift;
       corr.residual_ev = cp.residual_ev;

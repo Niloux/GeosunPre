@@ -19,7 +19,8 @@ set(GEOSUN_SOURCES
   src/io/scene.cpp src/io/cache.cpp src/io/las.cpp src/io/colmap.cpp src/io/crop.cpp
   src/io/roi.cpp src/io/trainer_config.cpp
   src/geometry/camera.cpp src/geometry/model.cpp src/geometry/monocular.cpp
-  src/geometry/supervision.cpp src/geometry/supervision_kernels.cu src/geometry/static_masks.cpp
+  src/geometry/photometric.cpp src/geometry/supervision.cpp
+  src/geometry/supervision_kernels.cu src/geometry/static_masks.cpp
   src/frontend/inference.cpp src/frontend/kernels.cu src/frontend/preprocessing.cu src/frontend/frontend.cpp
   src/sfm/reconstruction.cpp src/sfm/optimization.cpp src/sfm/structure.cpp
   src/sfm/shutter.cpp

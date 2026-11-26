@@ -31,14 +31,15 @@ std::optional<double> ReadJpegExifEv(const fs::path& path);
 // Photometric normalization parameters to apply in linear light during JPEG export.
 struct PhotometricCorrection {
   Camera source_camera;
-  std::array<double, 3> vig_coeffs{0.0, 0.0, 0.0};
+  std::array<std::array<double, 3>, 3> vig_coeffs_rgb{};
   std::array<double, 3> wb_gains{1.0, 1.0, 1.0};
   double pixel_ev_shift = 0.0;
   double residual_ev = 0.0;
 };
-// Decodes source JPEG, optionally crops on pixel coordinates, applies linear de-vignetting,
-// 3-channel white-balance gains, and bounded exposure shift, re-encodes at jpeg_quality, and
-// writes residual_ev into the EXIF APP1 header while preserving non-EXIF markers (e.g. ICC/XMP).
+// Decodes source JPEG, optionally crops on pixel coordinates, applies 3-channel linear
+// de-vignetting, 3-channel white-balance gains, bounded exposure shift, and per-channel soft
+// highlight roll-off, re-encodes at jpeg_quality, and writes residual_ev into EXIF APP1 while
+// preserving non-EXIF markers (e.g. ICC/XMP).
 void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
                           const std::optional<CropWindow>& window,
                           const PhotometricCorrection& correction, int jpeg_quality = 97);
