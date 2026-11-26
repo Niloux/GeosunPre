@@ -22,7 +22,7 @@ cache/{masks,features,matches}_profile.json 保存本次阶段的计算及复用
 
 `cache/{visual,aligned}.bin`：标记 `GEOSUN_RECONSTRUCTION`；相机 JSON 字符串；uint32 gauge_image、scale_image；float64 gauge_baseline；uint64 图像数、点数。图像为 uint32 camera、uint8 registered、7 个 float64 `qx qy qz qw tx ty tz`、uint64 N、N 对 float64 像素坐标。点为 3 个 float64 XYZ、3 个 uint8 RGB、float64 error、uint64 轨迹长度及 `(uint32 image,feature)` 列表。点引用由轨迹重建；空轨迹保留内部编号，导出时省略。
 
-掩码为 `cache/masks/索引.png`。导出时持续人物、经 LAS 核验的天空误检改回静态及多视角光度一致性剔除单帧移动阴影/强镜面高光后的掩码为 `cache/static_masks/索引.png`，其身份（LAS、所选模型、卷帘运动、来源掩码及判定规则）和报告在 `cache/static_masks.json`（交付 `manifest.json` 同时保存不含 `component_rows` 的摘要统计，便于生产模式删除工作目录后回溯）；身份相同时复用，否则重算并替换，不改动 `cache/masks`。阶段完成后才提交状态，中断时保留完成的单图/单对缓存；`.writing` 不作为完成依据。残留交付 `.pending` 在重试时改名保留，再重新生成。
+掩码为 `cache/masks/索引.png`。导出时持续人物、经 LAS 核验的天空误检改回静态及多视角光度一致性剔除单帧移动阴影/强镜面高光/过曝裁切与泛光后的掩码为 `cache/static_masks/索引.png`，其身份（LAS、所选模型、卷帘运动、来源掩码及判定规则）、每图求解曝光/白平衡/安全像素迁移参数（`exposure_ev` 含 `ev`、`pixel_ev_shift`、`residual_ev`、`wb_gains`）与报告在 `cache/static_masks.json`（交付 `manifest.json` 同时保存不含 `component_rows` 与 `exposure_ev` 数组的摘要统计，并在 `images` 中记录 `calibrated_ev`、`raw_relative_ev`、`pixel_ev_shift`、`wb_gains`，便于生产模式删除工作目录后回溯）；身份相同时复用，否则重算并替换，不改动 `cache/masks`。阶段完成后才提交状态，中断时保留完成的单图/单对缓存；`.writing` 不作为完成依据。残留交付 `.pending` 在重试时改名保留，再重新生成。
 
 `cache/incremental.bin` 使用同一重建格式，保存 SfM 的部分注册结果，按时间间隔（距上次保存不少于 20 s 且每注册 8 幅图像触发一次）及停滞或标定剔除时原子更新。补匹配及中断恢复会重新验证匹配几何、重建候选关联，保留已有位姿、三维点和观测身份；该文件不作为视觉验收或导出依据。
 

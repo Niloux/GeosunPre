@@ -1,6 +1,8 @@
 #include "geometry/static_masks.h"
 #include "geometry/supervision.h"
 #include <Eigen/Cholesky>
+#include <Eigen/SparseCholesky>
+#include <Eigen/SparseCore>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -9,7 +11,9 @@
 #include <cstdio>
 #include <deque>
 #include <map>
+#include <numeric>
 #include <thread>
+#include <unordered_map>
 
 namespace geosun {
 namespace {
@@ -61,6 +65,34 @@ constexpr int PhotoBrightGrowRadius = 3, PhotoBrightDilateRadius = 1;
 constexpr int PhotoPersonShadowReach = 24, PhotoPersonMinSeen = 5, PhotoPersonMinCompArea = 12;
 constexpr double PhotoPersonDarkShare = 0.70, PhotoPersonDarkRatio = 0.88, PhotoPersonDarkDiff = 0.04;
 constexpr double PhotoPersonDarkMaxGrad = 0.15;
+// Global multi-view relative exposure, white balance, homogenization, and overexposure clipping.
+constexpr int ExposureNeighbors = 25, ExposureMinSamples = 40, ExposureIters = 15;
+constexpr double ExposureMinSrgb = 0.10, ExposureMaxSrgb = 0.78;
+constexpr double ExposureMaxPairEv = 3.5, ExposureMaxPairMad = 0.45, ExposureHuberDeltaEv = 0.15;
+constexpr double ExposureMinComponentShare = 0.90, ExposureMaxMedianResidualEv = 0.15;
+constexpr double WbMinChSrgb = 0.04, WbMaxChSrgb = 0.84, WbPriorWeight = 0.5, WbMaxAbsEv = 0.35;
+constexpr double WbMaxPairEv = 1.0, WbHuberDeltaEv = 0.08;
+constexpr int WbIters = 5;
+constexpr double HomogKdeBandwidthEv = 0.35, HomogMaxBrightenEv = 1.20, HomogMaxDarkenEv = 1.40;
+constexpr double HomogMinP50Srgb = 0.25;
+constexpr int PhotoClipNeighbors = 32, PhotoClipNearestQuota = 12;
+constexpr double PhotoClipLargeEvDiff = 1.20, PhotoClipMaxNeighborDistM = 25.0;
+constexpr double PhotoClipMaxDepthM = 30.0;
+constexpr double PhotoClipMinLum = 0.92, PhotoClipMinMaxCh = 0.96, PhotoClipMinEvDiff = 0.35;
+constexpr double PhotoClipRefMaxLum = 0.86, PhotoClipRefMaxCh = 0.92;
+constexpr int PhotoClipMinSeen = 2, PhotoClipMinCompArea = 12;
+constexpr double PhotoClipShare = 0.60, PhotoClipGrowLum = 0.88, PhotoClipGrowMaxCh = 0.94;
+constexpr double PhotoClipHighEvBoost = 2.0, PhotoClipHighEvMinLum = 0.95;
+constexpr double PhotoClipHighEvMinMaxCh = 0.985, PhotoClipHighEvMinDepthM = 7.0;
+constexpr double PhotoClipBloomEvBoost = 1.5;
+constexpr int PhotoClipBloomCloseRadius = 4, PhotoClipHighEvDilateRadius = 3;
+constexpr int PhotoClipDilateRadius = 2;
+constexpr double PhotoMaxClipMaskShare = 0.45;
+
+inline float SrgbToLin(float c) {
+  const float x = std::clamp(c, 0.0f, 1.0f);
+  return x <= 0.04045f ? x / 12.92f : std::pow((x + 0.055f) / 1.055f, 2.4f);
+}
 
 struct Candidate {
   uint32_t image = 0;
@@ -92,7 +124,9 @@ struct PhotoCamGrid {
 };
 struct PhotoView {
   cv::Mat lum_lin;
+  cv::Mat rgb_lin;
   cv::Mat lum_srgb;
+  cv::Mat max_srgb;
   cv::Mat grad_srgb;
   cv::Mat p_lin, p_min3, p_max3;
   cv::Mat depth;
@@ -102,6 +136,7 @@ struct PhotoView {
   cv::Mat person_small;
   cv::Mat transient_mask;
   bool capped = false;
+  bool clip_capped = false;
 };
 struct Context {
   const Scene& scene;
@@ -122,6 +157,16 @@ struct Context {
   std::array<std::array<double, 3>, 2> vig_coeffs{};
   double photo_seconds = 0.0;
   bool keep_sky = true;
+  bool exposure_calibrated = false;
+  double exposure_ref_ev = 0.0;
+  std::vector<double> exposure_ev;
+  std::vector<double> pixel_ev_shift;
+  std::vector<double> residual_ev;
+  std::vector<uint8_t> exposure_valid;
+  Json exposure_report = Json::object();
+  bool wb_calibrated = false;
+  std::vector<std::array<double, 3>> wb_gains;
+  Json wb_report = Json::object();
 };
 struct Labelled {
   cv::Mat mask, transient_map, labels, stats, centroids;
@@ -282,22 +327,32 @@ void BuildPhotoView(Context& context, uint32_t id, const cv::Mat& full_mask,
 
   cv::Mat small_bgr, rgb_f;
   cv::resize(bgr, small_bgr, {grid.width, grid.height}, 0, 0, cv::INTER_AREA);
+  view.max_srgb.create(grid.height, grid.width, CV_32FC1);
+  for (int y = 0; y < grid.height; ++y) {
+    const cv::Vec3b* sp = small_bgr.ptr<cv::Vec3b>(y);
+    float* mp = view.max_srgb.ptr<float>(y);
+    for (int x = 0; x < grid.width; ++x)
+      mp[x] = float(std::max({sp[x][0], sp[x][1], sp[x][2]})) / 255.0f;
+  }
   small_bgr.convertTo(rgb_f, CV_32FC3, 1.0 / 255.0);
   cv::GaussianBlur(rgb_f, rgb_f, {3, 3}, 0.7);
 
   view.lum_srgb.create(grid.height, grid.width, CV_32FC1);
   view.lum_lin.create(grid.height, grid.width, CV_32FC1);
+  view.rgb_lin.create(grid.height, grid.width, CV_32FC3);
   for (int y = 0; y < grid.height; ++y) {
     const cv::Vec3f* sp = rgb_f.ptr<cv::Vec3f>(y);
     float* ps = view.lum_srgb.ptr<float>(y);
     float* pl = view.lum_lin.ptr<float>(y);
+    cv::Vec3f* rl = view.rgb_lin.ptr<cv::Vec3f>(y);
     for (int x = 0; x < grid.width; ++x) {
       const float b = std::clamp(sp[x][0], 0.f, 1.f);
       const float g = std::clamp(sp[x][1], 0.f, 1.f);
       const float r = std::clamp(sp[x][2], 0.f, 1.f);
+      const float bl = SrgbToLin(b), gl = SrgbToLin(g), rl_v = SrgbToLin(r);
       ps[x] = 0.114f * b + 0.587f * g + 0.299f * r;
-      pl[x] = 0.0722f * std::pow(b, 2.2f) + 0.7152f * std::pow(g, 2.2f) +
-              0.2126f * std::pow(r, 2.2f);
+      pl[x] = 0.0722f * bl + 0.7152f * gl + 0.2126f * rl_v;
+      rl[x] = {bl, gl, rl_v};
     }
   }
   cv::Mat gx, gy;
@@ -490,6 +545,7 @@ struct ApplyCounts {
   uint64_t sky_edge_to_static = 0;
   uint64_t photo_dark = 0;
   uint64_t photo_bright = 0;
+  uint64_t photo_clipped = 0;
 };
 // Smooth local per-channel mean and variance over seed_mask != 0 using 4x block accumulation
 // (exact squared-sum accumulation before smoothing avoids downsampling variance bias), blending
@@ -931,6 +987,19 @@ inline float SampleBilinear(const cv::Mat& img, double u, double v) {
   return (1.f - fy) * ((1.f - fx) * r0[x0] + fx * r0[x0 + 1]) +
          fy * ((1.f - fx) * r1[x0] + fx * r1[x0 + 1]);
 }
+inline cv::Vec3f SampleBilinearVec3(const cv::Mat& img, double u, double v) {
+  const int x0 = int(std::floor(u)), y0 = int(std::floor(v));
+  const float fx = float(u - x0), fy = float(v - y0);
+  const cv::Vec3f* r0 = img.ptr<cv::Vec3f>(y0);
+  const cv::Vec3f* r1 = img.ptr<cv::Vec3f>(y0 + 1);
+  return r0[x0] * ((1.f - fx) * (1.f - fy)) + r0[x0 + 1] * (fx * (1.f - fy)) +
+         r1[x0] * ((1.f - fx) * fy) + r1[x0 + 1] * (fx * fy);
+}
+inline double MedianValue(std::vector<double>& v) {
+  const size_t mid = v.size() / 2;
+  std::nth_element(v.begin(), v.begin() + mid, v.end());
+  return v[mid];
+}
 void FitVignetting(Context& context, const std::vector<uint32_t>& written) {
   struct VigSample {
     double dr2, dr4, dr6, dl;
@@ -1082,6 +1151,7 @@ void FitVignetting(Context& context, const std::vector<uint32_t>& written) {
     constexpr float inv_gamma = 1.f / 2.2f;
     for (int y = 0; y < grid.height; ++y) {
       float* lp = view.lum_lin.ptr<float>(y);
+      cv::Vec3f* rp = view.rgb_lin.ptr<cv::Vec3f>(y);
       float* pp = view.p_lin.ptr<float>(y);
       for (int x = 0; x < grid.width; ++x) {
         const double r2 = double(grid.rho[size_t(y) * size_t(grid.width) + size_t(x)]);
@@ -1089,6 +1159,7 @@ void FitVignetting(Context& context, const std::vector<uint32_t>& written) {
         const float vig = float(std::clamp(
             std::exp(vc[0] * rr + vc[1] * rr * rr + vc[2] * rr * rr * rr), 0.35, 1.35));
         lp[x] /= vig;
+        rp[x] /= vig;
         pp[x] = std::pow(std::max(lp[x], 0.f), inv_gamma);
       }
     }
@@ -1110,11 +1181,16 @@ cv::Mat GrowHysteresisMask(const cv::Mat& seed, const cv::Mat& soft_raw, int gro
                            int dilate_radius) {
   if (cv::countNonZero(seed) == 0)
     return {};
-  cv::Mat reach;
-  cv::dilate(seed, reach,
-             cv::getStructuringElement(cv::MORPH_ELLIPSE,
-                                       {2 * grow_radius + 1, 2 * grow_radius + 1}));
-  const cv::Mat allowed = (soft_raw > 0) & (reach > 0);
+  cv::Mat allowed;
+  if (grow_radius >= 0) {
+    cv::Mat reach;
+    cv::dilate(seed, reach,
+               cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                         {2 * grow_radius + 1, 2 * grow_radius + 1}));
+    allowed = (soft_raw > 0) & (reach > 0);
+  } else {
+    allowed = soft_raw > 0;
+  }
   cv::Mat grown = seed.clone();
   std::vector<cv::Point> queue;
   cv::findNonZero(seed, queue);
@@ -1147,6 +1223,529 @@ cv::Mat GrowHysteresisMask(const cv::Mat& seed, const cv::Mat& soft_raw, int gro
   }
   return grown;
 }
+void SolveRelativeExposures(Context& context, const std::vector<uint32_t>& written, int workers) {
+  context.exposure_calibrated = false;
+  context.exposure_ref_ev = 0.0;
+  context.exposure_ev.assign(context.model.images.size(), 0.0);
+  context.pixel_ev_shift.assign(context.model.images.size(), 0.0);
+  context.residual_ev.assign(context.model.images.size(), 0.0);
+  context.exposure_valid.assign(context.model.images.size(), 0);
+  context.wb_calibrated = false;
+  context.wb_gains.assign(context.model.images.size(), {1.0, 1.0, 1.0});
+  context.exposure_report = {{"calibrated", false},
+                             {"edges", 0},
+                             {"cross_lens_edges", 0},
+                             {"components", 0},
+                             {"largest_component_images", 0},
+                             {"residual_median_ev", 0.0},
+                             {"residual_p90_ev", 0.0},
+                             {"ev_min", 0.0},
+                             {"ev_max", 0.0},
+                             {"reference_ev", 0.0},
+                             {"homogenized_images", 0},
+                             {"exact_zero_residual_images", 0},
+                             {"residual_ev_min", 0.0},
+                             {"residual_ev_max", 0.0},
+                             {"pixel_shift_min", 0.0},
+                             {"pixel_shift_max", 0.0}};
+  context.wb_report = {{"calibrated", false},
+                       {"edges", 0},
+                       {"max_abs_rg_ev", 0.0},
+                       {"max_abs_bg_ev", 0.0},
+                       {"residual_rg_median_ev", 0.0},
+                       {"residual_bg_median_ev", 0.0}};
+  const size_t n = written.size();
+  if (n < 2)
+    return;
+
+  struct Edge {
+    size_t a = 0, b = 0;
+    double med = 0.0, w = 1.0;
+    double med_rg = 0.0, med_bg = 0.0, w_wb = 0.0;
+  };
+  std::vector<std::vector<Edge>> slot_edges(n);
+  const float wb_min_lin = SrgbToLin(float(WbMinChSrgb));
+  const float wb_max_lin = SrgbToLin(float(WbMaxChSrgb));
+
+  ParallelFor(n, workers, 1, [&](size_t slot_i) {
+    const uint32_t i = written[slot_i];
+    const uint32_t cid_i = context.model.images[i].camera;
+    const auto& cam_i = context.model.cameras[cid_i];
+    const auto& grid_i = context.photo_grids[cid_i];
+    const auto& view_i = context.photo_views[i];
+    const Eigen::Vector3d fwd_i = context.rotations[i].row(2).transpose();
+
+    std::vector<std::pair<double, size_t>> cand;
+    for (size_t slot_j = 0; slot_j < n; ++slot_j) {
+      if (slot_j == slot_i)
+        continue;
+      const uint32_t j = written[slot_j];
+      const double dist = (context.centers[j] - context.centers[i]).norm();
+      if (dist >= PhotoMaxNeighborDistM)
+        continue;
+      const Eigen::Vector3d fwd_j = context.rotations[j].row(2).transpose();
+      if (fwd_i.dot(fwd_j) <= -0.35)
+        continue;
+      cand.emplace_back(dist, slot_j);
+    }
+    if (cand.empty())
+      return;
+    std::sort(cand.begin(), cand.end());
+    if (cand.size() > size_t(ExposureNeighbors))
+      cand.resize(size_t(ExposureNeighbors));
+
+    struct SrcPt {
+      Eigen::Vector3d world;
+      float lum, b, g, r;
+    };
+    std::vector<SrcPt> all_pts;
+    all_pts.reserve(size_t(grid_i.width) * size_t(grid_i.height) / 4);
+    for (int y = 0; y < grid_i.height; ++y) {
+      const uint8_t* mp = view_i.static_mask.ptr<uint8_t>(y);
+      const uint8_t* sp = view_i.depth_smooth.ptr<uint8_t>(y);
+      const float* sr = view_i.lum_srgb.ptr<float>(y);
+      const float* lp = view_i.lum_lin.ptr<float>(y);
+      const cv::Vec3f* rp = view_i.rgb_lin.ptr<cv::Vec3f>(y);
+      const float* dp = view_i.depth.ptr<float>(y);
+      for (int x = 0; x < grid_i.width; ++x) {
+        if (!mp[x] || !sp[x] || sr[x] <= float(ExposureMinSrgb) ||
+            sr[x] >= float(ExposureMaxSrgb) || lp[x] <= 1e-4f)
+          continue;
+        const size_t gidx = size_t(y) * size_t(grid_i.width) + size_t(x);
+        const Eigen::Vector3d moved = grid_i.rays[gidx] * double(dp[x]);
+        const Eigen::Vector3d cam_pt =
+            context.motion
+                ? context.motion->Reference(
+                      i, cid_i,
+                      context.motion->Fraction(
+                          cam_i, {(x + 0.5) / grid_i.scale_x, (y + 0.5) / grid_i.scale_y}),
+                      moved)
+                : moved;
+        const Eigen::Vector3d world =
+            context.rotations[i].transpose() * (cam_pt - context.translations[i]);
+        all_pts.push_back({world, lp[x], rp[x][0], rp[x][1], rp[x][2]});
+      }
+    }
+    if (all_pts.size() < size_t(ExposureMinSamples))
+      return;
+
+    const size_t step = std::max<size_t>(1, all_pts.size() / 600);
+    std::vector<SrcPt> pts;
+    pts.reserve(640);
+    for (size_t k = 0; k < all_pts.size(); k += step)
+      pts.push_back(all_pts[k]);
+
+    std::vector<double> log2_r, log2_rg, log2_bg, devs;
+    log2_r.reserve(pts.size());
+    log2_rg.reserve(pts.size());
+    log2_bg.reserve(pts.size());
+    devs.reserve(pts.size());
+    for (const auto& [dist_c, slot_j] : cand) {
+      (void)dist_c;
+      const uint32_t j = written[slot_j];
+      const auto& view_j = context.photo_views[j];
+      log2_r.clear();
+      log2_rg.clear();
+      log2_bg.clear();
+      for (const auto& pt : pts) {
+        double u = 0.0, v = 0.0, d_proj = 0.0;
+        float rho_j = 0.f;
+        if (!ProjectWorldToPhoto(context, j, pt.world, u, v, d_proj, rho_j))
+          continue;
+        const int ui = int(std::lround(u)), vi = int(std::lround(v));
+        if (!view_j.static_mask.at<uint8_t>(vi, ui))
+          continue;
+        const float d_j = view_j.depth.at<float>(vi, ui);
+        if (d_j <= 0.30f || std::abs(d_proj - double(d_j)) > std::max(0.08, 0.05 * d_proj))
+          continue;
+        const float s_samp = SampleBilinear(view_j.lum_srgb, u, v);
+        if (s_samp <= float(ExposureMinSrgb) || s_samp >= float(ExposureMaxSrgb))
+          continue;
+        const float l_samp = SampleBilinear(view_j.lum_lin, u, v);
+        if (l_samp <= 1e-4f)
+          continue;
+        log2_r.push_back(std::log2(double(pt.lum) / double(l_samp)));
+        if (std::min({pt.b, pt.g, pt.r}) > wb_min_lin &&
+            std::max({pt.b, pt.g, pt.r}) < wb_max_lin) {
+          const cv::Vec3f c_samp = SampleBilinearVec3(view_j.rgb_lin, u, v);
+          if (std::min({c_samp[0], c_samp[1], c_samp[2]}) > wb_min_lin &&
+              std::max({c_samp[0], c_samp[1], c_samp[2]}) < wb_max_lin) {
+            log2_rg.push_back(std::log2((double(pt.r) / double(pt.g)) /
+                                        (double(c_samp[2]) / double(c_samp[1]))));
+            log2_bg.push_back(std::log2((double(pt.b) / double(pt.g)) /
+                                        (double(c_samp[0]) / double(c_samp[1]))));
+          }
+        }
+      }
+      if (log2_r.size() < size_t(ExposureMinSamples))
+        continue;
+      const double med = MedianValue(log2_r);
+      if (!std::isfinite(med) || std::abs(med) > ExposureMaxPairEv)
+        continue;
+      devs.resize(log2_r.size());
+      for (size_t k = 0; k < log2_r.size(); ++k)
+        devs[k] = std::abs(log2_r[k] - med);
+      const double mad = MedianValue(devs);
+      if (!std::isfinite(mad) || mad > ExposureMaxPairMad)
+        continue;
+      const double w = std::min(double(log2_r.size()), 400.0) / std::max(mad * mad + 0.02, 0.02);
+
+      Edge edge{slot_i, slot_j, med, w, 0.0, 0.0, 0.0};
+      if (log2_rg.size() >= size_t(ExposureMinSamples)) {
+        const double med_rg = MedianValue(log2_rg);
+        const double med_bg = MedianValue(log2_bg);
+        if (std::isfinite(med_rg) && std::isfinite(med_bg) && std::abs(med_rg) <= WbMaxPairEv &&
+            std::abs(med_bg) <= WbMaxPairEv) {
+          edge.med_rg = med_rg;
+          edge.med_bg = med_bg;
+          edge.w_wb = std::min(double(log2_rg.size()), 400.0) / 100.0;
+        }
+      }
+      slot_edges[slot_i].push_back(edge);
+    }
+  });
+
+  std::vector<Edge> edges;
+  std::vector<std::vector<size_t>> adj(n);
+  size_t cross_lens_edges = 0, wb_edge_count = 0;
+  for (size_t s = 0; s < n; ++s) {
+    for (const auto& e : slot_edges[s]) {
+      edges.push_back(e);
+      adj[e.a].push_back(e.b);
+      adj[e.b].push_back(e.a);
+      if (context.model.images[written[e.a]].camera != context.model.images[written[e.b]].camera)
+        ++cross_lens_edges;
+      if (e.w_wb > 0.0)
+        ++wb_edge_count;
+    }
+  }
+  if (edges.empty())
+    return;
+
+  std::vector<int> comp_id(n, -1);
+  std::vector<std::vector<size_t>> components;
+  std::vector<size_t> queue;
+  for (size_t s = 0; s < n; ++s) {
+    if (comp_id[s] >= 0)
+      continue;
+    const int cid = int(components.size());
+    comp_id[s] = cid;
+    queue.clear();
+    queue.push_back(s);
+    for (size_t head = 0; head < queue.size(); ++head) {
+      const size_t u = queue[head];
+      for (const size_t v : adj[u]) {
+        if (comp_id[v] < 0) {
+          comp_id[v] = cid;
+          queue.push_back(v);
+        }
+      }
+    }
+    components.push_back(queue);
+  }
+
+  std::vector<std::vector<Edge>> comp_edges(components.size());
+  for (const auto& e : edges)
+    comp_edges[size_t(comp_id[e.a])].push_back(e);
+
+  size_t largest_comp = 0;
+  bool all_finite = true, all_wb_finite = wb_edge_count > 0;
+  std::vector<size_t> local_idx(n, 0);
+  std::vector<double> wb_r_ev(context.model.images.size(), 0.0);
+  std::vector<double> wb_b_ev(context.model.images.size(), 0.0);
+  auto solve_wb_channel = [&](const std::vector<size_t>& comp, const std::vector<Edge>& c_edges,
+                              bool is_red, Eigen::VectorXd& out_vec) -> bool {
+    const int k_dim = int(comp.size());
+    out_vec = Eigen::VectorXd::Zero(k_dim);
+    std::vector<double> hw(c_edges.size(), 1.0);
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(c_edges.size() * 4 + size_t(k_dim));
+    for (int iter = 0; iter < WbIters; ++iter) {
+      triplets.clear();
+      Eigen::VectorXd rhs = Eigen::VectorXd::Zero(k_dim);
+      for (size_t ei = 0; ei < c_edges.size(); ++ei) {
+        const auto& ed = c_edges[ei];
+        if (ed.w_wb <= 0.0)
+          continue;
+        const int a = int(local_idx[ed.a]), b = int(local_idx[ed.b]);
+        const double wij = ed.w_wb * hw[ei];
+        const double obs = is_red ? ed.med_rg : ed.med_bg;
+        triplets.emplace_back(a, a, wij);
+        triplets.emplace_back(b, b, wij);
+        triplets.emplace_back(a, b, -wij);
+        triplets.emplace_back(b, a, -wij);
+        rhs[a] += wij * obs;
+        rhs[b] -= wij * obs;
+      }
+      for (int d = 0; d < k_dim; ++d)
+        triplets.emplace_back(d, d, WbPriorWeight);
+      Eigen::SparseMatrix<double> mat(k_dim, k_dim);
+      mat.setFromTriplets(triplets.begin(), triplets.end());
+      Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+      solver.compute(mat);
+      if (solver.info() != Eigen::Success)
+        return false;
+      const Eigen::VectorXd sol = solver.solve(rhs);
+      if (solver.info() != Eigen::Success || !sol.allFinite())
+        return false;
+      std::vector<double> tmp(sol.data(), sol.data() + k_dim);
+      const double med = MedianValue(tmp);
+      out_vec = sol.array() - med;
+      for (size_t ei = 0; ei < c_edges.size(); ++ei) {
+        const auto& ed = c_edges[ei];
+        if (ed.w_wb <= 0.0)
+          continue;
+        const double obs = is_red ? ed.med_rg : ed.med_bg;
+        const double res = std::abs((out_vec[Eigen::Index(local_idx[ed.a])] -
+                                     out_vec[Eigen::Index(local_idx[ed.b])]) -
+                                    obs);
+        hw[ei] = res < WbHuberDeltaEv ? 1.0 : WbHuberDeltaEv / std::max(res, 1e-6);
+      }
+    }
+    return out_vec.allFinite();
+  };
+
+  for (size_t c = 0; c < components.size(); ++c) {
+    const auto& comp = components[c];
+    largest_comp = std::max(largest_comp, comp.size());
+    if (comp.size() < 2 || comp_edges[c].empty())
+      continue;
+    const int k_dim = int(comp.size());
+    for (size_t lk = 0; lk < comp.size(); ++lk)
+      local_idx[comp[lk]] = lk;
+
+    Eigen::VectorXd e_vec = Eigen::VectorXd::Zero(k_dim);
+    std::vector<double> hw(comp_edges[c].size(), 1.0);
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(comp_edges[c].size() * 4 + size_t(k_dim));
+    for (int iter = 0; iter < ExposureIters; ++iter) {
+      triplets.clear();
+      Eigen::VectorXd rhs = Eigen::VectorXd::Zero(k_dim);
+      for (size_t ei = 0; ei < comp_edges[c].size(); ++ei) {
+        const auto& ed = comp_edges[c][ei];
+        const int a = int(local_idx[ed.a]);
+        const int b = int(local_idx[ed.b]);
+        const double wij = ed.w * hw[ei];
+        triplets.emplace_back(a, a, wij);
+        triplets.emplace_back(b, b, wij);
+        triplets.emplace_back(a, b, -wij);
+        triplets.emplace_back(b, a, -wij);
+        rhs[a] += wij * ed.med;
+        rhs[b] -= wij * ed.med;
+      }
+      for (int d = 0; d < k_dim; ++d)
+        triplets.emplace_back(d, d, d == 0 ? 1.0 + 1e-9 : 1e-9);
+      Eigen::SparseMatrix<double> mat(k_dim, k_dim);
+      mat.setFromTriplets(triplets.begin(), triplets.end());
+      Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+      solver.compute(mat);
+      if (solver.info() != Eigen::Success) {
+        all_finite = false;
+        break;
+      }
+      const Eigen::VectorXd sol = solver.solve(rhs);
+      if (solver.info() != Eigen::Success || !sol.allFinite()) {
+        all_finite = false;
+        break;
+      }
+      e_vec = sol.array() - sol.mean();
+      for (size_t ei = 0; ei < comp_edges[c].size(); ++ei) {
+        const auto& ed = comp_edges[c][ei];
+        const double res =
+            std::abs((e_vec[Eigen::Index(local_idx[ed.a])] -
+                      e_vec[Eigen::Index(local_idx[ed.b])]) -
+                     ed.med);
+        hw[ei] = res < ExposureHuberDeltaEv ? 1.0 : ExposureHuberDeltaEv / std::max(res, 1e-6);
+      }
+    }
+    if (!e_vec.allFinite()) {
+      all_finite = false;
+      continue;
+    }
+    Eigen::VectorXd r_vec, b_vec;
+    const bool wb_ok = all_wb_finite && solve_wb_channel(comp, comp_edges[c], true, r_vec) &&
+                       solve_wb_channel(comp, comp_edges[c], false, b_vec);
+    all_wb_finite = all_wb_finite && wb_ok;
+    for (size_t lk = 0; lk < comp.size(); ++lk) {
+      const uint32_t img_id = written[comp[lk]];
+      context.exposure_ev[img_id] = std::clamp(e_vec[Eigen::Index(lk)], -12.0, 12.0);
+      context.exposure_valid[img_id] = 1;
+      if (wb_ok) {
+        const double er = std::clamp(r_vec[Eigen::Index(lk)], -WbMaxAbsEv, WbMaxAbsEv);
+        const double eb = std::clamp(b_vec[Eigen::Index(lk)], -WbMaxAbsEv, WbMaxAbsEv);
+        wb_r_ev[img_id] = er;
+        wb_b_ev[img_id] = eb;
+        const double gr = std::exp2(-er), gg = 1.0, gb = std::exp2(-eb);
+        const double norm = 0.2126 * gr + 0.7152 * gg + 0.0722 * gb;
+        context.wb_gains[img_id] = {gr / norm, gg / norm, gb / norm};
+      }
+    }
+  }
+
+  std::vector<double> residuals, rg_res, bg_res;
+  residuals.reserve(edges.size());
+  rg_res.reserve(edges.size());
+  bg_res.reserve(edges.size());
+  for (const auto& ed : edges) {
+    const uint32_t ia = written[ed.a], ib = written[ed.b];
+    if (context.exposure_valid[ia] && context.exposure_valid[ib]) {
+      residuals.push_back(std::abs((context.exposure_ev[ia] - context.exposure_ev[ib]) - ed.med));
+      if (all_wb_finite && ed.w_wb > 0.0) {
+        rg_res.push_back(std::abs((wb_r_ev[ia] - wb_r_ev[ib]) - ed.med_rg));
+        bg_res.push_back(std::abs((wb_b_ev[ia] - wb_b_ev[ib]) - ed.med_bg));
+      }
+    }
+  }
+  double median_res = 0.0, p90_res = 0.0;
+  if (!residuals.empty()) {
+    median_res = MedianValue(residuals);
+    const size_t p_idx = std::min(residuals.size() - 1, size_t(0.9 * double(residuals.size())));
+    std::nth_element(residuals.begin(), residuals.begin() + p_idx, residuals.end());
+    p90_res = residuals[p_idx];
+  }
+  double ev_min = 0.0, ev_max = 0.0;
+  bool has_ev = false;
+  std::vector<double> valid_evs;
+  for (const uint32_t id : written) {
+    if (!context.exposure_valid[id])
+      continue;
+    const double ev = context.exposure_ev[id];
+    valid_evs.push_back(ev);
+    if (!has_ev) {
+      ev_min = ev_max = ev;
+      has_ev = true;
+    } else {
+      ev_min = std::min(ev_min, ev);
+      ev_max = std::max(ev_max, ev);
+    }
+  }
+  if (has_ev) {
+    if (ev_max - ev_min <= 1e-6 || valid_evs.size() < 2) {
+      context.exposure_ref_ev = ev_min;
+    } else {
+      constexpr int kKdeBins = 400;
+      const double inv_2bw2 = 0.5 / (HomogKdeBandwidthEv * HomogKdeBandwidthEv);
+      double best_score = -1.0, best_ev = ev_min;
+      for (int b = 0; b < kKdeBins; ++b) {
+        const double g = ev_min + (ev_max - ev_min) * (double(b) / double(kKdeBins - 1));
+        double score = 0.0;
+        for (const double e : valid_evs) {
+          const double d = g - e;
+          score += std::exp(-d * d * inv_2bw2);
+        }
+        if (score > best_score) {
+          best_score = score;
+          best_ev = g;
+        }
+      }
+      context.exposure_ref_ev = best_ev;
+    }
+  }
+  const size_t min_comp_images =
+      size_t(std::ceil(ExposureMinComponentShare * double(written.size())));
+  context.exposure_calibrated = all_finite && has_ev && largest_comp >= min_comp_images &&
+                                !residuals.empty() && median_res <= ExposureMaxMedianResidualEv;
+  context.wb_calibrated = context.exposure_calibrated && all_wb_finite && !rg_res.empty();
+  double max_abs_rg = 0.0, max_abs_bg = 0.0;
+  if (context.wb_calibrated) {
+    for (const uint32_t id : written) {
+      if (context.exposure_valid[id]) {
+        max_abs_rg = std::max(max_abs_rg, std::abs(wb_r_ev[id]));
+        max_abs_bg = std::max(max_abs_bg, std::abs(wb_b_ev[id]));
+      }
+    }
+  }
+  context.exposure_report = {{"calibrated", context.exposure_calibrated},
+                             {"edges", edges.size()},
+                             {"cross_lens_edges", cross_lens_edges},
+                             {"components", components.size()},
+                             {"largest_component_images", largest_comp},
+                             {"residual_median_ev", median_res},
+                             {"residual_p90_ev", p90_res},
+                             {"ev_min", ev_min},
+                             {"ev_max", ev_max},
+                             {"reference_ev", context.exposure_ref_ev}};
+  context.wb_report = {{"calibrated", context.wb_calibrated},
+                       {"edges", wb_edge_count},
+                       {"max_abs_rg_ev", max_abs_rg},
+                       {"max_abs_bg_ev", max_abs_bg},
+                       {"residual_rg_median_ev", rg_res.empty() ? 0.0 : MedianValue(rg_res)},
+                       {"residual_bg_median_ev", bg_res.empty() ? 0.0 : MedianValue(bg_res)}};
+}
+void ComputeHomogenizationPlan(Context& context, const std::vector<uint32_t>& written) {
+  if (!context.exposure_calibrated)
+    return;
+  size_t homog_cnt = 0, exact_zero_cnt = 0;
+  double res_min = 0.0, res_max = 0.0, shift_min = 0.0, shift_max = 0.0;
+  bool first = true;
+  std::vector<float> vals;
+  for (const uint32_t id : written) {
+    if (!context.exposure_valid[id])
+      continue;
+    const auto& view = context.photo_views[id];
+    const auto& grid = context.photo_grids[context.model.images[id].camera];
+    vals.clear();
+    vals.reserve(size_t(grid.width) * size_t(grid.height));
+    const bool has_t = !view.transient_mask.empty();
+    for (int y = 0; y < grid.height; ++y) {
+      const uint8_t* mp = view.static_mask.ptr<uint8_t>(y);
+      const uint8_t* tp = has_t ? view.transient_mask.ptr<uint8_t>(y) : nullptr;
+      const float* sr = view.lum_srgb.ptr<float>(y);
+      for (int x = 0; x < grid.width; ++x)
+        if (mp[x] && (!tp || (tp[x] & 4) == 0))
+          vals.push_back(sr[x]);
+    }
+    if (vals.empty()) {
+      for (int y = 0; y < grid.height; ++y) {
+        const uint8_t* mp = view.static_mask.ptr<uint8_t>(y);
+        const float* sr = view.lum_srgb.ptr<float>(y);
+        for (int x = 0; x < grid.width; ++x)
+          if (mp[x])
+            vals.push_back(sr[x]);
+      }
+    }
+    double p50 = 0.5;
+    if (!vals.empty()) {
+      const size_t i50 = vals.size() / 2;
+      std::nth_element(vals.begin(), vals.begin() + i50, vals.end());
+      p50 = double(vals[i50]);
+    }
+    const double want = context.exposure_ev[id] - context.exposure_ref_ev;
+    double shift = 0.0;
+    if (want > 0.0) {
+      const double t50 = std::min(p50, HomogMinP50Srgb);
+      const double md50 =
+          p50 > t50 ? std::log2(std::max<double>(SrgbToLin(float(p50)), 1e-6) /
+                                std::max<double>(SrgbToLin(float(t50)), 1e-6))
+                    : 0.0;
+      shift = std::min({want, HomogMaxDarkenEv, std::max(0.0, md50)});
+    } else {
+      shift = std::max(want, -HomogMaxBrightenEv);
+    }
+    const double residual = want - shift;
+    context.pixel_ev_shift[id] = shift;
+    context.residual_ev[id] = residual;
+    ++homog_cnt;
+    if (std::abs(residual) < 0.01)
+      ++exact_zero_cnt;
+    if (first) {
+      res_min = res_max = residual;
+      shift_min = shift_max = shift;
+      first = false;
+    } else {
+      res_min = std::min(res_min, residual);
+      res_max = std::max(res_max, residual);
+      shift_min = std::min(shift_min, shift);
+      shift_max = std::max(shift_max, shift);
+    }
+  }
+  context.exposure_report["homogenized_images"] = homog_cnt;
+  context.exposure_report["exact_zero_residual_images"] = exact_zero_cnt;
+  context.exposure_report["residual_ev_min"] = res_min;
+  context.exposure_report["residual_ev_max"] = res_max;
+  context.exposure_report["pixel_shift_min"] = shift_min;
+  context.exposure_report["pixel_shift_max"] = shift_max;
+}
 void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& written,
                                  int workers) {
   const auto started = Clock::now();
@@ -1165,6 +1764,7 @@ void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& 
     view.raw_sky_small.release();
   }
   FitVignetting(context, written);
+  SolveRelativeExposures(context, written, workers);
 
   const cv::Mat k3 = cv::Mat::ones(3, 3, CV_8UC1);
   const cv::Mat person_reach_kernel = cv::getStructuringElement(
@@ -1206,176 +1806,338 @@ void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& 
       if (!used[k])
         nbrs.push_back(cand[k].second);
     }
-    if (nbrs.size() < size_t(PhotoMinSeen))
-      return;
+    cv::Mat dark_mask, bright_mask;
+    if (nbrs.size() >= size_t(PhotoMinSeen)) {
+      cv::Mat p_min3_i, p_max3_i;
+      cv::erode(view_i.p_lin, p_min3_i, k3);
+      cv::dilate(view_i.p_lin, p_max3_i, k3);
 
-    cv::Mat p_min3_i, p_max3_i;
-    cv::erode(view_i.p_lin, p_min3_i, k3);
-    cv::dilate(view_i.p_lin, p_max3_i, k3);
-
-    bool enable_person_near = false;
-    for (const auto& c : context.candidates[i]) {
-      if (c.reason != "static") {
-        enable_person_near = true;
-        break;
-      }
-    }
-    cv::Mat person_near;
-    if (enable_person_near && !view_i.person_small.empty() &&
-        cv::countNonZero(view_i.person_small) > 0) {
-      cv::dilate(view_i.person_small, person_near, person_reach_kernel);
-    }
-
-    struct ValidPx {
-      int x, y;
-      float p_i, p_min3_i, p_max3_i, lum_i, srgb_i, grad_i;
-      uint8_t near_person;
-      Eigen::Vector3d world;
-    };
-    std::vector<ValidPx> valid;
-    valid.reserve(size_t(grid_i.width) * size_t(grid_i.height) / 2);
-    for (int y = 0; y < grid_i.height; ++y) {
-      const uint8_t* mp = view_i.static_mask.ptr<uint8_t>(y);
-      const uint8_t* sp = view_i.depth_smooth.ptr<uint8_t>(y);
-      const uint8_t* np = person_near.empty() ? nullptr : person_near.ptr<uint8_t>(y);
-      const float* pp = view_i.p_lin.ptr<float>(y);
-      const float* pminp = p_min3_i.ptr<float>(y);
-      const float* pmaxp = p_max3_i.ptr<float>(y);
-      const float* lp = view_i.lum_lin.ptr<float>(y);
-      const float* sr = view_i.lum_srgb.ptr<float>(y);
-      const float* gr = view_i.grad_srgb.ptr<float>(y);
-      const float* dp = view_i.depth.ptr<float>(y);
-      for (int x = 0; x < grid_i.width; ++x) {
-        if (!mp[x] || !sp[x])
-          continue;
-        const size_t gidx = size_t(y) * size_t(grid_i.width) + size_t(x);
-        const Eigen::Vector3d moved = grid_i.rays[gidx] * double(dp[x]);
-        const Eigen::Vector3d cam_pt =
-            context.motion
-                ? context.motion->Reference(
-                      i, cid_i,
-                      context.motion->Fraction(
-                          cam_i, {(x + 0.5) / grid_i.scale_x, (y + 0.5) / grid_i.scale_y}),
-                      moved)
-                : moved;
-        const Eigen::Vector3d world =
-            context.rotations[i].transpose() * (cam_pt - context.translations[i]);
-        valid.push_back({x, y, pp[x], pminp[x], pmaxp[x], lp[x], sr[x], gr[x],
-                         uint8_t(np && np[x] ? 1 : 0), world});
-      }
-    }
-    if (valid.empty())
-      return;
-
-    std::vector<uint16_t> seen(valid.size(), 0), dark_global(valid.size(), 0),
-        dark_person(valid.size(), 0), dark_soft(valid.size(), 0), bright_global(valid.size(), 0),
-        bright_soft(valid.size(), 0);
-    struct Hit {
-      size_t k;
-      float p_lo, p_hi;
-    };
-    std::vector<Hit> hits;
-    std::vector<float> ratios;
-    hits.reserve(valid.size());
-    ratios.reserve(valid.size());
-
-    for (const uint32_t j : nbrs) {
-      const auto& view_j = context.photo_views[j];
-      hits.clear();
-      ratios.clear();
-      for (size_t k = 0; k < valid.size(); ++k) {
-        const auto& px = valid[k];
-        double u = 0.0, v = 0.0, d_proj = 0.0;
-        float rho_j = 0.f;
-        if (!ProjectWorldToPhoto(context, j, px.world, u, v, d_proj, rho_j))
-          continue;
-        const int ui = int(std::lround(u)), vi = int(std::lround(v));
-        if (!view_j.static_mask.at<uint8_t>(vi, ui))
-          continue;
-        const float d_j = view_j.depth.at<float>(vi, ui);
-        if (d_j <= 0.30f || std::abs(d_proj - double(d_j)) > std::max(0.08, 0.05 * d_proj))
-          continue;
-        const float l_samp = SampleBilinear(view_j.lum_lin, u, v);
-        const float s_samp = SampleBilinear(view_j.lum_srgb, u, v);
-        const float p_lo = SampleBilinear(view_j.p_min3, u, v);
-        const float p_hi = SampleBilinear(view_j.p_max3, u, v);
-        hits.push_back({k, p_lo, p_hi});
-        if (px.srgb_i > 0.10f && px.srgb_i < 0.90f && s_samp > 0.10f && s_samp < 0.90f)
-          ratios.push_back(px.lum_i / std::max(l_samp, 1e-5f));
-      }
-      if (ratios.size() < size_t(PhotoMinGainSamples))
-        continue;
-      const size_t mid = ratios.size() / 2;
-      std::nth_element(ratios.begin(), ratios.begin() + mid, ratios.end());
-      const float gain = ratios[mid];
-      if (gain < float(PhotoMinPairGain) || gain > float(PhotoMaxPairGain))
-        continue;
-      const float gain_p = std::pow(gain, 1.f / 2.2f);
-      for (const auto& h : hits) {
-        const size_t k = h.k;
-        ++seen[k];
-        const auto& px = valid[k];
-        const float p_lo = h.p_lo * gain_p;
-        const float p_hi = h.p_hi * gain_p;
-        if (p_lo > float(PhotoMinRefPerceptual)) {
-          if (px.grad_i < float(PhotoDarkMaxGrad) && px.p_max3_i < p_lo * float(PhotoDarkRatio) &&
-              px.p_max3_i < p_lo - float(PhotoDarkDiff))
-            ++dark_global[k];
-          if (px.near_person && px.grad_i < float(PhotoPersonDarkMaxGrad) &&
-              px.p_i < p_lo * float(PhotoPersonDarkRatio) &&
-              px.p_i < p_lo - float(PhotoPersonDarkDiff))
-            ++dark_person[k];
-          if (px.grad_i < float(PhotoDarkGrowMaxGrad) &&
-              px.p_i < p_lo * float(PhotoDarkGrowRatio) && px.p_i < p_lo - float(PhotoDarkGrowDiff))
-            ++dark_soft[k];
-        }
-        if (p_hi > float(PhotoMinRefPerceptual)) {
-          if (px.grad_i < float(PhotoBrightMaxGrad) &&
-              px.p_min3_i > p_hi * float(PhotoBrightRatio) &&
-              px.p_min3_i > p_hi + float(PhotoBrightDiff))
-            ++bright_global[k];
-          if (px.grad_i < float(PhotoBrightGrowMaxGrad) &&
-              px.p_i > p_hi * float(PhotoBrightGrowRatio) &&
-              px.p_i > p_hi + float(PhotoBrightGrowDiff))
-            ++bright_soft[k];
+      bool enable_person_near = false;
+      for (const auto& c : context.candidates[i]) {
+        if (c.reason != "static") {
+          enable_person_near = true;
+          break;
         }
       }
+      cv::Mat person_near;
+      if (enable_person_near && !view_i.person_small.empty() &&
+          cv::countNonZero(view_i.person_small) > 0) {
+        cv::dilate(view_i.person_small, person_near, person_reach_kernel);
+      }
+
+      struct ValidPx {
+        int x, y;
+        float p_i, p_min3_i, p_max3_i, lum_i, srgb_i, grad_i;
+        uint8_t near_person;
+        Eigen::Vector3d world;
+      };
+      std::vector<ValidPx> valid;
+      valid.reserve(size_t(grid_i.width) * size_t(grid_i.height) / 2);
+      for (int y = 0; y < grid_i.height; ++y) {
+        const uint8_t* mp = view_i.static_mask.ptr<uint8_t>(y);
+        const uint8_t* sp = view_i.depth_smooth.ptr<uint8_t>(y);
+        const uint8_t* np = person_near.empty() ? nullptr : person_near.ptr<uint8_t>(y);
+        const float* pp = view_i.p_lin.ptr<float>(y);
+        const float* pminp = p_min3_i.ptr<float>(y);
+        const float* pmaxp = p_max3_i.ptr<float>(y);
+        const float* lp = view_i.lum_lin.ptr<float>(y);
+        const float* sr = view_i.lum_srgb.ptr<float>(y);
+        const float* gr = view_i.grad_srgb.ptr<float>(y);
+        const float* dp = view_i.depth.ptr<float>(y);
+        for (int x = 0; x < grid_i.width; ++x) {
+          if (!mp[x] || !sp[x])
+            continue;
+          const size_t gidx = size_t(y) * size_t(grid_i.width) + size_t(x);
+          const Eigen::Vector3d moved = grid_i.rays[gidx] * double(dp[x]);
+          const Eigen::Vector3d cam_pt =
+              context.motion
+                  ? context.motion->Reference(
+                        i, cid_i,
+                        context.motion->Fraction(
+                            cam_i, {(x + 0.5) / grid_i.scale_x, (y + 0.5) / grid_i.scale_y}),
+                        moved)
+                  : moved;
+          const Eigen::Vector3d world =
+              context.rotations[i].transpose() * (cam_pt - context.translations[i]);
+          valid.push_back({x, y, pp[x], pminp[x], pmaxp[x], lp[x], sr[x], gr[x],
+                           uint8_t(np && np[x] ? 1 : 0), world});
+        }
+      }
+      if (!valid.empty()) {
+        std::vector<uint16_t> seen(valid.size(), 0), dark_global(valid.size(), 0),
+            dark_person(valid.size(), 0), dark_soft(valid.size(), 0),
+            bright_global(valid.size(), 0), bright_soft(valid.size(), 0);
+        struct Hit {
+          size_t k;
+          float p_lo, p_hi;
+        };
+        std::vector<Hit> hits;
+        std::vector<float> ratios;
+        hits.reserve(valid.size());
+        ratios.reserve(valid.size());
+
+        for (const uint32_t j : nbrs) {
+          const auto& view_j = context.photo_views[j];
+          hits.clear();
+          ratios.clear();
+          for (size_t k = 0; k < valid.size(); ++k) {
+            const auto& px = valid[k];
+            double u = 0.0, v = 0.0, d_proj = 0.0;
+            float rho_j = 0.f;
+            if (!ProjectWorldToPhoto(context, j, px.world, u, v, d_proj, rho_j))
+              continue;
+            const int ui = int(std::lround(u)), vi = int(std::lround(v));
+            if (!view_j.static_mask.at<uint8_t>(vi, ui))
+              continue;
+            const float d_j = view_j.depth.at<float>(vi, ui);
+            if (d_j <= 0.30f || std::abs(d_proj - double(d_j)) > std::max(0.08, 0.05 * d_proj))
+              continue;
+            const float l_samp = SampleBilinear(view_j.lum_lin, u, v);
+            const float s_samp = SampleBilinear(view_j.lum_srgb, u, v);
+            const float p_lo = SampleBilinear(view_j.p_min3, u, v);
+            const float p_hi = SampleBilinear(view_j.p_max3, u, v);
+            hits.push_back({k, p_lo, p_hi});
+            if (px.srgb_i > 0.10f && px.srgb_i < 0.90f && s_samp > 0.10f && s_samp < 0.90f)
+              ratios.push_back(px.lum_i / std::max(l_samp, 1e-5f));
+          }
+          if (ratios.size() < size_t(PhotoMinGainSamples))
+            continue;
+          const size_t mid = ratios.size() / 2;
+          std::nth_element(ratios.begin(), ratios.begin() + mid, ratios.end());
+          const float gain = ratios[mid];
+          if (gain < float(PhotoMinPairGain) || gain > float(PhotoMaxPairGain))
+            continue;
+          const float gain_p = std::pow(gain, 1.f / 2.2f);
+          for (const auto& h : hits) {
+            const size_t k = h.k;
+            ++seen[k];
+            const auto& px = valid[k];
+            const float p_lo = h.p_lo * gain_p;
+            const float p_hi = h.p_hi * gain_p;
+            if (p_lo > float(PhotoMinRefPerceptual)) {
+              if (px.grad_i < float(PhotoDarkMaxGrad) &&
+                  px.p_max3_i < p_lo * float(PhotoDarkRatio) &&
+                  px.p_max3_i < p_lo - float(PhotoDarkDiff))
+                ++dark_global[k];
+              if (px.near_person && px.grad_i < float(PhotoPersonDarkMaxGrad) &&
+                  px.p_i < p_lo * float(PhotoPersonDarkRatio) &&
+                  px.p_i < p_lo - float(PhotoPersonDarkDiff))
+                ++dark_person[k];
+              if (px.grad_i < float(PhotoDarkGrowMaxGrad) &&
+                  px.p_i < p_lo * float(PhotoDarkGrowRatio) &&
+                  px.p_i < p_lo - float(PhotoDarkGrowDiff))
+                ++dark_soft[k];
+            }
+            if (p_hi > float(PhotoMinRefPerceptual)) {
+              if (px.grad_i < float(PhotoBrightMaxGrad) &&
+                  px.p_min3_i > p_hi * float(PhotoBrightRatio) &&
+                  px.p_min3_i > p_hi + float(PhotoBrightDiff))
+                ++bright_global[k];
+              if (px.grad_i < float(PhotoBrightGrowMaxGrad) &&
+                  px.p_i > p_hi * float(PhotoBrightGrowRatio) &&
+                  px.p_i > p_hi + float(PhotoBrightGrowDiff))
+                ++bright_soft[k];
+            }
+          }
+        }
+
+        cv::Mat dark_global_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+        cv::Mat dark_person_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+        cv::Mat dark_soft_map = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+        cv::Mat bright_seed_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+        cv::Mat bright_soft_map = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+        for (size_t k = 0; k < valid.size(); ++k) {
+          const int x = valid[k].x, y = valid[k].y;
+          const uint16_t s = seen[k];
+          if (s < uint16_t(PhotoGrowMinSeen))
+            continue;
+          if (double(dark_soft[k]) >= PhotoDarkGrowShare * double(s))
+            dark_soft_map.at<uint8_t>(y, x) = 255;
+          if (double(bright_soft[k]) >= PhotoBrightGrowShare * double(s))
+            bright_soft_map.at<uint8_t>(y, x) = 255;
+          if (s >= uint16_t(PhotoPersonMinSeen) &&
+              double(dark_person[k]) >= PhotoPersonDarkShare * double(s))
+            dark_person_raw.at<uint8_t>(y, x) = 255;
+          if (s < uint16_t(PhotoMinSeen))
+            continue;
+          if (double(dark_global[k]) >= PhotoDarkShare * double(s))
+            dark_global_raw.at<uint8_t>(y, x) = 255;
+          if (double(bright_global[k]) >= PhotoBrightShare * double(s))
+            bright_seed_raw.at<uint8_t>(y, x) = 255;
+        }
+
+        const cv::Mat dark_seed =
+            FilterComponents(dark_global_raw, PhotoMinCompArea) |
+            FilterComponents(dark_person_raw, PhotoPersonMinCompArea);
+        dark_mask = GrowHysteresisMask(dark_seed, dark_soft_map, PhotoDarkGrowRadius,
+                                       PhotoDarkDilateRadius);
+        bright_mask = GrowHysteresisMask(FilterComponents(bright_seed_raw, PhotoMinCompArea),
+                                         bright_soft_map, PhotoBrightGrowRadius,
+                                         PhotoBrightDilateRadius);
+      }
     }
 
-    cv::Mat dark_global_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-    cv::Mat dark_person_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-    cv::Mat dark_soft_map = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-    cv::Mat bright_seed_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-    cv::Mat bright_soft_map = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-    for (size_t k = 0; k < valid.size(); ++k) {
-      const uint16_t s = seen[k];
-      if (s < uint16_t(PhotoGrowMinSeen))
-        continue;
-      const int x = valid[k].x, y = valid[k].y;
-      if (double(dark_soft[k]) >= PhotoDarkGrowShare * double(s))
-        dark_soft_map.at<uint8_t>(y, x) = 255;
-      if (double(bright_soft[k]) >= PhotoBrightGrowShare * double(s))
-        bright_soft_map.at<uint8_t>(y, x) = 255;
-      if (s >= uint16_t(PhotoPersonMinSeen) &&
-          double(dark_person[k]) >= PhotoPersonDarkShare * double(s))
-        dark_person_raw.at<uint8_t>(y, x) = 255;
-      if (s < uint16_t(PhotoMinSeen))
-        continue;
-      if (double(dark_global[k]) >= PhotoDarkShare * double(s))
-        dark_global_raw.at<uint8_t>(y, x) = 255;
-      if (double(bright_global[k]) >= PhotoBrightShare * double(s))
-        bright_seed_raw.at<uint8_t>(y, x) = 255;
+    cv::Mat clip_mask;
+    if (context.exposure_calibrated && context.exposure_valid[i]) {
+      const double ev_i = context.exposure_ev[i];
+      struct ClipNbrCand {
+        double dist = 0.0, dev = 0.0;
+        uint32_t j = 0;
+      };
+      std::vector<ClipNbrCand> clip_cand;
+      for (const uint32_t j : written) {
+        if (j == i || !context.exposure_valid[j])
+          continue;
+        const double dev = ev_i - context.exposure_ev[j];
+        if (dev < PhotoClipMinEvDiff)
+          continue;
+        const double dist = (context.centers[j] - context.centers[i]).norm();
+        if (dist >= PhotoClipMaxNeighborDistM)
+          continue;
+        const Eigen::Vector3d fwd_j = context.rotations[j].row(2).transpose();
+        if (fwd_i.dot(fwd_j) <= -0.35)
+          continue;
+        clip_cand.push_back({dist, dev, j});
+      }
+      std::sort(clip_cand.begin(), clip_cand.end(),
+                [](const ClipNbrCand& a, const ClipNbrCand& b) { return a.dist < b.dist; });
+      std::vector<uint32_t> clip_nbrs;
+      clip_nbrs.reserve(size_t(PhotoClipNeighbors));
+      std::vector<uint8_t> clip_used(clip_cand.size(), 0);
+      for (size_t k = 0; k < clip_cand.size() && clip_nbrs.size() < size_t(PhotoClipNearestQuota);
+           ++k) {
+        clip_nbrs.push_back(clip_cand[k].j);
+        clip_used[k] = 1;
+      }
+      for (size_t k = 0; k < clip_cand.size() && clip_nbrs.size() < size_t(PhotoClipNeighbors);
+           ++k) {
+        if (!clip_used[k] && clip_cand[k].dev >= PhotoClipLargeEvDiff) {
+          clip_nbrs.push_back(clip_cand[k].j);
+          clip_used[k] = 1;
+        }
+      }
+      for (size_t k = 0; k < clip_cand.size() && clip_nbrs.size() < size_t(PhotoClipNeighbors);
+           ++k) {
+        if (!clip_used[k])
+          clip_nbrs.push_back(clip_cand[k].j);
+      }
+
+      cv::Mat clip_seed_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+      cv::Mat clip_soft_map = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+      struct ClipPx {
+        int x = 0, y = 0;
+        Eigen::Vector3d world;
+      };
+      std::vector<ClipPx> clip_cands;
+      const bool high_ev_frame = (ev_i - context.exposure_ref_ev) >= PhotoClipHighEvBoost;
+      for (int y = 0; y < grid_i.height; ++y) {
+        const uint8_t* mp = view_i.static_mask.ptr<uint8_t>(y);
+        const float* sr = view_i.lum_srgb.ptr<float>(y);
+        const float* msr = view_i.max_srgb.ptr<float>(y);
+        const float* dp = view_i.depth.ptr<float>(y);
+        uint8_t* csoft = clip_soft_map.ptr<uint8_t>(y);
+        uint8_t* cseed = clip_seed_raw.ptr<uint8_t>(y);
+        for (int x = 0; x < grid_i.width; ++x) {
+          if (!mp[x])
+            continue;
+          const float lum = sr[x], mx = msr[x], d = dp[x];
+          if (lum >= float(PhotoClipGrowLum) || mx >= float(PhotoClipGrowMaxCh))
+            csoft[x] = 255;
+          if (high_ev_frame &&
+              (lum >= float(PhotoClipHighEvMinLum) || mx >= float(PhotoClipHighEvMinMaxCh)) &&
+              (d <= 0.f || d >= float(PhotoClipHighEvMinDepthM))) {
+            cseed[x] = 255;
+          }
+          if (!clip_nbrs.empty() && d >= 0.30f && d <= float(PhotoClipMaxDepthM) &&
+              (lum >= float(PhotoClipMinLum) || mx >= float(PhotoClipMinMaxCh))) {
+            const size_t gidx = size_t(y) * size_t(grid_i.width) + size_t(x);
+            const Eigen::Vector3d moved = grid_i.rays[gidx] * double(d);
+            const Eigen::Vector3d cam_pt =
+                context.motion
+                    ? context.motion->Reference(
+                          i, cid_i,
+                          context.motion->Fraction(
+                              cam_i, {(x + 0.5) / grid_i.scale_x, (y + 0.5) / grid_i.scale_y}),
+                          moved)
+                    : moved;
+            const Eigen::Vector3d world =
+                context.rotations[i].transpose() * (cam_pt - context.translations[i]);
+            clip_cands.push_back({x, y, world});
+          }
+        }
+      }
+      if (!clip_cands.empty() && !clip_nbrs.empty()) {
+        std::vector<uint16_t> darker_seen(clip_cands.size(), 0), unclipped(clip_cands.size(), 0);
+        for (const uint32_t j : clip_nbrs) {
+          const auto& view_j = context.photo_views[j];
+          for (size_t k = 0; k < clip_cands.size(); ++k) {
+            double u = 0.0, v = 0.0, d_proj = 0.0;
+            float rho_j = 0.f;
+            if (!ProjectWorldToPhoto(context, j, clip_cands[k].world, u, v, d_proj, rho_j))
+              continue;
+            const int ui = int(std::lround(u)), vi = int(std::lround(v));
+            if (!view_j.static_mask.at<uint8_t>(vi, ui))
+              continue;
+            const float d_j = view_j.depth.at<float>(vi, ui);
+            if (d_j <= 0.30f || std::abs(d_proj - double(d_j)) > std::max(0.15, 0.08 * d_proj))
+              continue;
+            ++darker_seen[k];
+            const float s_samp = SampleBilinear(view_j.lum_srgb, u, v);
+            const float max_samp = SampleBilinear(view_j.max_srgb, u, v);
+            if (s_samp < float(PhotoClipRefMaxLum) && max_samp < float(PhotoClipRefMaxCh))
+              ++unclipped[k];
+          }
+        }
+        for (size_t k = 0; k < clip_cands.size(); ++k) {
+          if (darker_seen[k] >= uint16_t(PhotoClipMinSeen) &&
+              double(unclipped[k]) >= PhotoClipShare * double(darker_seen[k])) {
+            clip_seed_raw.at<uint8_t>(clip_cands[k].y, clip_cands[k].x) = 255;
+          }
+        }
+      }
+      clip_mask = GrowHysteresisMask(FilterComponents(clip_seed_raw, PhotoClipMinCompArea),
+                                     clip_soft_map, -1, 0);
+      if (!clip_mask.empty()) {
+        const bool bloom_frame = (ev_i - context.exposure_ref_ev) >= PhotoClipBloomEvBoost;
+        if (bloom_frame) {
+          cv::morphologyEx(
+              clip_mask, clip_mask, cv::MORPH_CLOSE,
+              cv::getStructuringElement(
+                  cv::MORPH_ELLIPSE,
+                  {2 * PhotoClipBloomCloseRadius + 1, 2 * PhotoClipBloomCloseRadius + 1}));
+          clip_mask &= view_i.static_mask;
+        }
+        const int dilate_r = bloom_frame ? PhotoClipHighEvDilateRadius : PhotoClipDilateRadius;
+        if (dilate_r > 0) {
+          cv::dilate(clip_mask, clip_mask,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                               {2 * dilate_r + 1, 2 * dilate_r + 1}));
+        }
+      }
     }
 
-    const cv::Mat dark_seed =
-        FilterComponents(dark_global_raw, PhotoMinCompArea) |
-        FilterComponents(dark_person_raw, PhotoPersonMinCompArea);
-    const cv::Mat dark_mask =
-        GrowHysteresisMask(dark_seed, dark_soft_map, PhotoDarkGrowRadius, PhotoDarkDilateRadius);
-    const cv::Mat bright_mask = GrowHysteresisMask(
-        FilterComponents(bright_seed_raw, PhotoMinCompArea), bright_soft_map, PhotoBrightGrowRadius,
-        PhotoBrightDilateRadius);
-    if (dark_mask.empty() && bright_mask.empty())
+    const int static_count = cv::countNonZero(view_i.static_mask);
+    if (static_count > 0 && (!dark_mask.empty() || !bright_mask.empty())) {
+      cv::Mat db_mask = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+      if (!dark_mask.empty())
+        db_mask |= dark_mask;
+      if (!bright_mask.empty())
+        db_mask |= bright_mask;
+      const int db_count = cv::countNonZero(db_mask & view_i.static_mask);
+      if (double(db_count) > PhotoMaxImageMaskShare * double(static_count)) {
+        context.photo_views[i].capped = true;
+        dark_mask.release();
+        bright_mask.release();
+      }
+    }
+    if (static_count > 0 && !clip_mask.empty()) {
+      const int clip_count = cv::countNonZero(clip_mask & view_i.static_mask);
+      if (double(clip_count) > PhotoMaxClipMaskShare * double(static_count)) {
+        context.photo_views[i].clip_capped = true;
+        clip_mask.release();
+      }
+    }
+    if (dark_mask.empty() && bright_mask.empty() && clip_mask.empty())
       return;
 
     cv::Mat combined = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
@@ -1390,20 +2152,26 @@ void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& 
             cp[x] |= 2;
       }
     }
-    const int static_count = cv::countNonZero(view_i.static_mask);
-    const int masked_count = cv::countNonZero((combined > 0) & view_i.static_mask);
-    if (static_count > 0 &&
-        double(masked_count) > PhotoMaxImageMaskShare * double(static_count)) {
-      context.photo_views[i].capped = true;
-      return;
+    if (!clip_mask.empty()) {
+      for (int y = 0; y < grid_i.height; ++y) {
+        const uint8_t* clp = clip_mask.ptr<uint8_t>(y);
+        uint8_t* cp = combined.ptr<uint8_t>(y);
+        for (int x = 0; x < grid_i.width; ++x)
+          if (clp[x])
+            cp[x] |= 4;
+      }
     }
     context.photo_views[i].transient_mask = std::move(combined);
   });
 
+  ComputeHomogenizationPlan(context, written);
+
   for (const uint32_t id : written) {
     auto& view = context.photo_views[id];
     view.lum_lin.release();
+    view.rgb_lin.release();
     view.lum_srgb.release();
+    view.max_srgb.release();
     view.grad_srgb.release();
     view.p_lin.release();
     view.p_min3.release();
@@ -1485,6 +2253,7 @@ ApplyCounts Apply(Context& context, uint32_t id, cv::Size grid) {
     const cv::Mat& full_dom = context.full_domains[cam_idx];
     const cv::Mat dark_small = (photo_transient & 1) != 0;
     const cv::Mat bright_small = (photo_transient & 2) != 0;
+    const cv::Mat clip_small = (photo_transient & 4) != 0;
     cv::Mat dark_change = cv::Mat::zeros(camera.height, camera.width, CV_8UC1);
     cv::Mat bright_change = cv::Mat::zeros(camera.height, camera.width, CV_8UC1);
     if (cv::countNonZero(dark_small) > 0) {
@@ -1500,6 +2269,13 @@ ApplyCounts Apply(Context& context, uint32_t id, cv::Size grid) {
       bright_change = (bright_up >= 128) & (labelled.mask == 255) & full_dom;
       counts.photo_bright = uint64_t(cv::countNonZero(bright_change));
       labelled.mask.setTo(0, bright_change);
+    }
+    if (cv::countNonZero(clip_small) > 0) {
+      cv::Mat clip_up;
+      cv::resize(clip_small, clip_up, {camera.width, camera.height}, 0, 0, cv::INTER_LINEAR);
+      const cv::Mat clip_change = (clip_up >= 128) & (labelled.mask == 255) & full_dom;
+      counts.photo_clipped = uint64_t(cv::countNonZero(clip_change));
+      labelled.mask.setTo(0, clip_change);
     }
   }
   const auto path = context.destination(id);
@@ -1564,7 +2340,52 @@ Json StaticMaskRules() {
           {"photo_person_dark_share", PhotoPersonDarkShare},
           {"photo_person_dark_ratio", PhotoPersonDarkRatio},
           {"photo_person_dark_diff", PhotoPersonDarkDiff},
-          {"photo_person_dark_max_grad", PhotoPersonDarkMaxGrad}};
+          {"photo_person_dark_max_grad", PhotoPersonDarkMaxGrad},
+          {"exposure_neighbors", ExposureNeighbors},
+          {"exposure_min_samples", ExposureMinSamples},
+          {"exposure_iters", ExposureIters},
+          {"exposure_min_srgb", ExposureMinSrgb},
+          {"exposure_max_srgb", ExposureMaxSrgb},
+          {"exposure_max_pair_ev", ExposureMaxPairEv},
+          {"exposure_max_pair_mad", ExposureMaxPairMad},
+          {"exposure_huber_delta_ev", ExposureHuberDeltaEv},
+          {"exposure_min_component_share", ExposureMinComponentShare},
+          {"exposure_max_median_residual_ev", ExposureMaxMedianResidualEv},
+          {"wb_min_ch_srgb", WbMinChSrgb},
+          {"wb_max_ch_srgb", WbMaxChSrgb},
+          {"wb_prior_weight", WbPriorWeight},
+          {"wb_max_abs_ev", WbMaxAbsEv},
+          {"wb_max_pair_ev", WbMaxPairEv},
+          {"wb_huber_delta_ev", WbHuberDeltaEv},
+          {"wb_iters", WbIters},
+          {"homog_kde_bandwidth_ev", HomogKdeBandwidthEv},
+          {"homog_max_brighten_ev", HomogMaxBrightenEv},
+          {"homog_max_darken_ev", HomogMaxDarkenEv},
+          {"homog_min_p50_srgb", HomogMinP50Srgb},
+          {"photo_clip_neighbors", PhotoClipNeighbors},
+          {"photo_clip_nearest_quota", PhotoClipNearestQuota},
+          {"photo_clip_large_ev_diff", PhotoClipLargeEvDiff},
+          {"photo_clip_max_neighbor_dist_m", PhotoClipMaxNeighborDistM},
+          {"photo_clip_max_depth_m", PhotoClipMaxDepthM},
+          {"photo_clip_min_lum", PhotoClipMinLum},
+          {"photo_clip_min_max_ch", PhotoClipMinMaxCh},
+          {"photo_clip_min_ev_diff", PhotoClipMinEvDiff},
+          {"photo_clip_ref_max_lum", PhotoClipRefMaxLum},
+          {"photo_clip_ref_max_ch", PhotoClipRefMaxCh},
+          {"photo_clip_min_seen", PhotoClipMinSeen},
+          {"photo_clip_share", PhotoClipShare},
+          {"photo_clip_min_comp_area", PhotoClipMinCompArea},
+          {"photo_clip_grow_lum", PhotoClipGrowLum},
+          {"photo_clip_grow_max_ch", PhotoClipGrowMaxCh},
+          {"photo_clip_high_ev_boost", PhotoClipHighEvBoost},
+          {"photo_clip_high_ev_min_lum", PhotoClipHighEvMinLum},
+          {"photo_clip_high_ev_min_max_ch", PhotoClipHighEvMinMaxCh},
+          {"photo_clip_high_ev_min_depth_m", PhotoClipHighEvMinDepthM},
+          {"photo_clip_bloom_ev_boost", PhotoClipBloomEvBoost},
+          {"photo_clip_bloom_close_radius", PhotoClipBloomCloseRadius},
+          {"photo_clip_high_ev_dilate_radius", PhotoClipHighEvDilateRadius},
+          {"photo_clip_dilate_radius", PhotoClipDilateRadius},
+          {"photo_max_clip_mask_share", PhotoMaxClipMaskShare}};
 }
 Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterMotion* motion,
                  const LasHeader& header, LasSurfelCache& cache,
@@ -1692,9 +2513,10 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
   Json rows = Json::array();
   std::map<std::string, size_t> reasons;
   uint64_t pixels = 0, sky_pixels = 0, sky_edge_to_sky = 0, sky_edge_to_static = 0;
-  uint64_t photo_dark_pixels = 0, photo_bright_pixels = 0;
+  uint64_t photo_dark_pixels = 0, photo_bright_pixels = 0, photo_clipped_pixels = 0;
   size_t changed = 0, sky_changed = 0, sky_edge_refined = 0;
-  size_t photo_dark_images = 0, photo_bright_images = 0, photo_capped_images = 0;
+  size_t photo_dark_images = 0, photo_bright_images = 0, photo_clipped_images = 0,
+         photo_capped_images = 0, photo_clip_capped_images = 0;
   for (const auto id : written) {
     pixels += applied[id].person_unmasked;
     changed += applied[id].person_unmasked > 0;
@@ -1707,7 +2529,10 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
     photo_dark_images += applied[id].photo_dark > 0;
     photo_bright_pixels += applied[id].photo_bright;
     photo_bright_images += applied[id].photo_bright > 0;
+    photo_clipped_pixels += applied[id].photo_clipped;
+    photo_clipped_images += applied[id].photo_clipped > 0;
     photo_capped_images += context.photo_views[id].capped ? 1 : 0;
+    photo_clip_capped_images += context.photo_views[id].clip_capped ? 1 : 0;
     for (const auto& c : context.candidates[id]) {
       ++reasons[c.reason];
       Json row = {{"image_index", id},
@@ -1727,16 +2552,36 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
       rows.push_back(std::move(row));
     }
   }
+  Json exposure_ev = Json::array();
+  if (context.exposure_calibrated) {
+    for (const auto id : written) {
+      if (context.exposure_valid[id]) {
+        const auto& wb = context.wb_gains[id];
+        exposure_ev.push_back({{"image_index", id},
+                               {"ev", context.exposure_ev[id]},
+                               {"pixel_ev_shift", context.pixel_ev_shift[id]},
+                               {"residual_ev", context.residual_ev[id]},
+                               {"wb_gains", {wb[0], wb[1], wb[2]}}});
+      }
+    }
+  }
   Log("Static masks: unmasked " + std::to_string(pixels) + " person pixels (" +
       std::to_string(changed) + " images), sky " +
       std::string(context.keep_sky ? "kept" : "cleared (indoor)") + ", cleared " +
       std::to_string(sky_pixels) + " sky pixels (" + std::to_string(sky_changed) +
       " images), edge refined " + std::to_string(sky_edge_refined) + " images (+" +
       std::to_string(sky_edge_to_sky) + " sky, +" + std::to_string(sky_edge_to_static) +
-      " static), photometric masked dark " + std::to_string(photo_dark_pixels) + " px (" +
-      std::to_string(photo_dark_images) + " images) & bright " +
+      " static), exposure " +
+      std::string(context.exposure_calibrated ? "calibrated" : "uncalibrated") +
+      " (med=" +
+      std::to_string(context.exposure_report.value("residual_median_ev", 0.0)) +
+      " EV, wb=" + std::string(context.wb_calibrated ? "calibrated" : "off") +
+      "), photometric masked dark " + std::to_string(photo_dark_pixels) + " px (" +
+      std::to_string(photo_dark_images) + " images), bright " +
       std::to_string(photo_bright_pixels) + " px (" + std::to_string(photo_bright_images) +
-      " images, capped " + std::to_string(photo_capped_images) + ") in " +
+      " images, capped " + std::to_string(photo_capped_images) + "), clipped " +
+      std::to_string(photo_clipped_pixels) + " px (" + std::to_string(photo_clipped_images) +
+      " images, capped " + std::to_string(photo_clip_capped_images) + ") in " +
       std::to_string(context.photo_seconds) + " s");
   return {{"images", written.size()},
           {"images_changed", changed},
@@ -1761,10 +2606,16 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
             {"dark_pixels", photo_dark_pixels},
             {"bright_images", photo_bright_images},
             {"bright_pixels", photo_bright_pixels},
+            {"clipped_images", photo_clipped_images},
+            {"clipped_pixels", photo_clipped_pixels},
             {"capped_images", photo_capped_images},
+            {"clip_capped_images", photo_clip_capped_images},
+            {"exposure", context.exposure_report},
+            {"white_balance", context.wb_report},
             {"seconds", context.photo_seconds}}},
           {"rules", StaticMaskRules()},
           {"seconds", Seconds(started)},
+          {"exposure_ev", exposure_ev},
           {"component_rows", rows}};
 }
 }  // namespace geosun

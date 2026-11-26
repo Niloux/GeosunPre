@@ -1,6 +1,8 @@
 #include "io/crop.h"
 #include "sfm/shutter.h"
+#include <algorithm>
 #include <climits>
+#include <cmath>
 #include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +45,213 @@ void WriteBytes(const fs::path& path, const uint8_t* data, size_t size) {
 struct Extent {
   int x0 = INT_MAX, y0 = INT_MAX, x1 = 0, y1 = 0;
 };
+bool IsExifApp1(const uint8_t* data, size_t size) {
+  return size >= 6 && !std::memcmp(data, "Exif\0\0", 6);
+}
+std::vector<uint8_t> BuildCalibratedExifApp1(double relative_ev) {
+  const double ev = std::clamp(relative_ev, -12.0, 12.0);
+  const double t_i = 0.01 * std::exp2(ev);
+  uint32_t num = 1, den = 100;
+  if (t_i >= 0.01) {
+    den = 1000000;
+    num = static_cast<uint32_t>(std::clamp<long long>(std::llround(t_i * 1000000.0), 1LL, 4000000000LL));
+  } else {
+    num = 1000;
+    den = static_cast<uint32_t>(std::clamp<long long>(std::llround(1000.0 / t_i), 1LL, 4000000000LL));
+  }
+  std::vector<uint8_t> payload(102, 0);
+  std::memcpy(payload.data(), "Exif\0\0", 6);
+  uint8_t* t = payload.data() + 6;
+  t[0] = 'I';
+  t[1] = 'I';
+  auto put_u16 = [&](size_t off, uint16_t v) {
+    t[off] = uint8_t(v & 0xffu);
+    t[off + 1] = uint8_t((v >> 8) & 0xffu);
+  };
+  auto put_u32 = [&](size_t off, uint32_t v) {
+    t[off] = uint8_t(v & 0xffu);
+    t[off + 1] = uint8_t((v >> 8) & 0xffu);
+    t[off + 2] = uint8_t((v >> 16) & 0xffu);
+    t[off + 3] = uint8_t((v >> 24) & 0xffu);
+  };
+  auto put_entry = [&](size_t off, uint16_t tag, uint16_t type, uint32_t count, uint32_t value) {
+    put_u16(off, tag);
+    put_u16(off + 2, type);
+    put_u32(off + 4, count);
+    put_u32(off + 8, value);
+  };
+  put_u16(2, 42);
+  put_u32(4, 8);
+  // IFD0 at 8: Orientation = 1, ExifIFD = 38.
+  put_u16(8, 2);
+  put_entry(10, 0x0112, 3, 1, 1);
+  put_entry(22, 0x8769, 4, 1, 38);
+  put_u32(34, 0);
+  // ExifIFD at 38: ExposureTime at 80, FNumber at 88, ISOSpeedRatings = 100.
+  put_u16(38, 3);
+  put_entry(40, 0x829A, 5, 1, 80);
+  put_entry(52, 0x829D, 5, 1, 88);
+  put_entry(64, 0x8827, 3, 1, 100);
+  put_u32(76, 0);
+  put_u32(80, num);
+  put_u32(84, den);
+  put_u32(88, 1);
+  put_u32(92, 1);
+  return payload;
+}
+std::optional<double> ParseTiffExifEv(const uint8_t* tiff, size_t size) {
+  if (size < 8)
+    return std::nullopt;
+  const bool little = tiff[0] == 'I' && tiff[1] == 'I';
+  const bool big = tiff[0] == 'M' && tiff[1] == 'M';
+  if (!little && !big)
+    return std::nullopt;
+  auto fits = [&](size_t off, size_t n) { return off <= size && n <= size - off; };
+  auto u16 = [&](size_t off) -> std::optional<uint16_t> {
+    if (!fits(off, 2))
+      return std::nullopt;
+    return little ? uint16_t(tiff[off] | (uint16_t(tiff[off + 1]) << 8))
+                  : uint16_t((uint16_t(tiff[off]) << 8) | tiff[off + 1]);
+  };
+  auto u32 = [&](size_t off) -> std::optional<uint32_t> {
+    if (!fits(off, 4))
+      return std::nullopt;
+    if (little)
+      return uint32_t(tiff[off]) | (uint32_t(tiff[off + 1]) << 8) |
+             (uint32_t(tiff[off + 2]) << 16) | (uint32_t(tiff[off + 3]) << 24);
+    return (uint32_t(tiff[off]) << 24) | (uint32_t(tiff[off + 1]) << 16) |
+           (uint32_t(tiff[off + 2]) << 8) | uint32_t(tiff[off + 3]);
+  };
+  const auto magic = u16(2);
+  const auto ifd0 = u32(4);
+  if (!magic || *magic != 42 || !ifd0)
+    return std::nullopt;
+
+  std::optional<double> exposure_time, f_number, iso, iso_sos, iso_rei, iso_speed, shutter_apex,
+      aperture_apex;
+  std::optional<uint32_t> exif_ifd;
+
+  auto read_unsigned = [&](uint16_t type, uint32_t count, size_t entry_off,
+                           uint32_t val_off) -> std::optional<double> {
+    size_t elem = 0;
+    if (type == 3)
+      elem = 2;
+    else if (type == 4)
+      elem = 4;
+    else if (type == 5)
+      elem = 8;
+    if (elem == 0 || count == 0)
+      return std::nullopt;
+    const size_t data_off = elem * size_t(count) <= 4 ? entry_off + 8 : size_t(val_off);
+    if (type == 3) {
+      const auto v = u16(data_off);
+      return v ? std::optional<double>(double(*v)) : std::nullopt;
+    }
+    if (type == 4) {
+      const auto v = u32(data_off);
+      return v ? std::optional<double>(double(*v)) : std::nullopt;
+    }
+    const auto num = u32(data_off), den = u32(data_off + 4);
+    if (!num || !den || *den == 0)
+      return std::nullopt;
+    return double(*num) / double(*den);
+  };
+  auto read_signed = [&](uint16_t type, uint32_t count, size_t entry_off,
+                         uint32_t val_off) -> std::optional<double> {
+    if (type == 3 || type == 4 || type == 5)
+      return read_unsigned(type, count, entry_off, val_off);
+    size_t elem = 0;
+    if (type == 9)
+      elem = 4;
+    else if (type == 10)
+      elem = 8;
+    if (elem == 0 || count == 0)
+      return std::nullopt;
+    const size_t data_off = elem * size_t(count) <= 4 ? entry_off + 8 : size_t(val_off);
+    if (type == 9) {
+      const auto v = u32(data_off);
+      return v ? std::optional<double>(double(int32_t(*v))) : std::nullopt;
+    }
+    const auto num = u32(data_off), den = u32(data_off + 4);
+    if (!num || !den || *den == 0)
+      return std::nullopt;
+    return double(int32_t(*num)) / double(int32_t(*den));
+  };
+
+  auto parse_ifd = [&](uint32_t offset) -> bool {
+    const auto count = u16(offset);
+    if (!count || *count > 256 || !fits(size_t(offset) + 2, size_t(*count) * 12))
+      return false;
+    for (uint16_t i = 0; i < *count; ++i) {
+      const size_t eoff = size_t(offset) + 2 + size_t(i) * 12;
+      const auto tag = u16(eoff), type = u16(eoff + 2);
+      const auto cnt = u32(eoff + 4), val = u32(eoff + 8);
+      if (!tag || !type || !cnt || !val)
+        return false;
+      switch (*tag) {
+      case 0x8769: {
+        const auto v = read_unsigned(*type, *cnt, eoff, *val);
+        if (v && *v >= 0.0 && *v <= double(UINT32_MAX))
+          exif_ifd = uint32_t(*v);
+        break;
+      }
+      case 0x829A:
+        exposure_time = read_unsigned(*type, *cnt, eoff, *val);
+        break;
+      case 0x829D:
+        f_number = read_unsigned(*type, *cnt, eoff, *val);
+        break;
+      case 0x8827:
+        iso = read_unsigned(*type, *cnt, eoff, *val);
+        break;
+      case 0x8831:
+        iso_sos = read_unsigned(*type, *cnt, eoff, *val);
+        break;
+      case 0x8832:
+        iso_rei = read_unsigned(*type, *cnt, eoff, *val);
+        break;
+      case 0x8833:
+        iso_speed = read_unsigned(*type, *cnt, eoff, *val);
+        break;
+      case 0x9201:
+        shutter_apex = read_signed(*type, *cnt, eoff, *val);
+        break;
+      case 0x9202:
+        aperture_apex = read_unsigned(*type, *cnt, eoff, *val);
+        break;
+      default:
+        break;
+      }
+    }
+    return true;
+  };
+  if (!parse_ifd(*ifd0))
+    return std::nullopt;
+  if (exif_ifd && !parse_ifd(*exif_ifd))
+    return std::nullopt;
+
+  auto pos_opt = [](std::optional<double> v) -> std::optional<double> {
+    return v && std::isfinite(*v) && *v > 0.0 ? v : std::nullopt;
+  };
+  std::optional<double> t = pos_opt(exposure_time);
+  if (!t && shutter_apex && std::isfinite(*shutter_apex))
+    t = pos_opt(std::exp2(-*shutter_apex));
+  std::optional<double> fno = pos_opt(f_number);
+  if (!fno && aperture_apex && std::isfinite(*aperture_apex))
+    fno = pos_opt(std::exp2(*aperture_apex * 0.5));
+  std::optional<double> spd;
+  for (const auto& c : {iso, iso_sos, iso_rei, iso_speed}) {
+    if (auto ok = pos_opt(c)) {
+      spd = ok;
+      break;
+    }
+  }
+  if (!t && !fno && !spd)
+    return std::nullopt;
+  const double ev = std::log2(t.value_or(1.0) / (fno.value_or(1.0) * fno.value_or(1.0)) *
+                              spd.value_or(1.0));
+  return std::isfinite(ev) ? std::optional<double>(ev) : std::nullopt;
+}
 }  // namespace
 std::array<CropWindow, 2> ValidDomainCrop(const Scene& scene, const Reconstruction& model,
                                           const fs::path& masks, int readout_axis, int mcu,
@@ -280,10 +489,227 @@ void CropJpeg(const fs::path& source, const fs::path& destination, const CropWin
   WriteBytes(destination, buffer, buffer_size);
   std::free(buffer);
 }
+std::optional<double> ReadJpegExifEv(const fs::path& path) {
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream)
+    return std::nullopt;
+  std::vector<uint8_t> bytes(65536);
+  stream.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+  bytes.resize(size_t(stream.gcount()));
+  if (bytes.size() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8)
+    return std::nullopt;
+  size_t pos = 2;
+  while (pos < bytes.size()) {
+    if (bytes[pos] != 0xff)
+      return std::nullopt;
+    while (pos < bytes.size() && bytes[pos] == 0xff)
+      ++pos;
+    if (pos >= bytes.size())
+      return std::nullopt;
+    const uint8_t marker = bytes[pos++];
+    if (marker == 0xda || marker == 0xd9)
+      return std::nullopt;
+    if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7))
+      continue;
+    if (pos + 2 > bytes.size())
+      return std::nullopt;
+    const size_t seg_len = (size_t(bytes[pos]) << 8) | size_t(bytes[pos + 1]);
+    if (seg_len < 2 || pos + seg_len > bytes.size())
+      return std::nullopt;
+    const size_t payload_off = pos + 2;
+    const size_t payload_len = seg_len - 2;
+    if (marker == 0xe1 && IsExifApp1(bytes.data() + payload_off, payload_len))
+      return ParseTiffExifEv(bytes.data() + payload_off + 6, payload_len - 6);
+    pos += seg_len;
+  }
+  return std::nullopt;
+}
 void CropMask(const fs::path& source, const fs::path& destination, const CropWindow& window) {
   const auto mask = ReadImage(source, cv::IMREAD_GRAYSCALE);
   if (window.x + window.width > mask.cols || window.y + window.height > mask.rows)
     throw std::runtime_error("Crop window lies outside mask " + source.u8string());
   WriteImage(destination, mask(cv::Rect(window.x, window.y, window.width, window.height)).clone());
+}
+void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
+                          const std::optional<CropWindow>& window,
+                          const PhotometricCorrection& correction, int jpeg_quality) {
+  static const std::array<float, 256> kSrgbToLin = [] {
+    std::array<float, 256> t{};
+    for (int i = 0; i < 256; ++i) {
+      const double c = double(i) / 255.0;
+      t[size_t(i)] = float(c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4));
+    }
+    return t;
+  }();
+  static constexpr int kLinLutSize = 16384;
+  static const std::vector<uint8_t> kLinToSrgb = []() {
+    std::vector<uint8_t> t(kLinLutSize + 1);
+    for (int i = 0; i <= kLinLutSize; ++i) {
+      const double x = double(i) / double(kLinLutSize);
+      const double s = x <= 0.0031308 ? 12.92 * x : 1.055 * std::pow(x, 1.0 / 2.4) - 0.055;
+      t[size_t(i)] = static_cast<uint8_t>(std::clamp(std::lround(s * 255.0), 0L, 255L));
+    }
+    return t;
+  }();
+
+  const auto& cam = correction.source_camera;
+  const double fx = cam.params[0], fy = cam.params[1], cx = cam.params[2], cy = cam.params[3];
+  const double k1 = cam.params[4], k2 = cam.params[5], k3 = cam.params[6], k4 = cam.params[7];
+  if (fx <= 0.0 || fy <= 0.0)
+    throw std::runtime_error("Invalid camera focal length for photometric export");
+  double rd_max = 0.0;
+  for (const double px : {0.0, double(cam.width)}) {
+    for (const double py : {0.0, double(cam.height)}) {
+      rd_max = std::max(rd_max, std::hypot((px - cx) / fx, (py - cy) / fy));
+    }
+  }
+  rd_max = std::max(rd_max, 1e-6);
+  constexpr int kVigLutSize = 4096;
+  constexpr double kMaxThetaRad = 80.0 * Pi / 180.0;
+  std::vector<float> inv_vig_lut(kVigLutSize + 1, 1.0f);
+  const auto& vc = correction.vig_coeffs;
+  for (int i = 0; i <= kVigLutSize; ++i) {
+    const double rd = rd_max * (double(i) / double(kVigLutSize));
+    double theta = rd;
+    if (rd > 1e-12) {
+      for (int it = 0; it < 30; ++it) {
+        const double t2 = theta * theta;
+        const double f = theta * (1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4)))) - rd;
+        const double df =
+            1.0 + t2 * (3.0 * k1 + t2 * (5.0 * k2 + t2 * (7.0 * k3 + t2 * 9.0 * k4)));
+        if (df <= 1e-6) {
+          theta = kMaxThetaRad;
+          break;
+        }
+        const double delta = f / df;
+        theta -= delta;
+        if (theta >= kMaxThetaRad) {
+          theta = kMaxThetaRad;
+          break;
+        }
+        if (std::abs(delta) < 1e-10)
+          break;
+      }
+    }
+    const double rho = std::clamp(theta / kMaxThetaRad, 0.0, 1.0);
+    const double r2 = rho * rho;
+    const double vig =
+        std::clamp(std::exp(vc[0] * r2 + vc[1] * r2 * r2 + vc[2] * r2 * r2 * r2), 0.35, 1.35);
+    inv_vig_lut[size_t(i)] = float(1.0 / vig);
+  }
+
+  const auto bytes = ReadBytes(source);
+  jpeg_decompress_struct in{};
+  jpeg_compress_struct out{};
+  JpegError error{};
+  unsigned char* buffer = nullptr;
+  unsigned long buffer_size = 0;
+  std::vector<uint8_t> decoded_rgb;
+  std::vector<uint8_t> out_rgb;
+  std::vector<uint8_t> calibrated_exif;
+  in.err = out.err = jpeg_std_error(&error.manager);
+  error.manager.error_exit = JpegExit;
+  if (setjmp(error.jump)) {
+    jpeg_destroy_compress(&out);
+    jpeg_destroy_decompress(&in);
+    throw std::runtime_error("Cannot normalize JPEG " + source.u8string() + ": " + error.message);
+  }
+  jpeg_create_decompress(&in);
+  jpeg_create_compress(&out);
+  jpeg_mem_src(&in, bytes.data(), static_cast<unsigned long>(bytes.size()));
+  jpeg_save_markers(&in, JPEG_COM, 0xffff);
+  for (int m = 0; m < 16; ++m)
+    jpeg_save_markers(&in, JPEG_APP0 + m, 0xffff);
+  jpeg_read_header(&in, TRUE);
+  in.out_color_space = JCS_RGB;
+  jpeg_start_decompress(&in);
+  const int src_w = int(in.output_width), src_h = int(in.output_height);
+  if (in.output_components != 3 || src_w != cam.width || src_h != cam.height) {
+    jpeg_destroy_compress(&out);
+    jpeg_destroy_decompress(&in);
+    throw std::runtime_error("Unexpected image geometry/channels in " + source.u8string());
+  }
+  const int wx = window ? window->x : 0;
+  const int wy = window ? window->y : 0;
+  const int out_w = window ? window->width : src_w;
+  const int out_h = window ? window->height : src_h;
+  if (wx < 0 || wy < 0 || out_w <= 0 || out_h <= 0 || wx + out_w > src_w || wy + out_h > src_h) {
+    jpeg_destroy_compress(&out);
+    jpeg_destroy_decompress(&in);
+    throw std::runtime_error("Crop window lies outside " + source.u8string());
+  }
+
+  decoded_rgb.resize(size_t(src_w) * size_t(src_h) * 3);
+  while (in.output_scanline < in.output_height) {
+    JSAMPROW row_ptr = decoded_rgb.data() + size_t(in.output_scanline) * size_t(src_w) * 3;
+    jpeg_read_scanlines(&in, &row_ptr, 1);
+  }
+
+  out_rgb.resize(size_t(out_w) * size_t(out_h) * 3);
+  const double exp_gain = std::exp2(-correction.pixel_ev_shift);
+  const float g_r = float(exp_gain * correction.wb_gains[0]);
+  const float g_g = float(exp_gain * correction.wb_gains[1]);
+  const float g_b = float(exp_gain * correction.wb_gains[2]);
+  const double rd_scale = double(kVigLutSize) / rd_max;
+  for (int y = 0; y < out_h; ++y) {
+    const uint8_t* src_row = decoded_rgb.data() + (size_t(wy + y) * size_t(src_w) + size_t(wx)) * 3;
+    uint8_t* dst_row = out_rgb.data() + size_t(y) * size_t(out_w) * 3;
+    const double dy = (double(wy + y) + 0.5 - cy) / fy;
+    const double dy2 = dy * dy;
+    for (int x = 0; x < out_w; ++x) {
+      const double dx = (double(wx + x) + 0.5 - cx) / fx;
+      const double rd = std::sqrt(dx * dx + dy2);
+      const double fidx = std::min(rd * rd_scale, double(kVigLutSize));
+      const int idx0 = std::min(int(fidx), kVigLutSize - 1);
+      const float frac = float(fidx - double(idx0));
+      const float inv_vig =
+          inv_vig_lut[size_t(idx0)] * (1.0f - frac) + inv_vig_lut[size_t(idx0 + 1)] * frac;
+
+      const size_t px_off = size_t(x) * 3;
+      const float lr = std::clamp(kSrgbToLin[src_row[px_off + 0]] * g_r * inv_vig, 0.0f, 1.0f);
+      const float lg = std::clamp(kSrgbToLin[src_row[px_off + 1]] * g_g * inv_vig, 0.0f, 1.0f);
+      const float lb = std::clamp(kSrgbToLin[src_row[px_off + 2]] * g_b * inv_vig, 0.0f, 1.0f);
+      dst_row[px_off + 0] = kLinToSrgb[size_t(lr * float(kLinLutSize) + 0.5f)];
+      dst_row[px_off + 1] = kLinToSrgb[size_t(lg * float(kLinLutSize) + 0.5f)];
+      dst_row[px_off + 2] = kLinToSrgb[size_t(lb * float(kLinLutSize) + 0.5f)];
+    }
+  }
+
+  jpeg_mem_dest(&out, &buffer, &buffer_size);
+  out.image_width = JDIMENSION(out_w);
+  out.image_height = JDIMENSION(out_h);
+  out.input_components = 3;
+  out.in_color_space = JCS_RGB;
+  jpeg_set_defaults(&out);
+  jpeg_set_quality(&out, std::clamp(jpeg_quality, 1, 100), TRUE);
+  for (int ci = 0; ci < out.num_components; ++ci) {
+    out.comp_info[ci].h_samp_factor = 1;
+    out.comp_info[ci].v_samp_factor = 1;
+  }
+  jpeg_start_compress(&out, TRUE);
+  calibrated_exif = BuildCalibratedExifApp1(correction.residual_ev);
+  jpeg_write_marker(&out, JPEG_APP0 + 1, calibrated_exif.data(),
+                    static_cast<unsigned int>(calibrated_exif.size()));
+  for (auto* marker = in.marker_list; marker; marker = marker->next) {
+    if (out.write_JFIF_header && marker->marker == JPEG_APP0 && marker->data_length >= 5 &&
+        !std::memcmp(marker->data, "JFIF", 5))
+      continue;
+    if (out.write_Adobe_marker && marker->marker == JPEG_APP0 + 14 && marker->data_length >= 5 &&
+        !std::memcmp(marker->data, "Adobe", 5))
+      continue;
+    if (marker->marker == JPEG_APP0 + 1 && IsExifApp1(marker->data, marker->data_length))
+      continue;
+    jpeg_write_marker(&out, marker->marker, marker->data, marker->data_length);
+  }
+  while (out.next_scanline < out.image_height) {
+    JSAMPROW row_ptr = out_rgb.data() + size_t(out.next_scanline) * size_t(out_w) * 3;
+    jpeg_write_scanlines(&out, &row_ptr, 1);
+  }
+  jpeg_finish_compress(&out);
+  jpeg_finish_decompress(&in);
+  jpeg_destroy_compress(&out);
+  jpeg_destroy_decompress(&in);
+  WriteBytes(destination, buffer, buffer_size);
+  std::free(buffer);
 }
 }  // namespace geosun

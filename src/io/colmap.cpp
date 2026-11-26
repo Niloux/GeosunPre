@@ -331,13 +331,51 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   // supervision LAS depths before MoGe-2 loads on the GPU.
   Json static_request = nullptr;
   Json static_summary;
+  struct CalibratedPhoto {
+    double ev = 0.0;
+    double pixel_ev_shift = 0.0;
+    double residual_ev = 0.0;
+    std::array<double, 3> wb_gains{1.0, 1.0, 1.0};
+  };
+  bool photometric_calibrated = false;
+  bool wb_calibrated = false;
+  double exposure_ref_ev = 0.0;
+  std::array<std::array<double, 3>, 2> vig_coeffs{};
+  std::unordered_map<uint32_t, CalibratedPhoto> calibrated_photos;
   if (options.enabled && options.static_masks) {
     masks = BuildStaticMasks(scene, selected, rolling ? &motion : nullptr, work, report,
                              options.cache_mb, &surfel_cache);
     static_request = {{"rules", StaticMaskRules()},
                       {"file", FileMetadata(masks / "static_masks.json")}};
     static_summary = ReadJson(masks / "static_masks.json").at("result");
+    if (static_summary.contains("photometric") &&
+        static_summary.at("photometric").contains("exposure") &&
+        static_summary.at("photometric").at("exposure").value("calibrated", false) &&
+        static_summary.contains("exposure_ev")) {
+      const auto& pm = static_summary.at("photometric");
+      photometric_calibrated = true;
+      exposure_ref_ev = pm.at("exposure").value("reference_ev", 0.0);
+      if (pm.contains("white_balance"))
+        wb_calibrated = pm.at("white_balance").value("calibrated", false);
+      if (pm.contains("vignetting_coeffs") && pm.at("vignetting_coeffs").size() == 2) {
+        for (size_t c = 0; c < 2; ++c)
+          for (size_t k = 0; k < 3; ++k)
+            vig_coeffs[c][k] = pm.at("vignetting_coeffs")[c][k].get<double>();
+      }
+      for (const auto& item : static_summary.at("exposure_ev")) {
+        CalibratedPhoto cp;
+        cp.ev = item.at("ev").get<double>();
+        cp.pixel_ev_shift = item.value("pixel_ev_shift", 0.0);
+        cp.residual_ev = item.value("residual_ev", cp.ev);
+        if (item.contains("wb_gains") && item.at("wb_gains").size() == 3) {
+          for (int ch = 0; ch < 3; ++ch)
+            cp.wb_gains[size_t(ch)] = item.at("wb_gains")[size_t(ch)].get<double>();
+        }
+        calibrated_photos.emplace(item.at("image_index").get<uint32_t>(), cp);
+      }
+    }
     static_summary.erase("component_rows");
+    static_summary.erase("exposure_ev");
     timed("static masks");
   }
   // Photos and masks are independent files; their decoding and writing run on all cores.
@@ -369,6 +407,12 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   if (windows)
     request["crop"] = {{"mode", "valid_domain"},
                        {"windows", {(*windows)[0].ToJson(), (*windows)[1].ToJson()}}};
+  if (photometric_calibrated)
+    request["photometric_normalization"] = {{"enabled", true},
+                                            {"jpeg_quality", 97},
+                                            {"vignetting_corrected", true},
+                                            {"white_balance_corrected", wb_calibrated},
+                                            {"reference_ev", exposure_ref_ev}};
   if (include_ply)
     request["ply_filter"] = {
         {"max_range_m", 50.0}, {"max_points", 2500000}, {"max_visual_supplement_points", 100000}};
@@ -447,7 +491,25 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     const auto destination = pending / "images" / fs::u8path(e.name);
     const auto mask = pending / "masks" / fs::u8path(e.name + ".png");
     const auto source_mask = masks / (std::to_string(e.id) + ".png");
-    if (windows) {
+    const auto cal_it = calibrated_photos.find(e.id);
+    if (cal_it != calibrated_photos.end()) {
+      const auto& cp = cal_it->second;
+      PhotometricCorrection corr;
+      corr.source_camera = selected.cameras[e.camera];
+      corr.vig_coeffs = vig_coeffs[e.camera];
+      corr.wb_gains = cp.wb_gains;
+      corr.pixel_ev_shift = cp.pixel_ev_shift;
+      corr.residual_ev = cp.residual_ev;
+      const std::optional<CropWindow> win =
+          windows ? std::optional<CropWindow>((*windows)[e.camera]) : std::nullopt;
+      ExportNormalizedJpeg(e.source, destination, win, corr, 97);
+      if (win)
+        CropMask(source_mask, mask, *win);
+      else
+        fs::copy_file(source_mask, mask);
+      if (FileMetadata(e.source) != e.source_file)
+        throw std::runtime_error("Source image changed while normalizing: " + e.name);
+    } else if (windows) {
       CropJpeg(e.source, destination, (*windows)[e.camera]);
       CropMask(source_mask, mask, (*windows)[e.camera]);
       if (FileMetadata(e.source) != e.source_file)
@@ -463,6 +525,13 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
                {"camera", e.camera},
                {"mask_size", fs::file_size(mask)},
                {"image_size", fs::file_size(destination)}};
+    if (cal_it != calibrated_photos.end()) {
+      const auto& cp = cal_it->second;
+      rows[i]["calibrated_ev"] = cp.residual_ev;
+      rows[i]["raw_relative_ev"] = cp.ev;
+      rows[i]["pixel_ev_shift"] = cp.pixel_ev_shift;
+      rows[i]["wb_gains"] = {cp.wb_gains[0], cp.wb_gains[1], cp.wb_gains[2]};
+    }
   });
   Json photos = Json::array();
   for (auto& row : rows)
@@ -616,6 +685,12 @@ Json CheckBundle(const fs::path& output, const std::string& project) {
         ih.at("orientation") != 1 || mh.at("width") != camera.width ||
         mh.at("height") != camera.height || mh.at("mode") != "L")
       throw std::runtime_error("Image/mask geometry differs");
+    if (saved.contains("calibrated_ev")) {
+      const auto ev = ReadJpegExifEv(image);
+      const double expected_ev = saved.at("calibrated_ev").get<double>();
+      if (!ev || !std::isfinite(*ev) || std::abs(*ev - expected_ev) > 0.01)
+        throw std::runtime_error("Calibrated EXIF EV differs for " + e.name);
+    }
   }
   if (!manifest.at("initialization").is_null())
     VerifyInitializationPly(sparse / "points3D.ply", manifest.at("initialization").at("points"));

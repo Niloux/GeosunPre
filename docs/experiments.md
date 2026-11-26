@@ -254,3 +254,53 @@ Ceres 2.2.0 在 `LAPACK=OFF`、`SUITESPARSE=OFF` 下，所有纯 CPU 替代求�
 | 三维目标点静态视角保留 | `gold_plaque`: `169/169 (100%)`、`floor_fig1`: `42/43 (97.7%)`、`floor_fig2`: `77/77 (100%)` | — |
 
 - **结论与未验证项**：两个实景交付包均将误检压至 `0.23%–0.92%` 且精准屏蔽地板移动阴影与金属牌/玻璃反光高光。**未验证项**：尚未以 `work/展厅-photofix2` 在下游 `LichtFeld-Studio` 完成 29,000 步 3DGS 训练，需实际试训确认图 1/2 地面黑斑与图 3 金属牌反光伪影的最终成图改善。
+
+## 2026-11-26：`StaticMasks` 多视角相对曝光求解（无损 EXIF 重写）与过曝裁切屏蔽（`小场景-evfix`）
+
+- **问题根因定位（`work/小场景` 中庭白墙正面雾斑）**：
+  1. **硬件双镜头 EXIF 抄写偏差**：实测 `work/小场景` 148 对 `L`/`R` 照片的原始 EXIF `EV` 完全相等（`max |EV_L - EV_R| == 0.0`），但 `R` 镜头独立测光/增益与 `L` 并不一致。在红框白墙 `P_wall` 57 张室外非裁切视角上，原硬件 EXIF 与去暗角线性亮度仅呈弱相关（`R` 镜头 `corr = +0.427`、补偿后残差标准差 `0.296 EV` 反而劣于裸图 `0.262`），导致正对红框的 `00111-R ~ 00117-R` 被错误种子化偏高 `+0.23 ~ +0.76 EV`，与贴墙近景 `00048-L ~ 00051-L` 产生 `+0.7 ~ +1.0 EV` 假亮度冲突，在 `SH=0` + 薄墙监督下驱动出“小颗粒灰白层 + 大尺度亮白补丁层”叠加与 Z 排序翻转雾斑；
+  2. **暗走廊过曝裁切帧未屏蔽**：`00156-R ~ 00165-R` 从暗走廊（`EV +1.0 ~ +5.9`）回拍室外白墙时，中庭墙面及门洞已饱和裁切（`RGB 242–255`）却仍保持 `mask == 255` 参与梯度反传。
+- **改动**：
+  - [static_masks.h](../src/geometry/static_masks.h)、[static_masks.cpp](../src/geometry/static_masks.cpp)：在 `DetectPhotometricTransients` 的 `FitVignetting` 之后新增 `SolveRelativeExposures`，在全场景 `L`/`R` 共视帧对（`<= 10 m`、去暗角中灰区 `>= 40` 采样、`MAD <= 0.45 EV`）上构建稀疏图并跑 15 轮 Huber IRLS 求解每帧零均值相对 EV（结果写入 `cache/static_masks.json` 的 `exposure_ev` 与 `photometric.exposure`）；同时利用校准相对 EV（`ev_i - ev_j >= 0.35 EV`）在共视更暗未裁切帧上核验并经滞后扩边屏蔽过曝裁切区为 `0`（独立 `35%` 熔断上限）。全部新规则常量纳入 `StaticMaskRules()`。
+  - [crop.h](../src/io/crop.h)、[crop.cpp](../src/io/crop.cpp)、[colmap.cpp](../src/io/colmap.cpp)：新增 `BuildCalibratedExifApp1`、`CopyJpegWithCalibratedExif` 与 `ReadJpegExifEv`，在 `CropJpeg`（及未裁剪分支）中无损替换 JPEG 的 `"Exif\0\0"` `APP1` 段为校准后的 `ExposureTime`/`FNumber=1`/`ISO=100`/`Orientation=1`（保留 DCT 像素与 XMP/ICC 等其他段），并在 `manifest.json` 的 `images` 记录 `calibrated_ev`、`CheckBundle` 逐图回读核验误差 `<= 0.01 EV`。
+  - [output.md](output.md)、[cache.md](cache.md)：同步更新静态掩码、无损 EXIF 重写及 `check` 回读契约。
+- **实景验证**（`.\tools\windows\build.ps1` Ninja Release `/W4` 0 错误 0 新增警告；从零运行全流程 `.\run.ps1 run --input D:\Data\小场景 --debug --work work\小场景-evfix.work --output work\小场景-evfix`，总耗时 `289.72 s`，保留 `work/小场景-evfix` 与 `work/小场景` 并存对照）：
+
+| 指标 (`小场景` 296 图) | 基线 (`work/小场景`) | 修复后 (`work/小场景-evfix`) |
+| --- | :---: | :---: |
+| `geosunpre check` / 注册数 | `passed: true` / `296/296` | **`passed: true`** / **`296/296`** |
+| 全局相对曝光求解 | — | **`calibrated: true`**，`1` 连通分量（`296/296`），`5,995` 边（含 `1,124` 跨 `L/R` 边），残差 med **`0.0225 EV`** / p90 **`0.1033 EV`** |
+| 交付 JPEG EXIF 回读一致性 | — | 296 图 `orientation = 1`，`max |PIL_ev - calibrated_ev| = 0.000054 EV` |
+| `P_wall` 57 视角 `corr(EV, log2_lum)` / 补偿后 `std` (`L` / `R` / `ALL`) | `0.947 (0.127)` / `0.427 (0.296)` / `0.591 (0.275)` | **`0.985 (0.055)`** / **`0.933 (0.122)`** / **`0.944 (0.108)`** |
+| 过曝裁切屏蔽 (`clipped_pixels` / `images` / `capped`) | — | `14,243,749 px` / `79` 图 / `0` 熔断（`00162-R`: `+14.85%`、`00163-R`: `+13.50%`、`00049-L`: `0.01%`、`00114-R`: `0.00%`） |
+| `LichtFeld-Studio.exe` 5 步冒烟 | — | 退出码 `0`：确认 `PPISP exposure seeded from EXIF for 296 of 296 frames (mean -0.00 EV)`、`296/296` 卷帘/深度/法向/掩码与 `roi.json` 生效 |
+
+- **结论与未验证项**：从源头彻底消除了 `R` 镜头抄写 `L` 镜头 EXIF 的系统误差（`ALL` 亮度残差标准差由 `0.275` 降至 `0.108 EV`）并精确隔离走廊过曝白块，下游 `LichtFeld-Studio` 零改动即在 Step 0 按真实相对曝光初始化。**未验证项**：1）尚未以 `work/小场景-evfix` 在 `LichtFeld-Studio` 跑完完整 20k–30k 步训练并实测红框白墙在 novel view 的最终成图改善；2）尚未验证 `--no-crop-valid-domain` 分支下 `CopyJpegWithCalibratedExif` 的实景交付回读。
+
+## 2026-11-26：源头线性匀光匀色（去暗角 + 3 通道白平衡 + 有界曝光对齐）与过曝/泛光掩码 v2（`小场景-evfix2`）
+
+- **问题复盘（基于 `work/小场景-evfix` 试训反馈与 22,475 条无遮挡 SfM 轨迹诊断）**：
+  1. **过曝掩码 v1 盲区**：仅检查 `<= 20` 邻且 `< 10 m`、强制要求 `depth_smooth` 且仅允许 `radius=3` 格滞后泛洪，导致走廊深处（`00153-R`、`00162-R` 红框与远端安全出口玻璃门、`00167-L`）等大片死白（`RGB=255`）及被镜头泛光冲灰的枝叶/门框缝隙漏检；
+  2. **物理暗角与 ISP 高光肩部残差**：双镜头强径向暗角（`L: -22%`, `R: -30%`）仍保留在导出的 JPEG 中，在 `P_wall` 上造出 `0.730–0.874` 的中心/边缘裂隙；同时相机 ISP 在 `sRGB > 0.78` 进入高光压缩肩部（实测曝光斜率 `0.69`），而 `PPISP`（`train_crf=false`）仅做全场景均值归零+线性缩放，且仅凭 EXIF 无法抵消 `R` 镜头独立白平衡漂移（最大 `±0.15 EV`）；
+  3. **有界像素匀光策略**：直接把室外主众数曝光（KDE 峰值 `-0.692 EV`）与 3 通道白平衡差/径向暗角在线性光空间消除，只把超出 8-bit 安全动态范围（中位 `p50 >= 0.25`、最大压暗 `1.40 EV`、最大提亮 `1.20 EV`）的跨室内部份残差写入 EXIF。
+- **改动**：
+  - [static_masks.h](../src/geometry/static_masks.h)、[static_masks.cpp](../src/geometry/static_masks.cpp)：将相对曝光求解窗口收敛至 `sRGB 0.10–0.78` 并联合求解逐帧 3 通道白平衡（`wb_gains` 保持中性灰亮度不变）；新增 KDE 主曝光众数估计与 `ComputeHomogenizationPlan`（`pixel_ev_shift` / `residual_ev`）；过曝掩码 v2 扩展至 `32` 邻（`< 25 m`、放宽 LAS 深度至 `30 m`、移除 `depth_smooth` 限制）、无界连通饱和平台泛洪、高 EV 室内帧无深度/远距纯白门窗直接补种以及高 EV 泛光缝隙闭运算与外扩（单图 `45%` 熔断）。
+  - [crop.h](../src/io/crop.h)、[crop.cpp](../src/io/crop.cpp)、[colmap.cpp](../src/io/colmap.cpp)：新增 `ExportNormalizedJpeg` 在物理线性空间叠加 KB8 逆暗角查找表、3 通道 `wb_gains` 与 `-pixel_ev_shift` 增益并以 `Q=97`（`4:4:4` 无色度抽样、保留 ICC/XMP 等非 EXIF 段）编码导出 JPEG，将 `residual_ev` 写入 EXIF `APP1` 并删除旧版旁路函数 `CopyJpegWithCalibratedExif`；`manifest.json` 同步记录 `photometric_normalization`、`white_balance` 与每图 `calibrated_ev`/`raw_relative_ev`/`pixel_ev_shift`/`wb_gains`。
+  - [output.md](output.md)、[cache.md](cache.md)：同步更新导出图像光度预处理、`static_masks.json` 与 `manifest.json` 契约。
+- **实景验证**（`.\tools\windows\build.ps1` Ninja Release `/W4` 0 错误 0 新增警告；复用 `work\小场景-evfix.work` 独立导出 `work\小场景-evfix2` 并通过 `.\run.ps1 check`，保留 `work\小场景` 与 `work\小场景-evfix` 并存对照）：
+
+| 指标 (`小场景` 296 图) | 基线 (`work/小场景-evfix`) | 修复后 (`work/小场景-evfix2`) |
+| --- | :---: | :---: |
+| `geosunpre check` / 耗时 (`static_masks` / `export photos`) | `passed: true` (`8.43 s` / —) | **`passed: true`**（`9.33 s` / `11.84 s`） |
+| 联合求解 (`exposure` / `white_balance`) | `med=0.0225 EV` / — | **`med=0.0229 EV`** / `wb calibrated`（`R/G=0.0316`, `B/G=0.0116 EV`） |
+| 源头像素拉平 (`EXIF == 0.00 EV` 帧数 / 全局 EXIF 均值) | `~0/296`（范围 `-1.59..+5.89`） | **`252/296`**（室外 **`246/246` 全部 `0.00 EV`**，均值 `+0.510 EV`） |
+| 过曝裁切屏蔽 (`clipped_pixels` / `images` / `capped`) | `14,243,749 px` / `79` / `0` | **`66,789,373 px`** / **`190`** / **`0` 熔断** |
+| 典型漏检帧未遮死白 (`00167-L` / `00153-R` / `00162-R` / `00162-R`红框) | `18.87%` / `12.39%` / `6.15%` / `~33%` | **`0.00%`** / **`0.42%`** / **`0.05%`** / **`0.01%`** |
+| `P_wall` 裸图跨视角一致性 (`ALL std` / `L lin std` / 门洞 `00168-R..173-R`) | 须靠 PPISP（暗角仍差 `0.73–0.87`） | **裸图免 PPISP 即达 `std=0.0385` (`L=0.0114`, `0.054 EV`)**，门洞 **`0.634–0.680` (`res=0.00`)** |
+| 全场景室外裸图 SfM 轨迹一致性 (`Lum med/p90` / `L-R` / 帧 `std(R/G,B/G)`) | `0.2228 / 0.8085 EV` / `+0.2685 EV` / `0.0336, 0.0223` | **`0.1570 / 0.6896 EV`** / **`+0.0761 EV`** / **`0.0274, 0.0187`** |
+| 室内暗部保护 (`raw_ev >= 0.5` 静态中位 `p50 min / med`) | — | **`0.252 / 0.274`**（无压黑） |
+| `LichtFeld-Studio.exe` 5 步冒烟 (`trainer.json`) | 退出码 `0`（EXIF mean `-0.00 EV`） | 退出码 `0`（`PPISP exposure seeded ... 296/296 frames, mean 0.51 EV`，846k 点正常收敛） |
+
+- **结论与未验证项**：源头线性去暗角 + 白平衡 + 有界匀光已将全部 246 帧室外图直接在像素层面拉平到 `0.00 EV` 且彻底清除了 `00162-R`/`00153-R`/`00167-L` 门洞过曝白块，显著降低了训练器 `PPISP`/`BilateralGrid` 的拟合负担。**未验证项**：1）尚未在 `LichtFeld-Studio` 中用 `work/小场景-evfix2` 跑完完整 20k 步训练并实测 `P_wall` 与其余区域在 novel view 上的最终成图消除效果；2）对于走廊深处看室内与室外的局部高反差镜头（如 `00044-R`、`00052-R` 上半墙在室外多帧共同过曝、没有任何更暗参考帧可对照的区域 `6.2%–8.7%`），因全场景均无未裁切观测而不应人为猜测篡改像素，需实训观察其是否仍有影响。
+
+
