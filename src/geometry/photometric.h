@@ -65,4 +65,21 @@ void PlanSafeHomogenization(const Reconstruction& model, const std::vector<uint3
 
 // Decision constants recorded in static_masks.json for cache invalidation.
 Json PhotometricRules();
+
+struct DiffuseViewRecord {
+  uint32_t image_id = 0;
+  uint32_t camera_id = 0;
+  cv::Mat depth;           // CV_32FC1, cleaned LAS ray depth (m)
+  cv::Mat diffuse_weight;  // CV_8UC1, 0..255
+  cv::Mat srgb_cal;        // CV_8UC3, RGB order, reference-EV calibrated sRGB
+};
+
+void WriteDiffuseViewsArchive(const fs::path& path, const std::array<PhotometricCamGrid, 2>& grids,
+                              const std::vector<DiffuseViewRecord>& views);
+
+// Stream-recolors points3D.ply vertices in-place using calibrated multi-view trimmed-mean
+// [25%, 65%] diffuse sRGB from up to 24 directionally-stratified neighboring views.
+Json RecolorPlyDiffuse(const fs::path& ply_path, const Reconstruction& model,
+                       const ShutterMotion* motion, const fs::path& diffuse_views_path,
+                       int workers);
 }  // namespace geosun

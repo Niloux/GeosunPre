@@ -106,6 +106,7 @@ AdaptiveTrainerResult BuildAdaptiveTrainerConfig(const AdaptiveTrainerInput& inp
   scale_field("sh_degree_interval", true);
   scale_field("grow_until_iter", false);
   scale_field("color_variance_warmup_iters", false);
+  scale_field("exposure_correction_grid_start_iter", false);
   scale_list("eval_steps");
   scale_list("save_steps");
   opt["steps_scaler"] = 1.0;

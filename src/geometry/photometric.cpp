@@ -1,4 +1,7 @@
 #include "geometry/photometric.h"
+#include "io/cache.h"
+#include "io/las.h"
+#include "sfm/shutter.h"
 #include <Eigen/Cholesky>
 #include <Eigen/SparseCholesky>
 #include <Eigen/SparseCore>
@@ -6,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <numeric>
 #include <unordered_map>
 
@@ -1463,5 +1468,450 @@ Json PhotometricRules() {
           {"safe_sat_hi_share", kSafeSatHiShare},
           {"post_clip_lin_thresh", kPostClipLinThresh},
           {"post_dark_sat_shift_ev", kPostDarkSatShiftEv}};
+}
+
+namespace {
+constexpr char kDiffuseMagic[4] = {'G', 'S', 'D', 'V'};
+constexpr uint32_t kDiffuseVersion = 1;
+
+struct LoadedDiffuseGrid {
+  int32_t width = 0, height = 0;
+  double scale_x = 1.0, scale_y = 1.0;
+};
+
+struct LoadedDiffuseView {
+  uint32_t image_id = 0, camera_id = 0;
+  int32_t width = 0, height = 0;
+  Eigen::Matrix3d rot = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d trans = Eigen::Vector3d::Zero();
+  Eigen::Vector3d center = Eigen::Vector3d::Zero();
+  Eigen::Vector3d fwd = Eigen::Vector3d::UnitZ();
+  std::vector<float> depth;
+  std::vector<uint8_t> weight;
+  std::vector<uint8_t> srgb;
+};
+
+struct ViewCellKey {
+  int64_t x = 0, y = 0, z = 0;
+  bool operator==(const ViewCellKey& o) const { return x == o.x && y == o.y && z == o.z; }
+};
+
+struct ViewCellHash {
+  size_t operator()(const ViewCellKey& k) const {
+    uint64_t h = uint64_t(k.x) * 73856093ULL;
+    h ^= uint64_t(k.y) * 19349663ULL;
+    h ^= uint64_t(k.z) * 83492791ULL;
+    return size_t(h);
+  }
+};
+
+const std::array<float, 256>& SrgbLut() {
+  static const std::array<float, 256> lut = []() {
+    std::array<float, 256> t{};
+    for (int i = 0; i < 256; ++i) {
+      const float c = float(i) / 255.0f;
+      t[size_t(i)] = c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+    }
+    return t;
+  }();
+  return lut;
+}
+
+uint8_t LinToSrgbU8(float lin) {
+  const float c = std::clamp(lin, 0.0f, 1.0f);
+  const float s = c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+  return uint8_t(std::clamp(int(std::lround(s * 255.0f)), 0, 255));
+}
+
+bool ProjectPointToDiffuseView(const Reconstruction& model, const ShutterMotion* motion,
+                               const LoadedDiffuseGrid& grid, const LoadedDiffuseView& view,
+                               const Eigen::Vector3d& world, double& out_u, double& out_v,
+                               double& out_dist, double& out_cos) {
+  const uint32_t cid = view.camera_id;
+  const Camera& cam = model.cameras[cid];
+  const Eigen::Vector3d v = view.rot * world + view.trans;
+  Eigen::Vector3d p = v;
+  Eigen::Vector2d px;
+  if (motion) {
+    double s = 0.0;
+    for (int it = 0; it < 2; ++it) {
+      p = motion->Apply(view.image_id, cid, s, v);
+      if (p.norm() <= 0.25)
+        return false;
+      px = cam.Project(p);
+      s = motion->Fraction(cam, px);
+    }
+    p = motion->Apply(view.image_id, cid, s, v);
+  }
+  const double dist = p.norm();
+  if (dist <= 0.25 || dist > 26.0)
+    return false;
+  const double cos_theta = p.z() / dist;
+  const double theta = std::acos(std::clamp(cos_theta, -1.0, 1.0));
+  if (theta >= 79.0 * Pi / 180.0)
+    return false;
+  px = cam.Project(p);
+  out_u = px.x() * grid.scale_x - 0.5;
+  out_v = px.y() * grid.scale_y - 0.5;
+  if (out_u < 1.5 || out_u >= double(grid.width) - 2.5 || out_v < 1.5 ||
+      out_v >= double(grid.height) - 2.5)
+    return false;
+  out_dist = dist;
+  out_cos = std::max(0.05, cos_theta);
+  return true;
+}
+}  // namespace
+
+void WriteDiffuseViewsArchive(const fs::path& path, const std::array<PhotometricCamGrid, 2>& grids,
+                              const std::vector<DiffuseViewRecord>& views) {
+  BinaryWriter out(path);
+  out.Bytes(kDiffuseMagic, 4);
+  out.Value(kDiffuseVersion);
+  out.Value(uint32_t(views.size()));
+  for (int c = 0; c < 2; ++c) {
+    out.Value(int32_t(grids[c].width));
+    out.Value(int32_t(grids[c].height));
+    out.Value(double(grids[c].scale_x));
+    out.Value(double(grids[c].scale_y));
+  }
+  for (const auto& v : views) {
+    if (v.camera_id >= 2)
+      throw std::runtime_error("Invalid camera id in diffuse views archive");
+    const auto& grid = grids[v.camera_id];
+    if (v.depth.cols != grid.width || v.depth.rows != grid.height || v.depth.type() != CV_32FC1 ||
+        v.diffuse_weight.cols != grid.width || v.diffuse_weight.rows != grid.height ||
+        v.diffuse_weight.type() != CV_8UC1 || v.srgb_cal.cols != grid.width ||
+        v.srgb_cal.rows != grid.height || v.srgb_cal.type() != CV_8UC3) {
+      throw std::runtime_error("Diffuse view matrix shape mismatch");
+    }
+    out.Value(v.image_id);
+    out.Value(v.camera_id);
+    out.Value(int32_t(grid.width));
+    out.Value(int32_t(grid.height));
+    for (int y = 0; y < grid.height; ++y)
+      out.Bytes(v.depth.ptr<float>(y), size_t(grid.width) * sizeof(float));
+    for (int y = 0; y < grid.height; ++y)
+      out.Bytes(v.diffuse_weight.ptr<uint8_t>(y), size_t(grid.width));
+    for (int y = 0; y < grid.height; ++y)
+      out.Bytes(v.srgb_cal.ptr<uint8_t>(y), size_t(grid.width) * 3);
+  }
+  out.Commit();
+}
+
+Json RecolorPlyDiffuse(const fs::path& ply_path, const Reconstruction& model,
+                       const ShutterMotion* motion, const fs::path& diffuse_views_path,
+                       int workers) {
+  std::array<LoadedDiffuseGrid, 2> grids{};
+  std::vector<LoadedDiffuseView> views;
+  {
+    BinaryReader in(diffuse_views_path);
+    char magic[4]{};
+    in.Bytes(magic, 4);
+    if (std::memcmp(magic, kDiffuseMagic, 4) != 0)
+      throw std::runtime_error("Invalid diffuse_views.bin magic");
+    const uint32_t version = in.Value<uint32_t>();
+    if (version != kDiffuseVersion)
+      throw std::runtime_error("Unsupported diffuse_views.bin version");
+    const uint32_t num_views = in.Value<uint32_t>();
+    for (int c = 0; c < 2; ++c) {
+      grids[c].width = in.Value<int32_t>();
+      grids[c].height = in.Value<int32_t>();
+      grids[c].scale_x = in.Value<double>();
+      grids[c].scale_y = in.Value<double>();
+    }
+    views.resize(num_views);
+    for (uint32_t k = 0; k < num_views; ++k) {
+      auto& v = views[k];
+      v.image_id = in.Value<uint32_t>();
+      v.camera_id = in.Value<uint32_t>();
+      v.width = in.Value<int32_t>();
+      v.height = in.Value<int32_t>();
+      if (v.image_id >= model.images.size() || !model.images[v.image_id].registered ||
+          v.camera_id >= 2 || v.width != grids[v.camera_id].width ||
+          v.height != grids[v.camera_id].height) {
+        throw std::runtime_error("Invalid view entry in diffuse_views.bin");
+      }
+      const size_t n_px = size_t(v.width) * size_t(v.height);
+      v.depth.resize(n_px);
+      v.weight.resize(n_px);
+      v.srgb.resize(n_px * 3);
+      in.Bytes(v.depth.data(), n_px * sizeof(float));
+      in.Bytes(v.weight.data(), n_px);
+      in.Bytes(v.srgb.data(), n_px * 3);
+      const auto& pose = model.images[v.image_id].pose;
+      v.rot = pose.Rotation().toRotationMatrix();
+      v.trans = pose.Translation();
+      v.center = pose.Center();
+      v.fwd = v.rot.row(2).transpose();
+    }
+    in.End();
+  }
+
+  constexpr double kCellSizeM = 10.0;
+  constexpr double kMaxDistM = 25.0;
+  constexpr double kMaxDistSq = kMaxDistM * kMaxDistM;
+  constexpr double kMinDirSepCos = 0.965;  // ~15 deg
+  constexpr size_t kMaxSelectedViews = 24;
+  constexpr size_t kNearestQuota = 8;
+
+  std::unordered_map<ViewCellKey, std::vector<uint32_t>, ViewCellHash> view_grid;
+  for (uint32_t k = 0; k < views.size(); ++k) {
+    const auto& c = views[k].center;
+    const ViewCellKey key{int64_t(std::floor(c.x() / kCellSizeM)),
+                          int64_t(std::floor(c.y() / kCellSizeM)),
+                          int64_t(std::floor(c.z() / kCellSizeM))};
+    view_grid[key].push_back(k);
+  }
+
+  std::fstream ply(ply_path, std::ios::in | std::ios::out | std::ios::binary);
+  if (!ply.is_open())
+    throw std::runtime_error("Cannot open PLY for diffuse recoloring: " + ply_path.u8string());
+
+  std::string line;
+  uint64_t vertex_count = 0;
+  bool seen_format = false;
+  bool seen_end = false;
+  int prop_count = 0;
+  while (std::getline(ply, line)) {
+    if (!line.empty() && line.back() == '\r')
+      line.pop_back();
+    if (line == "format binary_little_endian 1.0") {
+      seen_format = true;
+    } else if (line.rfind("element vertex ", 0) == 0) {
+      vertex_count = std::stoull(line.substr(15));
+    } else if (line.rfind("property ", 0) == 0) {
+      ++prop_count;
+    } else if (line == "end_header") {
+      seen_end = true;
+      break;
+    }
+  }
+  if (!seen_format || !seen_end || prop_count != 9)
+    throw std::runtime_error("Unexpected PLY header layout in RecolorPlyDiffuse");
+
+  const std::streampos data_offset = ply.tellg();
+  ply.seekg(0, std::ios::end);
+  const std::streamoff total_bytes = ply.tellg() - data_offset;
+  if (uint64_t(total_bytes) != vertex_count * 27ULL)
+    throw std::runtime_error("Unexpected PLY binary payload size in RecolorPlyDiffuse");
+
+  const auto& srgb_lut = SrgbLut();
+  uint64_t recolored_points = 0;
+  uint64_t fallback_points = 0;
+  std::vector<uint32_t> view_hist(65, 0);
+
+  constexpr uint64_t kChunkVertices = 65536;
+  std::vector<uint8_t> chunk_buf;
+  std::vector<uint8_t> chunk_recolored;
+  std::vector<uint16_t> chunk_valid_views;
+
+  for (uint64_t offset = 0; offset < vertex_count; offset += kChunkVertices) {
+    const uint64_t count = std::min(kChunkVertices, vertex_count - offset);
+    chunk_buf.resize(size_t(count) * 27);
+    chunk_recolored.assign(size_t(count), 0);
+    chunk_valid_views.assign(size_t(count), 0);
+
+    ply.seekg(data_offset + std::streamoff(offset * 27ULL));
+    ply.read(reinterpret_cast<char*>(chunk_buf.data()), std::streamsize(chunk_buf.size()));
+    if (!ply)
+      throw std::runtime_error("Failed to read PLY chunk in RecolorPlyDiffuse");
+
+    ParallelFor(size_t(count), workers, 256, [&](size_t idx) {
+      float xyz[3]{};
+      std::memcpy(xyz, chunk_buf.data() + idx * 27, 12);
+      const Eigen::Vector3d X(xyz[0], xyz[1], xyz[2]);
+
+      const int64_t gx = int64_t(std::floor(X.x() / kCellSizeM));
+      const int64_t gy = int64_t(std::floor(X.y() / kCellSizeM));
+      const int64_t gz = int64_t(std::floor(X.z() / kCellSizeM));
+
+      struct CandView {
+        double dist_sq = 0.0;
+        uint32_t k = 0;
+      };
+      std::vector<CandView> cands;
+      cands.reserve(64);
+      for (int64_t dz = -3; dz <= 3; ++dz) {
+        for (int64_t dy = -3; dy <= 3; ++dy) {
+          for (int64_t dx = -3; dx <= 3; ++dx) {
+            const auto it = view_grid.find({gx + dx, gy + dy, gz + dz});
+            if (it == view_grid.end())
+              continue;
+            for (const uint32_t k : it->second) {
+              const Eigen::Vector3d diff = views[k].center - X;
+              const double d2 = diff.squaredNorm();
+              if (d2 > kMaxDistSq || d2 < 0.0625)
+                continue;
+              if ((-diff).dot(views[k].fwd) <= 0.1 * std::sqrt(d2))
+                continue;
+              cands.push_back({d2, k});
+            }
+          }
+        }
+      }
+      if (cands.size() < 3)
+        return;
+      std::sort(cands.begin(), cands.end(),
+                [](const CandView& a, const CandView& b) { return a.dist_sq < b.dist_sq; });
+
+      std::vector<uint32_t> selected;
+      std::vector<Eigen::Vector3d> selected_dirs;
+      std::vector<uint8_t> used(cands.size(), 0);
+      selected.reserve(kMaxSelectedViews);
+      selected_dirs.reserve(kMaxSelectedViews);
+
+      const size_t nearest_limit = std::min(kNearestQuota, cands.size());
+      for (size_t i = 0; i < nearest_limit; ++i) {
+        selected.push_back(cands[i].k);
+        selected_dirs.push_back((views[cands[i].k].center - X).normalized());
+        used[i] = 1;
+      }
+      for (size_t i = nearest_limit; i < cands.size() && selected.size() < kMaxSelectedViews; ++i) {
+        const Eigen::Vector3d dir = (views[cands[i].k].center - X).normalized();
+        bool diverse = true;
+        for (const auto& sd : selected_dirs) {
+          if (dir.dot(sd) >= kMinDirSepCos) {
+            diverse = false;
+            break;
+          }
+        }
+        if (diverse) {
+          selected.push_back(cands[i].k);
+          selected_dirs.push_back(dir);
+          used[i] = 1;
+        }
+      }
+      for (size_t i = nearest_limit; i < cands.size() && selected.size() < kMaxSelectedViews; ++i) {
+        if (!used[i])
+          selected.push_back(cands[i].k);
+      }
+
+      struct ColorObs {
+        float lum = 0.0f;
+        float r = 0.0f, g = 0.0f, b = 0.0f;
+        float w = 0.0f;
+      };
+      std::vector<ColorObs> obs;
+      obs.reserve(selected.size());
+
+      for (const uint32_t k : selected) {
+        const auto& v = views[k];
+        const auto& grid = grids[v.camera_id];
+        double u = 0.0, v_coord = 0.0, d_proj = 0.0, cos_theta = 0.0;
+        if (!ProjectPointToDiffuseView(model, motion, grid, v, X, u, v_coord, d_proj, cos_theta))
+          continue;
+        const int ui = int(std::lround(u));
+        const int vi = int(std::lround(v_coord));
+        const size_t nidx = size_t(vi) * size_t(v.width) + size_t(ui);
+        const float d_j = v.depth[nidx];
+        if (d_j <= 0.25f || std::abs(d_proj - double(d_j)) > std::max(0.12, 0.06 * d_proj))
+          continue;
+        const uint8_t w_u8 = v.weight[nidx];
+        if (w_u8 < 64)
+          continue;
+
+        const int x0 = int(std::floor(u));
+        const int y0 = int(std::floor(v_coord));
+        const float fx = float(u - x0), fy = float(v_coord - y0);
+        const size_t i00 = (size_t(y0) * size_t(v.width) + size_t(x0)) * 3;
+        const size_t i10 = i00 + 3;
+        const size_t i01 = i00 + size_t(v.width) * 3;
+        const size_t i11 = i01 + 3;
+        const float w00 = (1.0f - fx) * (1.0f - fy);
+        const float w10 = fx * (1.0f - fy);
+        const float w01 = (1.0f - fx) * fy;
+        const float w11 = fx * fy;
+
+        const float r_lin = w00 * srgb_lut[v.srgb[i00 + 0]] + w10 * srgb_lut[v.srgb[i10 + 0]] +
+                            w01 * srgb_lut[v.srgb[i01 + 0]] + w11 * srgb_lut[v.srgb[i11 + 0]];
+        const float g_lin = w00 * srgb_lut[v.srgb[i00 + 1]] + w10 * srgb_lut[v.srgb[i10 + 1]] +
+                            w01 * srgb_lut[v.srgb[i01 + 1]] + w11 * srgb_lut[v.srgb[i11 + 1]];
+        const float b_lin = w00 * srgb_lut[v.srgb[i00 + 2]] + w10 * srgb_lut[v.srgb[i10 + 2]] +
+                            w01 * srgb_lut[v.srgb[i01 + 2]] + w11 * srgb_lut[v.srgb[i11 + 2]];
+        const float lum = 0.2126f * r_lin + 0.7152f * g_lin + 0.0722f * b_lin;
+        const float w_obs =
+            (float(w_u8) / 255.0f) * float(cos_theta) / float(std::max(1.0, d_proj * d_proj));
+        if (w_obs > 0.0f)
+          obs.push_back({lum, r_lin, g_lin, b_lin, w_obs});
+      }
+
+      if (obs.size() < 3)
+        return;
+
+      std::sort(obs.begin(), obs.end(),
+                [](const ColorObs& a, const ColorObs& b) { return a.lum < b.lum; });
+      double total_w = 0.0;
+      for (const auto& o : obs)
+        total_w += double(o.w);
+      if (total_w <= 0.0)
+        return;
+
+      const double lo_w = 0.25 * total_w;
+      const double hi_w = 0.65 * total_w;
+      double cum = 0.0;
+      double sum_w = 0.0, sum_r = 0.0, sum_g = 0.0, sum_b = 0.0;
+      for (const auto& o : obs) {
+        const double next = cum + double(o.w);
+        const double overlap = std::min(next, hi_w) - std::max(cum, lo_w);
+        if (overlap > 0.0) {
+          sum_w += overlap;
+          sum_r += overlap * double(o.r);
+          sum_g += overlap * double(o.g);
+          sum_b += overlap * double(o.b);
+        }
+        cum = next;
+      }
+      if (sum_w <= 0.0)
+        return;
+
+      chunk_buf[idx * 27 + 24] = LinToSrgbU8(float(sum_r / sum_w));
+      chunk_buf[idx * 27 + 25] = LinToSrgbU8(float(sum_g / sum_w));
+      chunk_buf[idx * 27 + 26] = LinToSrgbU8(float(sum_b / sum_w));
+      chunk_recolored[idx] = 1;
+      chunk_valid_views[idx] = uint16_t(std::min<size_t>(obs.size(), 64));
+    });
+
+    for (size_t idx = 0; idx < size_t(count); ++idx) {
+      if (chunk_recolored[idx]) {
+        ++recolored_points;
+        ++view_hist[chunk_valid_views[idx]];
+      } else {
+        ++fallback_points;
+      }
+    }
+
+    ply.seekp(data_offset + std::streamoff(offset * 27ULL));
+    ply.write(reinterpret_cast<const char*>(chunk_buf.data()), std::streamsize(chunk_buf.size()));
+    if (!ply)
+      throw std::runtime_error("Failed to write recolored PLY chunk");
+  }
+
+  ply.flush();
+  ply.close();
+  VerifyInitializationPly(ply_path, vertex_count);
+
+  uint32_t median_valid_views = 0;
+  if (recolored_points > 0) {
+    const uint64_t target = (recolored_points + 1) / 2;
+    uint64_t cum = 0;
+    for (uint32_t k = 0; k < view_hist.size(); ++k) {
+      cum += view_hist[k];
+      if (cum >= target) {
+        median_valid_views = k;
+        break;
+      }
+    }
+  }
+
+  const double ratio = vertex_count > 0 ? double(recolored_points) / double(vertex_count) : 0.0;
+  Log("Diffuse PLY recolor: recolored " + std::to_string(recolored_points) + "/" +
+      std::to_string(vertex_count) + " vertices (" + std::to_string(100.0 * ratio) +
+      "%, median_valid_views=" + std::to_string(median_valid_views) + ")");
+  return {{"enabled", true},
+          {"total_points", vertex_count},
+          {"recolored_points", recolored_points},
+          {"fallback_points", fallback_points},
+          {"recolored_ratio", ratio},
+          {"median_valid_views", median_valid_views}};
 }
 }  // namespace geosun

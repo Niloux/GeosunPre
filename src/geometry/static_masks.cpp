@@ -39,30 +39,37 @@ constexpr int SkyEdgeGuidedRadius4k = 12;
 constexpr double SkyEdgeAlphaThreshold = .35;
 constexpr int SkyCanopyPoreMaxArea4k = 2500;
 constexpr double SkyCanopyFoliageBorderShare = .65;
-// Multi-view photometric transient detection (moving shadows and specular glare).
-constexpr int PhotoGridSize = 256;
-constexpr int PhotoNeighbors = 20;
-constexpr double PhotoMaxNeighborDistM = 10.0;
-constexpr double PhotoMinTimeGapS = 1.5;
+// Multi-view diffuse irradiance weighting and specular/clipping attenuation.
+constexpr int PhotoGridSize = 320;
+constexpr int PhotoDiffuseNeighbors = 32;
+constexpr int PhotoDiffuseNearestQuota = 10;
+constexpr double PhotoDiffuseMaxNeighborDistM = 18.0;
+constexpr double PhotoDiffuseMinTimeGapS = 1.5;
+constexpr double PhotoDiffuseMinDirSepCos = 0.965;
+constexpr int PhotoDiffuseMinSeen = 4;
+constexpr double PhotoDiffuseMinNbrSrgb = 0.06;
 constexpr double PhotoMinDepthM = 0.35, PhotoMaxDepthM = 12.0, PhotoMaxDepthGrad = 0.35;
-constexpr int PhotoMinGainSamples = 150, PhotoMinSeen = 6, PhotoGrowMinSeen = 4;
-constexpr double PhotoMinPairGain = 0.50, PhotoMaxPairGain = 2.00;
-constexpr double PhotoMinRefPerceptual = 0.12;
-constexpr int PhotoMinCompArea = 25;
-constexpr double PhotoMaxImageMaskShare = 0.20;
-constexpr double PhotoDarkShare = 0.70, PhotoDarkRatio = 0.78, PhotoDarkDiff = 0.06;
-constexpr double PhotoDarkMaxGrad = 0.20;
-constexpr double PhotoDarkGrowShare = 0.65, PhotoDarkGrowRatio = 0.84, PhotoDarkGrowDiff = 0.04;
-constexpr double PhotoDarkGrowMaxGrad = 0.25;
-constexpr int PhotoDarkGrowRadius = 4, PhotoDarkDilateRadius = 1;
-constexpr double PhotoBrightShare = 0.70, PhotoBrightRatio = 1.30, PhotoBrightDiff = 0.10;
-constexpr double PhotoBrightMaxGrad = 0.25;
-constexpr double PhotoBrightGrowShare = 0.65, PhotoBrightGrowRatio = 1.20, PhotoBrightGrowDiff = 0.07;
-constexpr double PhotoBrightGrowMaxGrad = 0.30;
-constexpr int PhotoBrightGrowRadius = 3, PhotoBrightDilateRadius = 1;
-constexpr int PhotoPersonShadowReach = 24, PhotoPersonMinSeen = 5, PhotoPersonMinCompArea = 12;
-constexpr double PhotoPersonDarkShare = 0.70, PhotoPersonDarkRatio = 0.88, PhotoPersonDarkDiff = 0.04;
-constexpr double PhotoPersonDarkMaxGrad = 0.15;
+constexpr double PhotoDiffuseQuantile = 0.42;
+constexpr double PhotoDiffuseMaxNbrSrgb = 0.78;
+constexpr double PhotoDiffuseMaxNbrMaxCh = 0.84;
+constexpr double PhotoShoulderMinSrgb = 0.76;
+constexpr double PhotoShoulderMinMaxCh = 0.82;
+constexpr double PhotoShoulderMinEvDiff = 0.35;
+constexpr int PhotoShoulderMinDarkerSeen = 2;
+constexpr double PhotoShoulderMinDropEv = 0.12;
+constexpr double PhotoShoulderDropC = 0.25;
+constexpr double PhotoGlareMinEv = 0.15, PhotoGlareBrightC = 0.55;
+constexpr double PhotoGlareMinPerceptualDiff = 0.055, PhotoGlarePerceptualC = 0.12;
+constexpr double PhotoGlintMinEv = 0.40, PhotoGlintBrightC = 0.45;
+constexpr double PhotoGlintMinPerceptualDiff = 0.10, PhotoGlintPerceptualC = 0.15;
+constexpr double PhotoShadowMinRefPerceptual = 0.18;
+constexpr double PhotoShadowMinEv = 0.20, PhotoShadowDarkC = 0.65;
+constexpr double PhotoShadowMinPerceptualDiff = 0.075, PhotoShadowPerceptualC = 0.15;
+constexpr int PhotoPersonShadowReach = 24;
+constexpr double PhotoPersonMinEv = 0.10, PhotoPersonDarkC = 0.30;
+constexpr double PhotoPersonMinPerceptualDiff = 0.045, PhotoPersonPerceptualC = 0.08;
+constexpr int PhotoDiffuseCoreMinArea = 4;
+constexpr double PhotoMinDiffuseWeight = 0.02;
 // Multi-view overexposure clipping and bloom masking.
 constexpr int PhotoClipNeighbors = 32, PhotoClipNearestQuota = 12;
 constexpr double PhotoClipLargeEvDiff = 1.20, PhotoClipMaxNeighborDistM = 25.0;
@@ -105,12 +112,18 @@ struct SkyImage {
 };
 struct PhotoView {
   cv::Mat lum_lin;
-  cv::Mat p_lin, p_min3, p_max3;
+  cv::Mat env_log2_lum;
+  cv::Mat diffuse_weight;
+  cv::Mat srgb_cal;
   cv::Mat raw_sky_small;
   cv::Mat person_small;
   cv::Mat transient_mask;
-  bool capped = false;
   bool clip_capped = false;
+  uint64_t glare_attenuated_grid_px = 0;
+  uint64_t shadow_attenuated_grid_px = 0;
+  uint64_t shoulder_attenuated_grid_px = 0;
+  uint64_t static_grid_px = 0;
+  double weight_sum = 0.0;
 };
 struct Context {
   const Scene& scene;
@@ -510,8 +523,6 @@ struct ApplyCounts {
   uint64_t sky_cleared = 0;
   uint64_t sky_edge_to_sky = 0;
   uint64_t sky_edge_to_static = 0;
-  uint64_t photo_dark = 0;
-  uint64_t photo_bright = 0;
   uint64_t photo_clipped = 0;
 };
 // Smooth local per-channel mean and variance over seed_mask != 0 using 4x block accumulation
@@ -1013,7 +1024,7 @@ cv::Mat GrowHysteresisMask(const cv::Mat& seed, const cv::Mat& soft_raw, int gro
 void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& written,
                                  int workers) {
   const auto started = Clock::now();
-  if (written.size() < size_t(PhotoMinSeen + 1))
+  if (written.size() < size_t(PhotoDiffuseMinSeen + 1))
     return;
   struct OpenCvThreadsGuard {
     int previous = cv::getNumThreads();
@@ -1033,259 +1044,20 @@ void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& 
       context.translations, context.centers, context.seconds, context.photo_grids,
       context.photo_data, workers);
 
-  // Apply 3-channel inverse vignetting & white-balance gains to lum_lin / p_lin for shadow & glare
-  // multi-view comparison.
-  const cv::Mat k3 = cv::Mat::ones(3, 3, CV_8UC1);
-  ParallelFor(written.size(), workers, 1, [&](size_t idx) {
-    const uint32_t id = written[idx];
-    const uint32_t cid = context.model.images[id].camera;
-    const auto& grid = context.photo_grids[cid];
-    const auto& data = context.photo_data[id];
-    auto& view = context.photo_views[id];
-    const auto& wb = context.photo_cal.wb_gains[id];
-    const auto& vc = context.photo_cal.vig_coeffs_rgb[cid];
-    const int ord = context.photo_cal.vig_order[cid];
-    view.p_lin.create(grid.height, grid.width, CV_32FC1);
-    constexpr float inv_gamma = 1.f / 2.2f;
-    for (int y = 0; y < grid.height; ++y) {
-      const cv::Vec3f* rp = data.rgb_lin.ptr<cv::Vec3f>(y);
-      float* lp = view.lum_lin.ptr<float>(y);
-      float* pp = view.p_lin.ptr<float>(y);
-      for (int x = 0; x < grid.width; ++x) {
-        const float rho = grid.rho[size_t(y) * size_t(grid.width) + size_t(x)];
-        const double vr = EvaluateVignettingGain(vc[0], ord, rho);
-        const double vg = EvaluateVignettingGain(vc[1], ord, rho);
-        const double vb = EvaluateVignettingGain(vc[2], ord, rho);
-        const float cr = float(double(rp[x][0]) / vr * wb[0]);
-        const float cg = float(double(rp[x][1]) / vg * wb[1]);
-        const float cb = float(double(rp[x][2]) / vb * wb[2]);
-        lp[x] = 0.2126f * cr + 0.7152f * cg + 0.0722f * cb;
-        pp[x] = std::pow(std::max(lp[x], 0.f), inv_gamma);
-      }
-    }
-    cv::erode(view.p_lin, view.p_min3, k3);
-    cv::dilate(view.p_lin, view.p_max3, k3);
-  });
-
-  const cv::Mat person_reach_kernel = cv::getStructuringElement(
-      cv::MORPH_ELLIPSE, {2 * PhotoPersonShadowReach + 1, 2 * PhotoPersonShadowReach + 1});
-
-  std::vector<cv::Mat> dark_masks(context.model.images.size());
-  std::vector<cv::Mat> bright_masks(context.model.images.size());
+  // 1) Overexposure clipping and bloom masking (must remain 0 in masks/).
   std::vector<cv::Mat> clip_masks(context.model.images.size());
-
-  ParallelFor(written.size(), workers, 1, [&](size_t idx) {
-    const uint32_t i = written[idx];
-    const uint32_t cid_i = context.model.images[i].camera;
-    const auto& cam_i = context.model.cameras[cid_i];
-    const auto& grid_i = context.photo_grids[cid_i];
-    const auto& data_i = context.photo_data[i];
-    const auto& view_i = context.photo_views[i];
-    const Eigen::Vector3d fwd_i = context.rotations[i].row(2).transpose();
-
-    std::vector<std::pair<double, uint32_t>> cand;
-    for (const uint32_t j : written) {
-      if (j == i)
-        continue;
-      const double dist = (context.centers[j] - context.centers[i]).norm();
-      if (dist >= PhotoMaxNeighborDistM)
-        continue;
-      const Eigen::Vector3d fwd_j = context.rotations[j].row(2).transpose();
-      if (fwd_i.dot(fwd_j) <= -0.35)
-        continue;
-      cand.emplace_back(dist, j);
-    }
-    std::sort(cand.begin(), cand.end());
-    std::vector<uint32_t> nbrs;
-    nbrs.reserve(size_t(PhotoNeighbors));
-    std::vector<uint8_t> used(cand.size(), 0);
-    for (size_t k = 0; k < cand.size() && nbrs.size() < size_t(PhotoNeighbors); ++k) {
-      const uint32_t j = cand[k].second;
-      if (context.model.images[j].camera != cid_i ||
-          std::abs(context.seconds[j] - context.seconds[i]) >= PhotoMinTimeGapS) {
-        nbrs.push_back(j);
-        used[k] = 1;
-      }
-    }
-    for (size_t k = 0; k < cand.size() && nbrs.size() < size_t(PhotoNeighbors); ++k) {
-      if (!used[k])
-        nbrs.push_back(cand[k].second);
-    }
-    cv::Mat dark_mask, bright_mask;
-    if (nbrs.size() >= size_t(PhotoMinSeen)) {
-      cv::Mat p_min3_i, p_max3_i;
-      cv::erode(view_i.p_lin, p_min3_i, k3);
-      cv::dilate(view_i.p_lin, p_max3_i, k3);
-
-      bool enable_person_near = false;
-      for (const auto& c : context.candidates[i]) {
-        if (c.reason != "static") {
-          enable_person_near = true;
-          break;
-        }
-      }
-      cv::Mat person_near;
-      if (enable_person_near && !view_i.person_small.empty() &&
-          cv::countNonZero(view_i.person_small) > 0) {
-        cv::dilate(view_i.person_small, person_near, person_reach_kernel);
-      }
-
-      struct ValidPx {
-        int x, y;
-        float p_i, p_min3_i, p_max3_i, lum_i, srgb_i, grad_i;
-        uint8_t near_person;
-        Eigen::Vector3d world;
-      };
-      std::vector<ValidPx> valid;
-      valid.reserve(size_t(grid_i.width) * size_t(grid_i.height) / 2);
-      for (int y = 0; y < grid_i.height; ++y) {
-        const uint8_t* mp = data_i.static_mask.ptr<uint8_t>(y);
-        const uint8_t* sp = data_i.depth_smooth.ptr<uint8_t>(y);
-        const uint8_t* np = person_near.empty() ? nullptr : person_near.ptr<uint8_t>(y);
-        const float* pp = view_i.p_lin.ptr<float>(y);
-        const float* pminp = p_min3_i.ptr<float>(y);
-        const float* pmaxp = p_max3_i.ptr<float>(y);
-        const float* lp = view_i.lum_lin.ptr<float>(y);
-        const float* sr = data_i.lum_srgb.ptr<float>(y);
-        const float* gr = data_i.grad_srgb.ptr<float>(y);
-        const float* dp = data_i.depth.ptr<float>(y);
-        for (int x = 0; x < grid_i.width; ++x) {
-          if (!mp[x] || !sp[x])
-            continue;
-          const size_t gidx = size_t(y) * size_t(grid_i.width) + size_t(x);
-          const Eigen::Vector3d moved = grid_i.rays[gidx] * double(dp[x]);
-          const Eigen::Vector3d cam_pt =
-              context.motion
-                  ? context.motion->Reference(
-                        i, cid_i,
-                        context.motion->Fraction(
-                            cam_i, {(x + 0.5) / grid_i.scale_x, (y + 0.5) / grid_i.scale_y}),
-                        moved)
-                  : moved;
-          const Eigen::Vector3d world =
-              context.rotations[i].transpose() * (cam_pt - context.translations[i]);
-          valid.push_back({x, y, pp[x], pminp[x], pmaxp[x], lp[x], sr[x], gr[x],
-                           uint8_t(np && np[x] ? 1 : 0), world});
-        }
-      }
-      if (!valid.empty()) {
-        std::vector<uint16_t> seen(valid.size(), 0), dark_global(valid.size(), 0),
-            dark_person(valid.size(), 0), dark_soft(valid.size(), 0),
-            bright_global(valid.size(), 0), bright_soft(valid.size(), 0);
-        struct Hit {
-          size_t k;
-          float p_lo, p_hi;
-        };
-        std::vector<Hit> hits;
-        std::vector<float> ratios;
-        hits.reserve(valid.size());
-        ratios.reserve(valid.size());
-
-        for (const uint32_t j : nbrs) {
-          const auto& data_j = context.photo_data[j];
-          const auto& view_j = context.photo_views[j];
-          hits.clear();
-          ratios.clear();
-          for (size_t k = 0; k < valid.size(); ++k) {
-            const auto& px = valid[k];
-            double u = 0.0, v = 0.0, d_proj = 0.0;
-            float rho_j = 0.f;
-            if (!ProjectWorldToPhoto(context, j, px.world, u, v, d_proj, rho_j))
-              continue;
-            const int ui = int(std::lround(u)), vi = int(std::lround(v));
-            if (!data_j.static_mask.at<uint8_t>(vi, ui))
-              continue;
-            const float d_j = data_j.depth.at<float>(vi, ui);
-            if (d_j <= 0.30f || std::abs(d_proj - double(d_j)) > std::max(0.08, 0.05 * d_proj))
-              continue;
-            const float l_samp = SampleBilinear(view_j.lum_lin, u, v);
-            const float s_samp = SampleBilinear(data_j.lum_srgb, u, v);
-            const float p_lo = SampleBilinear(view_j.p_min3, u, v);
-            const float p_hi = SampleBilinear(view_j.p_max3, u, v);
-            hits.push_back({k, p_lo, p_hi});
-            if (px.srgb_i > 0.10f && px.srgb_i < 0.90f && s_samp > 0.10f && s_samp < 0.90f)
-              ratios.push_back(px.lum_i / std::max(l_samp, 1e-5f));
-          }
-          if (ratios.size() < size_t(PhotoMinGainSamples))
-            continue;
-          const size_t mid = ratios.size() / 2;
-          std::nth_element(ratios.begin(), ratios.begin() + mid, ratios.end());
-          const float gain = ratios[mid];
-          if (gain < float(PhotoMinPairGain) || gain > float(PhotoMaxPairGain))
-            continue;
-          const float gain_p = std::pow(gain, 1.f / 2.2f);
-          for (const auto& h : hits) {
-            const size_t k = h.k;
-            ++seen[k];
-            const auto& px = valid[k];
-            const float p_lo = h.p_lo * gain_p;
-            const float p_hi = h.p_hi * gain_p;
-            if (p_lo > float(PhotoMinRefPerceptual)) {
-              if (px.grad_i < float(PhotoDarkMaxGrad) &&
-                  px.p_max3_i < p_lo * float(PhotoDarkRatio) &&
-                  px.p_max3_i < p_lo - float(PhotoDarkDiff))
-                ++dark_global[k];
-              if (px.near_person && px.grad_i < float(PhotoPersonDarkMaxGrad) &&
-                  px.p_i < p_lo * float(PhotoPersonDarkRatio) &&
-                  px.p_i < p_lo - float(PhotoPersonDarkDiff))
-                ++dark_person[k];
-              if (px.grad_i < float(PhotoDarkGrowMaxGrad) &&
-                  px.p_i < p_lo * float(PhotoDarkGrowRatio) &&
-                  px.p_i < p_lo - float(PhotoDarkGrowDiff))
-                ++dark_soft[k];
-            }
-            if (p_hi > float(PhotoMinRefPerceptual)) {
-              if (px.grad_i < float(PhotoBrightMaxGrad) &&
-                  px.p_min3_i > p_hi * float(PhotoBrightRatio) &&
-                  px.p_min3_i > p_hi + float(PhotoBrightDiff))
-                ++bright_global[k];
-              if (px.grad_i < float(PhotoBrightGrowMaxGrad) &&
-                  px.p_i > p_hi * float(PhotoBrightGrowRatio) &&
-                  px.p_i > p_hi + float(PhotoBrightGrowDiff))
-                ++bright_soft[k];
-            }
-          }
-        }
-
-        cv::Mat dark_global_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-        cv::Mat dark_person_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-        cv::Mat dark_soft_map = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-        cv::Mat bright_seed_raw = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-        cv::Mat bright_soft_map = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-        for (size_t k = 0; k < valid.size(); ++k) {
-          const int x = valid[k].x, y = valid[k].y;
-          const uint16_t s = seen[k];
-          if (s < uint16_t(PhotoGrowMinSeen))
-            continue;
-          if (double(dark_soft[k]) >= PhotoDarkGrowShare * double(s))
-            dark_soft_map.at<uint8_t>(y, x) = 255;
-          if (double(bright_soft[k]) >= PhotoBrightGrowShare * double(s))
-            bright_soft_map.at<uint8_t>(y, x) = 255;
-          if (s >= uint16_t(PhotoPersonMinSeen) &&
-              double(dark_person[k]) >= PhotoPersonDarkShare * double(s))
-            dark_person_raw.at<uint8_t>(y, x) = 255;
-          if (s < uint16_t(PhotoMinSeen))
-            continue;
-          if (double(dark_global[k]) >= PhotoDarkShare * double(s))
-            dark_global_raw.at<uint8_t>(y, x) = 255;
-          if (double(bright_global[k]) >= PhotoBrightShare * double(s))
-            bright_seed_raw.at<uint8_t>(y, x) = 255;
-        }
-
-        const cv::Mat dark_seed =
-            FilterComponents(dark_global_raw, PhotoMinCompArea) |
-            FilterComponents(dark_person_raw, PhotoPersonMinCompArea);
-        dark_mask = GrowHysteresisMask(dark_seed, dark_soft_map, PhotoDarkGrowRadius,
-                                       PhotoDarkDilateRadius);
-        bright_mask = GrowHysteresisMask(FilterComponents(bright_seed_raw, PhotoMinCompArea),
-                                         bright_soft_map, PhotoBrightGrowRadius,
-                                         PhotoBrightDilateRadius);
-      }
-    }
-
-    cv::Mat clip_mask;
-    if (context.photo_cal.calibrated && context.photo_cal.exposure_valid[i]) {
+  if (context.photo_cal.calibrated) {
+    ParallelFor(written.size(), workers, 1, [&](size_t idx) {
+      const uint32_t i = written[idx];
+      if (!context.photo_cal.exposure_valid[i])
+        return;
+      const uint32_t cid_i = context.model.images[i].camera;
+      const auto& cam_i = context.model.cameras[cid_i];
+      const auto& grid_i = context.photo_grids[cid_i];
+      const auto& data_i = context.photo_data[i];
+      const Eigen::Vector3d fwd_i = context.rotations[i].row(2).transpose();
       const double ev_i = context.photo_cal.exposure_ev[i];
+
       struct ClipNbrCand {
         double dist = 0.0, dev = 0.0;
         uint32_t j = 0;
@@ -1401,8 +1173,8 @@ void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& 
           }
         }
       }
-      clip_mask = GrowHysteresisMask(FilterComponents(clip_seed_raw, PhotoClipMinCompArea),
-                                     clip_soft_map, -1, 0);
+      cv::Mat clip_mask = GrowHysteresisMask(FilterComponents(clip_seed_raw, PhotoClipMinCompArea),
+                                             clip_soft_map, -1, 0);
       if (!clip_mask.empty()) {
         const bool bloom_frame = (ev_i - context.photo_cal.reference_ev) >= PhotoClipBloomEvBoost;
         if (bloom_frame) {
@@ -1420,41 +1192,21 @@ void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& 
                                                {2 * dilate_r + 1, 2 * dilate_r + 1}));
         }
       }
-    }
-
-    const int static_count = cv::countNonZero(data_i.static_mask);
-    if (static_count > 0 && (!dark_mask.empty() || !bright_mask.empty())) {
-      cv::Mat db_mask = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-      if (!dark_mask.empty())
-        db_mask |= dark_mask;
-      if (!bright_mask.empty())
-        db_mask |= bright_mask;
-      const int db_count = cv::countNonZero(db_mask & data_i.static_mask);
-      if (double(db_count) > PhotoMaxImageMaskShare * double(static_count)) {
-        context.photo_views[i].capped = true;
-        dark_mask.release();
-        bright_mask.release();
-      }
-    }
-    dark_masks[i] = std::move(dark_mask);
-    bright_masks[i] = std::move(bright_mask);
-    clip_masks[i] = std::move(clip_mask);
-  });
+      clip_masks[i] = std::move(clip_mask);
+    });
+  }
 
   std::vector<cv::Mat> post_clip_masks;
   PlanSafeHomogenization(context.model, written, context.photo_grids, context.photo_data,
                          clip_masks, context.photo_cal, post_clip_masks);
 
+  std::vector<cv::Mat> final_clip_masks(context.model.images.size());
   for (const uint32_t i : written) {
-    const uint32_t cid_i = context.model.images[i].camera;
-    const auto& grid_i = context.photo_grids[cid_i];
     const auto& data_i = context.photo_data[i];
-    cv::Mat& dark_mask = dark_masks[i];
-    cv::Mat& bright_mask = bright_masks[i];
-    cv::Mat clip_mask = clip_masks[i];
+    cv::Mat clip_mask = std::move(clip_masks[i]);
     if (!post_clip_masks[i].empty()) {
       if (clip_mask.empty())
-        clip_mask = post_clip_masks[i];
+        clip_mask = std::move(post_clip_masks[i]);
       else
         clip_mask |= post_clip_masks[i];
     }
@@ -1466,30 +1218,483 @@ void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& 
         clip_mask.release();
       }
     }
-    if (!dark_mask.empty() || !bright_mask.empty() || !clip_mask.empty()) {
-      cv::Mat combined = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
-      if (!dark_mask.empty())
-        combined.setTo(1, dark_mask > 0);
-      if (!bright_mask.empty()) {
-        for (int y = 0; y < grid_i.height; ++y) {
-          const uint8_t* bp = bright_mask.ptr<uint8_t>(y);
-          uint8_t* cp = combined.ptr<uint8_t>(y);
-          for (int x = 0; x < grid_i.width; ++x)
-            if (bp[x])
-              cp[x] |= 2;
-        }
-      }
-      if (!clip_mask.empty()) {
-        for (int y = 0; y < grid_i.height; ++y) {
-          const uint8_t* clp = clip_mask.ptr<uint8_t>(y);
-          uint8_t* cp = combined.ptr<uint8_t>(y);
-          for (int x = 0; x < grid_i.width; ++x)
-            if (clp[x])
-              cp[x] |= 4;
-        }
-      }
-      context.photo_views[i].transient_mask = std::move(combined);
+    if (!clip_mask.empty()) {
+      final_clip_masks[i] = clip_mask;
+      context.photo_views[i].transient_mask = std::move(clip_mask);
     }
+  }
+
+  // 2) Full reference-EV calibrated linear irradiance + masked 5x5 log2 luminance envelope.
+  if (context.photo_cal.calibrated) {
+    auto lin_to_srgb_u8 = [](float lin) -> uint8_t {
+      const float c = std::clamp(lin, 0.0f, 1.0f);
+      const float s = c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+      return uint8_t(std::clamp(int(std::lround(s * 255.0f)), 0, 255));
+    };
+    ParallelFor(written.size(), workers, 1, [&](size_t idx) {
+      const uint32_t id = written[idx];
+      const uint32_t cid = context.model.images[id].camera;
+      const auto& grid = context.photo_grids[cid];
+      const auto& data = context.photo_data[id];
+      auto& view = context.photo_views[id];
+      const auto& wb = context.photo_cal.wb_gains[id];
+      const auto& vc = context.photo_cal.vig_coeffs_rgb[cid];
+      const int ord = context.photo_cal.vig_order[cid];
+      const double ev_scale =
+          context.photo_cal.exposure_valid[id]
+              ? std::exp2(context.photo_cal.reference_ev - context.photo_cal.exposure_ev[id])
+              : 1.0;
+
+      view.srgb_cal.create(grid.height, grid.width, CV_8UC3);
+      cv::Mat log2_lum(grid.height, grid.width, CV_32FC1);
+      cv::Mat valid_mask_f = cv::Mat::zeros(grid.height, grid.width, CV_32FC1);
+      const cv::Mat& clip_m = final_clip_masks[id];
+
+      for (int y = 0; y < grid.height; ++y) {
+        const cv::Vec3f* rp = data.rgb_lin.ptr<cv::Vec3f>(y);
+        const uint8_t* sp = data.static_mask.ptr<uint8_t>(y);
+        const uint8_t* cp = clip_m.empty() ? nullptr : clip_m.ptr<uint8_t>(y);
+        float* lp = view.lum_lin.ptr<float>(y);
+        float* llp = log2_lum.ptr<float>(y);
+        float* vmp = valid_mask_f.ptr<float>(y);
+        cv::Vec3b* calp = view.srgb_cal.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < grid.width; ++x) {
+          const float rho = grid.rho[size_t(y) * size_t(grid.width) + size_t(x)];
+          const double vr = EvaluateVignettingGain(vc[0], ord, rho);
+          const double vg = EvaluateVignettingGain(vc[1], ord, rho);
+          const double vb = EvaluateVignettingGain(vc[2], ord, rho);
+          const float cr = float(double(rp[x][0]) / vr * wb[0] * ev_scale);
+          const float cg = float(double(rp[x][1]) / vg * wb[1] * ev_scale);
+          const float cb = float(double(rp[x][2]) / vb * wb[2] * ev_scale);
+          const float lum = std::max(0.2126f * cr + 0.7152f * cg + 0.0722f * cb, 1e-4f);
+          lp[x] = lum;
+          llp[x] = std::log2(lum);
+          calp[x] = {lin_to_srgb_u8(cr), lin_to_srgb_u8(cg), lin_to_srgb_u8(cb)};
+          if (sp[x] && (!cp || !cp[x]))
+            vmp[x] = 1.0f;
+        }
+      }
+      cv::Mat weighted_num, weighted_den;
+      cv::GaussianBlur(log2_lum.mul(valid_mask_f), weighted_num, {5, 5}, 1.2);
+      cv::GaussianBlur(valid_mask_f, weighted_den, {5, 5}, 1.2);
+      view.env_log2_lum.create(grid.height, grid.width, CV_32FC1);
+      for (int y = 0; y < grid.height; ++y) {
+        const float* np = weighted_num.ptr<float>(y);
+        const float* dp = weighted_den.ptr<float>(y);
+        const float* llp = log2_lum.ptr<float>(y);
+        float* ep = view.env_log2_lum.ptr<float>(y);
+        for (int x = 0; x < grid.width; ++x)
+          ep[x] = dp[x] >= 1e-3f ? np[x] / dp[x] : llp[x];
+      }
+    });
+
+    // 3) Multi-view weighted q=0.42 diffuse weight estimation with directional stratification.
+    const cv::Mat person_reach_kernel = cv::getStructuringElement(
+        cv::MORPH_ELLIPSE, {2 * PhotoPersonShadowReach + 1, 2 * PhotoPersonShadowReach + 1});
+    const cv::Mat k3 = cv::Mat::ones(3, 3, CV_8UC1);
+
+    auto weighted_quantile = [](std::vector<std::pair<float, float>>& samples, float q) -> float {
+      std::sort(samples.begin(), samples.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+      double total_w = 0.0;
+      for (const auto& s : samples)
+        total_w += double(s.second);
+      if (total_w <= 0.0)
+        return samples[samples.size() / 2].first;
+      const double target = double(q) * total_w;
+      double cum = 0.0;
+      for (size_t k = 0; k < samples.size(); ++k) {
+        cum += double(samples[k].second);
+        if (cum >= target)
+          return samples[k].first;
+      }
+      return samples.back().first;
+    };
+
+    ParallelFor(written.size(), workers, 1, [&](size_t idx) {
+      const uint32_t i = written[idx];
+      const uint32_t cid_i = context.model.images[i].camera;
+      const auto& cam_i = context.model.cameras[cid_i];
+      const auto& grid_i = context.photo_grids[cid_i];
+      const auto& data_i = context.photo_data[i];
+      auto& view_i = context.photo_views[i];
+      const cv::Mat& clip_i = final_clip_masks[i];
+
+      cv::Mat w_map = cv::Mat::ones(grid_i.height, grid_i.width, CV_32FC1);
+      cv::Mat glare_flag = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+      cv::Mat shadow_flag = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+      cv::Mat shoulder_flag = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+
+      if (context.photo_cal.exposure_valid[i]) {
+        const double ev_i = context.photo_cal.exposure_ev[i];
+        const Eigen::Vector3d fwd_i = context.rotations[i].row(2).transpose();
+        struct DiffuseNbrCand {
+          double dist = 0.0;
+          uint32_t j = 0;
+          Eigen::Vector3d dir = Eigen::Vector3d::Zero();
+        };
+        std::vector<DiffuseNbrCand> cand;
+        for (const uint32_t j : written) {
+          if (j == i || !context.photo_cal.exposure_valid[j])
+            continue;
+          const Eigen::Vector3d offset = context.centers[j] - context.centers[i];
+          const double dist = offset.norm();
+          if (dist < 1e-3 || dist >= PhotoDiffuseMaxNeighborDistM)
+            continue;
+          const Eigen::Vector3d fwd_j = context.rotations[j].row(2).transpose();
+          if (fwd_i.dot(fwd_j) <= -0.35)
+            continue;
+          cand.push_back({dist, j, offset / dist});
+        }
+        std::sort(cand.begin(), cand.end(),
+                  [](const DiffuseNbrCand& a, const DiffuseNbrCand& b) { return a.dist < b.dist; });
+
+        std::vector<uint32_t> nbrs;
+        std::vector<Eigen::Vector3d> chosen_dirs;
+        std::vector<uint8_t> used(cand.size(), 0);
+        nbrs.reserve(size_t(PhotoDiffuseNeighbors));
+        chosen_dirs.reserve(size_t(PhotoDiffuseNeighbors));
+
+        for (size_t k = 0;
+             k < cand.size() && nbrs.size() < size_t(PhotoDiffuseNearestQuota); ++k) {
+          const uint32_t j = cand[k].j;
+          if (context.model.images[j].camera != cid_i ||
+              std::abs(context.seconds[j] - context.seconds[i]) >= PhotoDiffuseMinTimeGapS) {
+            nbrs.push_back(j);
+            chosen_dirs.push_back(cand[k].dir);
+            used[k] = 1;
+          }
+        }
+        for (size_t k = 0; k < cand.size() && nbrs.size() < size_t(PhotoDiffuseNeighbors); ++k) {
+          if (used[k])
+            continue;
+          bool diverse = true;
+          for (const auto& d : chosen_dirs) {
+            if (cand[k].dir.dot(d) >= PhotoDiffuseMinDirSepCos) {
+              diverse = false;
+              break;
+            }
+          }
+          if (diverse) {
+            nbrs.push_back(cand[k].j);
+            chosen_dirs.push_back(cand[k].dir);
+            used[k] = 1;
+          }
+        }
+        for (size_t k = 0; k < cand.size() && nbrs.size() < size_t(PhotoDiffuseNeighbors); ++k) {
+          if (!used[k])
+            nbrs.push_back(cand[k].j);
+        }
+
+        if (nbrs.size() >= size_t(PhotoDiffuseMinSeen)) {
+          bool enable_person_near = false;
+          for (const auto& c : context.candidates[i]) {
+            if (c.reason != "static") {
+              enable_person_near = true;
+              break;
+            }
+          }
+          cv::Mat person_near;
+          if (enable_person_near && !view_i.person_small.empty() &&
+              cv::countNonZero(view_i.person_small) > 0) {
+            cv::dilate(view_i.person_small, person_near, person_reach_kernel);
+          }
+
+          struct ValidPx {
+            int x = 0, y = 0;
+            float env_i = 0.0f, raw_log2_i = 0.0f;
+            float raw_srgb_i = 0.0f, raw_max_i = 0.0f;
+            uint8_t near_person = 0;
+            Eigen::Vector3d world = Eigen::Vector3d::Zero();
+          };
+          std::vector<ValidPx> valid;
+          valid.reserve(size_t(grid_i.width) * size_t(grid_i.height) / 2);
+
+          for (int y = 0; y < grid_i.height; ++y) {
+            const uint8_t* mp = data_i.static_mask.ptr<uint8_t>(y);
+            const uint8_t* sp = data_i.depth_smooth.ptr<uint8_t>(y);
+            const uint8_t* cp = clip_i.empty() ? nullptr : clip_i.ptr<uint8_t>(y);
+            const uint8_t* np = person_near.empty() ? nullptr : person_near.ptr<uint8_t>(y);
+            const float* ep = view_i.env_log2_lum.ptr<float>(y);
+            const float* lp = view_i.lum_lin.ptr<float>(y);
+            const float* srp = data_i.lum_srgb.ptr<float>(y);
+            const float* mxrp = data_i.max_srgb.ptr<float>(y);
+            const float* dp = data_i.depth.ptr<float>(y);
+            for (int x = 0; x < grid_i.width; ++x) {
+              if (!mp[x] || !sp[x] || (cp && cp[x]))
+                continue;
+              const size_t gidx = size_t(y) * size_t(grid_i.width) + size_t(x);
+              const Eigen::Vector3d moved = grid_i.rays[gidx] * double(dp[x]);
+              const Eigen::Vector3d cam_pt =
+                  context.motion
+                      ? context.motion->Reference(
+                            i, cid_i,
+                            context.motion->Fraction(
+                                cam_i, {(x + 0.5) / grid_i.scale_x, (y + 0.5) / grid_i.scale_y}),
+                            moved)
+                      : moved;
+              const Eigen::Vector3d world =
+                  context.rotations[i].transpose() * (cam_pt - context.translations[i]);
+              valid.push_back({x, y, ep[x], std::log2(std::max(lp[x], 1e-4f)), srp[x], mxrp[x],
+                               uint8_t(np && np[x] ? 1 : 0), world});
+            }
+          }
+
+          if (!valid.empty()) {
+            struct ObsSample {
+              float env_j = 0.0f;
+              float raw_log2_j = 0.0f;
+              float weight = 0.0f;
+              uint8_t is_linear = 0;
+              uint8_t is_darker_linear = 0;
+            };
+            std::vector<uint32_t> counts(valid.size(), 0);
+            std::vector<uint32_t> write_pos(valid.size(), 0);
+
+            struct TempHit {
+              uint32_t px_idx = 0;
+              float env_j = 0.0f;
+              float raw_log2_j = 0.0f;
+              float weight = 0.0f;
+              uint8_t is_linear = 0;
+              uint8_t is_darker_linear = 0;
+            };
+            std::vector<TempHit> all_hits;
+            all_hits.reserve(valid.size() * 6);
+
+            for (const uint32_t j : nbrs) {
+              const auto& data_j = context.photo_data[j];
+              const auto& view_j = context.photo_views[j];
+              const cv::Mat& clip_j = final_clip_masks[j];
+              const double ev_j = context.photo_cal.exposure_ev[j];
+              for (size_t k = 0; k < valid.size(); ++k) {
+                double u = 0.0, v = 0.0, d_proj = 0.0;
+                float rho_j = 0.f;
+                if (!ProjectWorldToPhoto(context, j, valid[k].world, u, v, d_proj, rho_j))
+                  continue;
+                const int ui = int(std::lround(u)), vi = int(std::lround(v));
+                if (!data_j.static_mask.at<uint8_t>(vi, ui))
+                  continue;
+                if (!clip_j.empty() && clip_j.at<uint8_t>(vi, ui))
+                  continue;
+                const float d_j = data_j.depth.at<float>(vi, ui);
+                if (d_j <= 0.30f ||
+                    std::abs(d_proj - double(d_j)) > std::max(0.10, 0.05 * d_proj))
+                  continue;
+                const float s_j = SampleBilinear(data_j.lum_srgb, u, v);
+                if (s_j < float(PhotoDiffuseMinNbrSrgb))
+                  continue;
+                const float mx_j = SampleBilinear(data_j.max_srgb, u, v);
+                const uint8_t is_lin =
+                    (s_j <= float(PhotoDiffuseMaxNbrSrgb) &&
+                     mx_j <= float(PhotoDiffuseMaxNbrMaxCh))
+                        ? 1
+                        : 0;
+                const uint8_t is_darker_lin =
+                    (is_lin && (ev_i - ev_j >= PhotoShoulderMinEvDiff)) ? 1 : 0;
+                const float cos_j = std::max(0.1f, std::cos(rho_j * float(80.0 * Pi / 180.0)));
+                const float w_j = cos_j / float(1.0 + 0.05 * d_proj * d_proj);
+                const float env_j = SampleBilinear(view_j.env_log2_lum, u, v);
+                const float lum_j = SampleBilinear(view_j.lum_lin, u, v);
+                all_hits.push_back({uint32_t(k), env_j, std::log2(std::max(lum_j, 1e-4f)), w_j,
+                                    is_lin, is_darker_lin});
+                ++counts[k];
+              }
+            }
+
+            std::vector<uint32_t> offsets(valid.size() + 1, 0);
+            for (size_t k = 0; k < valid.size(); ++k) {
+              offsets[k + 1] = offsets[k] + counts[k];
+              write_pos[k] = offsets[k];
+            }
+            std::vector<ObsSample> packed(offsets.back());
+            for (const auto& h : all_hits) {
+              packed[write_pos[h.px_idx]++] = {h.env_j, h.raw_log2_j, h.weight, h.is_linear,
+                                               h.is_darker_linear};
+            }
+            std::vector<TempHit>().swap(all_hits);
+
+            std::vector<std::pair<float, float>> env_buf, raw_buf;
+            env_buf.reserve(nbrs.size());
+            raw_buf.reserve(nbrs.size());
+
+            const float inv_ev_scale_i = float(std::exp2(
+                context.photo_cal.exposure_ev[i] - context.photo_cal.reference_ev));
+            auto to_perceptual = [](float lin) -> float {
+              return std::pow(std::max(lin, 0.0f), 1.0f / 2.2f);
+            };
+
+            for (size_t k = 0; k < valid.size(); ++k) {
+              const uint32_t begin = offsets[k], end = offsets[k + 1];
+              if (end - begin < uint32_t(PhotoDiffuseMinSeen))
+                continue;
+              uint32_t linear_cnt = 0;
+              uint32_t darker_linear_cnt = 0;
+              for (uint32_t m = begin; m < end; ++m) {
+                linear_cnt += packed[m].is_linear;
+                darker_linear_cnt += packed[m].is_darker_linear;
+              }
+              const bool use_linear_only = linear_cnt >= uint32_t(PhotoDiffuseMinSeen);
+              env_buf.clear();
+              raw_buf.clear();
+              for (uint32_t m = begin; m < end; ++m) {
+                if (use_linear_only && !packed[m].is_linear)
+                  continue;
+                env_buf.emplace_back(packed[m].env_j, packed[m].weight);
+                raw_buf.emplace_back(packed[m].raw_log2_j, packed[m].weight);
+              }
+              const float ref_env = weighted_quantile(env_buf, float(PhotoDiffuseQuantile));
+              const float ref_raw_p50 = weighted_quantile(raw_buf, 0.50f);
+              const auto& px = valid[k];
+              const float delta_ev = px.env_i - ref_env;
+              const float p_env_i = to_perceptual(std::exp2(px.env_i) * inv_ev_scale_i);
+              const float p_ref_i = to_perceptual(std::exp2(ref_env) * inv_ev_scale_i);
+              const float p_raw_i = to_perceptual(std::exp2(px.raw_log2_i) * inv_ev_scale_i);
+              const float p_raw_p50 = to_perceptual(std::exp2(ref_raw_p50) * inv_ev_scale_i);
+
+              float w_bright = 1.0f;
+              const float dp_bright = p_env_i - p_ref_i;
+              if (delta_ev > float(PhotoGlareMinEv) &&
+                  dp_bright > float(PhotoGlareMinPerceptualDiff)) {
+                const float u_ev =
+                    std::min(1.0f, (delta_ev - float(PhotoGlareMinEv)) / float(PhotoGlareBrightC));
+                const float u_p = std::min(
+                    1.0f, (dp_bright - float(PhotoGlareMinPerceptualDiff)) /
+                              float(PhotoGlarePerceptualC));
+                const float u = std::min(u_ev, u_p);
+                const float t = 1.0f - u * u;
+                w_bright = std::max(float(PhotoMinDiffuseWeight), t * t);
+              }
+              const float delta_glint = px.raw_log2_i - ref_raw_p50;
+              const float dp_glint = p_raw_i - p_raw_p50;
+              if (delta_glint > float(PhotoGlintMinEv) &&
+                  dp_glint > float(PhotoGlintMinPerceptualDiff)) {
+                const float ug_ev = std::min(
+                    1.0f, (delta_glint - float(PhotoGlintMinEv)) / float(PhotoGlintBrightC));
+                const float ug_p = std::min(
+                    1.0f, (dp_glint - float(PhotoGlintMinPerceptualDiff)) /
+                              float(PhotoGlintPerceptualC));
+                const float ug = std::min(ug_ev, ug_p);
+                const float tg = 1.0f - ug * ug;
+                w_bright = std::min(w_bright, std::max(float(PhotoMinDiffuseWeight), tg * tg));
+              }
+
+              float w_dark = 1.0f;
+              if (p_ref_i >= float(PhotoShadowMinRefPerceptual)) {
+                const float min_ev =
+                    px.near_person ? float(PhotoPersonMinEv) : float(PhotoShadowMinEv);
+                const float c_ev =
+                    px.near_person ? float(PhotoPersonDarkC) : float(PhotoShadowDarkC);
+                const float min_p = px.near_person ? float(PhotoPersonMinPerceptualDiff)
+                                                   : float(PhotoShadowMinPerceptualDiff);
+                const float c_p = px.near_person ? float(PhotoPersonPerceptualC)
+                                                 : float(PhotoShadowPerceptualC);
+                const float dp_dark = p_ref_i - p_env_i;
+                if (-delta_ev > min_ev && dp_dark > min_p) {
+                  const float ud_ev = std::min(1.0f, (-delta_ev - min_ev) / c_ev);
+                  const float ud_p = std::min(1.0f, (dp_dark - min_p) / c_p);
+                  const float ud = std::min(ud_ev, ud_p);
+                  const float td = 1.0f - ud * ud;
+                  w_dark = std::max(float(PhotoMinDiffuseWeight), td * td);
+                }
+              }
+
+              float w_shoulder = 1.0f;
+              if ((px.raw_srgb_i > float(PhotoShoulderMinSrgb) ||
+                   px.raw_max_i > float(PhotoShoulderMinMaxCh)) &&
+                  darker_linear_cnt >= uint32_t(PhotoShoulderMinDarkerSeen) &&
+                  -delta_ev > float(PhotoShoulderMinDropEv)) {
+                const float us = std::min(
+                    1.0f, (-delta_ev - float(PhotoShoulderMinDropEv)) / float(PhotoShoulderDropC));
+                const float ts = 1.0f - us * us;
+                w_shoulder = std::max(float(PhotoMinDiffuseWeight), ts * ts);
+              }
+
+              w_map.at<float>(px.y, px.x) = std::min({w_bright, w_dark, w_shoulder});
+              if (w_bright < 0.5f)
+                glare_flag.at<uint8_t>(px.y, px.x) = 1;
+              if (w_dark < 0.5f)
+                shadow_flag.at<uint8_t>(px.y, px.x) = 1;
+              if (w_shoulder < 0.5f)
+                shoulder_flag.at<uint8_t>(px.y, px.x) = 1;
+            }
+          }
+        }
+      }
+
+      // 4) Despeckled core halo feathering without bleeding person/domain zeros.
+      cv::Mat halo_in = w_map.clone();
+      cv::Mat raw_core = cv::Mat::zeros(grid_i.height, grid_i.width, CV_8UC1);
+      for (int y = 0; y < grid_i.height; ++y) {
+        const uint8_t* dp = grid_i.domain.ptr<uint8_t>(y);
+        const uint8_t* cp = clip_i.empty() ? nullptr : clip_i.ptr<uint8_t>(y);
+        const uint8_t* pp = view_i.person_small.empty() ? nullptr : view_i.person_small.ptr<uint8_t>(y);
+        float* hp = halo_in.ptr<float>(y);
+        uint8_t* rcp = raw_core.ptr<uint8_t>(y);
+        for (int x = 0; x < grid_i.width; ++x) {
+          if (!dp[x] || (cp && cp[x]) || (pp && pp[x])) {
+            hp[x] = 1.0f;
+          } else if (hp[x] < 0.50f) {
+            rcp[x] = 255;
+          }
+        }
+      }
+      const cv::Mat clean_core = FilterComponents(raw_core, PhotoDiffuseCoreMinArea);
+      cv::Mat core_halo;
+      cv::dilate(clean_core, core_halo, k3);
+      for (int y = 0; y < grid_i.height; ++y) {
+        const uint8_t* rcp = raw_core.ptr<uint8_t>(y);
+        const uint8_t* ccp = clean_core.ptr<uint8_t>(y);
+        const uint8_t* chp = core_halo.ptr<uint8_t>(y);
+        float* hp = halo_in.ptr<float>(y);
+        uint8_t* gfp = glare_flag.ptr<uint8_t>(y);
+        uint8_t* sfp = shadow_flag.ptr<uint8_t>(y);
+        uint8_t* shfp = shoulder_flag.ptr<uint8_t>(y);
+        for (int x = 0; x < grid_i.width; ++x) {
+          if (rcp[x] && !ccp[x]) {
+            hp[x] = std::max(hp[x], 0.80f);
+            gfp[x] = 0;
+            sfp[x] = 0;
+            shfp[x] = 0;
+          } else if (chp[x] && !ccp[x]) {
+            hp[x] = std::min(hp[x], 0.50f);
+          }
+        }
+      }
+      cv::Mat w_feathered;
+      cv::GaussianBlur(halo_in, w_feathered, {3, 3}, 0.85);
+
+      view_i.diffuse_weight.create(grid_i.height, grid_i.width, CV_8UC1);
+      for (int y = 0; y < grid_i.height; ++y) {
+        const uint8_t* dp = grid_i.domain.ptr<uint8_t>(y);
+        const uint8_t* sp = data_i.static_mask.ptr<uint8_t>(y);
+        const uint8_t* cp = clip_i.empty() ? nullptr : clip_i.ptr<uint8_t>(y);
+        const uint8_t* pp = view_i.person_small.empty() ? nullptr : view_i.person_small.ptr<uint8_t>(y);
+        const uint8_t* gfp = glare_flag.ptr<uint8_t>(y);
+        const uint8_t* sfp = shadow_flag.ptr<uint8_t>(y);
+        const uint8_t* shfp = shoulder_flag.ptr<uint8_t>(y);
+        const float* wp = w_feathered.ptr<float>(y);
+        uint8_t* outp = view_i.diffuse_weight.ptr<uint8_t>(y);
+        for (int x = 0; x < grid_i.width; ++x) {
+          if (!dp[x] || (cp && cp[x]) || (pp && pp[x])) {
+            outp[x] = 0;
+            continue;
+          }
+          const float w_clamped = std::clamp(wp[x], 0.0f, 1.0f);
+          outp[x] = uint8_t(std::clamp(int(std::lround(w_clamped * 255.0f)), 0, 255));
+          if (sp[x]) {
+            ++view_i.static_grid_px;
+            view_i.weight_sum += double(outp[x]) / 255.0;
+            if (gfp[x])
+              ++view_i.glare_attenuated_grid_px;
+            if (sfp[x])
+              ++view_i.shadow_attenuated_grid_px;
+            if (shfp[x])
+              ++view_i.shoulder_attenuated_grid_px;
+          }
+        }
+      }
+    });
   }
 
   for (const uint32_t id : written) {
@@ -1499,13 +1704,10 @@ void DetectPhotometricTransients(Context& context, const std::vector<uint32_t>& 
     data.lum_srgb.release();
     data.max_srgb.release();
     data.grad_srgb.release();
-    data.depth.release();
     data.depth_smooth.release();
     data.static_mask.release();
     view.lum_lin.release();
-    view.p_lin.release();
-    view.p_min3.release();
-    view.p_max3.release();
+    view.env_log2_lum.release();
     view.person_small.release();
   }
   context.photo_seconds = Seconds(started);
@@ -1574,40 +1776,26 @@ ApplyCounts Apply(Context& context, uint32_t id, cv::Size grid) {
   }
   if (context.keep_sky && cv::countNonZero(labelled.mask == 128) > 0)
     RefineOutdoorSkyBoundary(context, id, labelled.mask, counts);
-  const cv::Mat& photo_transient = context.photo_views[id].transient_mask;
-  if (!photo_transient.empty()) {
+  const cv::Mat& clip_small = context.photo_views[id].transient_mask;
+  if (!clip_small.empty() && cv::countNonZero(clip_small) > 0) {
     const uint32_t cam_idx = model.images[id].camera;
     const cv::Mat& full_dom = context.full_domains[cam_idx];
-    const cv::Mat dark_small = (photo_transient & 1) != 0;
-    const cv::Mat bright_small = (photo_transient & 2) != 0;
-    const cv::Mat clip_small = (photo_transient & 4) != 0;
-    cv::Mat dark_change = cv::Mat::zeros(camera.height, camera.width, CV_8UC1);
-    cv::Mat bright_change = cv::Mat::zeros(camera.height, camera.width, CV_8UC1);
-    if (cv::countNonZero(dark_small) > 0) {
-      cv::Mat dark_up;
-      cv::resize(dark_small, dark_up, {camera.width, camera.height}, 0, 0, cv::INTER_LINEAR);
-      dark_change = (dark_up >= 128) & (labelled.mask == 255) & full_dom;
-      counts.photo_dark = uint64_t(cv::countNonZero(dark_change));
-      labelled.mask.setTo(0, dark_change);
-    }
-    if (cv::countNonZero(bright_small) > 0) {
-      cv::Mat bright_up;
-      cv::resize(bright_small, bright_up, {camera.width, camera.height}, 0, 0, cv::INTER_LINEAR);
-      bright_change = (bright_up >= 128) & (labelled.mask == 255) & full_dom;
-      counts.photo_bright = uint64_t(cv::countNonZero(bright_change));
-      labelled.mask.setTo(0, bright_change);
-    }
-    if (cv::countNonZero(clip_small) > 0) {
-      cv::Mat clip_up;
-      cv::resize(clip_small, clip_up, {camera.width, camera.height}, 0, 0, cv::INTER_LINEAR);
-      const cv::Mat clip_change = (clip_up >= 128) & (labelled.mask == 255) & full_dom;
-      counts.photo_clipped = uint64_t(cv::countNonZero(clip_change));
-      labelled.mask.setTo(0, clip_change);
-    }
+    cv::Mat clip_up;
+    cv::resize(clip_small, clip_up, {camera.width, camera.height}, 0, 0, cv::INTER_LINEAR);
+    const cv::Mat clip_change = (clip_up >= 128) & (labelled.mask == 255) & full_dom;
+    counts.photo_clipped = uint64_t(cv::countNonZero(clip_change));
+    labelled.mask.setTo(0, clip_change);
   }
   const auto path = context.destination(id);
   fs::create_directories(path.parent_path());
   WriteImage(path, labelled.mask, 1);
+  auto& diffuse_w = context.photo_views[id].diffuse_weight;
+  if (!diffuse_w.empty()) {
+    cv::Mat mask_zero_small;
+    cv::resize(labelled.mask == 0, mask_zero_small, diffuse_w.size(), 0, 0, cv::INTER_AREA);
+    diffuse_w.setTo(0, mask_zero_small >= 128);
+    WriteImage(path.parent_path() / ("w_" + std::to_string(id) + ".png"), diffuse_w, 1);
+  }
   return counts;
 }
 }  // namespace
@@ -1627,47 +1815,45 @@ Json StaticMaskRules() {
           {"sky_canopy_pore_max_area_4k", SkyCanopyPoreMaxArea4k},
           {"sky_canopy_foliage_border_share", SkyCanopyFoliageBorderShare},
           {"photo_grid_size", PhotoGridSize},
-          {"photo_neighbors", PhotoNeighbors},
-          {"photo_max_neighbor_dist_m", PhotoMaxNeighborDistM},
-          {"photo_min_time_gap_s", PhotoMinTimeGapS},
+          {"photo_diffuse_neighbors", PhotoDiffuseNeighbors},
+          {"photo_diffuse_nearest_quota", PhotoDiffuseNearestQuota},
+          {"photo_diffuse_max_neighbor_dist_m", PhotoDiffuseMaxNeighborDistM},
+          {"photo_diffuse_min_time_gap_s", PhotoDiffuseMinTimeGapS},
+          {"photo_diffuse_min_dir_sep_cos", PhotoDiffuseMinDirSepCos},
+          {"photo_diffuse_min_seen", PhotoDiffuseMinSeen},
+          {"photo_diffuse_min_nbr_srgb", PhotoDiffuseMinNbrSrgb},
           {"photo_min_depth_m", PhotoMinDepthM},
           {"photo_max_depth_m", PhotoMaxDepthM},
           {"photo_max_depth_grad", PhotoMaxDepthGrad},
-          {"photo_min_gain_samples", PhotoMinGainSamples},
-          {"photo_min_seen", PhotoMinSeen},
-          {"photo_grow_min_seen", PhotoGrowMinSeen},
-          {"photo_min_pair_gain", PhotoMinPairGain},
-          {"photo_max_pair_gain", PhotoMaxPairGain},
-          {"photo_min_ref_perceptual", PhotoMinRefPerceptual},
-          {"photo_min_comp_area", PhotoMinCompArea},
-          {"photo_max_image_mask_share", PhotoMaxImageMaskShare},
-          {"photo_dark_share", PhotoDarkShare},
-          {"photo_dark_ratio", PhotoDarkRatio},
-          {"photo_dark_diff", PhotoDarkDiff},
-          {"photo_dark_max_grad", PhotoDarkMaxGrad},
-          {"photo_dark_grow_share", PhotoDarkGrowShare},
-          {"photo_dark_grow_ratio", PhotoDarkGrowRatio},
-          {"photo_dark_grow_diff", PhotoDarkGrowDiff},
-          {"photo_dark_grow_max_grad", PhotoDarkGrowMaxGrad},
-          {"photo_dark_grow_radius", PhotoDarkGrowRadius},
-          {"photo_dark_dilate_radius", PhotoDarkDilateRadius},
-          {"photo_bright_share", PhotoBrightShare},
-          {"photo_bright_ratio", PhotoBrightRatio},
-          {"photo_bright_diff", PhotoBrightDiff},
-          {"photo_bright_max_grad", PhotoBrightMaxGrad},
-          {"photo_bright_grow_share", PhotoBrightGrowShare},
-          {"photo_bright_grow_ratio", PhotoBrightGrowRatio},
-          {"photo_bright_grow_diff", PhotoBrightGrowDiff},
-          {"photo_bright_grow_max_grad", PhotoBrightGrowMaxGrad},
-          {"photo_bright_grow_radius", PhotoBrightGrowRadius},
-          {"photo_bright_dilate_radius", PhotoBrightDilateRadius},
+          {"photo_diffuse_quantile", PhotoDiffuseQuantile},
+          {"photo_diffuse_max_nbr_srgb", PhotoDiffuseMaxNbrSrgb},
+          {"photo_diffuse_max_nbr_max_ch", PhotoDiffuseMaxNbrMaxCh},
+          {"photo_shoulder_min_srgb", PhotoShoulderMinSrgb},
+          {"photo_shoulder_min_max_ch", PhotoShoulderMinMaxCh},
+          {"photo_shoulder_min_ev_diff", PhotoShoulderMinEvDiff},
+          {"photo_shoulder_min_darker_seen", PhotoShoulderMinDarkerSeen},
+          {"photo_shoulder_min_drop_ev", PhotoShoulderMinDropEv},
+          {"photo_shoulder_drop_c", PhotoShoulderDropC},
+          {"photo_glare_min_ev", PhotoGlareMinEv},
+          {"photo_glare_bright_c", PhotoGlareBrightC},
+          {"photo_glare_min_perceptual_diff", PhotoGlareMinPerceptualDiff},
+          {"photo_glare_perceptual_c", PhotoGlarePerceptualC},
+          {"photo_glint_min_ev", PhotoGlintMinEv},
+          {"photo_glint_bright_c", PhotoGlintBrightC},
+          {"photo_glint_min_perceptual_diff", PhotoGlintMinPerceptualDiff},
+          {"photo_glint_perceptual_c", PhotoGlintPerceptualC},
+          {"photo_shadow_min_ref_perceptual", PhotoShadowMinRefPerceptual},
+          {"photo_shadow_min_ev", PhotoShadowMinEv},
+          {"photo_shadow_dark_c", PhotoShadowDarkC},
+          {"photo_shadow_min_perceptual_diff", PhotoShadowMinPerceptualDiff},
+          {"photo_shadow_perceptual_c", PhotoShadowPerceptualC},
           {"photo_person_shadow_reach", PhotoPersonShadowReach},
-          {"photo_person_min_seen", PhotoPersonMinSeen},
-          {"photo_person_min_comp_area", PhotoPersonMinCompArea},
-          {"photo_person_dark_share", PhotoPersonDarkShare},
-          {"photo_person_dark_ratio", PhotoPersonDarkRatio},
-          {"photo_person_dark_diff", PhotoPersonDarkDiff},
-          {"photo_person_dark_max_grad", PhotoPersonDarkMaxGrad},
+          {"photo_person_min_ev", PhotoPersonMinEv},
+          {"photo_person_dark_c", PhotoPersonDarkC},
+          {"photo_person_min_perceptual_diff", PhotoPersonMinPerceptualDiff},
+          {"photo_person_perceptual_c", PhotoPersonPerceptualC},
+          {"photo_diffuse_core_min_area", PhotoDiffuseCoreMinArea},
+          {"photo_min_diffuse_weight", PhotoMinDiffuseWeight},
           {"photometric_calibration", PhotometricRules()},
           {"photo_clip_neighbors", PhotoClipNeighbors},
           {"photo_clip_nearest_quota", PhotoClipNearestQuota},
@@ -1818,13 +2004,30 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
       applied[written[i]] = Apply(context, written[i], {grid.width, grid.height});
     });
   }
+  if (context.photo_cal.calibrated && !written.empty()) {
+    std::vector<DiffuseViewRecord> records;
+    records.reserve(written.size());
+    for (const uint32_t id : written) {
+      auto& data = context.photo_data[id];
+      auto& view = context.photo_views[id];
+      if (!data.depth.empty() && !view.diffuse_weight.empty() && !view.srgb_cal.empty()) {
+        records.push_back({id, model.images[id].camera, std::move(data.depth),
+                           std::move(view.diffuse_weight), std::move(view.srgb_cal)});
+      }
+    }
+    if (!records.empty()) {
+      WriteDiffuseViewsArchive(context.destination(written.front()).parent_path() / "diffuse_views.bin",
+                               context.photo_grids, records);
+    }
+  }
   Json rows = Json::array();
   std::map<std::string, size_t> reasons;
   uint64_t pixels = 0, sky_pixels = 0, sky_edge_to_sky = 0, sky_edge_to_static = 0;
-  uint64_t photo_dark_pixels = 0, photo_bright_pixels = 0, photo_clipped_pixels = 0;
+  uint64_t photo_clipped_pixels = 0, glare_atten_px = 0, shadow_atten_px = 0,
+           shoulder_atten_px = 0, static_grid_px = 0;
+  double weight_sum = 0.0;
   size_t changed = 0, sky_changed = 0, sky_edge_refined = 0;
-  size_t photo_dark_images = 0, photo_bright_images = 0, photo_clipped_images = 0,
-         photo_capped_images = 0, photo_clip_capped_images = 0;
+  size_t photo_clipped_images = 0, photo_clip_capped_images = 0;
   for (const auto id : written) {
     pixels += applied[id].person_unmasked;
     changed += applied[id].person_unmasked > 0;
@@ -1833,14 +2036,14 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
     sky_edge_to_sky += applied[id].sky_edge_to_sky;
     sky_edge_to_static += applied[id].sky_edge_to_static;
     sky_edge_refined += (applied[id].sky_edge_to_sky > 0 || applied[id].sky_edge_to_static > 0);
-    photo_dark_pixels += applied[id].photo_dark;
-    photo_dark_images += applied[id].photo_dark > 0;
-    photo_bright_pixels += applied[id].photo_bright;
-    photo_bright_images += applied[id].photo_bright > 0;
     photo_clipped_pixels += applied[id].photo_clipped;
     photo_clipped_images += applied[id].photo_clipped > 0;
-    photo_capped_images += context.photo_views[id].capped ? 1 : 0;
     photo_clip_capped_images += context.photo_views[id].clip_capped ? 1 : 0;
+    glare_atten_px += context.photo_views[id].glare_attenuated_grid_px;
+    shadow_atten_px += context.photo_views[id].shadow_attenuated_grid_px;
+    shoulder_atten_px += context.photo_views[id].shoulder_attenuated_grid_px;
+    static_grid_px += context.photo_views[id].static_grid_px;
+    weight_sum += context.photo_views[id].weight_sum;
     for (const auto& c : context.candidates[id]) {
       ++reasons[c.reason];
       Json row = {{"image_index", id},
@@ -1879,6 +2082,14 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
   const double new_clip_pct =
       100.0 * (pm.contains("homogenization") ? pm.at("homogenization").value("new_clip_rate", 0.0)
                                              : 0.0);
+  const double mean_static_weight =
+      static_grid_px > 0 ? weight_sum / double(static_grid_px) : 1.0;
+  const double glare_atten_ratio =
+      static_grid_px > 0 ? double(glare_atten_px) / double(static_grid_px) : 0.0;
+  const double shadow_atten_ratio =
+      static_grid_px > 0 ? double(shadow_atten_px) / double(static_grid_px) : 0.0;
+  const double shoulder_atten_ratio =
+      static_grid_px > 0 ? double(shoulder_atten_px) / double(static_grid_px) : 0.0;
   Log("Static masks: unmasked " + std::to_string(pixels) + " person pixels (" +
       std::to_string(changed) + " images), sky " +
       std::string(context.keep_sky ? "kept" : "cleared (indoor)") + ", cleared " +
@@ -1890,22 +2101,25 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
       " (holdout_p50=" + std::to_string(holdout_p50) + " EV, new_clip=" +
       std::to_string(new_clip_pct) + "%, wb=" +
       std::string(context.photo_cal.wb_calibrated ? "calibrated" : "off") +
-      "), masked dark " + std::to_string(photo_dark_pixels) + " px (" +
-      std::to_string(photo_dark_images) + " images), bright " +
-      std::to_string(photo_bright_pixels) + " px (" + std::to_string(photo_bright_images) +
-      " images, capped " + std::to_string(photo_capped_images) + "), clipped " +
+      ", mean_diffuse_w=" + std::to_string(mean_static_weight) + ", glare_atten=" +
+      std::to_string(100.0 * glare_atten_ratio) + "%, shadow_atten=" +
+      std::to_string(100.0 * shadow_atten_ratio) + "%, shoulder_atten=" +
+      std::to_string(100.0 * shoulder_atten_ratio) + "%), clipped " +
       std::to_string(photo_clipped_pixels) + " px (" + std::to_string(photo_clipped_images) +
       " images, capped " + std::to_string(photo_clip_capped_images) + ") in " +
       std::to_string(context.photo_seconds) + " s");
   Json photometric_report = context.photo_cal.report;
-  photometric_report["dark_images"] = photo_dark_images;
-  photometric_report["dark_pixels"] = photo_dark_pixels;
-  photometric_report["bright_images"] = photo_bright_images;
-  photometric_report["bright_pixels"] = photo_bright_pixels;
   photometric_report["clipped_images"] = photo_clipped_images;
   photometric_report["clipped_pixels"] = photo_clipped_pixels;
-  photometric_report["capped_images"] = photo_capped_images;
   photometric_report["clip_capped_images"] = photo_clip_capped_images;
+  photometric_report["diffuse_weights"] = {{"static_grid_pixels", static_grid_px},
+                                           {"glare_attenuated_grid_pixels", glare_atten_px},
+                                           {"shadow_attenuated_grid_pixels", shadow_atten_px},
+                                           {"shoulder_attenuated_grid_pixels", shoulder_atten_px},
+                                           {"glare_attenuated_ratio", glare_atten_ratio},
+                                           {"shadow_attenuated_ratio", shadow_atten_ratio},
+                                           {"shoulder_attenuated_ratio", shoulder_atten_ratio},
+                                           {"mean_static_weight", mean_static_weight}};
   photometric_report["seconds"] = context.photo_seconds;
   return {{"images", written.size()},
           {"images_changed", changed},

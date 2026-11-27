@@ -24,7 +24,7 @@
 
 ## 下游训练与核验
 
-定制 LFS 以交付目录为数据路径，直接读取 `depths/`、`normals/` 和 `supervision.json`：识别到 `depth_format = "uint16_png_ssi"`、`depth_type = "ray_distance"` 与 `normal_frame = "opencv_camera"` 后，保持 `depth_loss_mode = "ssi"`、将 `normal_loss_space` 设为 `camera-opencv`（若为 `auto`），并关闭 `depth_auto_generate` 与 `normal_auto_generate`；显式指定的非默认选择保持不变。深度是沿视线距离，只有 GUT 光栅化按鱼眼视线渲染，训练须开启 `--gut`（见 `configs/trainer.json` 默认配置），否则 LFS 告警且离轴处深度监督有偏。`configs/trainer.json` 统一使用 `mask_mode = "segment_and_ignore"`：室外保留的 `128` 施加天空不透明度惩罚并忽略 `0`；封闭室内经静态掩码将 `128` 全部改回 `255` 后仅含 `{255, 0}`，避免室内灯箱或天花被挖空。`supervision.json` 记录每图有效像素、子图规划、生成参数及文件身份，`check` 会逐图回读校验。
+定制 LFS 以交付目录为数据路径，直接读取 `depths/`、`normals/`、`weights/`（若存在 `320` 长边单通道连续漫反射权重）和 `supervision.json`：识别到 `depth_format = "uint16_png_ssi"`、`depth_type = "ray_distance"` 与 `normal_frame = "opencv_camera"` 后，保持 `depth_loss_mode = "ssi"`、将 `normal_loss_space` 设为 `camera-opencv`（若为 `auto`），并关闭 `depth_auto_generate` 与 `normal_auto_generate`；显式指定的非默认选择保持不变。光度连续权重（离线静态先验叠加延迟对称在线离群保护）仅缩放光度与梯度残差权重，自适应密度误差图仅采用离线静态权重，法向与深度监督保留完整 `masks/` 权重。深度是沿视线距离，只有 GUT 光栅化按鱼眼视线渲染，训练须开启 `--gut`（见 `configs/trainer.json` 默认配置），否则 LFS 告警且离轴处深度监督有偏。`configs/trainer.json` 统一使用 `mask_mode = "segment_and_ignore"`：室外保留的 `128` 施加天空不透明度惩罚并忽略 `0`；封闭室内经静态掩码将 `128` 全部改回 `255` 后仅含 `{255, 0}`，避免室内灯箱或天花被挖空。`supervision.json` 记录每图有效像素、子图规划、生成参数及文件身份，`check` 会逐图回读校验。
 
 在 LFS 中以交付目录试训示例：
 

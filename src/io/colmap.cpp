@@ -3,9 +3,12 @@
 #include "io/crop.h"
 #include "io/las.h"
 #include "io/roi.h"
+#include "io/scene.h"
 #include "io/trainer_config.h"
+#include "geometry/photometric.h"
 #include "geometry/static_masks.h"
 #include "sfm/shutter.h"
+#include <opencv2/imgcodecs.hpp>
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -413,14 +416,18 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
                        {"windows", {(*windows)[0].ToJson(), (*windows)[1].ToJson()}}};
   if (photometric_calibrated)
     request["photometric_normalization"] = {{"enabled", true},
-                                            {"version", 2},
+                                            {"version", 3},
                                             {"mode", homog_mode},
                                             {"jpeg_quality", 97},
                                             {"vignetting_corrected", true},
                                             {"vignetting_rgb", true},
                                             {"soft_highlight_knee", 0.92},
                                             {"white_balance_corrected", wb_calibrated},
-                                            {"reference_ev", exposure_ref_ev}};
+                                            {"reference_ev", exposure_ref_ev},
+                                            {"photometric_weights",
+                                             {{"enabled", true},
+                                              {"max_size", 320},
+                                              {"encoding", "uint8_linear_0_255"}}}};
   if (include_ply)
     request["ply_filter"] = {
         {"max_range_m", 50.0}, {"max_points", 2500000}, {"max_visual_supplement_points", 100000}};
@@ -479,6 +486,7 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     uncropped_visual = rolling ? OriginalPhotoObservations(pre_cleanup, motion, 8)
                                : std::move(pre_cleanup);
   }
+  const ShutterMotion uncropped_motion = motion;
   if (windows && rolling)
     motion = CropMotion(motion, original, *windows);
   const auto model = windows ? CropModel(original, *windows, rolling ? &motion : nullptr) : original;
@@ -492,6 +500,8 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   for (const auto* e : registered) {
     fs::create_directories((pending / "images" / fs::u8path(e->name)).parent_path());
     fs::create_directories((pending / "masks" / fs::u8path(e->name + ".png")).parent_path());
+    if (photometric_calibrated)
+      fs::create_directories((pending / "weights" / fs::u8path(e->name + ".png")).parent_path());
   }
   std::vector<Json> rows(registered.size());
   ParallelFor(registered.size(), workers, 1, [&](size_t i) {
@@ -533,6 +543,49 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
                {"camera", e.camera},
                {"mask_size", fs::file_size(mask)},
                {"image_size", fs::file_size(destination)}};
+    if (photometric_calibrated) {
+      const auto weight_src = masks / ("w_" + std::to_string(e.id) + ".png");
+      const cv::Mat w_grid = ReadImage(weight_src, cv::IMREAD_GRAYSCALE);
+      if (w_grid.empty())
+        throw std::runtime_error("Missing cached diffuse weight map: " + weight_src.u8string());
+      const auto& out_cam = model.cameras[e.camera];
+      const auto& orig_cam = selected.cameras[e.camera];
+      const double win_x = windows ? double((*windows)[e.camera].x) : 0.0;
+      const double win_y = windows ? double((*windows)[e.camera].y) : 0.0;
+      const int max_dim = std::max(out_cam.width, out_cam.height);
+      const double scale = 320.0 / double(std::max(1, max_dim));
+      const int w_out = std::max(1, int(std::lround(double(out_cam.width) * scale)));
+      const int h_out = std::max(1, int(std::lround(double(out_cam.height) * scale)));
+      const double step_x = double(out_cam.width) / double(w_out);
+      const double step_y = double(out_cam.height) / double(h_out);
+      const double grid_sx = double(w_grid.cols) / double(orig_cam.width);
+      const double grid_sy = double(w_grid.rows) / double(orig_cam.height);
+      cv::Mat weight_out(h_out, w_out, CV_8UC1);
+      for (int y = 0; y < h_out; ++y) {
+        const double full_y = win_y + (double(y) + 0.5) * step_y;
+        const double gv = std::clamp(full_y * grid_sy - 0.5, 0.0, double(w_grid.rows - 1));
+        const int y0 = int(std::floor(gv));
+        const int y1 = std::min(y0 + 1, w_grid.rows - 1);
+        const float fy = float(gv - double(y0));
+        const uint8_t* r0 = w_grid.ptr<uint8_t>(y0);
+        const uint8_t* r1 = w_grid.ptr<uint8_t>(y1);
+        uint8_t* dst = weight_out.ptr<uint8_t>(y);
+        for (int x = 0; x < w_out; ++x) {
+          const double full_x = win_x + (double(x) + 0.5) * step_x;
+          const double gu = std::clamp(full_x * grid_sx - 0.5, 0.0, double(w_grid.cols - 1));
+          const int x0 = int(std::floor(gu));
+          const int x1 = std::min(x0 + 1, w_grid.cols - 1);
+          const float fx = float(gu - double(x0));
+          const float val =
+              (1.0f - fy) * ((1.0f - fx) * float(r0[x0]) + fx * float(r0[x1])) +
+              fy * ((1.0f - fx) * float(r1[x0]) + fx * float(r1[x1]));
+          dst[x] = uint8_t(std::clamp(int(std::lround(val)), 0, 255));
+        }
+      }
+      const auto weight_dest = pending / "weights" / fs::u8path(e.name + ".png");
+      WriteImage(weight_dest, weight_out, 1);
+      rows[i]["weight_size"] = fs::file_size(weight_dest);
+    }
     if (cal_it != calibrated_photos.end()) {
       const auto& cp = cal_it->second;
       rows[i]["calibrated_ev"] = cp.residual_ev;
@@ -575,11 +628,24 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   if (options.enabled) {
     supervision = ExportSupervision(scene, model, masks, pending, options, rolling ? &motion : nullptr,
                                     surfel_cache.get());
+    supervision["photometric_weights"] = {{"enabled", photometric_calibrated},
+                                          {"max_size", 320},
+                                          {"encoding", "uint8_linear_0_255"}};
     surfel_cache.reset();
     WriteJson(pending / "supervision.json", supervision);
   }
   surfel_cache.reset();
-  const Json initialization = include_ply ? initialization_job.get() : Json(nullptr);
+  Json initialization = include_ply ? initialization_job.get() : Json(nullptr);
+  if (include_ply && photometric_calibrated &&
+      fs::is_regular_file(masks / "diffuse_views.bin")) {
+    const Json diffuse_ply =
+        RecolorPlyDiffuse(pending / "sparse/0/points3D.ply", selected,
+                          rolling ? &uncropped_motion : nullptr, masks / "diffuse_views.bin",
+                          workers);
+    initialization["color"] = "calibrated_multi_view_diffuse_srgb";
+    initialization["diffuse_recoloring"] = diffuse_ply;
+    initialization["ply_size_bytes"] = fs::file_size(pending / "sparse/0/points3D.ply");
+  }
   if (generate_roi)
     WriteJson(pending / "roi.json", roi_json);
   uint64_t geom_points = 0;
@@ -677,6 +743,9 @@ Json CheckBundle(const fs::path& output, const std::string& project) {
   const auto model = ReadColmap(sparse, scene, rolling ? &shutter : nullptr, motion);
   if (manifest.at("images").size() != scene.images.size())
     throw std::runtime_error("Bundle exposure count differs");
+  const bool expect_weights =
+      manifest.at("request").contains("photometric_normalization") &&
+      manifest.at("request").at("photometric_normalization").value("version", 0) >= 3;
   for (uint32_t i = 0; i < scene.images.size(); ++i) {
     const auto& e = scene.images[i];
     const auto& saved = manifest.at("images")[i];
@@ -693,6 +762,19 @@ Json CheckBundle(const fs::path& output, const std::string& project) {
         ih.at("orientation") != 1 || mh.at("width") != camera.width ||
         mh.at("height") != camera.height || mh.at("mode") != "L")
       throw std::runtime_error("Image/mask geometry differs");
+    if (expect_weights || saved.contains("weight_size")) {
+      const auto weight = output / "weights" / fs::u8path(e.name + ".png");
+      if (!saved.contains("weight_size") || !fs::is_regular_file(weight) ||
+          fs::file_size(weight) != saved.at("weight_size").get<uint64_t>())
+        throw std::runtime_error("Photometric weight file missing or size differs for " + e.name);
+      const auto wh = ImageHeader(weight);
+      const int max_dim = std::max(camera.width, camera.height);
+      const double scale = 320.0 / double(std::max(1, max_dim));
+      const int exp_w = std::max(1, int(std::lround(double(camera.width) * scale)));
+      const int exp_h = std::max(1, int(std::lround(double(camera.height) * scale)));
+      if (wh.at("width") != exp_w || wh.at("height") != exp_h || wh.at("mode") != "L")
+        throw std::runtime_error("Photometric weight geometry differs for " + e.name);
+    }
     if (saved.contains("calibrated_ev")) {
       const auto ev = ReadJpegExifEv(image);
       const double expected_ev = saved.at("calibrated_ev").get<double>();

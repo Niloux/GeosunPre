@@ -333,4 +333,67 @@ Ceres 2.2.0 在 `LAPACK=OFF`、`SUITESPARSE=OFF` 下，所有纯 CPU 替代求�
 
 - **结论与未验证项**：收敛为单一 `SafeBounded` 主线（3 通道 Schur-Complement IRLS 标定 + 时序平滑白平衡 + 有界安全像素匀光 + 每通道 `0.92` 高光软拐点 + 亮度联合过曝/闭环审计）。在 `小场景` 实测较 `work/1125/小场景` 提升 `PSNR +0.682 dB`、`Aligned PSNR +0.924 dB`、走廊 6 视角 `+2.595 dB`，几何精度亦最优（`normal_angle_deg: 16.319°` vs `16.431°`，`depth_absrel: 0.0231` vs `0.0256`）；`展厅` 目视核验 `00194-R`/`00168-R` 蓝色 LED 灯槽与屏幕均保持静态 `255` 且 `clip_capped_images == 0`。**未验证项**：尚未以 `work/展厅-photov3` 在下游 `LichtFeld-Studio` 跑完完整 29,000 步 3DGS 训练以实测该室内场景最终成图表现。
 
+## 2026-11-27：全链路无反光纯漫反射 3DGS 重建（`weights/` 连续漫反射权重 + `RecolorPlyDiffuse` + `sh_degree=0` / `PPISP` 损失链路修复）
+
+- **问题根因定位**：
+  1. 原 `GeosunPre` 瞬态光度剔除仅在配对曝光比 `[0.50, 2.00]` 内采样且带 `grad < 0.25` 门限，跳过了大曝光差参考帧与展板文字/奖牌框线上的镜面反光，同时对阴影/高光二值置 `0` 会破坏静态展板与地面的 MoGe-2 深度/法向监督；`points3D.ply` 仍直接使用未经光度校准和反光过滤的原始 `.las` RGB；默认模板保留 `sh_degree=1` 与 `color_variance_weight=0.0`，使半透明浮层与球谐视角项在训练中拟合出吊顶灯高光、奖牌高光与残余行人影子。
+  2. 原 `LichtFeld-Studio` 在开启 `use_exposure_correction` 时，将未经过 `PPISP` 曝光/白平衡校准的原始渲染 `output.image`（`raw_loss_input`）送入高权重 `gradient_residual_loss`（`weight=1.8`）及解耦后的 `SSIM` 对比度/结构项，导致大曝光跳变视角强行将未经曝光拉平的参考光影烙入静态表面；同时缺乏消费级 `weights/` 连续降权 sidecar 与无参数梯度污染的 `PPISP::backward_rgb_only_in_place` 回传通路。
+- **改动**：
+  - `LichtFeld-Studio`：
+    - 新增 [photometric_robust_weight.hpp](../../LichtFeld-Studio/src/training/kernels/photometric_robust_weight.hpp)、[photometric_robust_weight.cu](../../LichtFeld-Studio/src/training/kernels/photometric_robust_weight.cu) 与 [photometric_weights_sidecar.hpp](../../LichtFeld-Studio/src/training/photometric_weights_sidecar.hpp) / [.cpp](../../LichtFeld-Studio/src/training/photometric_weights_sidecar.cpp)，实现 256 MiB CUDA 常驻（CPU 溢出回退）的 `weights/*.png` 双线性加载、与前景/掩码融合及在线 `8×8` 低频不对称高光/阴影残差连续降权。
+    - 扩展 [ppisp.hpp](../../LichtFeld-Studio/src/training/components/ppisp.hpp) / [.cpp](../../LichtFeld-Studio/src/training/components/ppisp.cpp) 新增 `backward_rgb_only_in_place`（分配全尺寸独立暂存缓冲，不写 `PPISP` 参数梯度），并在 [trainer.hpp](../../LichtFeld-Studio/src/training/trainer.hpp) / [.cpp](../../LichtFeld-Studio/src/training/trainer.cpp) 中保留 `normal_pixel_weight` 全自信度监督的同时用连续漫反射权重加权光度/梯度/自适应密度误差图，且修复 `use_exposure_correction` 启用期间 `SSIM` 与 `gradient_residual_loss` 的 `PPISP` 对齐前向/反传回路。
+    - 在 [test_mask_preprocess_fusion.cpp](../../LichtFeld-Studio/tests/test_mask_preprocess_fusion.cpp) 与 [test_ppisp_regularization.cpp](../../LichtFeld-Studio/tests/test_ppisp_regularization.cpp) 补充 GPU 权重核及 `backward_rgb_only_in_place` 有限差分单测。
+  - `GeosunPre`：
+    - 更新 [configs/trainer.json](../configs/trainer.json)（`"sh_degree": 0`、`"color_variance_weight": 0.05`、`"color_variance_warmup_iters": 1500`、`"exposure_correction_grid_start_iter": 3000`、`"tv_loss_weight": 20.0`）与 [trainer_config.cpp](../src/io/trainer_config.cpp)（同步按比例缩放 `exposure_correction_grid_start_iter`）。
+    - 重构 [static_masks.cpp](../src/geometry/static_masks.cpp)（提升至 `PhotoGridSize=320`，删除配对 `±1 EV` 二值暗/亮掩码旧路径）：在全局 `reference_ev` 线性空间用无梯度门槛的 `5×5` 掩码归一化包络、全视角原始 `p50` 点高光判别及至多 32 个 `<=18 m` 方向分层共视邻域的加权 `q=0.35` 漫反射基准，生成包含 `sRGB>=0.06` 邻域过滤、联合 EV/感知幅度门限（避免压暗黑地毯/黑边框等暗部量化区）及去噪核膨胀的连续 Tukey 漫反射权重 `weights/{L,R}/**.JPG.png`，并将 `masks/` 严格收敛为仅人物/有效域外/真过曝裁切置 `0`；写出 `cache/static_masks/diffuse_views.bin`。
+    - 在 [photometric.h](../src/geometry/photometric.h) / [photometric.cpp](../src/geometry/photometric.cpp) 新增流式分块 `RecolorPlyDiffuse`（每点至多 24 方向分层视角、LAS 深度抑遮挡、高漫反射权重过滤 `[20%, 55%]` 加权截断均值重着色 `points3D.ply`）；升级 [colmap.cpp](../src/io/colmap.cpp)（`photometric_normalization.version = 3`、`weights/` 随窗口双线性导出及 `check` 回读核验）并同步 [output.md](output.md)、[cache.md](cache.md)、[supervision.md](supervision.md)。
+- **验证与实测对照**：
+  - **单元测试**：`lichtfeld_tests.exe`（`MaskPreprocess*:GradientResidual*:TrainingParameters*:ArgumentParser*:PPISP*`）`273` 用例跑过 `262 PASS`、`11 SKIPPED`（仅外部数据集环境变量门控用例）、`0 FAILED`；`color_variance_tests.exe` `13/13 PASS`；`GeosunPre` `tools/windows/build.ps1` Ninja Release `/W4` `0` 错误 `0` 新增警告。
+  - **预处理门限迭代**：`小场景-diffuse` 初版纯 `log2` 权重因暗部 8-bit 量化与无条件 `3×3` 腐蚀导致 `mean_static_weight = 0.7161 < 0.85`（黑窗框/暗地毯误衰减），触发重规划门限并加入感知幅度门限与去噪核膨胀后恢复至 `0.9390`。
+
+| 预处理场景 (`geosunpre check passed: true`) | 配准 | 留出 `lum_p50` (前→后) | `mean_static_weight` | `glare_atten` / `shadow_atten` | 过曝图数 / 像素 (`capped`) | `RecolorPlyDiffuse` 重着色 | 监督有效像素 |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `小场景-diffuse` (`work/小场景-diffuse`) | `296/296` | `0.1354 → 0.0455 EV` | **`0.9390`** | `3.072%` / `1.325%` | `254` / `45.79M` (`0`) | `724,314 / 846,335` (**`85.58%`**, `med_views=11`) | `208.65M` |
+| `展厅-diffuse` (`work/展厅-diffuse`) | `588/588` | `0.1757 → 0.0760 EV` | **`0.9448`** | `3.269%` / `0.458%` | `461` / `58.44M` (`0`) | `625,228 / 882,717` (**`70.83%`**, `med_views=8`) | `396.65M` |
+
+| 下游 3DGS 训练对比 (`LichtFeld-Studio --headless --eval`) | 步数 (`train/val`) | `PSNR` | `Aligned PSNR` | `SSIM` / `Aligned` | `LPIPS` / `Aligned` | `Normal (°)` / `Depth AbsRel` | `Bias_corr (R,G,B)` | 终态效果与权衡 |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | --- |
+| `小场景` 基线 (`photov3` → `lfs-photov3`) | `20k` (`259/37`) | `23.2020` | `24.1104` | `0.7840 / 0.8019` | `0.2963 / 0.2929` | — | — | `sh_degree=1`，保留少量镜面反光 |
+| **`小场景-diffuse` (`work/小场景-lfs-diffuse`)** | `20k` (`259/37`) | `21.8964` | `22.4140` | `0.7841 / 0.7994` | `0.3017 / 0.2986` | `16.5851°` / `0.0161` | `(-0.020,-0.019,-0.019)` | `sh_degree=0` 移除电梯门/玻璃反光与移动阴影（结构 `SSIM` 持平，黑箱“recycle.”字体锐利） |
+| `展厅` 基线 (`work/展厅` → `work/展厅-lfs-base`) | `29k` (`514/74`) | `24.9800` | `25.7375` | `0.8318 / 0.8493` | `0.2792 / 0.2752` | `15.7113°` / `0.0094` | `(+0.0023,+0.0023,+0.0029)` | `00285-L` 地面仍有行人灰影与反光斑，`00253-L`/`00277-L` 展墙含高光雾与玻璃虚影 |
+| **`展厅-diffuse` (`work/展厅-lfs-diffuse`)** | `29k` (`514/74`) | `24.5014` | `25.1476` | `0.8292 / 0.8461` | `0.2836 / 0.2795` | `16.1574°` / **`0.0082`** | `(-0.0011,-0.0010,-0.0008)` | 清除地面行人灰影、白色展台/展墙高光雾与玻璃虚影，几何 `Depth AbsRel` 优 `12.8%`，汉字清晰 |
+
+- **结论与取舍**：
+  - 将交付目标收敛为纯漫反射无反光重建（`sh_degree=0` + `weights/` 连续降权 + 多视角截断均值重着色 + `color_variance=0.05` + `PPISP` 光度对齐梯度通路）后，尽管相对于仍包含实拍高光的未改动留出真值图，逐像素 `PSNR` 按预期微降 `0.48 dB`（`展厅`）至 `1.31 dB`（`小场景`），但渲染视觉上彻底消除了地面移动影子拖尾、白色展台与展墙顶灯高光雾、金属电梯门及玻璃反光虚影，`展厅` 几何深度精度 `Depth AbsRel` 从 `0.0094` 改善至 `0.0082`，色偏校正残差近乎归零（`< 0.0011`），且文字锐度与 `SSIM`（`0.8292` / `0.8461`）保持稳健。
+
+## 2026-11-27（续）：白墙暗黄/发灰污染与 PPISP 漂移修复（高光肩区降权 + HDR DC 上界释放 + GPU 融合 PPISP 正则，`小场景-lfs-diffuse4`）
+
+- **三层根因定位（围绕 `work/小场景-lfs-diffuse/eval_step_20000/2433-514856-679_00039-L.png` 弧形白墙脏斑）**：
+  1. **`GeosunPre` 高光非线性肩区未降权**：室内走廊/大堂白墙在过曝邻近亮度下虽未触及硬裁切掩码，但已进入相机/软拐点非线性肩区（`sRGB >= 0.76`, `max_ch >= 0.82`），相对更暗多视角观测线性偏暗 `0.12+ EV`，旧版 `diffuse` 未对该肩区降权，拖低白墙参考真值与 `RecolorPlyDiffuse` 初始色。
+  2. **`LichtFeld-Studio` `sh0` DC 上界锁死在 `1.0`**：[gut_regularization.cu](../../LichtFeld-Studio/src/training/kernels/gut_regularization.cu)、[adam_kernels.cuh](../../LichtFeld-Studio/src/training/rasterization/fastgs/optimizer/include/adam_kernels.cuh) 与 [kernels_backward.cuh](../../LichtFeld-Studio/src/training/rasterization/fastgs/rasterization/include/kernels_backward.cuh) 原先对 `sh0` DC 施加 `RGB ∈ [0, 1]` 软限幅；在近 `7 EV` 跨场景大曝光差下，`PPISP` 负曝光帧无法提高场景线性亮度来补偿暗曝光缩放，被迫压暗静态白墙（`diffuse` / `diffuse2` 评估残差 `Bias_corr ≈ -0.020`）。
+  3. **`PPISP` 自由度规范漂移（释放 `dc_max_rgb` 后在 `diffuse3` 进一步暴露）**：缺少每帧 ZCA 色彩潜变量 `color_l2` 惩罚与 EXIF 相对曝光先验 `exposure_prior` 锚点，使对向视角形成约 `0.65 EV` 伪曝光波并在 `00039-L` 弧形白墙前贴出一层偏黄前景浮壳；同时 [ppisp.cu](../../LichtFeld-Studio/src/training/kernels/ppisp.cu) 的 `ppisp_vignetting_reg_kernel` 仅惩罚正项 `alpha > 0`，导致解锁 HDR DC 上界后 `camera 2 (R)` 暗角 `a0` 漂移至 `-0.2855`，造成 `00163-R` 从 `20.23 dB`（`d1`）跌至 `16.82 dB`（`d3`）。
+- **改动**：
+  - `GeosunPre`：[static_masks.cpp](../src/geometry/static_masks.cpp) 与 [photometric.cpp](../src/geometry/photometric.cpp) 新增高光非线性肩区连续降权（`PhotoShoulderMinSrgb = 0.76`、`PhotoShoulderMinMaxCh = 0.82`、`PhotoShoulderMinEvDiff = 0.35`、`PhotoShoulderMinDropEv = 0.12`、`PhotoShoulderDropC = 0.25`），并收敛终态参数（`PhotoDiffuseQuantile` `0.35 -> 0.42`、`RecolorPlyDiffuse` 截断区间 `[20%, 55%] -> [25%, 65%]`、`PhotoMinDiffuseWeight` `0.05 -> 0.0 -> 0.02`，其中 `展厅-diffuse2` 导出于 `min_w = 0.0` 版本）。
+  - `LichtFeld-Studio`：
+    - **HDR `dc_max_rgb` 上界释放**：[trainer.cpp](../../LichtFeld-Studio/src/training/trainer.cpp) 新增 `Trainer::refresh_dc_max_rgb()`（按 `clamp(exp2(-min_exp) * 1.15, 1.0, 8.0)` 周期刷新），同步更新 [gut_regularization.cu](../../LichtFeld-Studio/src/training/kernels/gut_regularization.cu)、[adam_kernels.cuh](../../LichtFeld-Studio/src/training/rasterization/fastgs/optimizer/include/adam_kernels.cuh)、[kernels_backward.cuh](../../LichtFeld-Studio/src/training/rasterization/fastgs/rasterization/include/kernels_backward.cuh) 及 [test_gut_regularization.cpp](../../LichtFeld-Studio/tests/test_gut_regularization.cpp)。
+    - **GPU 融合 `PPISP` 正则（Schema v3）**：[ppisp.cuh](../../LichtFeld-Studio/src/training/include/lfs/kernels/ppisp.cuh) 与 [ppisp.cu](../../LichtFeld-Studio/src/training/kernels/ppisp.cu) 为 `ppisp_vignetting_reg_kernel` 增加 `vig_alpha_l2` 双向 L2 惩罚并新增 `ppisp_frame_reg_kernel` / `launch_ppisp_frame_reg`；[ppisp.hpp](../../LichtFeld-Studio/src/training/components/ppisp.hpp) / [.cpp](../../LichtFeld-Studio/src/training/components/ppisp.cpp) 将 `PPISPConfig` 升至 v3（向后兼容 v2），新增 `vig_alpha_l2`、`exposure_prior`、`color_l2`、`set_exposure_prior()`、`exposure_prior_slope()`、`exposure_prior_rms()`、`color_latent_rms()` 与梯度接口；[trainer.cpp](../../LichtFeld-Studio/src/training/trainer.cpp) 在启用 `use_exposure_correction` 时开启 `vig_alpha_l2 = 0.5f`、`exposure_prior = ppisp_exposure_from_exif ? 0.5f : 0.0f`、`color_l2 = 0.05f`，新增 `collect_ppisp_exif_evs()` 并在 `applyPPISPForEval()` 按拟合 `exposure_prior_slope()` 插值评估曝光、在断点续训时恢复先验。
+    - 补充单测：[test_component_config_serialization.cpp](../../LichtFeld-Studio/tests/test_component_config_serialization.cpp)、[test_ppisp_exposure_seed.cpp](../../LichtFeld-Studio/tests/test_ppisp_exposure_seed.cpp)、[test_ppisp_regularization.cpp](../../LichtFeld-Studio/tests/test_ppisp_regularization.cpp)。
+- **预处理（`geosunpre check` 均 `passed: true`）与 `小场景` 20k 下游演进对比**：
+
+| 预处理场景 | 配准 | 留出 `lum_p50` (前→后) | `mean_static_weight` | `glare` / `shadow` / `shoulder` | 过曝图数 / 像素 (`capped`) | 无残差图数 |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `小场景-diffuse3` (`work/小场景-diffuse3`) | `296/296` | `0.1354 → 0.0455` | `0.9382` | `2.535%` / `1.811%` / `0.335%` | `254` / `45.79M` (`0`) | `120/296` |
+| `展厅-diffuse2` (`work/展厅-diffuse2`) | `588/588` | `0.1757 → 0.0760` | `0.9416` | `3.100%` / `0.609%` / `0.125%` | `461` / `58.44M` (`0`) | `190/588` |
+
+| `小场景` 20k 下游方案 (`work/小场景-lfs-*`, `259/37`) | `PSNR` | `Aligned PSNR` | `SSIM` / `Aligned` | `LPIPS` / `Aligned` | `Normal (°)` / `Depth AbsRel` | `Bias_corr (R,G,B)` | 关键诊断 / 终态效果 |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | --- |
+| `小场景-lfs-diffuse` (`diffuse` 源数据) | `21.8964` | `22.4140` | `0.7841 / 0.7994` | `0.3017 / 0.2986` | `16.5851°` / `0.0161` | `(-0.020,-0.019,-0.019)` | `00039-L` 弧形白墙有暗黄脏斑 (`19.89 dB`) |
+| `小场景-lfs-diffuse2`（加高光肩区降权） | `22.1448` | `22.7111` | `0.7838 / 0.7974` | `0.3015 / 0.2989` | `16.7654°` / `0.0161` | `(-0.0192,-0.0174,-0.0176)` | DC 上界仍锁在 `1.0`，全局负偏依在 |
+| `小场景-lfs-diffuse3`（解锁 HDR `dc_max_rgb`） | `23.0314` | `23.8421` | `0.7867 / 0.8009` | `0.2973 / 0.2948` | `16.8987°` / `0.0157` | `(-0.0036,-0.0043,-0.0049)` | 曝光偏置清零，但 `00039-L` (`19.74 dB`) 仍有漂移壳、`00163-R` 暗角退化至 `16.82 dB` |
+| **`小场景-lfs-diffuse4`（融合 `PPISP` 正则）** | **`23.3808`** | **`24.2519`** | **`0.7894 / 0.8047`** | **`0.2941 / 0.2911`** | **`16.0455°` / `0.0117`** | **`(-0.0021,-0.0029,-0.0034)`** | **`00039-L` (`21.07 dB`) 弧形白墙脏斑基本消除、`00163-R` (`19.58 dB`) 暗角退化恢复、`00175-L` (`25.42 dB`) 干净；全面超越 `photov3`** |
+
+- **单测、约束验证与未验证项**：
+  - `PPISP` 漂移收敛（`小场景-lfs-diffuse4`）：`exp_prior_slope = 0.4580`、`exp_prior_rms = 0.0028`、`color_rms = 0.0119`；`cam1 vig a0 = (-0.0030, -0.0037, -0.0018)`、`cam2 vig a0 = (0.0000, -0.0000, 0.0000)`。
+  - `lichtfeld_tests.exe`（`MaskPreprocess*:PPISP*:GutRegularization*:FusedReg*`）共 `101` 用例：`96 PASSED`、`5 SKIPPED`（环境门控用例）、`0 FAILED`；`GeosunPre` `tools/windows/build.ps1` 构建及 `小场景-diffuse3` / `展厅-diffuse2` `geosunpre.exe check` 均通过（`passed: true`）。
+  - **未验证项**：尚未以 `work/展厅-diffuse2` 在新版 `LichtFeld-Studio` 上跑完完整 `29,000` 步 3DGS 实景训练回归。
 
