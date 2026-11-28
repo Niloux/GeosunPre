@@ -478,3 +478,32 @@ Ceres 2.2.0 在 `LAPACK=OFF`、`SUITESPARSE=OFF` 下，所有纯 CPU 替代求�
   1. `sfm` 与前端解码/几何准备等 CPU+BA 瓶颈已大幅压缩（`sfm` 缩短 `-51.39 s` / `-54.1%`，`masks` 解码+预处理缩短 `-21.04 s` / `-56.7%`，`RecolorPlyDiffuse` 彻底并行掩盖），端到端剩余绝对主导耗时已清晰集中到两大 TensorRT GPU 推理引擎：**SAM3**（`67.33 s`）与 **MoGe-2**（`60.41 s`），适合作为下一波（Wave 2）优化目标（如 SAM3 BF16/FMHA、MoGe-2 分辨率与标定输入/LAS 法线协同）。
   2. **未验证项**：`小场景` 未触发 Ceres CUDA 混合精度失败，因此 `mixed_precision_fallback` / `cuda_fallback_iterative` 仅完成编译链接验证，未在极端病态场景中实测触发；未在 `展厅` / `南非展会` 等更大场景回归；未对 `work/小场景-opt28` 重跑下游 LichtFeld Studio 3DGS 训练对比渲染指标。
 
+---
+
+## 2026-11-28：第二批（Wave 2）TensorRT GPU 推理引擎优化（`小场景-wave2`）
+
+- **实验目的**：攻克 Wave 1 后端到端占主导的两大 GPU 推理耗时（SAM3 `64.97 s` + MoGe-2 `55.83 s`），在独立引擎包 `work/models-wave2`（不覆盖只读 `models/`）上验证精度与端到端实测收益。
+- **技术路径与关键消融发现**：
+  1. **SAM3 (`grounding`)**：实测纯 BF16 与无约束 FP16 都会触发 TensorRT 10.13 Myelin 数值精度退化（`score_max = 0.928–0.971`、`mask_iou_min = 0.0`），单层消融锁定问题来自 **28 个窗口块**（`window=24`、`B=9, L=576`）和 **31 个带 `-inf` 掩码的交叉/解码 Softmax 链**，而 **10 个重型 5184-token 全局自注意力**（4 层全局 `trunk.{7,15,23,31}` + 6 层 `encoder.self_attn`）在纯 FP16 下完全稳定。改用 `PlainSelfAttention` / 预缩放 4D SDPA 取消 648 行分块并仅放开这 10 个全局自注意力融合 TensorRT FP16 `_gemm_mha_v2` FMHA，其余 59 个 Softmax 链保持 FP32。
+  2. **MoGe-2 (`geometry`)**：由 `644×644`（`2116` tokens）切换至官方建议区间中的 `560×560`（`40×40 = 1600` tokens），保持 FP16 与 `B = 1..8`（`opt=7`）动态批。
+- **验证命令与状态**：
+  - 引擎构建与校验：`.\tools\windows\prepare-models.ps1 -Models work\models-wave2 -OnnxFrom models` + `.\run.ps1 check-models --models work\models-wave2 --image input\小场景\Image\2433-514856-623_00039-R.JPG`（均 exit 0，`check-models` `passed: true`）。
+  - 实景全流程 + 回读检查：`.\run.ps1 run --input input\小场景 --models work\models-wave2 --debug --work work\小场景-wave2.work --output work\小场景-wave2; .\run.ps1 check --output work\小场景-wave2`（均 exit 0，`check` `passed: true`，`296/296` 已注册）。
+- **核心对比（同卡 RTX 5070 Ti，`input/小场景` 296 张）**：
+
+| 指标 / 阶段 | Wave 1 (`work/小场景-opt28`) | Wave 2 (`work/小场景-wave2`) | 相对 Wave 1 变化 |
+| --- | :---: | :---: | :---: |
+| **`grounding` 单帧延迟 / 运行显存** | `244.24 ms` / `1,743.9 MB` | **`124.50 ms`** / `1,794.4 MB` | **-49.0%**（PyTorch 参考 `IoU >= 0.9982`） |
+| **`masks` 阶段总耗时 / TRT GPU 耗时** | `68.53 s` / `64.97 s` | **`38.87 s`** / **`36.14 s`** | **`-29.66 s`（-43.3%）** / `-44.4%` |
+| `masks` 检测统计 & 296 图掩码一致性 | `persons=540, shadows=95, skies=132` | `persons=539, shadows=95, skies=131` | 像素一致率 **`99.934%`**，零掩码 IoU **均值 `0.9979` / 中位 `1.0000`** |
+| **`geometry` (`moge_estimate` / `TRT GPU`)** | `60.41 s` / `55.83 s` | **`46.03 s`** / **`42.30 s`** | **`-14.38 s`（-23.8%）** / `-24.2%` |
+| `export` 总耗时 (`sup_total` / `depth_px`) | `109.29 s` (`70.30 s` / `208,505,899`) | **`94.32 s`** (`55.86 s` / `208,444,607`) | **`-14.97 s`（-13.7%）** |
+| 60 图采样监督对比（米制深度 / 法向） | 基线 (`644×644`) | `560×560` | 深度相对差中位 **`0.228%`** (`p90 2.04%`)；法向角差中位 **`1.266°`** (`p90 6.48°`) |
+| 重建与配准质量 (`pts` / `reproj_med` / `p90`) | `122,659` / `0.7283` / `1.7658` | `123,528` / `0.7264` / `1.7687` | 精度等价 |
+| **全流程 `state.stages` / `run` 总耗时** | `312.75 s` / `312.87 s` | **`271.63 s` / `271.75 s`** | **`-41.12 s`（-13.1%）**（相对 Wave 1 前 `~368 s` 累计约 `-96 s`） |
+
+- **结论与未验证项**：
+  1. SAM3 10 层全局 FMHA + MoGe-2 `560×560` 在几乎零精度损失（掩码中位 IoU `1.0000`、米制深度差中位 `0.228%`、法向差中位 `1.266°`）下把整套 296 张实景预处理压进 **`271.75 s`**（4 分 32 秒），GPU 推理时间从 `120.80 s` 降到 `78.44 s`。
+  2. **未验证项**：默认 `models/` 已替换为验证通过的 `work/models-wave2` 引擎包；尚未用 `work/小场景-wave2` 重跑下游 LichtFeld Studio 3DGS 训练对比最终渲染 PSNR/SSIM/深度/法向评测指标，亦未在 `展厅`/`南非展会` 等更大场景实跑回归。
+
+

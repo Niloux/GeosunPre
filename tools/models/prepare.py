@@ -18,9 +18,9 @@ import tensorrt as trt
 from resources import (CACHE, GEOMETRY_REVISION, GROUNDING_SHA256, LOMA_COMMIT, MOGE_COMMIT, SAM3_COMMIT,
                        geometry_weights, grounding_weights, loma_source, moge_source, sam3_source, sha256,
                        torch_weights)
-from networks import (ATTENTION_BLOCK, Detector, Descriptor, Geometry, Grounding, Matcher,
-                      TextOnlyGeometryEncoder, block_grounding_attention, fix_descriptor_positions,
-                      fix_geometry_positions, freeze_grounding_rotary)
+from networks import (Detector, Descriptor, Geometry, Grounding, Matcher,
+                      TextOnlyGeometryEncoder, fix_descriptor_positions,
+                      fix_geometry_positions, freeze_grounding_rotary, fuse_grounding_attention)
 
 TRT_VERSION = '10.13.3.9'
 MAX_FEATURES = 3072
@@ -29,14 +29,15 @@ MATCHER_MAX_BATCH = 8
 DETECTOR_PROFILE = {'min': [16, 16], 'opt': [1152, 1536], 'max': [1536, 1536]}
 DETECTOR_CHECK_SIZES = ((1152, 1536), (1536, 1152), (1536, 864), (1000, 1536),
                         (1536, 1536), (16, 1536), (1536, 16))
-# MoGe-2 runs on square pinhole faces: 46x46 ViT tokens, inside the suggested 1200-2500.
-GEOMETRY_SIZE = 644
-GEOMETRY_TOKENS = 2116
+# MoGe-2 runs on square pinhole faces: 40x40 ViT tokens, inside the suggested 1200-2500.
+GEOMETRY_SIZE = 560
+GEOMETRY_TOKENS = 1600
 GEOMETRY_OPT_BATCH = 7
 GEOMETRY_MAX_BATCH = 8
-# SAM3 runs on the whole photo stretched to its native square input; prompts are baked in.
+# SAM3 runs on the whole photo stretched to its native square input in FP16 with fused 4D attention.
 GROUNDING_SIZE = 1008
 GROUNDING_MASK_SIZE = 288
+GROUNDING_PRECISION = 'fp16'
 GROUNDING_PROMPTS = ['person', 'shadow', 'robot', 'sky']
 GROUNDING_TOP_K = 20
 GROUNDING_SOURCE = {'model': 'facebook/sam3', 'sam3_commit': SAM3_COMMIT, 'checkpoint_sha256': GROUNDING_SHA256}
@@ -180,14 +181,14 @@ def load_grounding(weights):
     with torch.no_grad():
         upstream = module(image)
         freeze_grounding_rotary(model, vitdet)
-        block_grounding_attention(model, vitdet, encoder, model_misc)
+        fuse_grounding_attention(model, vitdet, encoder, model_misc)
         # Skip empty point/box operations that the legacy ONNX exporter cannot lower.
         model.geometry_encoder = TextOnlyGeometryEncoder(model.geometry_encoder).eval()
         exported = module(image)
     # Mask logits are unbounded; scores and boxes carry the detections.
     for before, after, tolerance in zip(upstream, exported, (1e-4, 1e-3, .5, .5)):
         if before.shape != after.shape or (before - after).abs().max() > tolerance:
-            raise RuntimeError('Export-mode SAM3 (real rotary, blocked attention) differs from upstream inference')
+            raise RuntimeError('Export-mode SAM3 (real rotary, 4D attention) differs from upstream inference')
     return module
 
 
@@ -336,20 +337,23 @@ def export_models(directory, names, shapes, source, images, references, sam3=Non
         torch.cuda.empty_cache()
 
 
-def pin_attention_logits(network):
-    """Keep every softmax and the layers producing its input, back to the score matmul, in FP32.
-
-    SAM3 attention logits leave the FP16 range inside TensorRT although PyTorch FP16 inference
-    (FP32 attention accumulation) is fine."""
+def pin_non_fmha_attention_logits(network):
+    """Keep windowed, masked, cross, and decoder softmax chains in FP32 while letting 5184-token global self-attentions fuse FMHA."""
+    global_trunk = frozenset(f'/trunk/blocks.{i}/attn/Softmax' for i in (7, 15, 23, 31))
     producer = {}
     for index in range(network.num_layers):
         layer = network.get_layer(index)
         for i in range(layer.num_outputs):
             producer[layer.get_output(i).name] = layer
     pinned = {}
+    fmha_skipped = 0
     for index in range(network.num_layers):
         layer = network.get_layer(index)
         if layer.type != trt.LayerType.SOFTMAX:
+            continue
+        if (layer.name in global_trunk or
+                (layer.name.startswith('/encoder/layers.') and '/self_attn/' in layer.name)):
+            fmha_skipped += 1
             continue
         stack = [(layer, 0)]
         while stack:
@@ -359,10 +363,12 @@ def pin_attention_logits(network):
                 continue
             for i in range(current.num_inputs):
                 tensor = current.get_input(i)
-                if tensor is not None and tensor.name in producer and producer[tensor.name].type != trt.LayerType.CONSTANT:
+                if (tensor is not None and tensor.name in producer and
+                        producer[tensor.name].type != trt.LayerType.CONSTANT):
                     stack.append((producer[tensor.name], depth + 1))
-    if not pinned:
-        raise RuntimeError('Grounding ONNX has no attention softmax')
+    if fmha_skipped != 10 or not pinned:
+        raise RuntimeError(
+            f'Unexpected SAM3 softmax layout: fmha_skipped={fmha_skipped}, pinned={len(pinned)}')
     for layer in pinned.values():
         floating = [i for i in range(layer.num_outputs) if layer.get_output(i).dtype == trt.float32]
         if floating:
@@ -379,7 +385,6 @@ def build_engine(path, name, shapes, matcher_precision, geometry_precision, hard
     onnx_path = path.parent.parent / 'onnx' / f'{name}.onnx'
     builder, network, parser = parse_network(onnx_path)
     config = builder.create_builder_config()
-    # SAM3 tactics get a large scratch cap; its activation memory is bounded by blocked attention.
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, (12 if name == 'grounding' else 2) << 30)
     if (name not in ('matcher', 'geometry') or
             (name == 'geometry' and geometry_precision == 'fp16')):
@@ -412,7 +417,7 @@ def build_engine(path, name, shapes, matcher_precision, geometry_precision, hard
             raise RuntimeError('FP16 matcher ONNX is missing the final scoring projection')
     if name == 'grounding':
         config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-        pin_attention_logits(network)
+        pin_non_fmha_attention_logits(network)
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
     if hardware == 'ampere_plus':
         config.hardware_compatibility_level = trt.HardwareCompatibilityLevel.AMPERE_PLUS
@@ -736,6 +741,10 @@ def verify_package(root, settings, shapes, images):
         raise RuntimeError('Existing matcher calculation/scoring precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
     if manifest.get('geometry_precision') != settings['geometry_precision']:
         raise RuntimeError('Existing geometry precision differs. Choose a new -Models directory; use -OnnxFrom to reuse exported graphs.')
+    if manifest.get('geometry_size') != GEOMETRY_SIZE or manifest.get('geometry_tokens') != GEOMETRY_TOKENS:
+        raise RuntimeError('Existing geometry input resolution differs. Choose a new -Models directory.')
+    if manifest.get('grounding_precision') != settings['grounding_precision']:
+        raise RuntimeError('Existing grounding precision differs. Choose a new -Models directory.')
     if manifest.get('matcher_max_batch') != MATCHER_MAX_BATCH or manifest.get('geometry_max_batch') != GEOMETRY_MAX_BATCH:
         raise RuntimeError('Existing model batch limits differ. Choose a new -Models directory.')
     if sorted(manifest['models']) != sorted(names):
@@ -850,6 +859,7 @@ def main():
                 'matcher_precision': args.matcher_precision,
                 'matcher_score_precision': 'fp32' if args.matcher_precision == 'fp16' else args.matcher_precision,
                 'geometry_precision': args.geometry_precision,
+                'grounding_precision': GROUNDING_PRECISION,
                 'matcher_max_batch': MATCHER_MAX_BATCH,
                 'geometry_max_batch': GEOMETRY_MAX_BATCH,
                 'recipe': hashlib.sha256(recipe.encode('ascii')).hexdigest(),
@@ -864,14 +874,26 @@ def main():
             bundle = read_bundle(origin.parent)
         if (origin.parent / 'manifest.json').is_file():
             reuse_manifest = json.loads((origin.parent / 'manifest.json').read_text(encoding='utf-8'))
-        # A grounding graph is reused only with the same baked prompts, attention blocks, and grounding source.
+        # Reuse exported ONNX only when resolution, attention structure, and precision contract match.
         prompts = (reuse_manifest or {}).get('grounding_prompts')
+        grounding_precision = (reuse_manifest or {}).get('grounding_precision')
         blocks = (reuse_manifest or {}).get('grounding_attention_block')
         grounding_source = (reuse_manifest or {}).get('grounding_source')
-        settings['onnx_from'] = {name: sha256(origin / f'{name}.onnx') for name in names
-                                 if name != 'grounding' or
-                                 (prompts == GROUNDING_PROMPTS and blocks == ATTENTION_BLOCK and
-                                  grounding_source == GROUNDING_SOURCE)}
+        geometry_ok = bool(bundle) or (
+            (reuse_manifest or {}).get('geometry_size') == GEOMETRY_SIZE and
+            (reuse_manifest or {}).get('geometry_tokens') == GEOMETRY_TOKENS
+        )
+        grounding_ok = (
+            prompts == GROUNDING_PROMPTS and
+            grounding_precision == settings['grounding_precision'] and
+            blocks is None and
+            grounding_source == GROUNDING_SOURCE
+        )
+        settings['onnx_from'] = {
+            name: sha256(origin / f'{name}.onnx')
+            for name in names
+            if (name != 'geometry' or geometry_ok) and (name != 'grounding' or grounding_ok)
+        }
     # A bundle carries its own validation images; no upstream source download is needed.
     source = None if args.images or bundle else loma_source()
     if args.images:
@@ -936,7 +958,8 @@ def main():
         destination = pending / 'engines' / f'{name}.engine'
         if (reuse_manifest and name in copied and not destination.exists() and
                 (name != 'matcher' or matcher_precisions(reuse_manifest) == matcher_precisions(settings)) and
-                (name != 'geometry' or reuse_manifest.get('geometry_precision') == settings['geometry_precision'])):
+                (name != 'geometry' or reuse_manifest.get('geometry_precision') == settings['geometry_precision']) and
+                (name != 'grounding' or reuse_manifest.get('grounding_precision') == settings['grounding_precision'])):
             spec = reuse_manifest['models'][name]
             candidate = origin.parent / 'engines' / f'{name}.engine'
             if spec['shapes'] != shapes[name] or sha256(candidate) != spec['sha256']:
@@ -973,8 +996,8 @@ def main():
                                   'sha256': sha256(pending / 'engines' / f'{name}.engine')}
                            for name in names},
                 'grounding_size': GROUNDING_SIZE, 'grounding_mask_size': GROUNDING_MASK_SIZE,
+                'grounding_precision': GROUNDING_PRECISION,
                 'grounding_prompts': GROUNDING_PROMPTS, 'grounding_top_k': GROUNDING_TOP_K,
-                'grounding_attention_block': ATTENTION_BLOCK,
                 'grounding_source': GROUNDING_SOURCE}
     write_json(pending / 'manifest.json', manifest)
     # Publish in PowerShell after this process releases any Windows file handles.

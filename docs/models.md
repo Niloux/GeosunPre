@@ -10,13 +10,13 @@
 .\run.ps1 prepare-models sam3.pt
 ```
 
-默认向 `models/` 准备五个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）默认允许 FP16 内部计算，输入为 644×644 方形透视图、固定 2116 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。grounding（SAM3）为掩码阶段检测人物、影子、人形展品和天空，见下文。SAM3 检查点 [facebook/sam3](https://huggingface.co/facebook/sam3) 在 Hugging Face 需登录申请，无法自动下载。首次准备时传入 `sam3.pt` 的路径，按 SHA256 校验后复制到 `.cache/model-prepare/source/sam3.pt`，以后可省略路径。`run.ps1` 使用本机引擎，`package.ps1` 自动生成或复用跨 GPU 的交付引擎。
+默认向 `models/` 准备五个引擎，检测器支持动态宽高，不需要指定原图分辨率。匹配器主干为 FP16，Softmax、Reduce 和 Normalization 层，以及最终投影、相似度和匹配评分保留 FP32，所有浮点输入输出保持 float32；geometry（MoGe-2 ViT-L normal）默认允许 FP16 内部计算，输入为 560×560 方形透视图、固定 1600 个 ViT token，只含原始前向输出，偏移恢复与尺度对齐由原生监督导出完成。grounding（SAM3）为掩码阶段检测人物、影子、人形展品和天空，见下文。SAM3 检查点 [facebook/sam3](https://huggingface.co/facebook/sam3) 在 Hugging Face 需登录申请，无法自动下载。首次准备时传入 `sam3.pt` 的路径，按 SHA256 校验后复制到 `.cache/model-prepare/source/sam3.pt`，以后可省略路径。`run.ps1` 使用本机引擎，`package.ps1` 自动生成或复用跨 GPU 的交付引擎。
 
 首次准备下载固定权重、导出 ONNX 并构建 TensorRT 引擎；完整且兼容的模型包在真实推理校验后复用。同 GPU 上更换照片分辨率、横竖方向或宽高比不需要重建模型。更换 GPU、模型协议或精度时需指定新的输出目录。
 
 ## 模型接口
 
-manifest.json：tensorrt=`10.13.3.9`、gpu、hardware_compatibility、matcher_precision、matcher_score_precision、geometry_precision、matcher_max_batch（默认 `8`）、geometry_max_batch（默认 `8`）、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、geometry_size=644、geometry_tokens=2116、geometry_source（MoGe 提交、模型名与 revision）、models、grounding_size=1008、grounding_mask_size=288、grounding_prompts=`["person","shadow","robot","sky"]`、grounding_top_k=20、grounding_source（模型名、sam3_commit 与检查点 SHA256）。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`，matcher 与 geometry 第一维为动态批大小 `-1`（matcher profile `min=1, opt=8, max=8`，geometry profile `min=1, opt=7, max=8`）。matcher_score_precision 记录最终评分精度，默认 FP16 主干搭配 FP32 评分。hardware_compatibility 为 `none` 或 `ampere_plus`；gpu 始终记录构建 GPU。
+manifest.json：tensorrt=`10.13.3.9`、gpu、hardware_compatibility、matcher_precision、matcher_score_precision、geometry_precision、grounding_precision（默认 `fp16`）、matcher_max_batch（默认 `8`）、geometry_max_batch（默认 `8`）、detector_profile、descriptor_size、max_features=3072、descriptor_dimension=256、geometry_size=560、geometry_tokens=1600、geometry_source（MoGe 提交、模型名与 revision）、models、grounding_size=1008、grounding_mask_size=288、grounding_prompts=`["person","shadow","robot","sky"]`、grounding_top_k=20、grounding_source（模型名、sam3_commit 与检查点 SHA256）。各模型记录 inputs/outputs 名称数组、参考 shapes、engine SHA256；检测器 shapes 为 `[1,3,-1,-1]`，matcher 与 geometry 第一维为动态批大小 `-1`（matcher profile `min=1, opt=8, max=8`，geometry profile `min=1, opt=7, max=8`）。matcher_score_precision 记录最终评分精度，默认 FP16 主干搭配 FP32 评分。hardware_compatibility 为 `none` 或 `ampere_plus`；gpu 始终记录构建 GPU。
 
 detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max=[1536,1536]`。opt 只用于 TensorRT 编译优化，不限制原图尺寸。
 
@@ -25,10 +25,10 @@ detector_profile 按 `[宽,高]` 记录 `min=[16,16]`、`opt=[1152,1536]`、`max
 | detector | image float32 `[1,3,H,W]` RGB/255 | logits float32 `[1,1,H,W]` |
 | descriptor | image float32 `[1,3,784,784]`；keypoints `[1,N,2]` | descriptors float32 `[1,N,256]` |
 | matcher | ka/kb float32 `[B,3072,2]`；da/db `[B,3072,256]`；mask_a/mask_b float32 `[B,3072]` | matches int32 `[B,3072]`；confidence float32 `[B,3072]` |
-| geometry | image float32 `[B,3,644,644]` RGB/255 | points float32 `[B,644,644,3]`；normal `[B,644,644,3]`；mask `[B,644,644]`；metric_scale `[B]` |
+| geometry | image float32 `[B,3,560,560]` RGB/255 | points float32 `[B,560,560,3]`；normal `[B,560,560,3]`；mask `[B,560,560]`；metric_scale `[B]` |
 | grounding | image float32 `[1,3,1008,1008]`，主点居中方形鱼眼 ROI 缩放，RGB/127.5−1 | scores float32 `[4,20]`；boxes `[4,20,4]`；masks `[4,20,288,288]`；semantic `[4,1,288,288]` |
 
-grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的文本特征在导出时算好并固化进图，不含文本编码器；改提示须重新导出并使用新模型目录。每个提示输出按联合分数（查询分数乘存在分数）降序的前 20 个查询：分数、归一化 cxcywh 框、实例掩码 logits 及该提示的语义 logits。ViT 的复数旋转位置编码导出为等价的实数 cos/sin 形式，导出前在随机输入上与原实现比对。TensorRT 构建工作区为 12 GiB；FP16 下注意力打分会超出半精度范围（PyTorch FP16 的注意力在 FP32 中累加，因此不受影响），故每个 Softmax 及其输入链直到打分矩阵乘保留 FP32，其余可用 FP16。
+grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的文本特征在导出时算好并固化进图，不含文本编码器；改提示须重新导出并使用新模型目录。每个提示输出按联合分数（查询分数乘存在分数）降序的前 20 个查询：分数、归一化 cxcywh 框、实例掩码 logits 及该提示的语义 logits。ViT 的复数旋转位置编码导出为等价的实数 cos/sin 形式，导出前在随机输入上与原实现比对。TensorRT 构建工作区为 12 GiB；导出时将 trunk 与 DETR encoder 自注意力改写为连续 4D 预缩放 SDPA（`PlainSelfAttention`），使其 10 个重型 5184-token 全局自注意力（4 层全局 trunk + 6 层 encoder `self_attn`）在 TensorRT 中直接融合为 FP16 FMHA，同时将 28 个窗口块及 31 个带掩码/交叉/解码 Softmax 链固定在 FP32。
 
 检测最长边缩放到 1536，各边向下取 8 的倍数；3000×4000 输入对应 W=1152、H=1536，4000×3000 对应 W=1536、H=1152，1920×1080 对应 W=1536、H=864，均使用同一引擎。范围约束作用于缩放后的检测输入，原图无需限制为这些尺寸；短边缩放后小于 16 时明确报错。原图与 `.pro` 标定尺寸仍须一致。
 
@@ -75,9 +75,9 @@ grounding 为 SAM3 概念检测，四个提示 person、shadow、robot、sky 的
 - `-HardwareCompatibility`：`none`（默认）或 `ampere_plus`。`none` 引擎只用于构建 GPU 同型号；`ampere_plus` 使用 TensorRT AMPERE_PLUS 兼容级别，一套引擎可在任意算力 ≥ 8.0 的 GPU（RTX 30/40/50、A 系列等）上运行，代价是部分优化策略不可用。构建 GPU 本身须算力 ≥ 8.0。修改级别时使用新目录，并在真实场景比较耗时与几何质量。
 - `-MatcherPrecision`：`fp16`（默认）、`fp32` 或 `tf32`，用于显式调整匹配引擎的计算精度。TF32 允许 Tensor Core 矩阵乘法。模型清单保存该选择。修改精度时使用新目录，并用真实场景检查最终几何质量。
 - `-GeometryPrecision`：`fp16`（默认）或 `fp32`，用于选择 MoGe 引擎的内部计算精度。浮点输入输出保持 float32，模型清单记录所选精度。
-- grounding 的注意力 logits 固定 FP32，TensorRT 无法融合注意力，会物化完整的 5184×5184 logit 矩阵。导出时 trunk 和 DETR encoder 的自注意力按 648 行 query 分块，清单记录 `grounding_attention_block`；RTX 4090 上激活内存由 5.4 GB 降到 2.3 GB，Mask 阶段显存峰值约少 3 GB。`-OnnxFrom` 遇到分块或提示不同的 grounding 时重新导出并构建 grounding。
+- grounding 保持 28 个窗口块与 31 个带掩码/交叉/解码 Softmax 链为 FP32，仅放开 10 个 5184-token 全局自注意力在 TensorRT 中直接融合为 FP16 FMHA（`grounding_precision = "fp16"`，不再需要 648 行分块，运行时激活显存仍保持约 `1.8 GB` 且单帧耗时大幅降低）。`-OnnxFrom` 遇到分辨率、精度协议或提示不同的 geometry/grounding 时会重新导出并构建对应引擎。
 - `-Sam3`：SAM3 检查点路径，只在缓存中还没有时需要。grounding 在两张验证照片上比较 PyTorch FP32 与 TensorRT：全部查询分数差 < 0.05，PyTorch 分数 > 0.3 的每个检测与引擎同提示最接近掩码的 IoU ≥ 0.95；验证照片应含人物或影子，例如 `-Images` 指定两张展厅照片。真实推理另检查形状、分数范围与降序、框归一化。
-- 当 `-OnnxFrom` 指向同 GPU、TensorRT 版本的完整模型包时，复用接口、精度及校验值匹配的引擎。matcher 精度变化时重建 matcher。有 PyTorch 参考输出时，匹配索引必须完全一致，置信度相对 L2 误差在 FP16 下 < 1%，在 FP32 和 TF32 下 < 0.5%。源清单缺少 `geometry_precision` 或精度不同时，复用 geometry ONNX 并重建引擎。
+- 当 `-OnnxFrom` 指向同 GPU、TensorRT 版本的完整模型包时，复用接口、精度及校验值匹配的引擎。matcher 精度变化时重建 matcher。有 PyTorch 参考输出时，匹配索引必须完全一致，置信度相对 L2 误差在 FP16 下 < 1%，在 FP32 和 TF32 下 < 0.5%。源清单缺少或不等的 `geometry_precision` / `grounding_precision` 会自动重建对应引擎。
 - `-Images`：两张真实验证照片；默认使用固定 LoMa 源码包中的 `0015_A.jpg` / `0015_B.jpg`。验证包括检测器动态宽高及边界、四模型有限输出及形状、描述子数量 32 / 127 / 3072、匹配有效数量不等、补零值变化不影响有效结果、同图匹配。新导出的检测图在横图、竖图、方图及短边边界上比较 PyTorch 与 TensorRT 输出。geometry 在两张照片上比较 PyTorch FP32 与 TensorRT：PyTorch 掩码有效处对数深度差 p99 < 0.01、法向夹角 p99 在 FP16 下 < 2°，在 FP32 下 < 1°、掩码差 p99 < 0.05、metric_scale 相对差在 FP16 下 < 1%，在 FP32 下 < 0.5%；真实推理还检查有效掩码过半、有效深度为正、法向为单位长度。
 
 使用自定义目录时，运行指定 `--models`，打包指定 `-Models`。复用 ONNX 可以省去权重导出；更换 GPU 时仍需在目标 GPU 上重新构建并校验引擎。
