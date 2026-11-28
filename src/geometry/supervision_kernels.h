@@ -48,6 +48,8 @@ void SampleMogeFaces(const uint8_t* prefiltered, int pre_w, int pre_h, const dou
                      cudaStream_t stream);
 void SampleMogeShiftGrid(const float* points, const float* mask, const uint8_t* face_valid,
                          int faces, int size, float4* samples, cudaStream_t stream);
+void SolveMogeShifts(const float4* samples, int faces, int size, double* shifts, uint8_t* shift_ok,
+                     cudaStream_t stream);
 void BuildMogeFaceEstimates(const float* points, const float* normals, const float* mask,
                             const uint8_t* face_valid, const double* shifts,
                             const uint8_t* shift_ok, const float* metric_scales,

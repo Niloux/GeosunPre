@@ -399,7 +399,8 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     int mcu = 0;
     for (const int size : mcus)
       mcu = std::max(mcu, size);
-    windows = ValidDomainCrop(scene, selected, masks, rolling ? motion.axis : 1, mcu, workers);
+    windows = ValidDomainCrop(scene, selected, masks, rolling ? motion.axis : 1, mcu, workers,
+                              static_summary.is_null() ? nullptr : &static_summary);
     options.crop = windows;
     timed("crop windows");
   }
@@ -503,6 +504,11 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
     if (photometric_calibrated)
       fs::create_directories((pending / "weights" / fs::u8path(e->name + ".png")).parent_path());
   }
+  std::array<VignettingLut, 2> vig_luts;
+  if (photometric_calibrated) {
+    for (int c = 0; c < 2; ++c)
+      vig_luts[size_t(c)] = BuildVignettingLut(selected.cameras[c], vig_coeffs_rgb[size_t(c)]);
+  }
   std::vector<Json> rows(registered.size());
   ParallelFor(registered.size(), workers, 1, [&](size_t i) {
     const auto& e = *registered[i];
@@ -520,7 +526,7 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
       corr.residual_ev = cp.residual_ev;
       const std::optional<CropWindow> win =
           windows ? std::optional<CropWindow>((*windows)[e.camera]) : std::nullopt;
-      ExportNormalizedJpeg(e.source, destination, win, corr, 97);
+      ExportNormalizedJpeg(e.source, destination, win, corr, 97, &vig_luts[e.camera]);
       if (win)
         CropMask(source_mask, mask, *win);
       else
@@ -616,13 +622,26 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
         .ply_cap;
   };
   Json roi_json;
+  const int recolor_workers = options.enabled ? std::max(1, workers / 2) : workers;
+  const fs::path diffuse_views_path = masks / "diffuse_views.bin";
+  const bool run_recolor =
+      include_ply && photometric_calibrated && fs::is_regular_file(diffuse_views_path);
   if (include_ply)
     initialization_job = std::async(std::launch::async, [&] {
-      return ExportLasPly(
+      Json init = ExportLasPly(
           scene.las, ReadSceneLas(scene), pending / "sparse/0/points3D.ply", voxel, &model,
           &visual_model,
           [&](uint32_t id) { return pending / "masks" / fs::u8path(scene.images[id].name + ".png"); },
           generate_roi ? &roi_json : nullptr, cap_resolver);
+      if (run_recolor) {
+        const Json diffuse_ply = RecolorPlyDiffuse(
+            pending / "sparse/0/points3D.ply", selected, rolling ? &uncropped_motion : nullptr,
+            diffuse_views_path, recolor_workers);
+        init["color"] = "calibrated_multi_view_diffuse_srgb";
+        init["diffuse_recoloring"] = diffuse_ply;
+        init["ply_size_bytes"] = fs::file_size(pending / "sparse/0/points3D.ply");
+      }
+      return init;
     });
   Json supervision = nullptr;
   if (options.enabled) {
@@ -636,16 +655,6 @@ Json ExportBundle(const Scene& scene, const Reconstruction& selected, const fs::
   }
   surfel_cache.reset();
   Json initialization = include_ply ? initialization_job.get() : Json(nullptr);
-  if (include_ply && photometric_calibrated &&
-      fs::is_regular_file(masks / "diffuse_views.bin")) {
-    const Json diffuse_ply =
-        RecolorPlyDiffuse(pending / "sparse/0/points3D.ply", selected,
-                          rolling ? &uncropped_motion : nullptr, masks / "diffuse_views.bin",
-                          workers);
-    initialization["color"] = "calibrated_multi_view_diffuse_srgb";
-    initialization["diffuse_recoloring"] = diffuse_ply;
-    initialization["ply_size_bytes"] = fs::file_size(pending / "sparse/0/points3D.ply");
-  }
   if (generate_roi)
     WriteJson(pending / "roi.json", roi_json);
   uint64_t geom_points = 0;
@@ -746,7 +755,9 @@ Json CheckBundle(const fs::path& output, const std::string& project) {
   const bool expect_weights =
       manifest.at("request").contains("photometric_normalization") &&
       manifest.at("request").at("photometric_normalization").value("version", 0) >= 3;
-  for (uint32_t i = 0; i < scene.images.size(); ++i) {
+  const int check_workers = std::clamp(int(std::thread::hardware_concurrency()), 1, 16);
+  ParallelFor(scene.images.size(), check_workers, 4, [&](size_t idx) {
+    const uint32_t i = uint32_t(idx);
     const auto& e = scene.images[i];
     const auto& saved = manifest.at("images")[i];
     if (saved.at("name") != e.name || saved.at("camera") != e.camera)
@@ -781,7 +792,7 @@ Json CheckBundle(const fs::path& output, const std::string& project) {
       if (!ev || !std::isfinite(*ev) || std::abs(*ev - expected_ev) > 0.01)
         throw std::runtime_error("Calibrated EXIF EV differs for " + e.name);
     }
-  }
+  });
   if (!manifest.at("initialization").is_null())
     VerifyInitializationPly(sparse / "points3D.ply", manifest.at("initialization").at("points"));
   std::optional<RoiPolygon> checked_roi;

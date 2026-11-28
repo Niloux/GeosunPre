@@ -49,7 +49,8 @@ Json StructureCoverage(const Reconstruction& before, const Reconstruction& after
 }
 }  // namespace
 StructureCleanup CleanSparseStructure(const Scene& scene, const Reconstruction& source, int workers,
-                                      const AlignmentLimits& limits) {
+                                      const AlignmentLimits& limits,
+                                      const fs::path& las_sample_cache) {
   const auto started = Clock::now();
   const auto source_quality = source.Quality(scene, limits.median_px, limits.p90_px);
   if (!source_quality.at("passed").get<bool>())
@@ -57,7 +58,7 @@ StructureCleanup CleanSparseStructure(const Scene& scene, const Reconstruction& 
   StructureCleanup cleanup;
   cleanup.candidate = source;
   auto& report = cleanup.report;
-  const auto planes = LasPlaneConstraints(scene, source, workers);
+  const auto planes = LasPlaneConstraints(scene, source, workers, las_sample_cache);
   if (planes.size() < 200) {
     report = {{"used", false},
               {"reason", "insufficient reliable LAS support for pruning"},
@@ -65,7 +66,7 @@ StructureCleanup CleanSparseStructure(const Scene& scene, const Reconstruction& 
               {"seconds", Seconds(started)}};
     return cleanup;
   }
-  report = FilterSparseStructure(scene, cleanup.candidate, limits);
+  report = FilterSparseStructure(scene, cleanup.candidate, limits, las_sample_cache);
   const auto quality = cleanup.candidate.Quality(scene, limits.median_px, limits.p90_px);
   report["coverage"] = StructureCoverage(source, cleanup.candidate, planes);
   std::vector<PlaneConstraint> retained_planes;

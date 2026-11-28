@@ -5,6 +5,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <deque>
@@ -524,6 +525,7 @@ struct ApplyCounts {
   uint64_t sky_edge_to_sky = 0;
   uint64_t sky_edge_to_static = 0;
   uint64_t photo_clipped = 0;
+  int x0 = INT_MAX, y0 = INT_MAX, x1 = 0, y1 = 0;
 };
 // Smooth local per-channel mean and variance over seed_mask != 0 using 4x block accumulation
 // (exact squared-sum accumulation before smoothing avoids downsampling variance bias), blending
@@ -1786,6 +1788,19 @@ ApplyCounts Apply(Context& context, uint32_t id, cv::Size grid) {
     counts.photo_clipped = uint64_t(cv::countNonZero(clip_change));
     labelled.mask.setTo(0, clip_change);
   }
+  cv::Mat cols_max, rows_max;
+  cv::reduce(labelled.mask, cols_max, 0, cv::REDUCE_MAX);
+  cv::reduce(labelled.mask, rows_max, 1, cv::REDUCE_MAX);
+  for (int x = 0; x < labelled.mask.cols; ++x)
+    if (cols_max.at<uint8_t>(0, x)) {
+      counts.x0 = std::min(counts.x0, x);
+      counts.x1 = x + 1;
+    }
+  for (int y = 0; y < labelled.mask.rows; ++y)
+    if (rows_max.at<uint8_t>(y, 0)) {
+      counts.y0 = std::min(counts.y0, y);
+      counts.y1 = y + 1;
+    }
   const auto path = context.destination(id);
   fs::create_directories(path.parent_path());
   WriteImage(path, labelled.mask, 1);
@@ -2028,7 +2043,16 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
   double weight_sum = 0.0;
   size_t changed = 0, sky_changed = 0, sky_edge_refined = 0;
   size_t photo_clipped_images = 0, photo_clip_capped_images = 0;
+  std::array<std::array<int, 4>, 2> camera_extents{
+      {{INT_MAX, INT_MAX, 0, 0}, {INT_MAX, INT_MAX, 0, 0}}};
   for (const auto id : written) {
+    if (applied[id].x1 > applied[id].x0 && applied[id].y1 > applied[id].y0) {
+      auto& ext = camera_extents[model.images[id].camera];
+      ext[0] = std::min(ext[0], applied[id].x0);
+      ext[1] = std::min(ext[1], applied[id].y0);
+      ext[2] = std::max(ext[2], applied[id].x1);
+      ext[3] = std::max(ext[3], applied[id].y1);
+    }
     pixels += applied[id].person_unmasked;
     changed += applied[id].person_unmasked > 0;
     sky_pixels += applied[id].sky_cleared;
@@ -2121,11 +2145,16 @@ Json StaticMasks(const Scene& scene, const Reconstruction& model, const ShutterM
                                            {"shoulder_attenuated_ratio", shoulder_atten_ratio},
                                            {"mean_static_weight", mean_static_weight}};
   photometric_report["seconds"] = context.photo_seconds;
+  Json camera_extents_json = Json::array();
+  for (int c = 0; c < 2; ++c)
+    camera_extents_json.push_back(
+        {camera_extents[c][0], camera_extents[c][1], camera_extents[c][2], camera_extents[c][3]});
   return {{"images", written.size()},
           {"images_changed", changed},
           {"components", rows.size()},
           {"unmasked_pixels", pixels},
           {"reasons", reasons},
+          {"camera_nonzero_extents", std::move(camera_extents_json)},
           {"sky",
            {{"kept", context.keep_sky},
             {"images_with_raw_sky", raw_sky_images},

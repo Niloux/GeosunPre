@@ -10,7 +10,7 @@ namespace geosun {
 // window is s' = s N / N', with N and N' the sizes along that axis.
 std::array<CropWindow, 2> ValidDomainCrop(const Scene& scene, const Reconstruction& model,
                                           const fs::path& masks, int readout_axis, int mcu,
-                                          int workers);
+                                          int workers, const Json* static_summary = nullptr);
 // The scene's cameras (the initial calibration, used for angle statistics) cut to the windows.
 Scene CropScene(const Scene& scene, const std::array<CropWindow, 2>& windows);
 // Cameras and observations moved into the windows; point errors are recomputed with the cropped
@@ -36,13 +36,22 @@ struct PhotometricCorrection {
   double pixel_ev_shift = 0.0;
   double residual_ev = 0.0;
 };
+struct VignettingLut {
+  static constexpr int kSize = 4096;
+  double rd_max_sq = 1.0;
+  double rd_sq_scale = double(kSize);
+  std::array<std::vector<float>, 3> inv_vig;
+};
+VignettingLut BuildVignettingLut(const Camera& camera,
+                                  const std::array<std::array<double, 3>, 3>& vig_coeffs_rgb);
 // Decodes source JPEG, optionally crops on pixel coordinates, applies 3-channel linear
 // de-vignetting, 3-channel white-balance gains, bounded exposure shift, and per-channel soft
 // highlight roll-off, re-encodes at jpeg_quality, and writes residual_ev into EXIF APP1 while
 // preserving non-EXIF markers (e.g. ICC/XMP).
 void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
                           const std::optional<CropWindow>& window,
-                          const PhotometricCorrection& correction, int jpeg_quality = 97);
+                          const PhotometricCorrection& correction, int jpeg_quality = 97,
+                          const VignettingLut* precomputed_lut = nullptr);
 // Exact crop of a single-channel PNG mask.
 void CropMask(const fs::path& source, const fs::path& destination, const CropWindow& window);
 }  // namespace geosun

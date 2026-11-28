@@ -33,7 +33,8 @@ void ConvertLasFrame(LasHeader& header, const Similarity& frame, const std::stri
 void ScanLas(const fs::path& path, const LasHeader& header,
              const std::function<void(uint64_t, const std::vector<LasPoint>&)>& consume);
 std::vector<Eigen::Vector3d> SampleLas(const fs::path& path, const LasHeader& header,
-                                       Json& metadata, size_t maximum = 1500000);
+                                       Json& metadata, size_t maximum = 1500000,
+                                       const fs::path& cache_path = {});
 Json ExportLasPly(const fs::path& las, const LasHeader& header, const fs::path& output,
                   double voxel = .05, const Reconstruction* model = nullptr,
                   const Reconstruction* visual_model = nullptr,

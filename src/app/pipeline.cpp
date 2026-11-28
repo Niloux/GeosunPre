@@ -325,8 +325,8 @@ std::vector<fs::path> ReconstructVisual(const Scene& scene, const fs::path& work
 }
 std::vector<fs::path> AlignVisual(const Scene& scene, const fs::path& work, const Json& settings) {
   auto model = ReadModel(work / "cache/visual.bin");
-  auto result =
-      Align(scene, model, settings.at("workers"), Limits(settings), settings.at("ba_workers"));
+  auto result = Align(scene, model, settings.at("workers"), Limits(settings),
+                      settings.at("ba_workers"), work / "cache/las_sample.bin");
   result["sfm"] = ReadJson(work / "cache/sfm.json");
   for (const auto& name : {"masks", "features", "matches"})
     result["frontend"][name] = ReadJson(work / "cache" / (std::string(name) + "_profile.json"));
@@ -369,7 +369,8 @@ std::vector<fs::path> CleanSelected(const Scene& scene, const fs::path& work, co
     original["shutter"] = {{"enabled", false}, {"used", false},
                            {"reason", "disabled by configuration"}};
   const auto model = ReadModel(SelectedModelPath(work, original));
-  auto cleanup = CleanSparseStructure(scene, model, settings.at("workers"), Limits(settings));
+  auto cleanup = CleanSparseStructure(scene, model, settings.at("workers"), Limits(settings),
+                                      work / "cache/las_sample.bin");
   cleanup.report["source_model"] = original.value("selected_model", std::string("aligned"));
   const auto& selected = cleanup.accepted ? cleanup.candidate : model;
   auto result = PostprocessResult(scene, selected, original, "cleaned");

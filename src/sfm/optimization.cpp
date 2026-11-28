@@ -29,24 +29,64 @@ Eigen::Matrix<double, 3, 4> RotationJacobian(const Eigen::Quaterniond& unit,
   j -= 2 * rotated * unit.coeffs().transpose();
   return j / norm;
 }
-Eigen::Matrix<double, 2, 8> CameraJacobian(const Camera& camera, const Eigen::Vector3d& v) {
-  Eigen::Matrix<double, 2, 8> camera_j = Eigen::Matrix<double, 2, 8>::Zero();
-  const auto& cam = camera.params;
-  const double r = std::hypot(v.x(), v.y()), theta = std::atan2(r, v.z()), t2 = theta * theta;
-  const double d =
-      r < 1e-15 ? 1 / v.z()
-                : theta * (1 + t2 * (cam[4] + t2 * (cam[5] + t2 * (cam[6] + t2 * cam[7])))) / r;
-  camera_j(0, 0) = v.x() * d;
-  camera_j(1, 1) = v.y() * d;
-  camera_j(0, 2) = camera_j(1, 3) = 1;
-  double power = theta * t2;
-  for (int k = 4; k < 8; ++k) {
-    const double radial = r < 1e-15 ? 0 : power / r;
-    camera_j(0, k) = cam[0] * v.x() * radial;
-    camera_j(1, k) = cam[1] * v.y() * radial;
-    power *= t2;
+void ProjectAndJacobians(const double* cam, const Eigen::Vector3d& v,
+                         Eigen::Map<Eigen::Vector2d>& proj, Eigen::Matrix<double, 2, 3>* dv,
+                         Eigen::Matrix<double, 2, 8>* dcam) {
+  const double r = std::hypot(v.x(), v.y());
+  if (r < 1e-15) {
+    proj[0] = cam[2];
+    proj[1] = cam[3];
+    if (dv) {
+      dv->setZero();
+      (*dv)(0, 0) = cam[0] / v.z();
+      (*dv)(1, 1) = cam[1] / v.z();
+    }
+    if (dcam) {
+      dcam->setZero();
+      const double inv_z = 1.0 / v.z();
+      (*dcam)(0, 0) = v.x() * inv_z;
+      (*dcam)(1, 1) = v.y() * inv_z;
+      (*dcam)(0, 2) = 1.0;
+      (*dcam)(1, 3) = 1.0;
+    }
+    return;
   }
-  return camera_j;
+  const double theta = std::atan2(r, v.z()), t2 = theta * theta;
+  const double radial =
+      theta * (1.0 + t2 * (cam[4] + t2 * (cam[5] + t2 * (cam[6] + t2 * cam[7]))));
+  const double scale = radial / r;
+  proj[0] = cam[0] * v.x() * scale + cam[2];
+  proj[1] = cam[1] * v.y() * scale + cam[3];
+  if (dv) {
+    if (r < 1e-10) {
+      dv->setZero();
+      (*dv)(0, 0) = cam[0] / v.z();
+      (*dv)(1, 1) = cam[1] / v.z();
+    } else {
+      const double slope =
+          1.0 +
+          t2 * (3.0 * cam[4] + t2 * (5.0 * cam[5] + t2 * (7.0 * cam[6] + t2 * 9.0 * cam[7])));
+      const Eigen::Vector3d dr(v.x() / r, v.y() / r, 0.0);
+      const Eigen::Vector3d dt = (v.z() * dr - Eigen::Vector3d(0.0, 0.0, r)) / v.squaredNorm();
+      const Eigen::Vector3d ds = (slope * dt - scale * dr) / r;
+      dv->row(0) = cam[0] * (v.x() * ds + Eigen::Vector3d(scale, 0.0, 0.0)).transpose();
+      dv->row(1) = cam[1] * (v.y() * ds + Eigen::Vector3d(0.0, scale, 0.0)).transpose();
+    }
+  }
+  if (dcam) {
+    dcam->setZero();
+    (*dcam)(0, 0) = v.x() * scale;
+    (*dcam)(1, 1) = v.y() * scale;
+    (*dcam)(0, 2) = 1.0;
+    (*dcam)(1, 3) = 1.0;
+    double power = theta * t2;
+    for (int k = 4; k < 8; ++k) {
+      const double radial_k = power / r;
+      (*dcam)(0, k) = cam[0] * v.x() * radial_k;
+      (*dcam)(1, k) = cam[1] * v.y() * radial_k;
+      power *= t2;
+    }
+  }
 }
 struct Reprojection : ceres::SizedCostFunction<2, 7, 3, 8> {
   Eigen::Vector2d pixel;
@@ -58,17 +98,22 @@ struct Reprojection : ceres::SizedCostFunction<2, 7, 3, 8> {
     Eigen::Quaterniond rotation(pose[3], pose[0], pose[1], pose[2]);
     const double norm = rotation.norm();
     rotation.coeffs() /= norm;
-    const Eigen::Vector3d rotated = rotation * point;
+    const Eigen::Matrix3d R = rotation.toRotationMatrix();
+    const Eigen::Vector3d rotated = R * point;
     const Eigen::Vector3d v = rotated + Eigen::Map<const Eigen::Vector3d>(pose + 4);
     if (v.z() <= 1e-6)
       return false;
-    Camera camera;
-    std::copy_n(parameters[2], 8, camera.params.begin());
     Eigen::Map<Eigen::Vector2d> output(residual);
-    output = camera.Project(v) - pixel;
-    if (!jacobians)
+    if (!jacobians) {
+      ProjectAndJacobians(parameters[2], v, output, nullptr, nullptr);
+      output -= pixel;
       return true;
-    const auto j = camera.ProjectionJacobian(v);
+    }
+    Eigen::Matrix<double, 2, 3> j;
+    Eigen::Matrix<double, 2, 8> cam_local;
+    ProjectAndJacobians(parameters[2], v, output, (jacobians[0] || jacobians[1]) ? &j : nullptr,
+                        jacobians[2] ? &cam_local : nullptr);
+    output -= pixel;
     if (jacobians[0]) {
       Eigen::Map<Eigen::Matrix<double, 2, 7, Eigen::RowMajor>> pose_j(jacobians[0]);
       pose_j.leftCols<4>() = j * RotationJacobian(rotation, point, rotated, norm);
@@ -76,11 +121,11 @@ struct Reprojection : ceres::SizedCostFunction<2, 7, 3, 8> {
     }
     if (jacobians[1]) {
       Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[1]);
-      point_j = j * rotation.toRotationMatrix();
+      point_j = j * R;
     }
     if (jacobians[2]) {
       Eigen::Map<Eigen::Matrix<double, 2, 8, Eigen::RowMajor>> cam_j(jacobians[2]);
-      cam_j = CameraJacobian(camera, v);
+      cam_j = cam_local;
     }
     return true;
   }
@@ -103,7 +148,8 @@ struct ShutterReprojection : ceres::SizedCostFunction<2, 10, 3, 9> {
     Eigen::Quaterniond rotation(pose[3], pose[0], pose[1], pose[2]);
     const double norm = rotation.norm();
     rotation.coeffs() /= norm;
-    const Eigen::Vector3d rotated = rotation * point;
+    const Eigen::Matrix3d R = rotation.toRotationMatrix();
+    const Eigen::Vector3d rotated = R * point;
     if (rotated.z() + pose[6] <= 1e-6)
       return false;
     const Eigen::Vector3d b =
@@ -113,13 +159,16 @@ struct ShutterReprojection : ceres::SizedCostFunction<2, 10, 3, 9> {
     const Eigen::Vector3d v = r_rs * b;
     if (v.z() <= 1e-6)
       return false;
-    Camera camera;
-    std::copy_n(parameters[2], 8, camera.params.begin());
     Eigen::Map<Eigen::Vector2d> output(residual);
-    output = camera.Project(v) - pixel;
-    if (!jacobians)
+    if (!jacobians) {
+      ProjectAndJacobians(parameters[2], v, output, nullptr, nullptr);
+      output -= pixel;
       return true;
-    const auto j = camera.ProjectionJacobian(v);
+    }
+    Eigen::Matrix<double, 2, 3> j;
+    Eigen::Matrix<double, 2, 8> cam_local;
+    ProjectAndJacobians(parameters[2], v, output, &j, jacobians[2] ? &cam_local : nullptr);
+    output -= pixel;
     const Eigen::Matrix<double, 2, 3> ja = j * r_rs;
     if (jacobians[0]) {
       Eigen::Map<Eigen::Matrix<double, 2, 10, Eigen::RowMajor>> pose_j(jacobians[0]);
@@ -129,11 +178,11 @@ struct ShutterReprojection : ceres::SizedCostFunction<2, 10, 3, 9> {
     }
     if (jacobians[1]) {
       Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> point_j(jacobians[1]);
-      point_j = ja * rotation.toRotationMatrix();
+      point_j = ja * R;
     }
     if (jacobians[2]) {
       Eigen::Map<Eigen::Matrix<double, 2, 9, Eigen::RowMajor>> cam_j(jacobians[2]);
-      cam_j.leftCols<8>() = CameraJacobian(camera, v);
+      cam_j.leftCols<8>() = cam_local;
       cam_j.col(8) = -s * ja * velocity;
     }
     return true;
@@ -466,7 +515,6 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
                        [&](const auto& o) { return variable_images.count(o.image) != 0; }))
         continue;
       const bool point_fixed = fixed_points.count(pid) != 0;
-      const bool need_depth_guard = !point_fixed && (!metric || p.track.size() == 2);
       for (const auto& o : p.track) {
         ++observations;
         auto& image = m.images[o.image];
@@ -475,6 +523,7 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
         if (depth <= 1e-6)
           throw std::runtime_error("BA requires initial depth > 1e-6 (point " + std::to_string(pid) +
                                    ", image " + std::to_string(o.image) + ")");
+        const bool need_depth_guard = !point_fixed && (!metric || (p.track.size() == 2 && depth < 1.0));
         const Eigen::Vector2d pixel = image.pixels[o.feature];
         if (shutter) {
           const double s = shutter->Fraction(m.cameras[image.camera], pixel);
@@ -763,8 +812,66 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
   ceres::Solver::Summary summary;
   Log("BA " + stage + ": " + std::to_string(used_images.size()) + " images, " +
       std::to_string(observations) + " observations");
+  struct BaSnapshot {
+    std::vector<Eigen::Vector3d> points;
+    std::vector<std::array<double, 7>> poses;
+    std::array<std::array<double, 8>, 2> cameras{};
+    std::vector<std::array<double, 10>> shutter_images;
+    std::array<std::array<double, 9>, 2> shutter_cameras{};
+    std::array<double, 7> rig{};
+  };
+  std::optional<BaSnapshot> snapshot;
+  if (use_cuda_dense && options.use_mixed_precision_solves) {
+    BaSnapshot snap;
+    snap.points.resize(m.points.size());
+    for (size_t i = 0; i < m.points.size(); ++i)
+      snap.points[i] = m.points[i].xyz;
+    snap.poses.resize(m.images.size());
+    for (size_t i = 0; i < m.images.size(); ++i)
+      snap.poses[i] = m.images[i].pose.params;
+    for (size_t c = 0; c < 2; ++c)
+      snap.cameras[c] = m.cameras[c].params;
+    snap.shutter_images = shutter_images;
+    snap.shutter_cameras = shutter_cameras;
+    snap.rig = rig.params;
+    snapshot = std::move(snap);
+  }
+  auto restore_snapshot = [&] {
+    if (!snapshot)
+      return;
+    for (size_t i = 0; i < m.points.size(); ++i)
+      m.points[i].xyz = snapshot->points[i];
+    for (size_t i = 0; i < m.images.size(); ++i)
+      m.images[i].pose.params = snapshot->poses[i];
+    for (size_t c = 0; c < 2; ++c)
+      m.cameras[c].params = snapshot->cameras[c];
+    shutter_images = snapshot->shutter_images;
+    shutter_cameras = snapshot->shutter_cameras;
+    rig.params = snapshot->rig;
+  };
   const double build_seconds = Seconds(started);
   ceres::Solve(options, &problem, &summary);
+  bool mixed_precision_fallback = false;
+  bool cuda_fallback_iterative = false;
+  if (!summary.IsSolutionUsable() && use_cuda_dense && options.use_mixed_precision_solves) {
+    Log("BA CUDA mixed-precision failed (" + summary.message + "); retrying CUDA FP64");
+    restore_snapshot();
+    options.use_mixed_precision_solves = false;
+    mixed_precision_fallback = true;
+    summary = ceres::Solver::Summary();
+    ceres::Solve(options, &problem, &summary);
+  }
+  if (!summary.IsSolutionUsable() && use_cuda_dense) {
+    Log("BA CUDA DENSE_SCHUR failed (" + summary.message + "); falling back to ITERATIVE_SCHUR");
+    restore_snapshot();
+    use_cuda_dense = false;
+    cuda_fallback_iterative = true;
+    options.linear_solver_type = ceres::ITERATIVE_SCHUR;
+    options.preconditioner_type = ceres::SCHUR_JACOBI;
+    options.use_explicit_schur_complement = used_images.size() <= 4096;
+    summary = ceres::Solver::Summary();
+    ceres::Solve(options, &problem, &summary);
+  }
   if (!summary.IsSolutionUsable())
     throw std::runtime_error("BA failed: " + summary.BriefReport());
   if (shutter) {
@@ -823,6 +930,8 @@ Json Optimize(Reconstruction& m, const std::array<Camera, 2>& initial, const std
           {"solver", ceres::LinearSolverTypeToString(summary.linear_solver_type_used)},
           {"cuda_dense", use_cuda_dense},
           {"mixed_precision", summary.mixed_precision_solves_used},
+          {"mixed_precision_fallback", mixed_precision_fallback},
+          {"cuda_fallback_iterative", cuda_fallback_iterative},
           {"explicit_schur", options.use_explicit_schur_complement},
           {"build_seconds", build_seconds},
           {"linear_solver_seconds", summary.linear_solver_time_in_seconds},

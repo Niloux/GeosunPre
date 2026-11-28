@@ -117,6 +117,7 @@ class ImageReader {
   // Square side of the grounding input for the masks; 0 reads the masks instead.
   const int grounding;
   const std::array<cv::Rect, 2> grounding_rois;
+  const std::array<cv::Size, 2> camera_sizes;
   size_t next = 0;
   std::deque<std::future<PreparedImage>> ready;
   // Four photos in flight keep the GPU fed with a few full-size photos in memory.
@@ -127,13 +128,27 @@ class ImageReader {
         PreparedImage image;
         image.id = record.id;
         auto started = Clock::now();
-        image.rgb = ReadImage(record.source, cv::IMREAD_COLOR);
+        const cv::Rect& roi = grounding_rois[record.camera];
+        const bool use_half =
+            grounding > 0 && roi.width >= 2 * grounding && roi.height >= 2 * grounding;
+        image.rgb = ReadImage(record.source, use_half ? cv::IMREAD_REDUCED_COLOR_2 : cv::IMREAD_COLOR);
         image.decode = Seconds(started);
         started = Clock::now();
         cv::cvtColor(image.rgb, image.rgb, cv::COLOR_BGR2RGB);
         if (grounding) {
-          const cv::Rect& roi = grounding_rois[record.camera];
-          const cv::Mat source = roi.empty() ? image.rgb : image.rgb(roi);
+          cv::Rect scaled_roi = roi;
+          const cv::Size cam_sz = camera_sizes[record.camera];
+          if (!scaled_roi.empty() && cam_sz.width > 0 && cam_sz.height > 0 &&
+              (image.rgb.cols != cam_sz.width || image.rgb.rows != cam_sz.height)) {
+            const double sx = double(image.rgb.cols) / double(cam_sz.width);
+            const double sy = double(image.rgb.rows) / double(cam_sz.height);
+            const int x0 = std::clamp(int(std::lround(roi.x * sx)), 0, image.rgb.cols - 1);
+            const int y0 = std::clamp(int(std::lround(roi.y * sy)), 0, image.rgb.rows - 1);
+            const int rw = std::clamp(int(std::lround(roi.width * sx)), 1, image.rgb.cols - x0);
+            const int rh = std::clamp(int(std::lround(roi.height * sy)), 1, image.rgb.rows - y0);
+            scaled_roi = {x0, y0, rw, rh};
+          }
+          const cv::Mat source = scaled_roi.empty() ? image.rgb : image.rgb(scaled_roi);
           cv::resize(source, image.grounding, {grounding, grounding}, 0, 0, cv::INTER_AREA);
           image.rgb.release();
         } else
@@ -146,11 +161,12 @@ class ImageReader {
 
  public:
   ImageReader(const std::vector<Exposure>& records, fs::path path, int grounding_size = 0,
-              std::array<cv::Rect, 2> rois = {})
+              std::array<cv::Rect, 2> rois = {}, std::array<cv::Size, 2> cam_sizes = {})
       : images(records),
         work(std::move(path)),
         grounding(grounding_size),
-        grounding_rois(rois) {
+        grounding_rois(rois),
+        camera_sizes(cam_sizes) {
     Fill();
   }
   PreparedImage Next() {
@@ -927,7 +943,9 @@ Json MakeMasks(const Scene& scene, const fs::path& work, const fs::path& root, i
     rim_zones[c] = (roi_domains_coarse[c] == 0) | ((roi_domains_coarse[c] > 0) & (inner == 0));
   }
   GroundingCounts counts;
-  ImageReader reader(pending, work, grounding_size, rois);
+  ImageReader reader(pending, work, grounding_size, rois,
+                     {cv::Size(scene.cameras[0].width, scene.cameras[0].height),
+                      cv::Size(scene.cameras[1].width, scene.cameras[1].height)});
   WriterPool writer(workers);
   for (const auto& record : pending) {
     auto phase = Clock::now();
@@ -1002,6 +1020,7 @@ Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
     return timing.Report(started);
   Models models(root);
   ImagePreprocessor pixels(models.Stream());
+  KeypointDetector keypoint_detector;
   ImageReader reader(pending, work);
   WriterPool writer;
   for (const auto& record : pending) {
@@ -1016,7 +1035,7 @@ Json MakeFeatures(const Scene& scene, const fs::path& work, const fs::path& root
     phase = Clock::now();
     pixels.Upload(image.rgb);
     const auto detected = models.Predict("detector", {pixels.Normalize(width, height)}, true)[0];
-    const auto raw = DetectKeypoints(detected, width, height, 12288, models.Stream());
+    const auto raw = keypoint_detector.Detect(detected, width, height, 12288, models.Stream());
     timing.gpu_pipeline += Seconds(phase);
     phase = Clock::now();
     std::vector<std::array<float, 3>> candidates;
@@ -1082,9 +1101,11 @@ std::set<std::pair<uint32_t, uint32_t>> CandidatePairs(const Scene& scene, const
                                                        const std::set<uint32_t>& repair,
                                                        size_t& navigation_added_pairs) {
   const uint32_t n = uint32_t(scene.images.size());
-  std::vector<std::array<float, 256>> retrieval;
-  for (uint32_t id = 0; id < n; ++id)
-    retrieval.push_back(ReadFeatures(FeaturePath(work, id)).retrieval);
+  Eigen::Matrix<float, Eigen::Dynamic, 256, Eigen::RowMajor> retrieval_mat(n, 256);
+  for (uint32_t id = 0; id < n; ++id) {
+    const auto r = ReadFeatures(FeaturePath(work, id)).retrieval;
+    std::copy_n(r.data(), 256, retrieval_mat.row(id).data());
+  }
   std::array<std::vector<uint32_t>, 2> lens_images;
   std::vector<size_t> lens_rank(n, 0);
   for (uint32_t id = 0; id < n; ++id) {
@@ -1148,6 +1169,7 @@ std::set<std::pair<uint32_t, uint32_t>> CandidatePairs(const Scene& scene, const
       add(id, candidate);
       navigation_added_pairs += pairs.size() - before;
     }
+    const Eigen::VectorXf sims = retrieval_mat * retrieval_mat.row(id).transpose();
     if (repair.empty()) {
       std::vector<std::pair<double, uint32_t>> loop_options, mid_options;
       for (uint32_t j = 0; j < n; ++j) {
@@ -1160,9 +1182,7 @@ std::set<std::pair<uint32_t, uint32_t>> CandidatePairs(const Scene& scene, const
             (positions[id] - positions[j]).squaredNorm() > 20. * 20. ||
             pairs.count({std::min(id, j), std::max(id, j)}))
           continue;
-        double similarity = 0;
-        for (int d = 0; d < 256; ++d)
-          similarity += retrieval[id][d] * retrieval[j][d];
+        const double similarity = double(sims[j]);
         (abs_dt > 30. ? loop_options : mid_options).emplace_back(similarity, j);
       }
       std::sort(loop_options.rbegin(), loop_options.rend());
@@ -1202,9 +1222,7 @@ std::set<std::pair<uint32_t, uint32_t>> CandidatePairs(const Scene& scene, const
           if (distance < range[0] || distance >= range[1] ||
               (abs_dt > 10. && FacesAway(scene, velocities, id, j)))
             continue;
-          double similarity = 0;
-          for (int d = 0; d < 256; ++d)
-            similarity += retrieval[id][d] * retrieval[j][d];
+          const double similarity = double(sims[j]);
           options.emplace_back(similarity, j);
         }
         std::sort(options.rbegin(), options.rend());

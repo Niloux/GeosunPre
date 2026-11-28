@@ -384,12 +384,12 @@ double FixedCameraPositionSigma(const Reconstruction& model, const ModelPoint& p
 }
 std::vector<double> LasSupportDistances(const Scene& scene, const Reconstruction& model,
                                         const LasHeader& header, double maximum,
-                                        Json& report) {
+                                        const fs::path& las_sample_cache, Json& report) {
   const auto started = Clock::now();
   const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
   Json sampling;
   Surface sample;
-  sample.points = SampleLas(scene.las, header, sampling);
+  sample.points = SampleLas(scene.las, header, sampling, 1500000, las_sample_cache);
   const double sample_seconds = Seconds(started);
   for (auto& point : sample.points)
     point -= origin;
@@ -502,11 +502,11 @@ Json FailedChecks(const Json& checks) {
   return failed;
 }
 std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Reconstruction& model,
-                                                 int workers) {
+                                                 int workers, const fs::path& las_sample_cache) {
   const auto header = ReadSceneLas(scene);
   const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
   Json sampling;
-  auto target = SampleLas(scene.las, header, sampling);
+  auto target = SampleLas(scene.las, header, sampling, 1500000, las_sample_cache);
   for (auto& p : target)
     p -= origin;
   auto surface = CoherentSurfaces(target, .025, workers);
@@ -539,7 +539,7 @@ std::vector<PlaneConstraint> LasPlaneConstraints(const Scene& scene, const Recon
   return planes;
 }
 Json FilterSparseStructure(const Scene& scene, Reconstruction& model,
-                           const AlignmentLimits& limits) {
+                           const AlignmentLimits& limits, const fs::path& las_sample_cache) {
   // Camera refinement requires >=3 views; reliable two-view points can still
   // seed 3DGS when parallax, depth precision and LAS support pass.
   constexpr size_t minimum_track_length = 2;
@@ -569,7 +569,7 @@ Json FilterSparseStructure(const Scene& scene, Reconstruction& model,
   }
   Json support;
   auto support_distances =
-      LasSupportDistances(scene, model, header, max_distance, support);
+      LasSupportDistances(scene, model, header, max_distance, las_sample_cache, support);
   Json support_passes = Json::array({support});
   for (uint64_t id = 0; id < model.points.size(); ++id) {
     auto& point = model.points[id];
@@ -626,7 +626,8 @@ Json FilterSparseStructure(const Scene& scene, Reconstruction& model,
   std::vector<double> distances, uncertainty;
   retained = 0;
   if (!removed_images.empty()) {
-    support_distances = LasSupportDistances(scene, model, header, max_distance, support);
+    support_distances =
+        LasSupportDistances(scene, model, header, max_distance, las_sample_cache, support);
     support_passes.push_back(support);
   }
   for (uint64_t id = 0; id < model.points.size(); ++id) {
@@ -940,13 +941,13 @@ Json CheckLasSurfaceHitRate(const Scene& scene, Reconstruction& model, const Las
 }
 }  // namespace
 Json Align(const Scene& scene, Reconstruction& model, int workers, const AlignmentLimits& limits,
-           int ba_workers) {
+           int ba_workers, const fs::path& las_sample_cache) {
   if (!ba_workers)
     ba_workers = workers;
   const auto header = ReadSceneLas(scene);
   Json sampling;
   const Eigen::Vector3d origin = (header.lower + header.upper) / 2;
-  auto target = SampleLas(scene.las, header, sampling);
+  auto target = SampleLas(scene.las, header, sampling, 1500000, las_sample_cache);
   for (auto& p : target)
     p -= origin;
   const auto navigation = NavigationPositions(scene);

@@ -217,6 +217,7 @@ struct ShutterInputs {
   std::array<double, 2> imu_boresight_median_deg{-1., -1.};
   std::vector<Eigen::Vector3d> imu_omega;
   std::string rig_mode = "none";
+  fs::path las_sample_cache;
 };
 std::array<double, 2> VerifyImuAttitude(const Reconstruction& model,
                                         const ExposureKinematics& kinematics, bool& verified) {
@@ -806,7 +807,7 @@ void PolishAcceptedShutter(const Scene& scene, const Reconstruction& source,
     model.points[id].error = ShutterPointError(model, motion, model.points[id]);
   }
   auto& report = accepted_axis.correction.report;
-  const auto polish_planes = LasPlaneConstraints(scene, model, workers);
+  const auto polish_planes = LasPlaneConstraints(scene, model, workers, inputs.las_sample_cache);
   Log("Rolling-shutter polish: " + std::to_string(all_tracks.size()) + " tracks, " +
       std::to_string(polish_planes.size()) + " LAS planes");
   const auto polish_opt =
@@ -1772,6 +1773,7 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
     ba_workers = workers;
   const auto started = Clock::now();
   ShutterInputs inputs;
+  inputs.las_sample_cache = work / "cache/las_sample.bin";
   inputs.source_quality = source.Quality(scene, limits.median_px, limits.p90_px);
   if (!inputs.source_quality.at("passed").get<bool>())
     throw std::runtime_error("Rolling-shutter source reconstruction failed visual acceptance");
@@ -1796,7 +1798,7 @@ ShutterCorrection CorrectRollingShutter(const Scene& scene, const Reconstruction
     }
   inputs.navigation = NavigationPositions(scene);
   Log("Rolling-shutter correction: " + std::to_string(source.Registered()) + " images");
-  inputs.planes = LasPlaneConstraints(scene, source, workers);
+  inputs.planes = LasPlaneConstraints(scene, source, workers, inputs.las_sample_cache);
   // Whole tracks are held out of the camera solve and refit afterwards with cameras fixed.
   for (uint64_t id = 0; id < source.points.size(); ++id) {
     const auto& point = source.points[id];

@@ -6,6 +6,7 @@
 #include <cub/device/device_scan.cuh>
 #include <algorithm>
 #include <cmath>
+#include <math_constants.h>
 
 namespace geosun::supervision_gpu {
 namespace {
@@ -611,6 +612,174 @@ __global__ void SampleMogeShiftGridKernel(const float* points, const float* mask
           : make_float4(0.f, 0.f, 0.f, 0.f);
 }
 
+__global__ void SolveMogeShiftsKernel(const float4* samples, int size, double* shifts,
+                                      uint8_t* shift_ok) {
+  __shared__ int s_count[256];
+  __shared__ double s_val[256];
+  __shared__ double s_val2[256];
+  __shared__ double s_nearest;
+  __shared__ double s_shift;
+  __shared__ double s_damping;
+  __shared__ double s_current;
+  __shared__ double s_trial_s;
+  __shared__ double s_step;
+  __shared__ int s_done;
+
+  const int tid = threadIdx.x;
+  const int f = blockIdx.x;
+  const float4* f_samples = samples + size_t(f) * 4096;
+
+  int local_count = 0;
+  double local_nearest = CUDART_INF;
+  for (int k = tid; k < 4096; k += 256) {
+    const float4 sp = f_samples[k];
+    if (sp.w > 0.f) {
+      ++local_count;
+      local_nearest = fmin(local_nearest, double(sp.z));
+    }
+  }
+  s_count[tid] = local_count;
+  s_val[tid] = local_nearest;
+  __syncthreads();
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      s_count[tid] += s_count[tid + stride];
+      s_val[tid] = fmin(s_val[tid], s_val[tid + stride]);
+    }
+    __syncthreads();
+  }
+  if (s_count[0] < 32) {
+    if (tid == 0) {
+      shifts[f] = 0.0;
+      shift_ok[f] = 0;
+    }
+    return;
+  }
+  if (tid == 0) {
+    s_nearest = s_val[0];
+    s_shift = 0.0;
+    s_damping = 1e-3;
+    s_done = 0;
+  }
+  __syncthreads();
+
+  const double inv_size = 1.0 / double(size);
+  double local_cost = 0.0;
+  if (s_nearest > 1e-6) {
+    for (int k = tid; k < 4096; k += 256) {
+      const float4 sp = f_samples[k];
+      if (sp.w <= 0.f)
+        continue;
+      const int i = k >> 6, j = k & 63;
+      const int row = (i * size) >> 6, column = (j * size) >> 6;
+      const double u = (2.0 * column + 1.0 - size) * inv_size;
+      const double v = (2.0 * row + 1.0 - size) * inv_size;
+      const double inv_z = 1.0 / double(sp.z);
+      const double ex = double(sp.x) * inv_z - u;
+      const double ey = double(sp.y) * inv_z - v;
+      local_cost += ex * ex + ey * ey;
+    }
+  }
+  s_val[tid] = local_cost;
+  __syncthreads();
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (tid < stride)
+      s_val[tid] += s_val[tid + stride];
+    __syncthreads();
+  }
+  if (tid == 0)
+    s_current = s_nearest > 1e-6 ? s_val[0] : CUDART_INF;
+  __syncthreads();
+
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    double local_grad = 0.0, local_hess = 0.0;
+    const double cur_s = s_shift;
+    for (int k = tid; k < 4096; k += 256) {
+      const float4 sp = f_samples[k];
+      if (sp.w <= 0.f)
+        continue;
+      const int i = k >> 6, j = k & 63;
+      const int row = (i * size) >> 6, column = (j * size) >> 6;
+      const double u = (2.0 * column + 1.0 - size) * inv_size;
+      const double v = (2.0 * row + 1.0 - size) * inv_size;
+      const double inv_z = 1.0 / (double(sp.z) + cur_s);
+      const double inv_z2 = inv_z * inv_z;
+      const double jx = -double(sp.x) * inv_z2;
+      const double jy = -double(sp.y) * inv_z2;
+      local_grad += jx * (double(sp.x) * inv_z - u) + jy * (double(sp.y) * inv_z - v);
+      local_hess += jx * jx + jy * jy;
+    }
+    s_val[tid] = local_grad;
+    s_val2[tid] = local_hess;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        s_val[tid] += s_val[tid + stride];
+        s_val2[tid] += s_val2[tid + stride];
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      if (!(s_val2[0] > 0.0)) {
+        s_done = 1;
+      } else {
+        s_step = -s_val[0] / (s_val2[0] * (1.0 + s_damping));
+        s_trial_s = cur_s + s_step;
+      }
+    }
+    __syncthreads();
+    if (s_done)
+      break;
+
+    const double trial_s = s_trial_s;
+    double local_trial = 0.0;
+    if (s_nearest + trial_s > 1e-6) {
+      for (int k = tid; k < 4096; k += 256) {
+        const float4 sp = f_samples[k];
+        if (sp.w <= 0.f)
+          continue;
+        const int i = k >> 6, j = k & 63;
+        const int row = (i * size) >> 6, column = (j * size) >> 6;
+        const double u = (2.0 * column + 1.0 - size) * inv_size;
+        const double v = (2.0 * row + 1.0 - size) * inv_size;
+        const double inv_z = 1.0 / (double(sp.z) + trial_s);
+        const double ex = double(sp.x) * inv_z - u;
+        const double ey = double(sp.y) * inv_z - v;
+        local_trial += ex * ex + ey * ey;
+      }
+    }
+    s_val[tid] = local_trial;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+      if (tid < stride)
+        s_val[tid] += s_val[tid + stride];
+      __syncthreads();
+    }
+    if (tid == 0) {
+      const double trial = (s_nearest + trial_s > 1e-6) ? s_val[0] : CUDART_INF;
+      if (trial < s_current) {
+        const bool converged =
+            fabs(s_step) < 1e-9 * (1.0 + fabs(cur_s)) || (s_current - trial) < 1e-12 * s_current;
+        s_shift = trial_s;
+        s_current = trial;
+        s_damping = fmax(s_damping / 10.0, 1e-9);
+        if (converged)
+          s_done = 1;
+      } else if ((s_damping *= 10.0) > 1e9) {
+        s_done = 1;
+      }
+    }
+    __syncthreads();
+    if (s_done)
+      break;
+  }
+  if (tid == 0) {
+    const bool ok = isfinite(s_current);
+    shift_ok[f] = ok ? 1 : 0;
+    shifts[f] = ok ? s_shift : 0.0;
+  }
+}
+
 __global__ void BuildMogeFaceEstimatesKernel(const float* points, const float* normals,
                                              const float* mask, const uint8_t* face_valid,
                                              const double* shifts, const uint8_t* shift_ok,
@@ -693,6 +862,14 @@ void SampleMogeShiftGrid(const float* points, const float* mask, const uint8_t* 
     return;
   const dim3 grid(unsigned((64 * 64 + 255) / 256), unsigned(faces));
   SampleMogeShiftGridKernel<<<grid, 256, 0, stream>>>(points, mask, face_valid, size, samples);
+  CudaCheck(cudaGetLastError());
+}
+
+void SolveMogeShifts(const float4* samples, int faces, int size, double* shifts, uint8_t* shift_ok,
+                     cudaStream_t stream) {
+  if (faces <= 0)
+    return;
+  SolveMogeShiftsKernel<<<unsigned(faces), 256, 0, stream>>>(samples, size, shifts, shift_ok);
   CudaCheck(cudaGetLastError());
 }
 

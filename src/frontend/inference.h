@@ -37,6 +37,18 @@ struct Tensor {
   static Tensor Float(std::vector<int64_t> shape, const float* data, size_t count);
   static Tensor Upload(std::vector<int64_t> shape, const float* data, size_t count);
 };
+class KeypointDetector {
+  struct Implementation;
+  std::unique_ptr<Implementation> impl_;
+
+ public:
+  KeypointDetector();
+  ~KeypointDetector();
+  KeypointDetector(const KeypointDetector&) = delete;
+  KeypointDetector& operator=(const KeypointDetector&) = delete;
+  std::vector<std::array<float, 3>> Detect(const Tensor& logits, int width, int height,
+                                           size_t maximum, cudaStream_t stream = nullptr);
+};
 std::vector<std::array<float, 3>> DetectKeypoints(const Tensor& logits, int width, int height,
                                                   size_t maximum, cudaStream_t stream = nullptr);
 class Models {

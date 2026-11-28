@@ -2258,10 +2258,14 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
   // intrinsics held. A second full calibration there lowered the cost by under
   // 0.1% on 生产车间; the rolling-shutter stage refines the intrinsics again.
   Json calibration_completion = Json::array();
-  auto calibrate = [&](const char* stage, int iterations) {
+  auto calibrate = [&](const char* stage, int iterations, bool skip_redundant_fixed = false) {
+    bool dropped_any = false;
     for (;;) {
       filter();
-      calibration_completion.push_back(CompleteUnassignedTracks(m, graph));
+      const size_t obs_before = m.Observations();
+      auto unassigned = CompleteUnassignedTracks(m, graph);
+      const size_t added_obs = unassigned.at("added_observations").get<size_t>();
+      calibration_completion.push_back(std::move(unassigned));
       Json support;
       std::set<uint64_t> selected;
       try {
@@ -2282,6 +2286,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
           Log("Omit from final calibration: " + scene.images[id].name +
               " (insufficient reliable track coverage)");
         }
+        dropped_any = true;
         unregister(missing.images);
         save_checkpoint();
         continue;
@@ -2289,6 +2294,10 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       support["optimization_tracks"] = stable_calibration ? "stable" : "all";
       support["used"] = true;
       calibration_selection.push_back(std::move(support));
+      if (skip_redundant_fixed && !stable_calibration && !dropped_any &&
+          added_obs <= std::max<size_t>(1, size_t(obs_before * 0.0005)) &&
+          !optimization.empty() && optimization.back().at("converged").get<bool>())
+        break;
       if (!stable_calibration)
         selected.clear();
       optimization.push_back(ba(stage, iterations, {}, selected));
@@ -2310,7 +2319,7 @@ Reconstruction Reconstruct(const Scene& scene, const fs::path& work, int workers
       break;
     optimization.push_back(ba("fixed", 100));
   }
-  calibrate("fixed", 100);
+  calibrate("fixed", 100, true);
   if (stable_calibration)
     optimization.push_back(ba("fixed", 200));
   filter();

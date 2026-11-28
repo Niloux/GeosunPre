@@ -62,43 +62,56 @@ __global__ void Subpixel(const float* logits, const Peak* peaks, float* output, 
   output[3 * i + 2] = float(exp(double(peaks[i].value) - *highest) / *total);
 }
 }  // namespace
-std::vector<std::array<float, 3>> DetectKeypoints(const Tensor& logits, int w, int h,
-                                                  size_t maximum, cudaStream_t stream) {
+struct KeypointDetector::Implementation {
+  std::unique_ptr<DeviceBuffer> source, peaks, counter, highest, total, workspace, output;
+  void Ensure(std::unique_ptr<DeviceBuffer>& buf, size_t bytes) {
+    if (!buf || buf->bytes < bytes)
+      buf = std::make_unique<DeviceBuffer>(bytes);
+  }
+};
+KeypointDetector::KeypointDetector() : impl_(std::make_unique<Implementation>()) {}
+KeypointDetector::~KeypointDetector() = default;
+std::vector<std::array<float, 3>> KeypointDetector::Detect(const Tensor& logits, int w, int h,
+                                                           size_t maximum, cudaStream_t stream) {
   if (logits.Count() != size_t(w) * h)
     throw std::runtime_error("Unexpected detector output dimensions");
   const size_t size = size_t(w) * h;
-  DeviceBuffer source(logits.device ? 0 : size * sizeof(float));
-  if (!logits.device)
-    CudaCheck(cudaMemcpyAsync(source.data, logits.Floats(), size * sizeof(float),
+  auto& d = *impl_;
+  if (!logits.device) {
+    d.Ensure(d.source, size * sizeof(float));
+    CudaCheck(cudaMemcpyAsync(d.source->data, logits.Floats(), size * sizeof(float),
                               cudaMemcpyHostToDevice, stream));
-  const auto* data = static_cast<const float*>(logits.device ? logits.device->data : source.data);
-  DeviceBuffer peaks(size * sizeof(Peak)), counter(sizeof(uint32_t)), highest(sizeof(float)),
-      total(sizeof(double));
+  }
+  const auto* data = static_cast<const float*>(logits.device ? logits.device->data : d.source->data);
+  d.Ensure(d.peaks, size * sizeof(Peak));
+  d.Ensure(d.counter, sizeof(uint32_t));
+  d.Ensure(d.highest, sizeof(float));
+  d.Ensure(d.total, sizeof(double));
   size_t max_bytes = 0, sum_bytes = 0;
-  CudaCheck(cub::DeviceReduce::Max(nullptr, max_bytes, data, static_cast<float*>(highest.data),
+  CudaCheck(cub::DeviceReduce::Max(nullptr, max_bytes, data, static_cast<float*>(d.highest->data),
                                    int(size), stream));
   auto exponent = cub::TransformInputIterator<double, ExpShift, const float*>(
-      data, ExpShift{static_cast<const float*>(highest.data)});
-  CudaCheck(cub::DeviceReduce::Sum(nullptr, sum_bytes, exponent, static_cast<double*>(total.data),
+      data, ExpShift{static_cast<const float*>(d.highest->data)});
+  CudaCheck(cub::DeviceReduce::Sum(nullptr, sum_bytes, exponent, static_cast<double*>(d.total->data),
                                    int(size), stream));
-  DeviceBuffer workspace(std::max(max_bytes, sum_bytes));
-  CudaCheck(cub::DeviceReduce::Max(workspace.data, max_bytes, data,
-                                   static_cast<float*>(highest.data), int(size), stream));
-  CudaCheck(cub::DeviceReduce::Sum(workspace.data, sum_bytes, exponent,
-                                   static_cast<double*>(total.data), int(size), stream));
-  CudaCheck(cudaMemsetAsync(counter.data, 0, sizeof(uint32_t), stream));
-  Candidates<<<(w * h + 255) / 256, 256, 0, stream>>>(data, static_cast<Peak*>(peaks.data),
-                                                      static_cast<uint32_t*>(counter.data), w, h);
+  d.Ensure(d.workspace, std::max(max_bytes, sum_bytes));
+  CudaCheck(cub::DeviceReduce::Max(d.workspace->data, max_bytes, data,
+                                   static_cast<float*>(d.highest->data), int(size), stream));
+  CudaCheck(cub::DeviceReduce::Sum(d.workspace->data, sum_bytes, exponent,
+                                   static_cast<double*>(d.total->data), int(size), stream));
+  CudaCheck(cudaMemsetAsync(d.counter->data, 0, sizeof(uint32_t), stream));
+  Candidates<<<(w * h + 255) / 256, 256, 0, stream>>>(data, static_cast<Peak*>(d.peaks->data),
+                                                      static_cast<uint32_t*>(d.counter->data), w, h);
   CudaCheck(cudaGetLastError());
   uint32_t count;
   double mass;
-  CudaCheck(cudaMemcpyAsync(&count, counter.data, sizeof(count), cudaMemcpyDeviceToHost, stream));
-  CudaCheck(cudaMemcpyAsync(&mass, total.data, sizeof(mass), cudaMemcpyDeviceToHost, stream));
+  CudaCheck(cudaMemcpyAsync(&count, d.counter->data, sizeof(count), cudaMemcpyDeviceToHost, stream));
+  CudaCheck(cudaMemcpyAsync(&mass, d.total->data, sizeof(mass), cudaMemcpyDeviceToHost, stream));
   CudaCheck(cudaStreamSynchronize(stream));
   if (!std::isfinite(mass) || mass <= 0)
     throw std::runtime_error("Nonfinite detector density");
   std::vector<Peak> candidates(count);
-  CudaCheck(cudaMemcpyAsync(candidates.data(), peaks.data, count * sizeof(Peak),
+  CudaCheck(cudaMemcpyAsync(candidates.data(), d.peaks->data, count * sizeof(Peak),
                             cudaMemcpyDeviceToHost, stream));
   CudaCheck(cudaStreamSynchronize(stream));
   maximum = std::min(maximum, candidates.size());
@@ -112,15 +125,22 @@ std::vector<std::array<float, 3>> DetectKeypoints(const Tensor& logits, int w, i
   std::vector<std::array<float, 3>> out(maximum);
   if (!maximum)
     return out;
-  DeviceBuffer output(maximum * sizeof(out[0]));
-  CudaCheck(cudaMemcpyAsync(peaks.data, candidates.data(), maximum * sizeof(Peak),
+  const size_t out_bytes = maximum * sizeof(out[0]);
+  d.Ensure(d.output, out_bytes);
+  CudaCheck(cudaMemcpyAsync(d.peaks->data, candidates.data(), maximum * sizeof(Peak),
                             cudaMemcpyHostToDevice, stream));
   Subpixel<<<unsigned((maximum + 255) / 256), 256, 0, stream>>>(
-      data, static_cast<const Peak*>(peaks.data), static_cast<float*>(output.data), int(maximum), w,
-      h, static_cast<const float*>(highest.data), static_cast<const double*>(total.data));
+      data, static_cast<const Peak*>(d.peaks->data), static_cast<float*>(d.output->data),
+      int(maximum), w, h, static_cast<const float*>(d.highest->data),
+      static_cast<const double*>(d.total->data));
   CudaCheck(cudaGetLastError());
-  CudaCheck(cudaMemcpyAsync(out.data(), output.data, output.bytes, cudaMemcpyDeviceToHost, stream));
+  CudaCheck(cudaMemcpyAsync(out.data(), d.output->data, out_bytes, cudaMemcpyDeviceToHost, stream));
   CudaCheck(cudaStreamSynchronize(stream));
   return out;
+}
+std::vector<std::array<float, 3>> DetectKeypoints(const Tensor& logits, int w, int h,
+                                                  size_t maximum, cudaStream_t stream) {
+  KeypointDetector detector;
+  return detector.Detect(logits, w, h, maximum, stream);
 }
 }  // namespace geosun

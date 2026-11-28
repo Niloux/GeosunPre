@@ -17,8 +17,6 @@ constexpr double RingStep = .85;
 constexpr double OuterRingDegrees = 15;
 // Grid weights fall to zero over this outer band of the face, as a share of its half width.
 constexpr double FeatherBand = .3;
-// Fewest valid samples in MoGe's 64 x 64 shift grid for a face to be used.
-constexpr size_t MinimumShiftSamples = 32;
 // Fewest overlapping samples needed to align the relative scale of a tilted face.
 constexpr size_t MinimumScaleOverlapSamples = 64;
 
@@ -32,67 +30,6 @@ void AddRing(std::vector<Eigen::Matrix3d>& rotations, int ring, double tilt) {
             .toRotationMatrix();
     rotations.push_back(face_to_camera.transpose());
   }
-}
-// Z shift turning MoGe's affine point map into camera space for the known face focal, as MoGe's
-// own inference: min sum |xy / (z + shift) - uv|^2 over its 64 x 64 nearest-neighbour grid.
-bool SolveShiftFromSamples(const float4* grid, int size, double& shift) {
-  struct Sample {
-    double x, y, z, u, v;
-  };
-  std::vector<Sample> samples;
-  samples.reserve(4096);
-  double nearest = INFINITY;
-  for (int i = 0; i < 64; ++i)
-    for (int j = 0; j < 64; ++j) {
-      const float4 s = grid[i * 64 + j];
-      if (s.w <= 0.f)
-        continue;
-      const int row = i * size / 64, column = j * size / 64;
-      samples.push_back({double(s.x), double(s.y), double(s.z), (2. * column + 1 - size) / size,
-                         (2. * row + 1 - size) / size});
-      nearest = std::min(nearest, double(s.z));
-    }
-  if (samples.size() < MinimumShiftSamples)
-    return false;
-  auto cost = [&](double s) {
-    if (nearest + s <= 1e-6)
-      return double(INFINITY);
-    double sum = 0;
-    for (const auto& p : samples) {
-      const double ex = p.x / (p.z + s) - p.u, ey = p.y / (p.z + s) - p.v;
-      sum += ex * ex + ey * ey;
-    }
-    return sum;
-  };
-  double s = 0, current = cost(s), damping = 1e-3;
-  for (int iteration = 0; iteration < 100; ++iteration) {
-    double gradient = 0, hessian = 0;
-    for (const auto& p : samples) {
-      const double inverse = 1 / (p.z + s), jx = -p.x * inverse * inverse,
-                   jy = -p.y * inverse * inverse;
-      gradient += jx * (p.x * inverse - p.u) + jy * (p.y * inverse - p.v);
-      hessian += jx * jx + jy * jy;
-    }
-    if (!(hessian > 0))
-      break;
-    const double step = -gradient / (hessian * (1 + damping));
-    const double trial = cost(s + step);
-    if (trial < current) {
-      const bool converged = std::abs(step) < 1e-9 * (1 + std::abs(s)) ||
-                             current - trial < 1e-12 * current;
-      s += step;
-      current = trial;
-      damping = std::max(damping / 10, 1e-9);
-      if (converged)
-        break;
-    } else if ((damping *= 10) > 1e9) {
-      break;
-    }
-  }
-  if (!std::isfinite(current))
-    return false;
-  shift = s;
-  return true;
 }
 }  // namespace
 cv::Mat MonocularLens::Prefilter(const cv::Mat& rgb) const {
@@ -248,7 +185,7 @@ struct MonocularEstimator::Workspace {
       d_normals, d_masks, d_face_valid, d_metric_scales, d_shift_samples, d_shifts, d_shift_ok,
       d_to_camera, d_out_distance, d_out_normal, d_valid_counts;
   std::shared_ptr<DeviceBuffer> d_all_face_inputs, d_face_input;
-  std::unique_ptr<HostBuffer> h_prefiltered, h_shift_samples, h_metric_scales, h_shifts, h_shift_ok,
+  std::unique_ptr<HostBuffer> h_prefiltered, h_metric_scales, h_shifts, h_shift_ok,
       h_to_camera, h_out_distance, h_out_normal, h_valid_counts;
   explicit Workspace(cudaStream_t s) : stream(s) {}
   ~Workspace() {
@@ -281,7 +218,6 @@ struct MonocularEstimator::Workspace {
     d_out_distance = std::make_unique<DeviceBuffer>(total_pixels * sizeof(float));
     d_out_normal = std::make_unique<DeviceBuffer>(total_pixels * 3 * sizeof(float));
     d_valid_counts = std::make_unique<DeviceBuffer>(size_t(count) * sizeof(uint32_t));
-    h_shift_samples = std::make_unique<HostBuffer>(size_t(count) * 4096 * sizeof(float4));
     h_metric_scales = std::make_unique<HostBuffer>(size_t(count) * sizeof(float));
     h_shifts = std::make_unique<HostBuffer>(size_t(count) * sizeof(double));
     h_shift_ok = std::make_unique<HostBuffer>(size_t(count));
@@ -400,26 +336,9 @@ std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens
       static_cast<const float*>(workspace_->d_masks->data),
       static_cast<const uint8_t*>(workspace_->d_face_valid->data), faces, size,
       static_cast<float4*>(workspace_->d_shift_samples->data), stream);
-  CudaCheck(cudaMemcpyAsync(workspace_->h_shift_samples->data, workspace_->d_shift_samples->data,
-                            size_t(faces) * 4096 * sizeof(float4), cudaMemcpyDeviceToHost, stream));
-  CudaCheck(cudaMemcpyAsync(workspace_->h_metric_scales->data, workspace_->d_metric_scales->data,
-                            size_t(faces) * sizeof(float), cudaMemcpyDeviceToHost, stream));
-  CudaCheck(cudaStreamSynchronize(stream));
-  const auto* metric_scales = static_cast<const float*>(workspace_->h_metric_scales->data);
-  const auto* samples = static_cast<const float4*>(workspace_->h_shift_samples->data);
-  auto* shifts = static_cast<double*>(workspace_->h_shifts->data);
-  auto* shift_ok = static_cast<uint8_t*>(workspace_->h_shift_ok->data);
-  for (int f = 0; f < faces; ++f) {
-    if (!std::isfinite(metric_scales[f]) || metric_scales[f] <= 0)
-      throw std::runtime_error("Geometry engine returned an invalid metric scale");
-    double shift = 0;
-    shift_ok[f] = SolveShiftFromSamples(samples + size_t(f) * 4096, size, shift) ? 1 : 0;
-    shifts[f] = shift;
-  }
-  CudaCheck(cudaMemcpyAsync(workspace_->d_shifts->data, shifts, size_t(faces) * sizeof(double),
-                            cudaMemcpyHostToDevice, stream));
-  CudaCheck(cudaMemcpyAsync(workspace_->d_shift_ok->data, shift_ok, size_t(faces),
-                            cudaMemcpyHostToDevice, stream));
+  supervision_gpu::SolveMogeShifts(static_cast<const float4*>(workspace_->d_shift_samples->data),
+                                   faces, size, static_cast<double*>(workspace_->d_shifts->data),
+                                   static_cast<uint8_t*>(workspace_->d_shift_ok->data), stream);
   CudaCheck(cudaMemsetAsync(workspace_->d_valid_counts->data, 0, size_t(faces) * sizeof(uint32_t),
                             stream));
   supervision_gpu::BuildMogeFaceEstimates(
@@ -434,6 +353,12 @@ std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens
       static_cast<float*>(workspace_->d_out_distance->data),
       static_cast<float*>(workspace_->d_out_normal->data),
       static_cast<uint32_t*>(workspace_->d_valid_counts->data), stream);
+  CudaCheck(cudaMemcpyAsync(workspace_->h_metric_scales->data, workspace_->d_metric_scales->data,
+                            size_t(faces) * sizeof(float), cudaMemcpyDeviceToHost, stream));
+  CudaCheck(cudaMemcpyAsync(workspace_->h_shifts->data, workspace_->d_shifts->data,
+                            size_t(faces) * sizeof(double), cudaMemcpyDeviceToHost, stream));
+  CudaCheck(cudaMemcpyAsync(workspace_->h_shift_ok->data, workspace_->d_shift_ok->data,
+                            size_t(faces), cudaMemcpyDeviceToHost, stream));
   CudaCheck(cudaMemcpyAsync(workspace_->h_out_distance->data, workspace_->d_out_distance->data,
                             size_t(faces) * face_pixels * sizeof(float), cudaMemcpyDeviceToHost,
                             stream));
@@ -443,6 +368,13 @@ std::vector<FaceEstimate> MonocularEstimator::Estimate(const MonocularLens& lens
   CudaCheck(cudaMemcpyAsync(workspace_->h_valid_counts->data, workspace_->d_valid_counts->data,
                             size_t(faces) * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
   CudaCheck(cudaStreamSynchronize(stream));
+  const auto* metric_scales = static_cast<const float*>(workspace_->h_metric_scales->data);
+  const auto* shifts = static_cast<const double*>(workspace_->h_shifts->data);
+  const auto* shift_ok = static_cast<const uint8_t*>(workspace_->h_shift_ok->data);
+  for (int f = 0; f < faces; ++f) {
+    if (!std::isfinite(metric_scales[f]) || metric_scales[f] <= 0)
+      throw std::runtime_error("Geometry engine returned an invalid metric scale");
+  }
   const auto* out_dist = static_cast<const float*>(workspace_->h_out_distance->data);
   const auto* out_norm = static_cast<const float*>(workspace_->h_out_normal->data);
   const auto* valid_counts = static_cast<const uint32_t*>(workspace_->h_valid_counts->data);
@@ -832,6 +764,19 @@ MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
   std::vector<cv::Vec3f> blended_normals(pixels, cv::Vec3f(0.f, 0.f, 0.f));
   std::vector<uint8_t> has_normal(pixels, 0);
 
+  std::vector<Eigen::Matrix3d> r_neg, r_pos;
+  if (rolling) {
+    const int axis_len = axis ? h : w;
+    r_neg.resize(size_t(axis_len));
+    r_pos.resize(size_t(axis_len));
+    for (int c = 0; c < axis_len; ++c) {
+      const double s = (c + 0.5 - 0.5 * axis_len) / axis_len;
+      const Eigen::Vector3d w_rot = s * (*omega);
+      r_neg[size_t(c)] = RodriguesMatrix(-w_rot);
+      r_pos[size_t(c)] = RodriguesMatrix(w_rot);
+    }
+  }
+
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x) {
       const size_t i = size_t(y) * w + x;
@@ -842,11 +787,9 @@ MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
 
       std::array<FaceSample, MonocularLens::MaxSamples> samples;
       int count = 0;
-      Eigen::Vector3d w_rot = Eigen::Vector3d::Zero();
+      const int line = axis ? y : x;
       if (rolling) {
-        const double s = axis ? (y + .5 - .5 * h) / h : (x + .5 - .5 * w) / w;
-        w_rot = s * (*omega);
-        const Eigen::Vector3d r_ref = (RodriguesMatrix(-w_rot) * r_exp).normalized();
+        const Eigen::Vector3d r_ref = (r_neg[size_t(line)] * r_exp).normalized();
         count = lens.SamplesAtRay(r_ref, samples);
       } else {
         samples = lens.samples[i];
@@ -873,7 +816,7 @@ MogeSsiResult EncodeMogeSsiMaps(const MonocularLens& lens,
         continue;
       Eigen::Vector3d normal = n_sum / n_norm;
       if (rolling)
-        normal = (RodriguesMatrix(w_rot) * normal).normalized();
+        normal = (r_pos[size_t(line)] * normal).normalized();
       if (normal.dot(r_exp) > 0.0)
         normal = -normal;
       blended_normals[i] = cv::Vec3f(float(normal.x()), float(normal.y()), float(normal.z()));

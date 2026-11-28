@@ -1,4 +1,5 @@
 #include "io/las.h"
+#include "io/cache.h"
 #include "io/roi.h"
 #include "io/scene.h"
 #include "geometry/model.h"
@@ -227,19 +228,20 @@ void ScanLas(const fs::path& path, const LasHeader& h,
   std::ifstream stream(path, std::ios::binary);
   stream.seekg(h.offset);
   constexpr uint64_t chunk = 500000;
+  std::vector<uint8_t> bytes;
+  std::vector<LasPoint> points;
   for (uint64_t start = 0; start < h.count; start += chunk) {
     const size_t count = size_t(std::min<uint64_t>(chunk, h.count - start));
-    std::vector<uint8_t> bytes(count * h.record_size);
+    bytes.resize(count * h.record_size);
     if (!stream.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size())))
       throw std::runtime_error("LAS changed or was truncated while reading");
-    std::vector<LasPoint> points(count);
+    points.resize(count);
     for (size_t i = 0; i < count; ++i) {
       const auto* p = bytes.data() + i * h.record_size;
       for (int j = 0; j < 3; ++j)
         points[i].raw[j] = Read<int32_t>(p, 4 * j);
       points[i].classification = p[15];
-      if (h.format == 1 || h.format == 3)
-        points[i].gps_time = Read<double>(p, 20);
+      points[i].gps_time = (h.format == 1 || h.format == 3) ? Read<double>(p, 20) : 0.0;
       for (int j = 0; j < 3; ++j)
         points[i].rgb[j] = (h.format == 2 || h.format == 3)
                                ? Read<uint16_t>(p, (h.format == 2 ? 20 : 28) + 2 * j)
@@ -251,9 +253,35 @@ void ScanLas(const fs::path& path, const LasHeader& h,
     throw std::runtime_error("LAS changed during reading");
 }
 std::vector<Eigen::Vector3d> SampleLas(const fs::path& path, const LasHeader& h, Json& metadata,
-                                       size_t maximum) {
+                                       size_t maximum, const fs::path& cache_path) {
   if (maximum < 1 || maximum > 5000000)
     throw std::runtime_error("Expected 1-5000000 LAS sample points");
+  const Json identity = {{"las_file", FileMetadata(path)},
+                         {"maximum", maximum},
+                         {"converted", h.converted},
+                         {"frame", h.converted ? h.frame.ToJson() : Json(nullptr)}};
+  if (!cache_path.empty() && fs::is_regular_file(cache_path)) {
+    try {
+      BinaryReader in(cache_path);
+      char magic[4]{};
+      in.Bytes(magic, 4);
+      if (std::memcmp(magic, "GSLS", 4) == 0 && in.Value<uint32_t>() == 1 &&
+          Json::parse(in.String()) == identity) {
+        Json cached_meta = Json::parse(in.String());
+        const uint64_t count = in.Value<uint64_t>();
+        static_assert(sizeof(Eigen::Vector3d) == 3 * sizeof(double));
+        std::vector<Eigen::Vector3d> xyz;
+        xyz.resize(size_t(count));
+        if (count)
+          in.Bytes(xyz.data(), size_t(count) * sizeof(Eigen::Vector3d));
+        in.End();
+        metadata = std::move(cached_meta);
+        return xyz;
+      }
+    } catch (...) {
+      // Fall through and rebuild stale or incomplete LAS sample cache.
+    }
+  }
   const uint64_t step = std::max<uint64_t>(1, (uint64_t(h.count) + maximum - 1) / maximum);
   std::mt19937_64 generator(0);
   std::uniform_int_distribution<uint64_t> random(0, step - 1);
@@ -283,6 +311,18 @@ std::vector<Eigen::Vector3d> SampleLas(const fs::path& path, const LasHeader& h,
                    {"sampled_points", xyz.size()},
                    {"excluded_withheld_or_noise", rejected},
                    {"chunk_points", 500000}});
+  if (!cache_path.empty()) {
+    fs::create_directories(cache_path.parent_path());
+    BinaryWriter out(cache_path);
+    out.Bytes("GSLS", 4);
+    out.Value(uint32_t(1));
+    out.String(identity.dump());
+    out.String(metadata.dump());
+    out.Value(uint64_t(xyz.size()));
+    if (!xyz.empty())
+      out.Bytes(xyz.data(), xyz.size() * sizeof(Eigen::Vector3d));
+    out.Commit();
+  }
   return xyz;
 }
 void VerifyInitializationPly(const fs::path& path, uint64_t points) {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <set>
 #include <cmath>
+#include <thread>
 
 namespace geosun {
 size_t Reconstruction::Registered() const {
@@ -55,7 +56,7 @@ void Reconstruction::RebuildReferences() {
     }
   }
 }
-void Reconstruction::Filter(double threshold, double min_angle) {
+void Reconstruction::Filter(double threshold, double min_angle, int workers) {
   const double cosine = std::cos(min_angle * Pi / 180);
   std::vector<Eigen::Matrix3d> rotations(images.size());
   std::vector<Eigen::Vector3d> translations(images.size()), centers(images.size());
@@ -65,36 +66,57 @@ void Reconstruction::Filter(double threshold, double min_angle) {
       translations[i] = images[i].pose.Translation();
       centers[i] = images[i].pose.Center();
     }
-  for (auto& p : points) {
-    if (p.track.empty())
-      continue;
+  const int effective_workers =
+      workers > 0 ? workers : std::clamp(int(std::thread::hardware_concurrency()), 1, 16);
+  auto filter_range = [&](size_t begin, size_t end) {
     std::vector<Observation> track;
     std::vector<Eigen::Vector3d> directions;
-    double error = 0;
-    for (const auto& o : p.track) {
-      const auto& image = images[o.image];
-      const auto xyz = rotations[o.image] * p.xyz + translations[o.image];
-      const auto& c = cameras[image.camera];
-      const double e = (c.Project(xyz) - image.pixels[o.feature]).norm();
-      if (xyz.z() > 1e-4 && xyz.allFinite() && std::isfinite(e) && e <= threshold) {
-        track.push_back(o);
-        error += e;
-        directions.push_back((p.xyz - centers[o.image]).normalized());
+    track.reserve(32);
+    directions.reserve(32);
+    for (size_t idx = begin; idx < end; ++idx) {
+      auto& p = points[idx];
+      if (p.track.empty())
+        continue;
+      track.clear();
+      directions.clear();
+      double error = 0;
+      for (const auto& o : p.track) {
+        const auto& image = images[o.image];
+        const auto xyz = rotations[o.image] * p.xyz + translations[o.image];
+        const auto& c = cameras[image.camera];
+        const double e = (c.Project(xyz) - image.pixels[o.feature]).norm();
+        if (xyz.z() > 1e-4 && xyz.allFinite() && std::isfinite(e) && e <= threshold) {
+          track.push_back(o);
+          error += e;
+          directions.push_back((p.xyz - centers[o.image]).normalized());
+        }
+      }
+      bool parallax = false;
+      for (size_t i = 0; i < directions.size() && !parallax; ++i)
+        for (size_t j = i + 1; j < directions.size(); ++j)
+          if (directions[i].dot(directions[j]) <= cosine) {
+            parallax = true;
+            break;
+          }
+      if (track.size() < 2 || !parallax) {
+        p.track.clear();
+      } else {
+        if (track.size() != p.track.size())
+          p.track = track;
+        p.error = error / p.track.size();
       }
     }
-    bool parallax = false;
-    for (size_t i = 0; i < directions.size() && !parallax; ++i)
-      for (size_t j = i + 1; j < directions.size(); ++j)
-        if (directions[i].dot(directions[j]) <= cosine) {
-          parallax = true;
-          break;
-        }
-    if (track.size() < 2 || !parallax)
-      p.track.clear();
-    else {
-      p.track = std::move(track);
-      p.error = error / p.track.size();
-    }
+  };
+  constexpr size_t kChunk = 1024;
+  if (points.size() >= 4096 && effective_workers > 1) {
+    const size_t chunks = (points.size() + kChunk - 1) / kChunk;
+    ParallelFor(chunks, effective_workers, 1, [&](size_t chunk_id) {
+      const size_t begin = chunk_id * kChunk;
+      const size_t end = std::min(points.size(), begin + kChunk);
+      filter_range(begin, end);
+    });
+  } else {
+    filter_range(0, points.size());
   }
   RebuildReferences();
 }

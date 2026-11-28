@@ -177,6 +177,20 @@ inline uint64_t VoxelKey(const Eigen::Vector3d& p) {
          uint64_t(iz & 0x1fffffLL);
 }
 
+struct ViewCellKey {
+  int64_t x = 0, y = 0, z = 0;
+  bool operator==(const ViewCellKey& o) const { return x == o.x && y == o.y && z == o.z; }
+};
+
+struct ViewCellHash {
+  size_t operator()(const ViewCellKey& k) const {
+    uint64_t h = uint64_t(k.x) * 73856093ULL;
+    h ^= uint64_t(k.y) * 19349663ULL;
+    h ^= uint64_t(k.z) * 83492791ULL;
+    return size_t(h);
+  }
+};
+
 Eigen::Vector3d CamPointForPixel(const Camera& cam, const PhotometricCamGrid& grid,
                                  const ShutterMotion* motion, uint32_t img_id, uint32_t cid,
                                  int x, int y, double depth) {
@@ -292,6 +306,14 @@ std::vector<PhotometricTrack> BuildPhotometricTracks(
   }
 
   // Project LAS seeds into nearby covisible frames to form multi-view photometric tracks.
+  std::unordered_map<ViewCellKey, std::vector<uint32_t>, ViewCellHash> cam_grid;
+  for (size_t slot_j = 0; slot_j < n; ++slot_j) {
+    const Eigen::Vector3d& c = centers[written[slot_j]];
+    const ViewCellKey key{int64_t(std::floor(c.x() / kLasMaxProjectDistM)),
+                          int64_t(std::floor(c.y() / kLasMaxProjectDistM)),
+                          int64_t(std::floor(c.z() / kLasMaxProjectDistM))};
+    cam_grid[key].push_back(uint32_t(slot_j));
+  }
   std::vector<PhotometricTrack> las_tracks(all_seeds.size());
   ParallelFor(all_seeds.size(), workers, 64, [&](size_t si) {
     const auto& seed = all_seeds[si];
@@ -300,16 +322,26 @@ std::vector<PhotometricTrack> BuildPhotometricTracks(
       uint32_t slot = 0;
     };
     std::vector<CandFrame> cands;
-    for (size_t slot_j = 0; slot_j < n; ++slot_j) {
-      const uint32_t j = written[slot_j];
-      const Eigen::Vector3d to_cam = centers[j] - seed.world;
-      const double dist = to_cam.norm();
-      if (dist <= 0.35 || dist >= kLasMaxProjectDistM)
-        continue;
-      if ((to_cam / dist).dot(seed.normal) < kLasMaxViewAngleCos)
-        continue;
-      cands.push_back({dist, uint32_t(slot_j)});
-    }
+    const int64_t gx = int64_t(std::floor(seed.world.x() / kLasMaxProjectDistM));
+    const int64_t gy = int64_t(std::floor(seed.world.y() / kLasMaxProjectDistM));
+    const int64_t gz = int64_t(std::floor(seed.world.z() / kLasMaxProjectDistM));
+    for (int64_t dz = -1; dz <= 1; ++dz)
+      for (int64_t dy = -1; dy <= 1; ++dy)
+        for (int64_t dx = -1; dx <= 1; ++dx) {
+          const auto it = cam_grid.find({gx + dx, gy + dy, gz + dz});
+          if (it == cam_grid.end())
+            continue;
+          for (const uint32_t slot_j : it->second) {
+            const uint32_t j = written[slot_j];
+            const Eigen::Vector3d to_cam = centers[j] - seed.world;
+            const double dist = to_cam.norm();
+            if (dist <= 0.35 || dist >= kLasMaxProjectDistM)
+              continue;
+            if ((to_cam / dist).dot(seed.normal) < kLasMaxViewAngleCos)
+              continue;
+            cands.push_back({dist, slot_j});
+          }
+        }
     if (cands.size() < 2)
       return;
     std::sort(cands.begin(), cands.end(),
@@ -1489,20 +1521,6 @@ struct LoadedDiffuseView {
   std::vector<float> depth;
   std::vector<uint8_t> weight;
   std::vector<uint8_t> srgb;
-};
-
-struct ViewCellKey {
-  int64_t x = 0, y = 0, z = 0;
-  bool operator==(const ViewCellKey& o) const { return x == o.x && y == o.y && z == o.z; }
-};
-
-struct ViewCellHash {
-  size_t operator()(const ViewCellKey& k) const {
-    uint64_t h = uint64_t(k.x) * 73856093ULL;
-    h ^= uint64_t(k.y) * 19349663ULL;
-    h ^= uint64_t(k.z) * 83492791ULL;
-    return size_t(h);
-  }
 };
 
 const std::array<float, 256>& SrgbLut() {

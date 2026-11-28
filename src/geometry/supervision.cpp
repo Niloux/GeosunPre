@@ -831,9 +831,11 @@ Json ExportSupervision(const Scene& scene, const Reconstruction& model, const fs
           auto photo = ReadImage(scene.images[id].source, cv::IMREAD_COLOR);
           if (options.crop) {
             const auto& window = (*options.crop)[cid];
-            photo = photo(cv::Rect(window.x, window.y, window.width, window.height)).clone();
+            cv::cvtColor(photo(cv::Rect(window.x, window.y, window.width, window.height)), photo,
+                         cv::COLOR_BGR2RGB);
+          } else {
+            cv::cvtColor(photo, photo, cv::COLOR_BGR2RGB);
           }
-          cv::cvtColor(photo, photo, cv::COLOR_BGR2RGB);
           cv::Mat las_depth;
           const auto& rec = las_records[id];
           if (rec.valid) {

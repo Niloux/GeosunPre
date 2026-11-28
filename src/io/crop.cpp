@@ -255,44 +255,68 @@ std::optional<double> ParseTiffExifEv(const uint8_t* tiff, size_t size) {
 }  // namespace
 std::array<CropWindow, 2> ValidDomainCrop(const Scene& scene, const Reconstruction& model,
                                           const fs::path& masks, int readout_axis, int mcu,
-                                          int workers) {
-  std::vector<const Exposure*> registered;
-  for (const auto& e : scene.images)
-    if (model.images[e.id].registered)
-      registered.push_back(&e);
-  // Each mask's own extent; the row and column maxima bound its non-zero pixels.
-  std::vector<Extent> boxes(registered.size());
-  ParallelFor(registered.size(), workers, 1, [&](size_t i) {
-    const auto& e = *registered[i];
-    const auto mask = ReadImage(masks / (std::to_string(e.id) + ".png"), cv::IMREAD_GRAYSCALE);
-    const auto& camera = model.cameras[e.camera];
-    if (mask.cols != camera.width || mask.rows != camera.height)
-      throw std::runtime_error("Static mask size differs from its camera: " + e.name);
-    cv::Mat columns, rows;
-    cv::reduce(mask, columns, 0, cv::REDUCE_MAX);
-    cv::reduce(mask, rows, 1, cv::REDUCE_MAX);
-    auto& box = boxes[i];
-    for (int x = 0; x < mask.cols; ++x)
-      if (columns.at<uint8_t>(0, x)) {
-        box.x0 = std::min(box.x0, x);
-        box.x1 = x + 1;
-      }
-    for (int y = 0; y < mask.rows; ++y)
-      if (rows.at<uint8_t>(y, 0)) {
-        box.y0 = std::min(box.y0, y);
-        box.y1 = y + 1;
-      }
-  });
+                                          int workers, const Json* static_summary) {
   std::array<Extent, 2> extents;
-  for (size_t i = 0; i < registered.size(); ++i) {
-    const auto& box = boxes[i];
-    if (box.x1 <= box.x0)
-      continue;
-    auto& extent = extents[registered[i]->camera];
-    extent.x0 = std::min(extent.x0, box.x0);
-    extent.y0 = std::min(extent.y0, box.y0);
-    extent.x1 = std::max(extent.x1, box.x1);
-    extent.y1 = std::max(extent.y1, box.y1);
+  bool used_summary = false;
+  if (static_summary && static_summary->contains("camera_nonzero_extents") &&
+      static_summary->at("camera_nonzero_extents").is_array() &&
+      static_summary->at("camera_nonzero_extents").size() == 2) {
+    bool valid = true;
+    for (int c = 0; c < 2; ++c) {
+      const auto& row = static_summary->at("camera_nonzero_extents")[c];
+      if (!row.is_array() || row.size() != 4) {
+        valid = false;
+        break;
+      }
+      const int x0 = row[0].get<int>(), y0 = row[1].get<int>(), x1 = row[2].get<int>(),
+                y1 = row[3].get<int>();
+      const auto& camera = model.cameras[c];
+      if (x0 < 0 || y0 < 0 || x1 <= x0 || y1 <= y0 || x1 > camera.width || y1 > camera.height) {
+        valid = false;
+        break;
+      }
+      extents[c] = {x0, y0, x1, y1};
+    }
+    used_summary = valid;
+  }
+  if (!used_summary) {
+    std::vector<const Exposure*> registered;
+    for (const auto& e : scene.images)
+      if (model.images[e.id].registered)
+        registered.push_back(&e);
+    // Each mask's own extent; the row and column maxima bound its non-zero pixels.
+    std::vector<Extent> boxes(registered.size());
+    ParallelFor(registered.size(), workers, 1, [&](size_t i) {
+      const auto& e = *registered[i];
+      const auto mask = ReadImage(masks / (std::to_string(e.id) + ".png"), cv::IMREAD_GRAYSCALE);
+      const auto& camera = model.cameras[e.camera];
+      if (mask.cols != camera.width || mask.rows != camera.height)
+        throw std::runtime_error("Static mask size differs from its camera: " + e.name);
+      cv::Mat columns, rows;
+      cv::reduce(mask, columns, 0, cv::REDUCE_MAX);
+      cv::reduce(mask, rows, 1, cv::REDUCE_MAX);
+      auto& box = boxes[i];
+      for (int x = 0; x < mask.cols; ++x)
+        if (columns.at<uint8_t>(0, x)) {
+          box.x0 = std::min(box.x0, x);
+          box.x1 = x + 1;
+        }
+      for (int y = 0; y < mask.rows; ++y)
+        if (rows.at<uint8_t>(y, 0)) {
+          box.y0 = std::min(box.y0, y);
+          box.y1 = y + 1;
+        }
+    });
+    for (size_t i = 0; i < registered.size(); ++i) {
+      const auto& box = boxes[i];
+      if (box.x1 <= box.x0)
+        continue;
+      auto& extent = extents[registered[i]->camera];
+      extent.x0 = std::min(extent.x0, box.x0);
+      extent.y0 = std::min(extent.y0, box.y0);
+      extent.x1 = std::max(extent.x1, box.x1);
+      extent.y1 = std::max(extent.y1, box.y1);
+    }
   }
   // Observations of the original rolling-shutter photos may sit a few pixels off the masks.
   constexpr int Margin = 16;
@@ -530,47 +554,28 @@ void CropMask(const fs::path& source, const fs::path& destination, const CropWin
     throw std::runtime_error("Crop window lies outside mask " + source.u8string());
   WriteImage(destination, mask(cv::Rect(window.x, window.y, window.width, window.height)).clone());
 }
-void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
-                          const std::optional<CropWindow>& window,
-                          const PhotometricCorrection& correction, int jpeg_quality) {
-  static const std::array<float, 256> kSrgbToLin = [] {
-    std::array<float, 256> t{};
-    for (int i = 0; i < 256; ++i) {
-      const double c = double(i) / 255.0;
-      t[size_t(i)] = float(c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4));
-    }
-    return t;
-  }();
-  static constexpr int kLinLutSize = 16384;
-  static const std::vector<uint8_t> kLinToSrgb = []() {
-    std::vector<uint8_t> t(kLinLutSize + 1);
-    for (int i = 0; i <= kLinLutSize; ++i) {
-      const double x = double(i) / double(kLinLutSize);
-      const double s = x <= 0.0031308 ? 12.92 * x : 1.055 * std::pow(x, 1.0 / 2.4) - 0.055;
-      t[size_t(i)] = static_cast<uint8_t>(std::clamp(std::lround(s * 255.0), 0L, 255L));
-    }
-    return t;
-  }();
-
-  const auto& cam = correction.source_camera;
+VignettingLut BuildVignettingLut(const Camera& cam,
+                                  const std::array<std::array<double, 3>, 3>& vig_coeffs_rgb) {
   const double fx = cam.params[0], fy = cam.params[1], cx = cam.params[2], cy = cam.params[3];
   const double k1 = cam.params[4], k2 = cam.params[5], k3 = cam.params[6], k4 = cam.params[7];
   if (fx <= 0.0 || fy <= 0.0)
     throw std::runtime_error("Invalid camera focal length for photometric export");
-  double rd_max = 0.0;
+  double rd_max_sq = 0.0;
   for (const double px : {0.0, double(cam.width)}) {
     for (const double py : {0.0, double(cam.height)}) {
-      rd_max = std::max(rd_max, std::hypot((px - cx) / fx, (py - cy) / fy));
+      const double rx = (px - cx) / fx, ry = (py - cy) / fy;
+      rd_max_sq = std::max(rd_max_sq, rx * rx + ry * ry);
     }
   }
-  rd_max = std::max(rd_max, 1e-6);
-  constexpr int kVigLutSize = 4096;
+  rd_max_sq = std::max(rd_max_sq, 1e-12);
   constexpr double kMaxThetaRad = 80.0 * Pi / 180.0;
-  std::array<std::vector<float>, 3> inv_vig_lut;
+  VignettingLut lut;
+  lut.rd_max_sq = rd_max_sq;
+  lut.rd_sq_scale = double(VignettingLut::kSize) / rd_max_sq;
   for (int ch = 0; ch < 3; ++ch)
-    inv_vig_lut[size_t(ch)].assign(kVigLutSize + 1, 1.0f);
-  for (int i = 0; i <= kVigLutSize; ++i) {
-    const double rd = rd_max * (double(i) / double(kVigLutSize));
+    lut.inv_vig[size_t(ch)].assign(VignettingLut::kSize + 1, 1.0f);
+  for (int i = 0; i <= VignettingLut::kSize; ++i) {
+    const double rd = std::sqrt(rd_max_sq * (double(i) / double(VignettingLut::kSize)));
     double theta = rd;
     if (rd > 1e-12) {
       for (int it = 0; it < 30; ++it) {
@@ -595,11 +600,44 @@ void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
     const double rho = std::clamp(theta / kMaxThetaRad, 0.0, 1.0);
     const double r2 = rho * rho;
     for (int ch = 0; ch < 3; ++ch) {
-      const auto& vc = correction.vig_coeffs_rgb[size_t(ch)];
+      const auto& vc = vig_coeffs_rgb[size_t(ch)];
       const double vig =
           std::clamp(std::exp2(vc[0] * r2 + vc[1] * r2 * r2 + vc[2] * r2 * r2 * r2), 0.40, 1.05);
-      inv_vig_lut[size_t(ch)][size_t(i)] = float(1.0 / vig);
+      lut.inv_vig[size_t(ch)][size_t(i)] = float(1.0 / vig);
     }
+  }
+  return lut;
+}
+void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
+                          const std::optional<CropWindow>& window,
+                          const PhotometricCorrection& correction, int jpeg_quality,
+                          const VignettingLut* precomputed_lut) {
+  static const std::array<float, 256> kSrgbToLin = [] {
+    std::array<float, 256> t{};
+    for (int i = 0; i < 256; ++i) {
+      const double c = double(i) / 255.0;
+      t[size_t(i)] = float(c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4));
+    }
+    return t;
+  }();
+  static constexpr int kLinLutSize = 16384;
+  static const std::vector<uint8_t> kLinToSrgb = []() {
+    std::vector<uint8_t> t(kLinLutSize + 1);
+    for (int i = 0; i <= kLinLutSize; ++i) {
+      const double x = double(i) / double(kLinLutSize);
+      const double s = x <= 0.0031308 ? 12.92 * x : 1.055 * std::pow(x, 1.0 / 2.4) - 0.055;
+      t[size_t(i)] = static_cast<uint8_t>(std::clamp(std::lround(s * 255.0), 0L, 255L));
+    }
+    return t;
+  }();
+
+  const auto& cam = correction.source_camera;
+  const double fx = cam.params[0], fy = cam.params[1], cx = cam.params[2], cy = cam.params[3];
+  std::optional<VignettingLut> local_lut;
+  const VignettingLut* lut = precomputed_lut;
+  if (!lut) {
+    local_lut = BuildVignettingLut(cam, correction.vig_coeffs_rgb);
+    lut = &*local_lut;
   }
 
   const auto bytes = ReadBytes(source);
@@ -654,7 +692,7 @@ void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
   const float g_r = float(exp_gain * correction.wb_gains[0]);
   const float g_g = float(exp_gain * correction.wb_gains[1]);
   const float g_b = float(exp_gain * correction.wb_gains[2]);
-  const double rd_scale = double(kVigLutSize) / rd_max;
+  const double rd_sq_scale = lut->rd_sq_scale;
   constexpr float kHighlightKnee = 0.92f;
   constexpr float kHighlightHeadroom = 1.0f - kHighlightKnee;
   for (int y = 0; y < out_h; ++y) {
@@ -664,16 +702,16 @@ void ExportNormalizedJpeg(const fs::path& source, const fs::path& destination,
     const double dy2 = dy * dy;
     for (int x = 0; x < out_w; ++x) {
       const double dx = (double(wx + x) + 0.5 - cx) / fx;
-      const double rd = std::sqrt(dx * dx + dy2);
-      const double fidx = std::min(rd * rd_scale, double(kVigLutSize));
-      const int idx0 = std::min(int(fidx), kVigLutSize - 1);
+      const double rd2 = dx * dx + dy2;
+      const double fidx = std::min(rd2 * rd_sq_scale, double(VignettingLut::kSize));
+      const int idx0 = std::min(int(fidx), VignettingLut::kSize - 1);
       const float frac = float(fidx - double(idx0));
-      const float iv_r = inv_vig_lut[0][size_t(idx0)] * (1.0f - frac) +
-                         inv_vig_lut[0][size_t(idx0 + 1)] * frac;
-      const float iv_g = inv_vig_lut[1][size_t(idx0)] * (1.0f - frac) +
-                         inv_vig_lut[1][size_t(idx0 + 1)] * frac;
-      const float iv_b = inv_vig_lut[2][size_t(idx0)] * (1.0f - frac) +
-                         inv_vig_lut[2][size_t(idx0 + 1)] * frac;
+      const float iv_r = lut->inv_vig[0][size_t(idx0)] * (1.0f - frac) +
+                         lut->inv_vig[0][size_t(idx0 + 1)] * frac;
+      const float iv_g = lut->inv_vig[1][size_t(idx0)] * (1.0f - frac) +
+                         lut->inv_vig[1][size_t(idx0 + 1)] * frac;
+      const float iv_b = lut->inv_vig[2][size_t(idx0)] * (1.0f - frac) +
+                         lut->inv_vig[2][size_t(idx0 + 1)] * frac;
 
       const size_t px_off = size_t(x) * 3;
       auto soft_knee = [&](float v) -> float {

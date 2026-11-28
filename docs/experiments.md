@@ -444,3 +444,37 @@ Ceres 2.2.0 在 `LAPACK=OFF`、`SUITESPARSE=OFF` 下，所有纯 CPU 替代求�
 | **本次 (`小场景-lfs-planA`, RTX 5070 Ti)** | **`259/259` 米制** / **`37/37`** | `449.1 s` / `22.28 ms/it` (`2,063,260`) | `5,928.8 MiB` | `23.2147` / `24.0580` | `0.7862` / `0.8032` | `0.2965` / `0.2934` | **`14.6517°`** | **`0.0097`** | `(-0.0022,-0.0029,-0.0036)` | `21.00` / **`19.74`** / `25.31` |
 
 - **结论与未验证项**：`train.log` 零警告零错误，`37/37` 评测 PNG 无碰撞导出，`PPISP` 收敛正常（`exp_prior_slope=0.4708`、`exp_prior_rms=0.0126`、`color_rms=0.0124`、`cam1 vig a0=[-0.0029,-0.0030,-0.0010]`），几何法线（`-1.39°`）与深度（`-17.1%`）显著优于原 SSI 基线且白墙/走廊目视干净。未验证项：本机未装 LibTorch，`test_metrics_evaluator.cpp` 未整套编译执行；未在跨硬件同卡对比方案 A 前后的纯吞吐微差。
+
+---
+
+## 2026-11-28：第一批（Wave 1）纯 C++/CUDA 端到端稳定性与性能重构验证（`小场景-opt28`）
+
+- **实验目的**：在不改动深度学习模型权重/精度与外部输出契约的前提下，消除预处理 CPU/GPU 同步等待、重复 LAS 读取、串行三角化过滤、`O(N^2)` 检索与冗余 Ceres BA 开销，并补齐 CUDA 混合精度 BA 失败自动恢复链路，在 RTX 5070 Ti 上对比重构前基线 `work/小场景` 与本次 `work/小场景-opt28`。
+- **关键改动**：
+  1. `src/geometry/model.h/.cpp`：`Reconstruction::Filter` 支持多线程（`ParallelFor` 分块 1024 点，`points.size() >= 4096` 启用）及线程局部缓冲复用，消除逐点堆分配与串行 bottlenecks。
+  2. `src/sfm/optimization.cpp` & `src/sfm/reconstruction.cpp`：合并 `Project`/`ProjectionJacobian`/`CameraJacobian` 为单次 `ProjectAndJacobians` 并消除冗余相机拷贝与旋转矩阵重复计算；米制模式下 2-view `Depth` 保护块收窄至 `depth < 1.0`；增加 Ceres CUDA mixed-precision 失败时 `BaSnapshot` 恢复并逐级降级至 FP64 `DENSE_SCHUR` / `ITERATIVE_SCHUR`；标定阶段在非稳定内参、未掉图、增量观测 `<= max(1, 0.0005 * obs_before)` 且前次 BA 已收敛时跳过冗余尾部固定内参 BA（仍执行完整覆盖校验）。
+  3. `src/frontend/inference.h`, `src/frontend/kernels.cu`, `src/frontend/frontend.cpp`：`KeypointDetector` 持久化复用 GPU 缓冲区；`MakeMasks` 对 `roi >= 2 * grounding_size` 采用 `cv::IMREAD_REDUCED_COLOR_2` 直接半分辨率解码并等比缩放 `roi`；`CandidatePairs` 将检索相似度由 `O(N^2)` 标量循环改为 Eigen 矩阵乘法。
+  4. `src/io/las.h/.cpp`, `src/alignment/alignment.cpp`, `src/sfm/structure.cpp`, `src/sfm/shutter.cpp`, `src/app/pipeline.cpp`：`ScanLas` 跨分块复用 `bytes`/`points` 向量；新增 `work/cache/las_sample.bin`（`GSLS` v1 + LAS 身份校验）供对齐、卷帘与结构清理复用。
+  5. `src/geometry/supervision_kernels.h/.cu`, `monocular.cpp`, `supervision.cpp`：新增 `SolveMogeShiftsKernel` GPU 求解各视角尺度/偏移，消除 `MonocularEstimator::Estimate` 中间 `cudaStreamSynchronize` + D2H/H2D 往返；`EncodeMogeSsiMaps` 沿 readout 轴预计算旋转 LUT；移除裁剪读取时多余全图 `.clone()`。
+  6. `src/geometry/photometric.cpp`, `static_masks.cpp`, `src/io/crop.h/.cpp`, `colmap.cpp`：`BuildPhotometricTracks` 改为 15 m 空间网格索引；`static_masks.json` 直接输出 `camera_nonzero_extents` 供裁剪窗口 `O(1)` 读取；`ExportNormalizedJpeg` 按镜头预构建 `rd^2` 索引 LUT 替代逐像素 `std::sqrt`；`RecolorPlyDiffuse` 移入初始化后台线程与 `ExportSupervision` 并行；`CheckBundle` 按图像 `ParallelFor` 并行校验。
+- **验证命令与状态**：
+  - 编译：`.\tools\windows\build.ps1`（Ninja Release，`/W4` 零错误、无新增警告）。
+  - 实景全流程 + 回读检查：`.\run.ps1 run --input input\小场景 --debug --work work\小场景-opt28.work --output work\小场景-opt28; .\run.ps1 check --output work\小场景-opt28`（均 exit 0，`check` `passed: true`，`296/296` 已注册）。
+- **核心对比（同卡 RTX 5070 Ti，`input/小场景` 296 张）**：
+
+| 指标 / 阶段 | 基线 (`work/小场景`) | 优化后 (`work/小场景-opt28`) | 变化 |
+| --- | :---: | :---: | :---: |
+| 全流程 `state.stages` / 总计 | 无 `.work` 记录 | `312.75 s` / **`312.87 s`** | — |
+| `masks` 总耗时 (`decode` + `preprocess` / GPU) | `71.46 s` (`23.70 + 13.42` / `69.79 s`) | `68.44 s` (`10.33 + 5.75` / `67.33 s`) | `decode+pre` **-56.7%**（已完全受限于 SAM3 FP16 GPU） |
+| `features` / `matches` | `19.30 s` / `27.77 s` | `18.63 s` / `26.79 s` | `-3.5%` / `-3.5%` |
+| **`sfm` 总耗时** (`filter` / `opts`) | `94.95 s` (`8.34 s` / `60.47 s`) | **`43.56 s`** (`0.30 s` / `29.28 s`) | **`sfm` 总计 -54.1%**（`filter` **-96.4%**，`opts` **-51.6%**） |
+| `align` (`plane_med` / `p90`) | `—` (`6.01 mm` / `21.76 mm`) | `17.67 s` (`5.76 mm` / `21.30 mm`) | 精度保持甚至略优 |
+| `shutter` (`val_after`) | `24.07 s` (`0.9530`) | `23.46 s` (`0.9343`) | 持平，验证误差略降 |
+| `cleanup` (`las_sample` 读取 / 耗时) | `0.458 s` / `4.55 s` (`plane_after 3.96 mm`) | `0.019 s` / **`3.24 s`** (`plane_after 3.72 mm`) | `sample_seconds` **-95.9%**，`las_sample.bin` (`33.6 MiB`) 生效 |
+| `export`（总计 / 裁剪窗口 / 校验回读） | `static_masks 26.82 s` + `sup 70.25 s` | `109.29 s` (`crop 0.054 s`, `readback 1.69 s`) | `RecolorPlyDiffuse`（`724,465/846,533 = 85.58%`）完全隐藏进 `70.31 s` `supervision` GPU 并行窗口 |
+| 重建与导出质量 (`pts` / `reproj_med` / `p90`) | `123,316` / `0.7279` / `1.7682` | `122,659` / `0.7284` / `1.7657` | 重投影精度一致，`depth_px=208,505,899`（基线 `208,683,919`） |
+
+- **结论与未验证项**：
+  1. `sfm` 与前端解码/几何准备等 CPU+BA 瓶颈已大幅压缩（`sfm` 缩短 `-51.39 s` / `-54.1%`，`masks` 解码+预处理缩短 `-21.04 s` / `-56.7%`，`RecolorPlyDiffuse` 彻底并行掩盖），端到端剩余绝对主导耗时已清晰集中到两大 TensorRT GPU 推理引擎：**SAM3**（`67.33 s`）与 **MoGe-2**（`60.41 s`），适合作为下一波（Wave 2）优化目标（如 SAM3 BF16/FMHA、MoGe-2 分辨率与标定输入/LAS 法线协同）。
+  2. **未验证项**：`小场景` 未触发 Ceres CUDA 混合精度失败，因此 `mixed_precision_fallback` / `cuda_fallback_iterative` 仅完成编译链接验证，未在极端病态场景中实测触发；未在 `展厅` / `南非展会` 等更大场景回归；未对 `work/小场景-opt28` 重跑下游 LichtFeld Studio 3DGS 训练对比渲染指标。
+
