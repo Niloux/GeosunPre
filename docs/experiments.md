@@ -74,8 +74,8 @@
 
 - **排查定位（基于 `work/小场景` `3000` 步分析与 `cuobjdump`）**：`RasterizeToPixelsFromWorld3DGSBwd.cu` 此前无条件为 `s_cv_target` / `s_cv_buf` 分配 `1,280 B` 共享内存（使 `CDIM=8` 达到 `10,240 / 10,496 B`）并保留内层分支，且存在 `pixel_weight` 时每像素重复读取 `*color_variance.pixel_weight_sum`；同时在 `pipelined_depth_own_size_ == true` 且先验已适配时存在重复 `fit_depth_prior` 调用。
 - **保留改动**：
-  - [RasterizeToPixelsFromWorld3DGSBwd.cu](file:///d:/Dev/LichtFeld-Studio/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSBwd.cu)：为 `rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel` 增加 `kColorVariance` 编译期模板参数（关闭时将 `s_cv_target`/`s_cv_buf` 缩至 1 元素，共享内存降回 `8960 / 9216 B`，`LOCAL:0`），并在开启分支前由 warp `lane 0` 读取 `*color_variance.pixel_weight_sum` 后 `__shfl_sync` 广播。
-  - [trainer.cpp](file:///d:/Dev/LichtFeld-Studio/src/training/trainer.cpp)：在分辨率匹配且无需重拟合时复用已适配的深度先验并 `sync_to_stream`，避免重复调用 `fit_depth_prior`。
+  - [RasterizeToPixelsFromWorld3DGSBwd.cu](../../LichtFeld-Studio/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSBwd.cu)：为 `rasterize_to_pixels_from_world_3dgs_bwd_splat_kernel` 增加 `kColorVariance` 编译期模板参数（关闭时将 `s_cv_target`/`s_cv_buf` 缩至 1 元素，共享内存降回 `8960 / 9216 B`，`LOCAL:0`），并在开启分支前由 warp `lane 0` 读取 `*color_variance.pixel_weight_sum` 后 `__shfl_sync` 广播。
+  - [trainer.cpp](../../LichtFeld-Studio/src/training/trainer.cpp)：在分辨率匹配且无需重拟合时复用已适配的深度先验并 `sync_to_stream`，避免重复调用 `fit_depth_prior`。
 - **当时基准实测**（`work/小场景`，`max_cap = 2,100,000`、`iterations = 3,000`）：修复前 `49.094 s (61.1 iter/s)` → 修复后（关闭 color variance，warmup 期间）提速至 `45.170 s (66.4 iter/s)`（`-8.0%`）；开启 color variance 时为 `46.912 s (63.9 iter/s)`。该核优化在后续清理魔改正则参数时完整保留。
 
 ## 2026-11-23：回归原版 LFS 默认训练参数并切换至纯 MoGe-2 SSI 监督
@@ -146,7 +146,7 @@
 - **改动概要**：
   1. **Ceres CUDA 混合精度 `DENSE_SCHUR` BA**（[dependencies.cmake](../dependencies/dependencies.cmake)、[optimization.cpp](../src/sfm/optimization.cpp)、[build.ps1](../tools/windows/build.ps1)）：开启 Ceres 2.2.0 `USE_CUDA=ON`（链接 `cudart`、`cublas`、`cusolver`、`cusparse` 并随 `build.ps1` 复制 6 个运行时 CUDA DLL）；对 `>= 64` 图且含可变三维点的全局 BA，在 Schur 补列数 `<= 12000` 且空闲显存满足 `>= 2 * (12 * schur_cols^2) + 512 MiB` 时启用 `DENSE_SCHUR + CUDA + use_mixed_precision_solves=true`（FP32 Cholesky + FP64 迭代精化），否则回退 `ITERATIVE_SCHUR + SCHUR_JACOBI`。
   2. **TensorRT 动态批推理**（[networks.py](../tools/models/networks.py)、[prepare.py](../tools/models/prepare.py)、[inference.cpp](../src/frontend/inference.cpp)、[frontend.cpp](../src/frontend/frontend.cpp)、[monocular.cpp](../src/geometry/monocular.cpp)、[supervision_kernels.cu](../src/geometry/supervision_kernels.cu)）：为 LoMa `matcher`（`B=1..8`, `opt=8`）与 MoGe-2 `geometry`（`B=1..8`, `opt=7`）开启动态批维度，构建独立模型包 `models-batched`（保留只读 `models/` 不变）；运行时按引擎 `MaxBatch` 与可用显存（`< 5 GiB` 收敛至 `<= 4`）自动分批。
-  3. **精确 `SO(3)` 卷帘模型与暴露–IMU 时钟偏置自标定**（[model.h](../src/geometry/model.h)、[optimization.cpp](../src/sfm/optimization.cpp)、[shutter.cpp](../src/sfm/shutter.cpp)、[scene.cpp](../src/io/scene.cpp)、[monocular.cpp](../src/geometry/monocular.cpp)、[supervision_kernels.cu](../src/geometry/supervision_kernels.cu) 及下游 `LichtFeld-Studio` [rolling_shutter.cpp](file:///d:/Dev/LichtFeld-Studio/src/training/components/rolling_shutter.cpp)）：将线性一阶卷帘统一升级为精确 `SO(3)` `Exp(s[ω]×)(v - s·τ·u)` 与精确左雅可比 `-s·J·[v]×·J_l(sω)`（经中心有限差分校验 `MAX_ABS_ERR = 1.84e-7`，`MAX_REL_ERR = 1.11e-7 < 1e-6`），单轴旋转边界由 `0.05` 放宽至 `0.10` rad；并在 `shutter` 前对 `[-80, +80] ms` 自标定共享时钟偏置 `time_offset_s`。
+  3. **精确 `SO(3)` 卷帘模型与曝光–IMU 时钟偏置自标定**（[model.h](../src/geometry/model.h)、[optimization.cpp](../src/sfm/optimization.cpp)、[shutter.cpp](../src/sfm/shutter.cpp)、[scene.cpp](../src/io/scene.cpp)、[monocular.cpp](../src/geometry/monocular.cpp)、[supervision_kernels.cu](../src/geometry/supervision_kernels.cu) 及下游 `LichtFeld-Studio` [rolling_shutter.cpp](../../LichtFeld-Studio/src/training/components/rolling_shutter.cpp)）：将线性一阶卷帘统一升级为精确 `SO(3)` `Exp(s[ω]×)(v - s·τ·u)` 与精确左雅可比 `-s·J·[v]×·J_l(sω)`（经中心有限差分校验 `MAX_ABS_ERR = 1.84e-7`，`MAX_REL_ERR = 1.11e-7 < 1e-6`），单轴旋转边界由 `0.05` 放宽至 `0.10` rad；并在 `shutter` 前对 `[-80, +80] ms` 自标定共享时钟偏置 `time_offset_s`。
   4. **导航展开度与 IMU 旋转感知的三级种子选对**（[reconstruction.cpp](../src/sfm/reconstruction.cpp)）：按 IMU 旋转一致性（`<= 3.0°`）、强邻域（`inliers >= 48`）数量及位置协方差横向展开度 `transverse_m` 分 Tier 2 / 1 / 0 择优。
 
 ### Ceres BA 线性求解器对比（同题复现，`ba_workers = 8`）
@@ -426,3 +426,21 @@ Ceres 2.2.0 在 `LAPACK=OFF`、`SUITESPARSE=OFF` 下，所有纯 CPU 替代求�
 - **结论与未验证项**：
   - Route B 在两个场景均实现 **100% 精确米制锚点加载**（零回退、解决 `展厅` 15 帧 RANSAC 丢失），且在不新增任何配置参数的前提下显著改善三维结构：`室内` 20 cm 平面中位厚度缩薄 **`25.8%`**（地面/顶面 **`-36.7%`**）、偏离 LAS `>5 cm` 高斯下降 **`16.5%`**、法线角 `11.44° -> 11.01°`、`Depth AbsRel 0.0093 -> 0.0072`；`展厅` 偏离 LAS `>5 cm` 下降 **`16.9%`**、`10–20 cm` 浮壳数量降 **`20.2%`** 且中位不透明度由 `0.403` 降至 **`0.237`**（`-41.2%`）、地面/墙面相机侧 `>5 cm` 浮壳同步收敛、全集法线（`15.53°`）、`Depth AbsRel`（`0.0072`）、同口径已见 `SSIM`/`LPIPS` 均优于基线，同口径 `Aligned PSNR` 仅微差 `0.17–0.28 dB`。
   - **未验证项**：1）针孔模型 `DepthRayGrid` 分支已在单测 `MetricDepthLossDeadbandHuberAndEdges` 通过编译与测试，尚未在真实针孔数据集做端到端训练；2）`work/室内-lfs-metricB` 与 `work/{室内,展厅}-lfs-metricB2` 已保留在本地供核验视觉成图与 `.licht` / `.ply`。
+
+## 2026-11-28：`LichtFeld-Studio` 上游 3DGUT 通用切片移植与 PPISP 曝光梯度修复（`小场景-lfs-planA`）
+
+- **背景与方案选择**：`upstream/master`（至 `7953aead9`）共推进 14 个提交，其中核心性能提交 `56be47617` 约 85% 面向 FastGS（针孔光栅化），且在 Lazy Adam / Morton / MRNF 稀疏折叠上与本地 3DGUT 主线存在 13 处重冲突。采用方案 A 选择性移植通用有益切片并修复本地潜伏 Bug：
+  1. Cherry-pick `40cfcfb40`（#4196）：修复 Windows 大小写不敏感目录下评测 PNG 同名/大小写别名覆盖（`filename_key.hpp` / `metrics.cpp` / `test_metrics_evaluator.cpp`）；
+  2. 从 `56be47617` 移植 4 项对 3DGUT 通用加速切片：`memory_arena.cu` shrink 免同步预判（`would_decommit`）、`joint_adam_codec.cuh` 小值区 5 阶 Horner 多项式（保留本地 `sr_uniform01` / `encode_us_sr`）、`morton_reorder_kernels.cu` + `morton_reorder.cpp` 连续均值采样打包与流内置换去全局 sync（保留本地 `flush_lazy_steps()`）、`ssim` + `calibration_correction` + `trainer.cpp` 预计算 `decoupled_raw_gradient` 融合；
+  3. 修复本地 [ppisp.cu](../../LichtFeld-Studio/src/training/kernels/ppisp.cu#L183-L188) 中 `ppisp_backward_chw_kernel` grid-stride 循环直接将累加器 `grad_exposure_local` 传入赋值语义的 `ppisp_apply_exposure_bwd` 导致仅保留最后一轮像素梯度的 Bug（改为先写临时标量再累加）。
+- **单测与构建验证**：
+  - 独立编译运行 Torch 无关 GTest 回归（`52` 用例：**`51 PASSED`、`1 SKIPPED`、`0 FAILED`**），覆盖 `JointAdamCodecTest`（10/10）、`GutJointAdamBatch`（2/2）、`GutShNJointAdam`（2/2）、`GutShNJointFromColor`（1/1）、`VramMapCaches`（2/2）、`CalibrationCorrectionTest`（13/13，含新增 `precomputed` 一致性校验）、`CalibrationScoring`（5/5）、`MortonReorderTest`（13/14 passed，1 缺 `bicycle` 数据集 skipped），以及补充回归（`PPISPBackwardGridStrideAccumulatesExposureAcrossAllPixels`、`FilenameKeyRespectsCaseSensitivityFlag`、`MemoryArenaShrinkNoDecommitFastPathPreservesAllocations`）；
+  - `scripts\build-windows-release.cmd` Release 构建与 `--version` 冒烟通过。
+- **实景验证**（基于 `work/小场景` 跑完整 `20,000` 步 `--headless --eval --perf-bench`，输出保留于 `work/小场景-lfs-planA`；本次同时叠加了 `5e16fd7a5` Route B 精确米制锚点/相对失真/Free-Space 与本次方案 A 修复/优化）：
+
+| 组别 (`小场景`, 259 训 / 37 测, 20k) | 锚点 / 卷帘 | 总耗时 / 稳态 (`#GS`) | 峰值显存 | `PSNR` / `Aligned` | `SSIM` / `Aligned` | `LPIPS` / `Aligned` | `Normal (°)` ↓ | `Depth AbsRel` ↓ | `Bias_corr (R,G,B)` | `00039-L` / `00163-R` / `00175-L` PSNR |
+| --- | :---: | :---: | ---: | :---: | :---: | :---: | ---: | ---: | :---: | :---: |
+| 基线 (`小场景-lfs-diffuse4`, RTX 4090口径) | SSI RANSAC / `37/37` | — | — | `23.3808` / `24.2519` | `0.7894` / `0.8047` | `0.2941` / `0.2911` | `16.0455°` | `0.0117` | `(-0.0021,-0.0029,-0.0034)` | `21.07` / `19.58` / `25.42` |
+| **本次 (`小场景-lfs-planA`, RTX 5070 Ti)** | **`259/259` 米制** / **`37/37`** | `449.1 s` / `22.28 ms/it` (`2,063,260`) | `5,928.8 MiB` | `23.2147` / `24.0580` | `0.7862` / `0.8032` | `0.2965` / `0.2934` | **`14.6517°`** | **`0.0097`** | `(-0.0022,-0.0029,-0.0036)` | `21.00` / **`19.74`** / `25.31` |
+
+- **结论与未验证项**：`train.log` 零警告零错误，`37/37` 评测 PNG 无碰撞导出，`PPISP` 收敛正常（`exp_prior_slope=0.4708`、`exp_prior_rms=0.0126`、`color_rms=0.0124`、`cam1 vig a0=[-0.0029,-0.0030,-0.0010]`），几何法线（`-1.39°`）与深度（`-17.1%`）显著优于原 SSI 基线且白墙/走廊目视干净。未验证项：本机未装 LibTorch，`test_metrics_evaluator.cpp` 未整套编译执行；未在跨硬件同卡对比方案 A 前后的纯吞吐微差。

@@ -1,6 +1,6 @@
 # GeosunPre
 
-原生 C++17/CUDA 双鱼眼与 LAS 输入预处理程序，交付包是定制 LichtFeld Studio（LFS）3DGS 训练的数据目录。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、卷帘快门校正、稀疏点清理、COLMAP/PLY 及纯 MoGe-2 SSI 深度和法向监督导出。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
+原生 C++17/CUDA 双鱼眼与 LAS 输入预处理程序，交付包是定制 LichtFeld Studio（LFS）3DGS 训练的数据目录。单进程完成语义掩码、LoMa 特征与匹配、自有 SfM、共享鱼眼内参优化、LAS 配准、卷帘快门校正、稀疏点清理、3 通道光度校准匀光、连续漫反射权重、漫反射重着色 LAS PLY，以及 COLMAP 与 LAS 尺度对齐的 MoGe-2 SSI 深度和法向监督导出。运行不需要 Python、LibTorch、COLMAP、WSL 或联网。
 
 ## 开始使用
 
@@ -41,7 +41,7 @@ $in = @('--project', 'D:/数据/场景/场景.pro', '--images', 'D:/数据/场�
 
 **调试模式**（`--debug`）：工作目录（默认 `work/<输出目录名>`）及 `cache/` 全部保留，可 `run --work WORK` 续跑或 `--stage` 单独执行阶段，也可用于独立 `export`。模式在首次运行时记入 `state.json`；生产工作目录续跑时加 `--debug` 可改为保留，调试工作目录不会被删除。
 
-交付包含照片（采用卷帘校正时另附读出运动参数）、掩码、鱼眼 COLMAP 模型、50 m 视锥内分档体素 LAS 初始化 PLY（基准体素默认 5 cm，上限随自适应 `max_cap` 联动且封顶 250 万点）、自动生成的多边形 ROI（`roi.json`）、按场景规模与显存自适应生成的训练配置（`trainer.json`），以及纯 MoGe-2 SSI 深度和法向监督图：默认最长边 1024 px，输出跨透视子图对齐尺度并融合的 16 位 SSI 射线深度与 OpenCV 相机系 8 位密集法向。`--no-ply` 省略 PLY 与 `roi.json`，`--no-roi` 仅省略 `roi.json`，`--ply-voxel` 调整基准体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人），以及有 LAS 表面支撑的天空误检块和封闭室内场景残余天空误检均在掩码里改回静态 `255`（配合 `configs/trainer.json` 统一的 `segment_and_ignore`），`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
+交付包含照片（启用静态掩码且光度校准通过时在线性空间完成去暗角、白平衡、安全匀光并以 Q=97 4:4:4 写出且将残余曝光写入 EXIF；采用卷帘校正时另附读出运动参数）、掩码、连续漫反射光度权重（`weights/`，320 长边单通道）、鱼眼 COLMAP 模型、50 m 视锥内分档体素漫反射重着色 LAS 初始化 PLY（基准体素默认 5 cm，上限随自适应 `max_cap` 联动且封顶 250 万点）、自动生成的多边形 ROI（`roi.json`）、按场景规模与显存自适应生成的训练配置（`trainer.json`），以及 LAS 尺度对齐的 MoGe-2 SSI 深度和法向监督图：默认最长边 1024 px，输出跨透视子图对齐尺度并融合的 16 位 SSI 射线深度与 OpenCV 相机系 8 位密集法向。`--no-ply` 省略 PLY 与 `roi.json`，`--no-roi` 仅省略 `roi.json`，`--ply-voxel` 调整基准体素边长；`--no-las-supervision` 省略深度、法向图和 `supervision.json`。开着监督时，持续出现的人物（画框、海报里的人，一直坐着不动的人），以及有 LAS 表面支撑的天空误检块和封闭室内场景残余天空误检均在掩码里改回静态 `255`（配合 `configs/trainer.json` 统一的 `segment_and_ignore`），`masks/` 仅保留人物、有效域外与真过曝裁切为 `0`，`--no-static-masks` 保留 SAM3 掩码。完整结构见[输出约定](docs/output.md)。
 
 监督尺寸、额外几何掩码、显存预算及 LFS 训练示例见[深度与法向监督](docs/supervision.md)。已有调试工作目录可直接导出到新目录，无需重跑重建。
 
@@ -66,7 +66,7 @@ models/
   runtime/nvinfer_10.dll
 ```
 
-匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32。原图按最长边 1536 缩放后送入动态检测器，横图、竖图及不同分辨率共用同一模型包。geometry 为 MoGe-2 ViT-L normal（FP16，644×644 透视子图），供默认的 MoGe 监督使用；grounding 为 SAM3（FP16，1008×1008 整幅照片），供掩码阶段区分天空、人物、影子与人形展品。模型准备后自动用真实照片验证动态宽高、五模型输出、动态描述子数量和匹配补零行为。输入范围、设备和精度参数见[模型文档](docs/models.md)。
+匹配器默认 FP16，Softmax、Reduce 和 Normalization 层保留 FP32；所有浮点输入输出保持 float32，matcher 与 geometry 均支持动态批推理（默认最大批大小 `8`）。原图按最长边 1536 缩放后送入动态检测器，横图、竖图及不同分辨率共用同一模型包。geometry 为 MoGe-2 ViT-L normal（FP16，644×644 透视子图），供默认的 MoGe 监督使用；grounding 为 SAM3（FP16，1008×1008 主点居中方形鱼眼 ROI），供掩码阶段区分天空、人物、影子与人形展品。模型准备后自动用真实照片验证动态宽高、五模型输出、动态描述子数量和匹配补零行为。输入范围、设备和精度参数见[模型文档](docs/models.md)。
 
 模型目录中完整且兼容的包会校验后复用。更换 GPU 或匹配精度时使用新模型目录，并用 `--models` 指定；更换图像分辨率不需要重建。新生成的目录同时保留 ONNX 和准备元数据，模型资源不进入 Git。
 
@@ -96,4 +96,4 @@ models/
 
 `package.ps1` 在整包模式下编译启动器，原样复制两个子包到 `preprocess/` 和 `trainer/`。脚本核对文件哈希、提交和训练配置，并检查启动器、五模型和训练器。整体包用法见 [bundle/README.md](bundle/README.md)。
 
-构建依赖使用固定版本；Ceres 使用轻量日志和 Eigen 稀疏求解，OpenCV 只构建图像处理所需模块。Ceres 回代补丁由 CMake 自动应用，清空 `build/` 后重新构建同样生效。
+构建依赖使用固定版本；Ceres 启用 CUDA 混合精度 `DENSE_SCHUR`（并保留 `ITERATIVE_SCHUR` / `EIGEN_SPARSE` 回退）与轻量日志，OpenCV 只构建图像处理所需模块。Ceres 回代补丁由 CMake 自动应用，清空 `build/` 后重新构建同样生效。
